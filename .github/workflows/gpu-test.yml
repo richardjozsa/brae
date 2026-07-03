@@ -31,7 +31,7 @@ jobs:
         run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=native
 
       - name: Build
-        run: cmake --build build -j --target brae
+        run: cmake --build build -j        # all targets: brae + the ctest unit-test executables (test_spmv, test_pcg, ...)
 
       - name: Test (ctest)
         run: ctest --test-dir build --output-on-failure -j4
