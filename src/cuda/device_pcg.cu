@@ -129,7 +129,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer
     // bd read stops it within K iters (vs OF's immediate break -- equivalent result; breakdown is pathological & rare).
     BiCGScalars& s = bicgScalars();
     cudaCheck(cudaMemsetAsync(s.bd.data(), 0, sizeof(scalar), cudaStreamPerThread), "bicg bd zero");
-    int nIter = 0; bool brokeDown = false;
+    int nIter = 0;
     if (!converged(perf.finalResidual)) {
         do {
             if (nIter > 0) deviceScalarCopy(s.rr.data(), s.rrOld.data());   // rA0rAold = rA0rA
@@ -158,12 +158,12 @@ DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer
             if (check) {
                 deviceSumMagInto(rA, s.rNorm.data());
                 perf.finalResidual = deviceReadScalar(s.rNorm.data()) / normFactor;
-                if (deviceReadScalar(s.bd.data()) != 0.0) { brokeDown = true; ++nIter; break; }   // OF break on singularity, batched to K
+                if (deviceReadScalar(s.bd.data()) != 0.0) { ++nIter; break; }   // OF break on singularity, batched to K
             }
             ++nIter;
         } while (nIter < maxIter && !converged(perf.finalResidual));
     }
-    perf.nIterations = nIter; (void)brokeDown;
+    perf.nIterations = nIter;
     return perf;
 }
 
