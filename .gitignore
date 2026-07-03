@@ -2,7 +2,27 @@ build/
 *.o
 *.a
 *.obj
-
-# generated OpenFOAM validation cases + outputs (1.4 GB), not for the public repo
-validation/
 VTK/
+
+# validation/: commit the input cases the ctests actually read (mesh, dicts, and the OF reference
+# solutions the tests compare against). Keep the large unused OF-comparison cases out (saf_*, *_of,
+# sweep_*, etc., ~1.3 GB that no test reads).
+validation/*
+!validation/cyclicChannel/
+!validation/cyclicChannelAMI/
+!validation/cyclicWedge/
+!validation/kEpsCase/
+!validation/kEpsCorrect/
+!validation/komegaCoeffs/
+!validation/lmFlatPlate/
+!validation/lm_ctest.sh
+!validation/matrixDump/
+!validation/matrixDumpAsym/
+!validation/matrixDumpGAMG/
+!validation/matrixDumpSimple/
+!validation/mrfBox/
+!validation/of_apps/
+!validation/pitzDaily/
+!validation/pitzDaily282/
+!validation/pitzDailyTurb/
+!validation/pitzDailyTurbBig/

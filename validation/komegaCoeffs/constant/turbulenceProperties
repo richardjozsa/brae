@@ -1,0 +1,30 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| Fixture for ctest komega_coeffs: custom kOmegaSSTCoeffs to verify dict read. |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      turbulenceProperties;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+simulationType  RAS;
+
+RAS
+{
+    RASModel        kOmegaSST;
+    turbulence      on;
+    printCoeffs     on;
+
+    kOmegaSSTCoeffs
+    {
+        a1          0.35;       // non-default (OF 0.31)
+        betaStar    0.085;      // non-default (OF 0.09)
+        F3          true;       // non-default (OF false)
+        // alphaK2, gamma1, ... omitted -> must keep OF defaults
+    }
+}
+
+// ************************************************************************* //

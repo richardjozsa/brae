@@ -1,0 +1,76 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+FoamFile
+{
+    version         2;
+    format          ascii;
+    class           dictionary;
+    object          controlDict;
+}
+
+application     simpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+endTime         3000;
+
+deltaT          1;
+
+writeControl    timeStep;
+
+writeInterval   3000;
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  16;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable true;
+
+functions
+{
+    streamlines
+    {
+        nLines          20;
+        start           ( 0 -4 1e-06 );
+        end             ( 0 4 1e-06 );
+        fields          ( U p );
+        type            streamLine;
+        libs            ( "libfieldFunctionObjects.so" );
+        executeControl  writeTime;
+        writeControl    writeTime;
+        setFormat       vtk;
+        direction       forward;
+        lifeTime        10000;
+        nSubCycle       5;
+        cloud           particleTracks;
+        seedSampleSet
+        {
+            type            uniform;
+            axis            x;
+            start           ( 0 -4 1e-06 );
+            end             ( 0 4 1e-06 );
+            nPoints         20;
+        }
+    }
+}
+
+
+// ************************************************************************* //

@@ -1,0 +1,85 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _e5c6ccc3-20250814 OPENFOAM=2412 patch=250814 version=2412
+Arch   : "LSB;label=32;scalar=64"
+Exec   : simpleFoam -postProcess -latestTime
+Date   : Jun 25 2026
+Time   : 14:21:36
+Host   : gx10-8ac0
+PID    : 105213
+I/O    : uncollated
+Case   : /home/ghost/cudafoam/cf/validation/pitzDaily282
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create mesh for time = 282
+
+
+SIMPLE: convergence criteria
+    field p	 tolerance 0.01
+    field U	 tolerance 0.001
+    field "(k|epsilon|omega|f|v2)"	 tolerance 0.001
+
+forces cfForces:
+    rho: rhoInf
+    Freestream density (rhoInf) set to 1
+    Not including porosity effects
+
+streamLine streamlines:
+    Employing velocity field U
+    automatic track length specified through number of sub cycles : 5
+
+Time = 282
+Reading field p
+
+Reading field U
+
+Reading/calculating face flux field phi
+
+Selecting incompressible transport model Newtonian
+Selecting turbulence model type RAS
+Selecting RAS turbulence model kEpsilon
+RAS
+{
+    RASModel        kEpsilon;
+    turbulence      on;
+    printCoeffs     on;
+    Cmu             0.09;
+    C1              1.44;
+    C2              1.92;
+    C3              0;
+    sigmak          1;
+    sigmaEps        1.3;
+}
+
+No MRF models present
+
+No finite volume options present
+forces cfForces write:
+    Sum of forces
+        Total    : (0.0004316009005921271 7.380433287534747e-05 1.736263073277851e-22)
+        Pressure : (0.0003347465081074252 7.540701267556556e-05 1.733746355749018e-22)
+        Viscous  : (9.685439248470183e-05 -1.60267980021808e-06 2.516717528833034e-25)
+    Sum of moments
+        Total    : (-1.102688085674128e-24 -4.211786547167168e-23 -5.698104098111702e-06)
+        Pressure : (-2.30969456093208e-24 -4.151647204268638e-23 -3.275648852074078e-06)
+        Viscous  : (1.207006475257951e-24 -6.013934289852935e-25 -2.422455246037623e-06)
+    writing force and moment files.
+
+streamLine streamlines write:
+    seeded 0 particles
+    Tracks:0
+    Total samples:0
+
+End
+
