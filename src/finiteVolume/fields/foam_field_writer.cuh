@@ -47,9 +47,9 @@ inline void writePatchEntry(std::ostream& os, const std::string& name, const Pat
 }
 
 // Splice the solved internalField into a fully-resolved OpenFOAM field written for `patches`.
-template <typename T>
+template <typename T, typename Patch>   // Patch = FvPatch (device solver) or PatchInfo (host solver); both carry name/type/inGroups
 inline void writeVolField(const std::string& origPath, const std::string& outPath,
-                          const std::vector<T>& values, const std::vector<FvPatch>& patches, int precision = 16) {
+                          const std::vector<T>& values, const std::vector<Patch>& patches, int precision = 16) {
     std::ifstream in(origPath);
     if (!in) throw std::runtime_error("writeVolField: cannot read " + origPath);
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -75,7 +75,7 @@ inline void writeVolField(const std::string& origPath, const std::string& outPat
     for (const T& v : values) { formatFoamValue(out, v); out << '\n'; }
     out << ")\n;\n\n";
     out << "boundaryField\n{\n";
-    for (const FvPatch& p : patches) {                                              // per mesh patch, matched like buildField
+    for (const Patch& p : patches) {                                                // per mesh patch, matched like buildField
         const PatchFieldData<T>* d = nullptr;
         for (const auto& b : fd.boundary) if (b.name == p.name) { d = &b; break; }   // pass 1: exact name
         if (!d) for (const auto& b : fd.boundary) {                                  // pass 2: group / regex
