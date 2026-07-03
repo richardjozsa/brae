@@ -1,0 +1,42 @@
+name: ci
+
+# GitHub-hosted build-check. Compiles brae on every push and pull request to catch build
+# breaks fast and for free. This runs the untrusted-PR-safe checks; the full ctest runs on the
+# self-hosted GB10 (gpu-test.yml). Compiles both code paths: sm_80 (Ampere, cluster intrinsics guarded
+# out) and sm_90 (Hopper, cluster path), so an unguarded cluster feature can't slip in unnoticed.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:        # let release.yml reuse this build-check as a release gate
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04            # x86 host, no GPU: cross-compiles device code, no kernel launch
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake libopenmpi-dev openmpi-bin zlib1g-dev libscotch-dev
+
+      - name: Install CUDA 13.0 toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-13-0
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - name: Versions
+        run: |
+          cmake --version | head -1
+          /usr/local/cuda/bin/nvcc --version | tail -1
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES="80;90"   # quoted: the ; must not be seen by the shell
+
+      - name: Build (compile-check)
+        run: cmake --build build -j --target brae

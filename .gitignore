@@ -1,0 +1,8 @@
+build/
+*.o
+*.a
+*.obj
+
+# generated OpenFOAM validation cases + outputs (1.4 GB), not for the public repo
+validation/
+VTK/

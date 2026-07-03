@@ -1,0 +1,37 @@
+name: gpu-test
+
+# Full ctest on the self-hosted GB10 (Grace-Blackwell, sm_121).
+# SECURITY: a self-hosted runner must never execute untrusted code, so this runs ONLY on
+# pushes to main and manual dispatch, never on pull requests from forks. Keep untrusted PRs
+# on the GitHub-hosted build-check (ci.yml) instead.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One GPU job at a time (kernels would contend for the single device).
+concurrency:
+  group: gpu-test
+  cancel-in-progress: false
+
+jobs:
+  ctest:
+    runs-on: [self-hosted, ARM64]        # matches the GB10 runner (self-hosted, Linux, ARM64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain and GPU
+        run: |
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"   # ensure nvcc is found even if the runner is a systemd service
+          cmake --version | head -1
+          /usr/local/cuda/bin/nvcc --version | tail -1
+          nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=native
+
+      - name: Build
+        run: cmake --build build -j --target brae
+
+      - name: Test (ctest)
+        run: ctest --test-dir build --output-on-failure -j4

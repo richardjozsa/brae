@@ -1,0 +1,8 @@
+OF + AMGX (aggregation, 1 GPU) | 100-iter total wall | Thu Jul  2 08:45:21 AM CEST 2026
+  mesh     nCells       amgx_s
+     9M                    80.0  (reached 100)
+    20M                   572.5  (reached 100)
+    29M                  1174.2  (reached 100)
+    35M                  1696.4  (reached 100)
+    54M                  4111.0  (reached 100)
+AMGX_SWEEP_DONE

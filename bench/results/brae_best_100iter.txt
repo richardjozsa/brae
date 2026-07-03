@@ -1,0 +1,8 @@
+cf BEST config: CF_PCG_DEVICE=1 CF_AMG_FP32=1 | 100-iter total wall Wed Jul  1 11:23:49 PM CEST 2026
+  mesh     nCells cfBEST_total_s
+     9M     990225         21.6
+    20M    4890000        107.7
+    29M   10281225        232.5
+    35M   14975625        339.6
+    54M   35648100        877.1
+CF_BEST_DONE

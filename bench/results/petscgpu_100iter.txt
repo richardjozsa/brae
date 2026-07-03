@@ -1,0 +1,6 @@
+OF + PETSc-GAMG-GPU (cuSPARSE, 1 GPU) | 100-iter total wall | Thu Jul  2 06:03:45 AM CEST 2026
+  mesh     nCells     petscgpu_s
+     9M     990225           89.3  (reached t=100)
+    20M    4890000          601.6  (reached t=100)
+    29M   10281225         1253.0  (reached t=100)
+    35M   14975625         1790.3  (reached t=100)

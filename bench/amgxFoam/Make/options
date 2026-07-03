@@ -1,0 +1,9 @@
+EXE_INC = \
+    -I$(AMGX_INC) \
+    -I$(LIB_SRC)/finiteVolume/lnInclude
+
+LIB_LIBS = \
+    -lOpenFOAM \
+    -lfiniteVolume \
+    -L$(AMGX_LIB) -lamgxsh \
+    -L/usr/local/cuda/lib64 -lcudart
