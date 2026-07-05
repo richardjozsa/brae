@@ -32,19 +32,31 @@ Other tuning knobs (advanced; sensible defaults):
 ## Benchmarks
 
 Total wall time for **100 SIMPLE iterations**, scaled-pitzDaily, on a single **NVIDIA GB10** (20 Grace CPU cores +
-one Blackwell GPU, unified LPDDR5x, **no HBM**). Partition/decompose is done once and excluded on all sides.
+one Blackwell GPU, unified LPDDR5x, **no HBM**). The one-time prep is done once and excluded on all sides: for
+OpenFOAM that is `decomposePar`; for brae it is `brae -partition -case <case>`, which builds and caches the mesh +
+AMG hierarchy (`constant/polyMesh/.brae_meshcache` + `.brae_amgcache`) so the timed run reloads them warm. See
+[Get started](../README.md#-get-started) for the workflow.
 
-| cells | **brae** (Blackwell GPU) | OpenFOAM (20 Grace cores) | OpenFOAM+AMGX (same GPU) | OpenFOAM+PETSc-GPU (same GPU) |
-|---|---:|---:|---:|---:|
-| 990k | 21.6 s | 15.9 s | 80.0 s | 89.3 s |
-| 4.89M | 107.7 s | 107.0 s | 572.5 s | 601.6 s |
-| 10.28M | 232.5 s | 228.8 s | 1174.2 s | 1253.0 s |
-| 14.97M | 339.6 s | 354.4 s | 1696.4 s | 1790.3 s |
-| 35.6M | 877.1 s | 990.4 s | 4111.0 s | - |
+| cells | **brae** (Blackwell GPU) | OpenFOAM (20 Grace cores) | OpenFOAM+AMGX (same GPU) | OpenFOAM+PETSc-GPU (same GPU) | SPUMA (same GPU) |
+|---|---:|---:|---:|---:|---:|
+| 990k | 21.6 s | 15.9 s | 80.0 s | 89.3 s | 92.4 s |
+| 4.89M | 107.7 s | 107.0 s | 572.5 s | 601.6 s | 623.2 s |
+| 10.28M | 232.5 s | 228.8 s | 1174.2 s | 1253.0 s | 1056.3 s |
+| 14.97M | 339.6 s | 354.4 s | 1696.4 s | 1790.3 s | 1359.3 s |
+| 35.6M | 877.1 s | 990.4 s | 4111.0 s | - | —¹ |
+
+SPUMA is the [CINECA / EU-exaFOAM OpenFOAM-GPU port](https://gitlab-hpc.cineca.it/exafoam/spuma) (a full GPU fork
+of OpenFOAM on unified memory), the closest full-residency peer to brae. ¹ SPUMA diverged to NaN on the extreme
+35.6M scaled mesh at stock solver settings.
 
 **Reading it:**
 
-- **~5× faster than OpenFOAM's best GPU offload (AMGX)** on the *same* GPU, at every size, the residency payoff.
+- **~4-5× faster than every other GPU approach** on the *same* GPU, OpenFOAM's own AMGX/PETSc offloads **and** the
+  SPUMA port, at every size, the residency payoff.
+- **SPUMA is a full-residency port, not an offload** (a GPU fork of OpenFOAM on unified memory): at ≤5M it is
+  roughly tied with AMGX/PETSc, but from ~10M up it *overtakes* them (1056 s vs 1174/1253 at 10.28M) because, like
+  brae, it avoids the offloads' per-iteration matrix rebuild-and-copy. It still stays ~4-4.5× behind brae, and its
+  GPU sits only ~7-8% utilized at these sizes (its design point is tens of millions of cells per GPU).
 - **Parity-to-ahead of a 20-core Grace CPU node**, and the lead grows with mesh size (0.74× at 990k → 1.13× at
   35.6M). Small meshes under-utilize the GPU; large meshes saturate it.
 

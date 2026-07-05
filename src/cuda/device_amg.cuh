@@ -103,7 +103,7 @@ AMGData buildAMG(const std::vector<label>& fineOwner, const std::vector<label>& 
 // Galerkin-rebuilt each step). loadAMGCache returns false (caller rebuilds) on any mismatch/corruption/mode change.
 void writeAMGCache(const AMGData& A, const std::string& path);
 bool loadAMGCache(const std::string& path, AMGData& A);
-// Build the hierarchy, or reload cacheDir/.cf_amgcache if valid (newer than cacheDir/owner). writeCache persists it.
+// Build the hierarchy, or reload cacheDir/.brae_amgcache if valid (newer than cacheDir/owner). writeCache persists it.
 AMGData buildOrLoadAMG(const std::vector<label>& fineOwner, const std::vector<label>& fineNei,
                        const std::vector<scalar>& faceWeights, int nFine, const std::string& cacheDir, bool writeCache);
 

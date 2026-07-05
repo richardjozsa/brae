@@ -751,13 +751,13 @@ bool loadAMGCache(const std::string& path, AMGData& A) {
     return true;
 }
 
-// Build the AMG hierarchy, or reload it from cacheDir/.cf_amgcache if a valid one is present (newer than the
+// Build the AMG hierarchy, or reload it from cacheDir/.brae_amgcache if a valid one is present (newer than the
 // polyMesh/owner file -> mesh unchanged). writeCache=true persists it (the "partition" step / BRAE_MESH_CACHE).
 AMGData buildOrLoadAMG(const std::vector<label>& fineOwner, const std::vector<label>& fineNei,
                        const std::vector<scalar>& faceWeights, int nFine,
                        const std::string& cacheDir, bool writeCache) {
     namespace fs = std::filesystem; std::error_code ec;
-    const std::string amgPath = cacheDir + "/.cf_amgcache";
+    const std::string amgPath = cacheDir + "/.brae_amgcache";
     const std::string ownerPath = cacheDir + "/owner";
     if (fs::exists(amgPath, ec) && fs::exists(ownerPath, ec)
         && fs::last_write_time(amgPath, ec) >= fs::last_write_time(ownerPath, ec)) {

@@ -72,7 +72,7 @@ struct DeviceSimpleControls {
                                    // (bit-identical); K>1 cuts (K-1)/K of the PCG host syncs (overshoots conv by <K).
     bool   corrScaling = false;    // AMG coarse-correction scaling + flexible CG (BRAE_CORR_SCALING). Cuts AMG cycles
                                    // ~2× at scale (graded meshes); nonlinear precond -> not bit-identical to off.
-    std::string caseDir = ".";     // case directory, for the AMG hierarchy cache (constant/polyMesh/.cf_amgcache).
+    std::string caseDir = ".";     // case directory, for the AMG hierarchy cache (constant/polyMesh/.brae_amgcache).
     bool   writeCache = false;     // write the mesh + AMG caches this run (set by -partition or BRAE_MESH_CACHE).
 };
 // OF-style per-field solve report for one SIMPLE step (matches OpenFOAM's "Solving for Ux/Uy/Uz/p" + continuity block).

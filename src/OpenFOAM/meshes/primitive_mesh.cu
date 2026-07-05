@@ -152,7 +152,7 @@ void PrimitiveMesh::read(const std::string& polyMeshDir) {
     // BRAE_MESH_CACHE: skip the (slow) ASCII parse on a warm run by reloading a binary blob, provided it is newer than
     // the polyMesh/owner file (so an edited/regenerated mesh auto-invalidates the cache). Same idea as OF reusing
     // decomposePar's processor* dirs, one cold parse, then fast warm starts.
-    const std::string cachePath = polyMeshDir + "/.cf_meshcache";
+    const std::string cachePath = polyMeshDir + "/.brae_meshcache";
     {   // AUTO warm-load if a valid cache is present (newer than owner), no env needed, so a `-partition` run makes
         // the subsequent solve warm automatically. Stale/foreign caches are rejected (mtime + magic) -> cold parse.
         std::error_code ec; namespace fs = std::filesystem;

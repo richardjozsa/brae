@@ -25,12 +25,15 @@ validated cell-by-cell against OpenFOAM itself, so it drops into your workflow u
 
 ## ⚡ How fast
 
-![Solver runtime comparison: brae vs OpenFOAM on 20 Grace cores and OpenFOAM's own GPU offloads (AMGX, PETSc) on a single NVIDIA GB10, total wall for 100 SIMPLE iterations, log scale, lower is better](bench/results/solver_runtime_comparison.png)
+![Solver runtime comparison: brae vs OpenFOAM on 20 Grace cores, OpenFOAM's own GPU offloads (AMGX, PETSc), and the SPUMA OpenFOAM-GPU port, on a single NVIDIA GB10, total wall for 100 SIMPLE iterations, log scale, lower is better](bench/results/solver_runtime_comparison.png)
 
-*Total wall time for 100 SIMPLE iterations (scaled-pitzDaily) on a single NVIDIA GB10, log scale, lower is better.*
+*Total wall time for 100 SIMPLE iterations (scaled-pitzDaily) on a single NVIDIA GB10, log scale, lower is better. At 35.6M both SPUMA and OpenFOAM+PETSc-GPU diverged to NaN on that extreme-aspect-ratio mesh at stock solver settings; brae, OpenFOAM-CPU, and OpenFOAM+AMGX complete it as timing cases.*
 
-- **~5× faster than OpenFOAM's own GPU offload** on the *same* GPU (both AMGX and PETSc-GPU, AMGX being the quicker of
-  the two), the payoff of full residency.
+- **~4-5× faster than every other GPU approach on the *same* GPU** — OpenFOAM's own AMGX and PETSc-GPU offloads, *and*
+  the [SPUMA](https://gitlab-hpc.cineca.it/exafoam/spuma) OpenFOAM-GPU port (CINECA / EU-exaFOAM), the closest
+  full-residency peer. The payoff of keeping the whole loop resident: the offloads pay a per-iteration matrix
+  rebuild-and-copy, and SPUMA's managed-memory port leaves the GPU only lightly loaded at these mesh sizes. (SPUMA
+  itself overtakes the AMGX/PETSc offloads once the mesh is large; brae stays ahead of all three.)
 - **Parity-to-ahead of a 20-core Grace CPU node once the mesh is large**, and the lead widens with size (the GPU is
   under-utilized below ~1M cells, so it trails there, and saturated at scale, where it pulls ahead).
 - **< 1% from OpenFOAM**, validated cell-by-cell. It is not bit-identical, and is not meant to be: parallelising the
@@ -48,18 +51,20 @@ See [docs/performance.md](docs/performance.md) for methodology and the full curv
 
 ## 🎯 Same case, same answer
 
-motorBike (2.9M cells, k-omega SST, 500 iterations), surface pressure at the last step, all four rendered on one
-shared color scale. Brae, OpenFOAM on the Grace CPU, and OpenFOAM's own GPU offloads (AMGX, PETSc) produce a
-visually indistinguishable field and agree to within **~1.6% on drag (Cd)**. Red is the stagnation pressure on
-the front wheel and nose, blue is the suction over the helmet, back, and tank.
+motorBike (2.9M cells, k-omega SST, 500 iterations), surface pressure at the last step, all five rendered on one
+shared color scale. Brae, OpenFOAM on the Grace CPU, OpenFOAM's own GPU offloads (AMGX, PETSc), and the SPUMA
+OpenFOAM-GPU port produce a visually indistinguishable field and agree to within **~1.6% on drag (Cd)**. Red is the
+stagnation pressure on the front wheel and nose, blue is the suction over the helmet, back, and tank.
 
 | brae (Blackwell GPU) | OpenFOAM (Grace CPU) |
 |:---:|:---:|
 | ![motorBike surface pressure, brae on a Blackwell GPU](bench/results/motorbike_p_brae.png) | ![motorBike surface pressure, OpenFOAM on Grace CPU cores](bench/results/motorbike_p_of.png) |
 | **OpenFOAM + AMGX (GPU)** | **OpenFOAM + PETSc (GPU)** |
 | ![motorBike surface pressure, OpenFOAM with the AMGX GPU solver](bench/results/motorbike_p_amgx.png) | ![motorBike surface pressure, OpenFOAM with the PETSc GPU solver](bench/results/motorbike_p_petsc.png) |
+| **SPUMA (OpenFOAM-GPU port)** |  |
+| ![motorBike surface pressure, the SPUMA OpenFOAM-GPU port](bench/results/motorbike_p_spuma.png) |  |
 
-See [the full four-way comparison](bench/results/motorbike_comparison.md) for the drag and lift numbers.
+See [the full five-way comparison](bench/results/motorbike_comparison.md) for the drag and lift numbers (brae, OpenFOAM-CPU, AMGX, PETSc, and the SPUMA OpenFOAM-GPU port).
 
 ---
 
@@ -75,6 +80,11 @@ ceiling.
 - **Faithful**, a clean-room reimplementation of OpenFOAM v2412, validated **cell-by-cell** against it (sub-1% on
   the fields that matter).
 - **Fast where it counts**, one Blackwell GPU keeps pace with a 20-core Grace CPU node, and pulls ahead as the mesh grows.
+
+The speedup is that residency, not any one allocator trick: brae keeps its fields and OpenFOAM's LDU matrix in
+explicit, pooled device memory and does zero host-device copies per iteration (pinned memory is used only for a
+couple of reduction scalars). See [docs/memory-model.md](docs/memory-model.md) for the full data-layout rationale
+(why a device pool over pinned/`thrust`, and why LDU-gather over CSR/cuSPARSE).
 
 ---
 
@@ -115,13 +125,19 @@ cmake --build build -j --target brae
 Run brae from inside any existing OpenFOAM (`simpleFoam`) case, exactly as you would run `simpleFoam` itself:
 
 ```bash
-cd yourCase                    # your OpenFOAM case directory (0/  constant/  system/)
-brae                           # solve in the current directory
-brae -case /path/to/yourCase   # or run it from anywhere
+cd yourCase                       # your OpenFOAM case directory (0/  constant/  system/)
+brae                              # solve in the current directory
+brae -case /path/to/yourCase      # or run it from anywhere
+
+# Optional: partition once (brae's analogue of decomposePar), then run warm
+brae -partition -case yourCase    # cold: build + cache the mesh and AMG hierarchy, then exit (no solve)
+brae -case yourCase               # warm: reloads the cache and solves (fast startup)
 ```
 
-Brae reads the standard dictionaries and mesh, auto-partitions for your GPU (no `decomposePar`), and writes ordinary
-time directories.
+Brae reads your standard case (dictionaries + mesh), auto-partitions for the GPU (no `decomposePar`), and writes
+ordinary time directories. A plain `brae` run does everything on its own. The optional `-partition` step just does
+the one-time mesh + AMG-hierarchy prep up front and caches it, so later runs of the same mesh start warm, handy for
+benchmarking and for re-running a mesh many times.
 
 The [**fast path**](docs/performance.md) (device-resident solver + mixed-precision multigrid, accuracy-preserving) is
 **on by default**; opt out with `BRAE_PCG_DEVICE=0 BRAE_AMG_FP32=0`.
@@ -154,4 +170,5 @@ See [the roadmap](docs/roadmap.md) for the current scope and what is coming next
 - [Getting started](docs/getting-started.md), install, first run, verifying against OpenFOAM
 - [Solvers](#-solvers), per-solver coverage
 - [Performance & tuning](docs/performance.md), the `BRAE_*` knobs, benchmarks, the residency story
+- [Memory model & data layout](docs/memory-model.md), device pool vs pinned, LDU-gather vs CSR, and why
 - [Roadmap](docs/roadmap.md), scope and what is coming next

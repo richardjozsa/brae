@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
             else if (a == "-partition") partition = true;
             else if (a[0] != '-') caseDir = a; }
         // -partition is cf's analogue of OF decomposePar: do the one-time prep (parse mesh + build AMG hierarchy) and
-        // persist it to constant/polyMesh/.cf_mesh|amgcache, so the actual run reloads it warm. Forces the cache write.
+        // persist it to constant/polyMesh/.brae_mesh|amgcache, so the actual run reloads it warm. Forces the cache write.
         if (partition) setenv("BRAE_MESH_CACHE", "1", 1);
 
         // ---- controls from the case dictionaries ----
@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
                                   ctl.lm ? &ReThetat : nullptr, ctl.lm ? &gammaInt : nullptr);
         _tsLap("solver ctor (incl AMG)");
         if (partition) {   // caches written by the mesh read + the AMG build above; done, like decomposePar finishing.
-            std::printf("brae -partition: mesh + AMG hierarchy cached to %s/constant/polyMesh/ (.cf_meshcache + .cf_amgcache).\n"
+            std::printf("brae -partition: mesh + AMG hierarchy cached to %s/constant/polyMesh/ (.brae_meshcache + .brae_amgcache).\n"
                         "  Run the solve normally; it will reload them warm.\n", caseDir.c_str());
             return 0;
         }

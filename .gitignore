@@ -26,3 +26,6 @@ validation/*
 !validation/pitzDaily282/
 !validation/pitzDailyTurb/
 !validation/pitzDailyTurbBig/
+
+# CTest-generated output (regenerated on every ctest run)
+Testing/
