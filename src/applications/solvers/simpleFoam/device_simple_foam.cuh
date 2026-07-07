@@ -54,6 +54,7 @@ struct DeviceSimpleControls {
     bool   lust = false;         // div(phi,U) "LUST": deferred correction = 0.75*linear + 0.25*linearUpwind (OF LUST.H).
     bool   nonOrth = false;      // laplacian "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction. Set from fvSchemes.
     scalar nonOrthLimit = 1.0;   // snGrad "limited <psi>" coeff (OF fv::limitedSnGrad); 1.0 = "corrected" (unlimited). Set from fvSchemes.
+    int    nNonOrth = 0;         // SIMPLE.nNonOrthogonalCorrectors: extra pressure-correction passes (pEqn re-solved nNonOrth+1 times). Set from fvSolution.
     scalar gradULimitK = 0.0;    // grad(U) "cellLimited Gauss linear <k>" coeff (OF cellLimitedGrad<minmod>); 0 = unlimited. Set from fvSchemes.
     bool   limitedK = false, limitedEps = false;  // div(phi,k|epsilon) "limitedLinear": implicit limited weight. Set from fvSchemes.
     bool   luK = false, luEps = false;             // div(phi,k|epsilon|nuTilda) "linearUpwind": deferred gradient correction. Set from fvSchemes.
@@ -509,7 +510,7 @@ public:
         if (ctl_.consistent) {
             // phiHbyA += interpolate(rAtU-rAU)*snGrad(p)*magSf = laplacian(interp(drAtU), p).flux()  (NOT via HbyA flux)
             DeviceBuffer<scalar> drAtUf; deviceInterpolate(dm, drAtU, drAtUf);
-            DeviceBuffer<scalar> ld, lu, ll; deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll);
+            DeviceBuffer<scalar> ld, lu, ll; deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
             DeviceBuffer<scalar> fInt; deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), dp_, fInt); deviceAxpy(1.0, fInt, phiHi);
             // OF's term is interp(rAtU-rAU)*fvc::snGrad(p)*magSf, and snGrad(p) is the CORRECTED snGrad (orth + non-orth).
             // The orth part is the laplacian flux above; add the non-orth part interp(drAtU)*(corrVec·grad(p)_f)*magSf so
@@ -522,51 +523,63 @@ public:
         DeviceBuffer<scalar> rAUf; deviceInterpolate(dm,rAtU,rAUf);
         // pressure matrix buffers are PERSISTENT members: their addresses stay fixed across SIMPLE steps (only the
         // values change), so the V-cycle CUDA graph (keyed on diagCp_) is captured once and replayed every step.
-        deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth);
-        DeviceBuffer<scalar> pIC,pBC; deviceBCLaplacianCoeffs(dbP_, rAtU, pIC, pBC);
-        DeviceBuffer<scalar> divPhiH; deviceDiv(dm, phiHi, phiHb, divPhiH);
-        if (hasCyclic_) deviceCyclicAddDiv(cyc_, dm.V, divPhiH);            // + cyclic-face flux into continuity div(phiHbyA)
-        if (hasAMI_)    deviceAmiAddDiv(ami_, dm.V, divPhiH);               // + AMI-face flux into continuity div(phiHbyA)
-        deviceFoldPressure(dm, pD_, divPhiH, pIC, pBC, diagCp_, bp_);
-        // cyclic pressure Laplacian laplacian(rAtU,p): fold the interface diagonal into diagCp_ + set cyc_.ifCoeff
-        // (= rAtUFace*dc*magSf) for the PCG's interface Amul. rAtU = rAU for SIMPLE (consistent=false).
-        if (hasCyclic_) deviceCyclicAssembleLaplacian(cyc_, rAtU, diagCp_, /*addToDiag*/true);
-        if (hasAMI_)    deviceAmiAssembleLaplacian(ami_, rAtU, diagCp_, /*addToDiag*/true);   // AMI pressure laplacian
-        // non-orth pressure correction: faceFluxCorr from grad(entering p); add -V*div(ffc) to b, subtract ffc
-        // from the reconstructed flux below (so div(phi)=0 on non-orth faces). gx/gy/gz = grad(dp_) at entry.
-        DeviceBuffer<scalar> ffcP, ffcPcyc, ffcPami;
-        if (ctl_.nonOrth) { deviceLaplacianCorrFluxLimited(dm, rAUf, dp_, gx, gy, gz, nonOrthLimitP, ffcP);
-            DeviceBuffer<scalar> sc; deviceFaceDivSource(dm, ffcP, sc); deviceAxpy(1.0, sc, bp_);
-            // cyclic-face pressure non-orth: ffc = rAtU_face*magSf*(corrVec.grad(p)_face); -V*div(ffc) into bp_ here,
-            // and the flux correction (cyc.phi -= ffc) applied post-solve below (p is scalar -> no rotation).
-            if (hasCyclic_) deviceCyclicLapCorrP(cyc_, rAtU, gx, gy, gz, bp_, ffcPcyc);
-            if (hasAMI_)    deviceAmiLapCorrP(ami_, rAtU, gx, gy, gz, bp_, ffcPami); }
-        // No fixedValue-p patch -> singular all-Neumann pressure. A single-cell pin (setReference) is ASYMMETRIC
-        // and biases the solution toward the pinned cell's column, on a PERIODIC mesh that breaks x-invariance.
-        // So for cyclic, remove the singularity with a tiny SYMMETRIC diagonal shift instead (the RHS div(phiHbyA)
-        // is zero-mean, cyclic fluxes cancel pairwise, walls carry none, so the shift doesn't excite the constant
-        // nullspace). Matches the validated host cyclic_simple. Non-cyclic keeps the OF single-cell setReference.
-        if (ctl_.needRef) {
-            if (hasCyclic_ || hasAMI_) { const scalar eps = -1e-10 * (deviceSumMag(diagCp_) / nC_); deviceAxpy(eps, ones_, diagCp_); }
-            else deviceSetReference(diagCp_, bp_, ctl_.pRefCell, ctl_.pRefValue);
+        DeviceBuffer<scalar> pPrev; deviceCopy(pPrev, dp_);   // p entering the pressure step (for relaxation), captured once
+        // nNonOrthogonalCorrectors (OF SIMPLE, pEqn.H `while (simple.correctNonOrthogonal())`): re-solve
+        // laplacian(rAtU,p) == div(phiHbyA) (nNonOrth+1) times, recomputing the EXPLICIT non-orthogonal correction
+        // (corrVec.grad(p)) from the UPDATED p each pass; the conservative flux is committed only on the final pass.
+        // Orthogonal scheme -> corrVec = 0 so the correction vanishes and one pass suffices (identical to nNonOrth=0).
+        // The pEqn is fully re-assembled each pass, exactly as OF rebuilds the fvMatrix (deviceFoldPressure WRITES
+        // diagCp_/bp_, and setReference doubles a FRESH diag, so per-pass re-assembly is self-consistent). Unchanged
+        // for SIMPLE vs SIMPLEC: rAtU is just the diffusivity (= rAU for SIMPLE, = 1/(1/rAU - H1) for SIMPLEC); the
+        // one-time SIMPLEC phiHbyA/HbyA correction above already used the entry p, as in OF (it is outside this loop).
+        const int nPass = (ctl_.nonOrth ? ctl_.nNonOrth : 0) + 1;
+        DeviceBuffer<scalar> pIC, pBC, ffcP, ffcPcyc, ffcPami;
+        DeviceSolverPerf pp, pp0;
+        for (int nonOrthPass = 0; nonOrthPass < nPass; ++nonOrthPass) {
+            if (nonOrthPass > 0) {   // recompute grad(p) from the just-solved p (pass 0 uses the entry grad in gx/gy/gz)
+                DeviceBuffer<scalar> pbvN; deviceBCValue(dbP_, dp_, pbvN);
+                deviceGaussGrad(dm, dp_, pbvN, gx, gy, gz);
+                if (hasCyclic_) deviceCyclicAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
+                if (hasAMI_)    deviceAmiAddGrad(ami_, dp_, dm.V, gx, gy, gz);
+            }
+            deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth);
+            deviceBCLaplacianCoeffs(dbP_, rAtU, pIC, pBC);
+            DeviceBuffer<scalar> divPhiH; deviceDiv(dm, phiHi, phiHb, divPhiH);
+            if (hasCyclic_) deviceCyclicAddDiv(cyc_, dm.V, divPhiH);            // + cyclic-face flux into continuity div(phiHbyA)
+            if (hasAMI_)    deviceAmiAddDiv(ami_, dm.V, divPhiH);               // + AMI-face flux into continuity div(phiHbyA)
+            deviceFoldPressure(dm, pD_, divPhiH, pIC, pBC, diagCp_, bp_);
+            // cyclic pressure Laplacian laplacian(rAtU,p): fold the interface diagonal into diagCp_ + set cyc_.ifCoeff.
+            if (hasCyclic_) deviceCyclicAssembleLaplacian(cyc_, rAtU, diagCp_, /*addToDiag*/true);
+            if (hasAMI_)    deviceAmiAssembleLaplacian(ami_, rAtU, diagCp_, /*addToDiag*/true);   // AMI pressure laplacian
+            // explicit non-orth correction: faceFluxCorr from grad(p) for THIS pass; add -V*div(ffc) to b, and subtract
+            // ffc from the reconstructed flux below (so div(phi)=0 on non-orth faces). gx/gy/gz = grad(p) this pass.
+            ffcP = DeviceBuffer<scalar>(); ffcPcyc = DeviceBuffer<scalar>(); ffcPami = DeviceBuffer<scalar>();
+            if (ctl_.nonOrth) { deviceLaplacianCorrFluxLimited(dm, rAUf, dp_, gx, gy, gz, nonOrthLimitP, ffcP);
+                DeviceBuffer<scalar> sc; deviceFaceDivSource(dm, ffcP, sc); deviceAxpy(1.0, sc, bp_);
+                if (hasCyclic_) deviceCyclicLapCorrP(cyc_, rAtU, gx, gy, gz, bp_, ffcPcyc);
+                if (hasAMI_)    deviceAmiLapCorrP(ami_, rAtU, gx, gy, gz, bp_, ffcPami); }
+            // No fixedValue-p patch -> singular all-Neumann pressure. cyclic/AMI use a tiny SYMMETRIC diagonal shift
+            // (the periodic RHS is zero-mean); non-cyclic keeps the OF single-cell setReference (doubles a fresh diag).
+            if (ctl_.needRef) {
+                if (hasCyclic_ || hasAMI_) { const scalar eps = -1e-10 * (deviceSumMag(diagCp_) / nC_); deviceAxpy(eps, ones_, diagCp_); }
+                else deviceSetReference(diagCp_, bp_, ctl_.pRefCell, ctl_.pRefValue);
+            }
+            if (hasCyclic_ || hasAMI_) {
+                // Periodic/AMI: interface-coupled operator solved with Jacobi-PCG (no AMG; the internal-face Galerkin
+                // coarse operator cannot represent the interface edges).
+                const DeviceLduView pvc = hasCyclic_
+                    ? deviceLduViewCyclic(dm,diagCp_,pU_,pL_, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
+                    : deviceLduViewAmi(dm,diagCp_,pU_,pL_, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
+                const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
+                pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000);
+            } else {
+                const scalar nfp = deviceNormFactor(deviceLduView(dm,diagCp_,pU_,pL_), dp_, bp_, ones_);
+                amgGalerkin(amg_, diagCp_, pU_, pL_);                                      // re-coarsen the pressure matrix
+                pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pL_), amg_, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000, ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling);
+            }
+            if (nonOrthPass == 0) pp0 = pp;   // SIMPLE residualControl uses the FIRST pass's initial residual (OF convention)
         }
-        DeviceBuffer<scalar> pPrev; deviceCopy(pPrev, dp_);
-        DeviceSolverPerf pp;
-        if (hasCyclic_ || hasAMI_) {
-            // Periodic/AMI pressure: solve the interface-coupled operator (the LduView applies the interface off-
-            // diagonal in Amul) with Jacobi-PCG (no AMG), the device analog of the validated host cyclicPCG.
-            // AMG is bypassed: its internal-face Galerkin coarse operator cannot represent the interface edges.
-            const DeviceLduView pvc = hasCyclic_
-                ? deviceLduViewCyclic(dm,diagCp_,pU_,pL_, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
-                : deviceLduViewAmi(dm,diagCp_,pU_,pL_, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
-            const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
-            pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000);
-        } else {
-            const scalar nfp = deviceNormFactor(deviceLduView(dm,diagCp_,pU_,pL_), dp_, bp_, ones_);
-            amgGalerkin(amg_, diagCp_, pU_, pL_);                                      // re-coarsen the pressure matrix
-            pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pL_), amg_, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000, ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling);
-        }
-        res.p = pp.initialResidual; res.pFinal = pp.finalResidual; res.pIters = pp.nIterations;
+        res.p = pp0.initialResidual; res.pFinal = pp.finalResidual; res.pIters = pp.nIterations;
         if (std::getenv("BRAE_SOLVER_DEBUG")) std::printf("    p %s iters=%d  init=%.2e final=%.2e\n",
                                                         (hasCyclic_||hasAMI_)?"Jacobi-PCG":"AMG-PCG", pp.nIterations, pp.initialResidual, pp.finalResidual);
         const DeviceLduView pview = deviceLduView(dm,diagCp_,pU_,pL_);

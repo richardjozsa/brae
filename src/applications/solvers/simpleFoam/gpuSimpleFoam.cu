@@ -273,6 +273,7 @@ int main(int argc, char** argv) {
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1, rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
         { const std::string cons = simple ? simple->wordOr("consistent", "no") : "no";
           ctl.consistent = (cons == "yes" || cons == "true" || cons == "on" || cons == "1"); }   // SIMPLEC
+        ctl.nNonOrth = simple ? simple->intOr("nNonOrthogonalCorrectors", 0) : 0;   // extra pressure passes on non-orthogonal meshes
         { const std::vector<scalar> bf = simple ? simple->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
           if (bf.size() >= 3) ctl.bodyForce = vector{bf[0], bf[1], bf[2]}; }   // constant momentum source (drives cyclic/periodic channels)
 
