@@ -17,15 +17,18 @@
 #  Prereqs: OpenFOAM v2412 sourced. Competitor back-ends are built with the repo's
 #           bench/setup_of_petsc.sh, setup_of_amgx.sh, setup_spuma.sh (all sm_90).
 #
-#  Usage:   ./run_benchmark.sh
+#  Usage:   ./run_benchmark.sh                # default: FP32 mixed-precision AMG preconditioner (brae fast path)
+#           BRAE_FP32=0 ./run_benchmark.sh    # pure-FP64 preconditioner (apples-to-apples vs double-precision OF)
 #  Env:     SIZES="6 13 20"     blockMesh scale factor M (cells ~= 12225 * M^2)
 #           ITERS=100  CORES=24  BRAE=brae  WORK=/tmp/h100_bench
+#           BRAE_FP32=1         1 = FP32 mixed-precision AMG V-cycle (default); 0 = pure FP64 (outer solve is FP64 either way)
 #           SPUMA_BIN=/path/to/spuma/platforms/linux64NvidiaDPInt32Opt/bin/simpleFoam
 #           SPUMA_POOL=24   NVARCH=90
 # ============================================================================
 set -u
 BRAE="${BRAE:-brae}"; ITERS="${ITERS:-100}"; CORES="${CORES:-24}"
 SIZES="${SIZES:-6 13 20}"; WORK="${WORK:-/tmp/h100_bench}"
+BRAE_FP32="${BRAE_FP32:-1}"   # brae AMG V-cycle precision: 1 = FP32 (default fast path), 0 = FP64. Fields/matrix/residuals/outer-Krylov stay FP64 regardless.
 SPUMA_BIN="${SPUMA_BIN:-}"; SPUMA_POOL="${SPUMA_POOL:-24}"; NVARCH="${NVARCH:-90}"
 OFBASHRC="${OFBASHRC:-$(ls /usr/lib/openfoam/openfoam*/etc/bashrc /opt/openfoam*/etc/bashrc 2>/dev/null | head -1)}"
 set +u; source "$OFBASHRC" >/dev/null 2>&1; set -u
@@ -62,7 +65,7 @@ perit(){ [ "${1:-}" = "-" ] && { echo "-"; return; }; printf "%.1f" "$(echo "sca
 rat(){   [ "${2:-}" = "-" ] || [ -z "${2:-}" ] && { echo "-"; return; }; printf "%.1f" "$(echo "scale=3; $2/$1" | bc)"; }
 
 mkdir -p "$WORK"
-echo "brae=$(command -v "$BRAE" || echo none) | OF cores=$CORES | iters=$ITERS | PETSc=$HAVE_PETSC AMGX=$HAVE_AMGX SPUMA=$HAVE_SPUMA"
+echo "brae=$(command -v "$BRAE" || echo none) (AMG V-cycle: $([ "$BRAE_FP32" = 0 ] && echo FP64 || echo FP32)) | OF cores=$CORES | iters=$ITERS | PETSc=$HAVE_PETSC AMGX=$HAVE_AMGX SPUMA=$HAVE_SPUMA"
 printf "\n%12s %9s %9s %9s %9s %9s\n" "cells" "brae" "OF-CPU" "SPUMA" "OF+AMGX" "OF+PETSc"
 printf   "%12s %9s %9s %9s %9s %9s\n" "-----" "----" "------" "-----" "-------" "--------"
 RATLINES=""
@@ -72,8 +75,8 @@ for M in $SIZES; do
   tB="-" tO="-" tS="-" tA="-" tP="-"
   # brae
   if command -v "$BRAE" >/dev/null; then
-    BW="$WORK/brae_$M"; cp -r "$SRC" "$BW"; "$BRAE" -case "$BW" -partition >/dev/null 2>&1
-    tB=$(wall "'$BRAE' -case '$BW'"); fi
+    BW="$WORK/brae_$M"; cp -r "$SRC" "$BW"; BRAE_AMG_FP32=$BRAE_FP32 "$BRAE" -case "$BW" -partition >/dev/null 2>&1
+    tB=$(wall "BRAE_AMG_FP32=$BRAE_FP32 '$BRAE' -case '$BW'"); fi
   # OpenFOAM-CPU
   OW="$WORK/of_$M"; cp -r "$SRC" "$OW"
   printf 'FoamFile{version 2.0;format ascii;class dictionary;object decomposeParDict;}\nnumberOfSubdomains %d;method scotch;\n' "$CORES" > "$OW/system/decomposeParDict"

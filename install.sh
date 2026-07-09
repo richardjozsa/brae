@@ -8,6 +8,10 @@
 #   BRAE_REF        branch or tag to build        (default: main)
 #   BRAE_CUDA_ARCH  GPU compute capability, e.g. 90, 121, or "native"
 #                   (default: auto-detected from nvidia-smi)
+#   BRAE_INSTALL_CUDA   1 = auto-install the CUDA toolkit (nvcc) if missing,
+#                       via the NVIDIA apt repo (Ubuntu/Debian). Installs the
+#                       toolkit only, never the GPU driver. (default: off)
+#   BRAE_CUDA_TOOLKIT_PKG  toolkit package to install (default: cuda-toolkit-12-6)
 #   PREFIX          install prefix for the binary (default: $HOME/.local)
 set -eu
 
@@ -28,6 +32,53 @@ warn() { printf '%s!! %s%s\n'  "$Y$B" "$*" "$N" >&2; }
 die()  { printf '%serror:%s %s\n' "$R$B" "$N" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# use sudo when not root (auto-install of CUDA needs apt/dpkg privileges)
+SUDO=''
+if [ "$(id -u)" -ne 0 ] && have sudo; then SUDO="sudo"; fi
+
+# NVIDIA CUDA apt-repo tags for this OS / CPU arch (empty if unsupported for auto-install)
+cuda_repo_id() {
+    [ -r /etc/os-release ] || return 0
+    . /etc/os-release
+    case "${ID:-}${VERSION_ID:-}" in
+        ubuntu24.04) echo ubuntu2404 ;;
+        ubuntu22.04) echo ubuntu2204 ;;
+        ubuntu20.04) echo ubuntu2004 ;;
+        debian12)    echo debian12  ;;
+        debian11)    echo debian11  ;;
+        *)           echo ''        ;;
+    esac
+}
+cuda_repo_arch() {
+    case "$(uname -m)" in
+        x86_64)  echo x86_64 ;;   # H100 / datacenter x86 hosts
+        aarch64) echo sbsa   ;;   # Grace / GB10 and other server ARM
+        *)       echo ''     ;;
+    esac
+}
+# opt-in (BRAE_INSTALL_CUDA=1): install just the toolkit (nvcc), NOT the `cuda` metapackage,
+# so the host's existing GPU driver is left untouched. Returns non-zero on any failure.
+install_cuda_toolkit() {
+    distro=$(cuda_repo_id); carch=$(cuda_repo_arch)
+    pkg="${BRAE_CUDA_TOOLKIT_PKG:-cuda-toolkit-12-6}"
+    if [ -z "$distro" ] || [ -z "$carch" ]; then
+        warn "CUDA auto-install unsupported on this OS/arch; use the manual steps below"; return 1
+    fi
+    if ! have wget && ! have curl; then warn "need wget or curl to fetch the CUDA repo key"; return 1; fi
+    say "installing CUDA toolkit ($pkg) from the NVIDIA repo ($distro/$carch) - downloads a few GB"
+    tmp=$(mktemp -d); key="cuda-keyring_1.1-1_all.deb"
+    url="https://developer.download.nvidia.com/compute/cuda/repos/$distro/$carch/$key"
+    if have wget; then wget -qO "$tmp/$key" "$url" || { warn "download failed: $url"; return 1; }
+    else curl -fsSL -o "$tmp/$key" "$url" || { warn "download failed: $url"; return 1; }
+    fi
+    $SUDO dpkg -i "$tmp/$key"       || return 1
+    $SUDO apt-get update            || return 1
+    $SUDO apt-get install -y "$pkg" || return 1
+    rm -rf "$tmp"
+    [ -x /usr/local/cuda/bin/nvcc ] && { PATH="/usr/local/cuda/bin:$PATH"; export PATH; }
+    have nvcc
+}
+
 say "installing brae"
 
 # ---- CUDA on PATH (it often lives in /usr/local/cuda/bin) ----
@@ -35,14 +86,31 @@ if ! have nvcc && [ -x /usr/local/cuda/bin/nvcc ]; then
     PATH="/usr/local/cuda/bin:$PATH"; export PATH
 fi
 
+# ---- CUDA toolkit: optional auto-install (opt-in via BRAE_INSTALL_CUDA=1) ----
+if ! have nvcc && [ "${BRAE_INSTALL_CUDA:-0}" = "1" ]; then
+    install_cuda_toolkit || warn "CUDA auto-install did not complete; see the manual steps below"
+fi
+
 # ---- required tools ----
 missing=''
 for t in git cmake nvcc; do have "$t" || missing="$missing $t"; done
 have c++ || have g++ || missing="$missing c++"
 have make || have ninja || missing="$missing make"
-[ -z "$missing" ] || die "missing required tools:$missing
-  On Ubuntu/Debian:  sudo apt-get install -y git cmake build-essential
-  CUDA toolkit (nvcc), 12.4+ (13.x recommended): https://developer.nvidia.com/cuda-downloads"
+if [ -n "$missing" ]; then
+    distro=$(cuda_repo_id); carch=$(cuda_repo_arch)
+    if [ -n "$distro" ] && [ -n "$carch" ]; then
+        cuda_hint="re-run with  BRAE_INSTALL_CUDA=1  to auto-install, or do it manually:
+     wget https://developer.download.nvidia.com/compute/cuda/repos/$distro/$carch/cuda-keyring_1.1-1_all.deb
+     ${SUDO:+$SUDO }dpkg -i cuda-keyring_1.1-1_all.deb && ${SUDO:+$SUDO }apt-get update && ${SUDO:+$SUDO }apt-get install -y cuda-toolkit-12-6
+     echo 'export PATH=/usr/local/cuda/bin:\$PATH' >> ~/.bashrc && . ~/.bashrc"
+    else
+        cuda_hint="https://developer.nvidia.com/cuda-downloads"
+    fi
+    die "missing required tools:$missing
+  base tools (Ubuntu/Debian):  ${SUDO:+$SUDO }apt-get install -y git cmake build-essential
+  CUDA toolkit (nvcc) 12.4+ (13.x recommended):
+     $cuda_hint"
+fi
 
 # ---- cmake >= 3.24 ----
 cmake_ver=$(cmake --version | head -n1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
