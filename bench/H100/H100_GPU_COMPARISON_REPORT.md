@@ -1,4 +1,4 @@
-# brae on H100 — GPU-vs-GPU CFD benchmark
+# brae on H100, GPU-vs-GPU CFD benchmark
 
 A same-hardware comparison of the [brae](https://github.com/simd-ai/brae) device-resident CFD engine against the
 other common ways to run OpenFOAM-class CFD on a GPU, all on **one NVIDIA H100 PCIe (80 GB)**, on an identical case
@@ -8,7 +8,7 @@ cells mark a runner that failed or was not measured, with the reason stated.
 
 This is the H100 counterpart to the earlier GB10 study (`bench/results/BENCHMARK_TOTALWALL.md`). GB10 has no HBM (its
 GPU shares the CPU's LPDDR5X), so there brae only reached parity with a CPU node. This report tests the follow-up
-question — whether the same code delivers an order-of-magnitude speedup on a GPU with real HBM.
+question, whether the same code delivers an order-of-magnitude speedup on a GPU with real HBM.
 
 ## Headline result
 
@@ -16,11 +16,11 @@ Per-SIMPLE-iteration wall time at 4.89 M cells (laminar scaled pitzDaily), lower
 
 | runner | ms / iteration | brae is |
 |---|---:|---:|
-| **brae** — device-resident | **263.5** | — |
+| **brae**, device-resident | **263.5** | - |
 | OpenFOAM, 24 CPU cores (reference) | 647.7 | 2.5× faster |
-| SPUMA — device-resident OpenFOAM-GPU port | 1022.2 | 3.9× faster |
-| OpenFOAM + AMGX — GPU offload | 6795.7 | 25.8× faster |
-| OpenFOAM + PETSc-GPU — GPU offload | 7897.1 | 30.0× faster |
+| SPUMA, device-resident OpenFOAM-GPU port | 1022.2 | 3.9× faster |
+| OpenFOAM + AMGX, GPU offload | 6795.7 | 25.8× faster |
+| OpenFOAM + PETSc-GPU, GPU offload | 7897.1 | 30.0× faster |
 
 brae is fastest at every mesh size tested (440 k → 28 M cells), at matched accuracy (< 1 % on U and p for all
 runners). The reason: brae keeps the entire SIMPLE loop on the GPU and its sparse matrix-vector kernel reaches **85 %
@@ -34,7 +34,7 @@ rebuilt on one CPU core and copied to the GPU every iteration).
 | | |
 |---|---|
 | GPU | NVIDIA H100 PCIe, 80 GB (81559 MiB HBM2e), compute capability sm_90, 350 W, PCIe Gen5 |
-| GPU memory bandwidth | ~2.0 TB/s (H100 **PCIe** HBM2e — the PCIe part, not the 3.35 TB/s SXM) |
+| GPU memory bandwidth | ~2.0 TB/s (H100 **PCIe** HBM2e, the PCIe part, not the 3.35 TB/s SXM) |
 | NVIDIA driver | 580.126.20 (CUDA driver 13.0) |
 | CUDA toolkit (nvcc) | 12.6 (all GPU code built for sm_90) |
 | CPU | AMD EPYC 9334, 24 vCPU (1 thread/core), KVM guest |
@@ -57,15 +57,15 @@ rebuilt on one CPU core and copied to the GPU every iteration).
 
 Two cases are used, because one scaled case cannot serve both goals:
 
-**Accuracy case** — the stock turbulent pitzDaily tutorial (kEpsilon, 12 225 cells), unchanged. It converges to a
+**Accuracy case**, the stock turbulent pitzDaily tutorial (kEpsilon, 12 225 cells), unchanged. It converges to a
 steady field. Every runner executes a fixed 2 000 SIMPLE iterations (residualControl removed, so all stop at the same
 iteration with the field settled), and each runner's U / p / k field is compared cell-by-cell to brae's (relative L2
 norm), with a < 1 % pass bar.
 
-**Performance case** — laminar scaled pitzDaily at fixed iteration count. Laminar is required for scaling: refining a
+**Performance case**, laminar scaled pitzDaily at fixed iteration count. Laminar is required for scaling: refining a
 kEpsilon *wall-function* mesh pushes y+ out of the log-law range, so the wall functions break and the case never
 converges (at 440 k cells OpenFOAM-CPU limit-cycles indefinitely). Laminar has no wall functions, so the mesh refines
-cleanly and every runner does identical work per iteration — a clean basis for timing, memory, and bandwidth.
+cleanly and every runner does identical work per iteration, a clean basis for timing, memory, and bandwidth.
 residualControl is removed so all runners execute exactly the same iteration count. This matches the harness in
 `bench/run_benchmark.sh`.
 
@@ -73,20 +73,20 @@ Mesh sizes follow the blockMesh scale factor M on pitzDaily: cells ≈ 12 225 ·
 excluded from every timed figure. The pressure tolerance is 1e-6 / relTol 0.1 for every runner.
 
 **Runner configurations:**
-- **brae** — 1 GPU, fully device-resident (mesh, fields, SIMPLE loop, and all linear solves on the GPU).
-- **OpenFOAM-CPU** — `mpirun -np 24 simpleFoam -parallel`, native GAMG on 24 cores. Host-CPU reference only, not a
+- **brae**, 1 GPU, fully device-resident (mesh, fields, SIMPLE loop, and all linear solves on the GPU).
+- **OpenFOAM-CPU**, `mpirun -np 24 simpleFoam -parallel`, native GAMG on 24 cores. Host-CPU reference only, not a
   cost-matched comparison.
-- **OpenFOAM + PETSc-GPU** — 1 CPU core + GPU; PETSc CG + GAMG on cuSPARSE (`mat_type aijcusparse`, `pc_type gamg`,
+- **OpenFOAM + PETSc-GPU**, 1 CPU core + GPU; PETSc CG + GAMG on cuSPARSE (`mat_type aijcusparse`, `pc_type gamg`,
   `-use_gpu_aware_mpi 0`) via petsc4Foam. Offloads only the pressure solve.
-- **OpenFOAM + AMGX** — 1 CPU core + GPU; the in-repo `amgxFoam` solver (LDU→CSR + AMGX C API), PCG + aggregation AMG.
+- **OpenFOAM + AMGX**, 1 CPU core + GPU; the in-repo `amgxFoam` solver (LDU→CSR + AMGX C API), PCG + aggregation AMG.
   Offloads only the pressure solve.
-- **SPUMA** — the whole SIMPLE loop on the GPU via generic wrapper kernels on unified (managed) memory, run as
+- **SPUMA**, the whole SIMPLE loop on the GPU via generic wrapper kernels on unified (managed) memory, run as
   `simpleFoam -pool fixedSizeMemoryPool -poolSize <GB>` with SPUMA's `twoStageGaussSeidel` GPU smoothers (required on
-  a discrete GPU — see §5; the default `GaussSeidel` runs on the CPU and thrashes managed memory over PCIe).
+  a discrete GPU, see §5; the default `GaussSeidel` runs on the CPU and thrashes managed memory over PCIe).
 
 ---
 
-## 3. Accuracy — every runner matches brae to < 1 %
+## 3. Accuracy, every runner matches brae to < 1 %
 
 Fixed 2 000 iterations, stock turbulent pitzDaily (12 225 cells), internal-field relative L2 versus brae:
 
@@ -119,7 +119,7 @@ Laminar scaled pitzDaily, fixed iterations, partition excluded. Reproduce with `
 | 440 k | **26.2** | 47.0 | 164.7 | 366.3 | 346.9 |
 | 2.07 M | **97.4** | 222.4 | 453.4 | 1969.6 | 2311.3 |
 | 4.89 M | **263.5** | 647.7 | 1022.2 | 6795.7 | 7897.1 |
-| 9.58 M | **733.9** | 1131.9 | — | — | — |
+| 9.58 M | **733.9** | 1131.9 | - | - | - |
 | 14.98 M | **1079.1** | 2346.5 | 2945.4 | 20738.0 | 24520.9 |
 
 (PETSc/AMGX/SPUMA were not run at 9.58 M; that point is bracketed by 4.9 M and 15 M.)
@@ -134,12 +134,12 @@ Laminar scaled pitzDaily, fixed iterations, partition excluded. Reproduce with `
 | 14.98 M | 22.7× | 19.2× | 2.7× | 2.2× |
 
 There are two clear tiers. The device-resident engines (brae, SPUMA) and the CPU sit at the bottom of the chart; the
-linear-solve offloads (PETSc, AMGX) sit 7–8× above SPUMA and are slower than the CPU alone, because they run only the
+linear-solve offloads (PETSc, AMGX) sit 7-8× above SPUMA and are slower than the CPU alone, because they run only the
 pressure solve on the GPU and copy a freshly assembled matrix from one CPU core every iteration. SPUMA runs the whole
-loop on the GPU and so clears the offloads by 2–8×, trailing only brae. Against the offloads brae is 13–30× faster
+loop on the GPU and so clears the offloads by 2-8×, trailing only brae. Against the offloads brae is 13-30× faster
 (the ratio peaks near 4.9 M, then eases to ~20× at 15 M as brae's multigrid hierarchy deepens while the offloads scale
-linearly). Against SPUMA brae is 2.7–6.3× faster, and that gap narrows as the mesh grows. On GB10 (no HBM) the same
-GPU-vs-GPU comparison was about 5×; on the H100's HBM it is 20–30×.
+linearly). Against SPUMA brae is 2.7-6.3× faster, and that gap narrows as the mesh grows. On GB10 (no HBM) the same
+GPU-vs-GPU comparison was about 5×; on the H100's HBM it is 20-30×.
 
 **Peak GPU memory and the device-resident ceiling.** brae's footprint is roughly linear at ~2.8 KB/cell (1833 / 6171
 / 14011 / 41479 MiB at 440 k / 2.07 M / 4.89 M / 14.98 M). The offloads keep the mesh in host RAM and put only the
@@ -154,12 +154,9 @@ figure is dominated by its pre-allocated pool and its managed pages migrate, so 
 | 28.17 M | 75.2 GB | ok (largest that fits) |
 | 35.65 M | 79.2 GB, then exit 1 | out of memory |
 
-This is the core trade-off: brae is far faster but bounded by GPU memory (~28 M cells here); beyond that the offloads
-or the CPU (mesh in the 235 GB host RAM) are the only option — OpenFOAM-CPU solved the 35.6 M case at 8.40 s/iteration.
-
 ---
 
-## 5. Why brae is faster — HBM bandwidth
+## 5. Why brae is faster, HBM bandwidth
 
 The question is which approaches actually use the H100's HBM. Measured with `nsys` (kernel mix, memory traffic) and
 `ncu` (per-kernel HBM throughput) on the 2.07 M-cell case. Two factors multiply: how much of the wall-clock the GPU is
@@ -171,7 +168,7 @@ busy, and how much of HBM's bandwidth each kernel reaches when it runs.
 |---|---:|
 | brae @ 4.89 M | 84.0 % |
 | brae @ 14.98 M | 78.6 % |
-| PETSc / AMGX offloads | GPU-starved — CPU-bound run, GPU idle the large majority of the time |
+| PETSc / AMGX offloads | GPU-starved, CPU-bound run, GPU idle the large majority of the time |
 
 brae keeps the whole loop on the device (its pressure solve is captured into a CUDA graph), so it stays ~80 %
 GPU-active across mesh sizes. The offloads are the genuine idle case: the run is dominated by one CPU core assembling
@@ -183,28 +180,28 @@ nsys kernel-time-over-wall figure above is the reliable measure.)
 
 | kernel | runner | % of HBM peak | GB/s |
 |---|---|---:|---:|
-| `amulKernel` — LDU SpMV (FP64) | brae | 84.9 % | 1731 |
-| `gsColorT` — colored Gauss-Seidel smoother | brae | 65.1 % | 1326 |
-| `cusparse::csrmv_v3` — fine-grid SpMV | AMGX | 60.3 % | 1227 |
-| `cuda::lambdaKernel` — generic wrapper (mean) | SPUMA | 6.7 % (max 75.5 %) | ~140 |
-| `cusparse::csrmv_v3` — SpMV (coarse-grid sample) | PETSc | 4–16 % | 88 |
+| `amulKernel`, LDU SpMV (FP64) | brae | 84.9 % | 1731 |
+| `gsColorT`, colored Gauss-Seidel smoother | brae | 65.1 % | 1326 |
+| `cusparse::csrmv_v3`, fine-grid SpMV | AMGX | 60.3 % | 1227 |
+| `cuda::lambdaKernel`, generic wrapper (mean) | SPUMA | 6.7 % (max 75.5 %) | ~140 |
+| `cusparse::csrmv_v3`, SpMV (coarse-grid sample) | PETSc | 4-16 % | 88 |
 
-brae's SpMV reaches 1731 GB/s — 85 % of this card's HBM peak, which also confirms the peak (1731 / 0.849 ≈ 2040 GB/s,
+brae's SpMV reaches 1731 GB/s, 85 % of this card's HBM peak, which also confirms the peak (1731 / 0.849 ≈ 2040 GB/s,
 the ~2 TB/s PCIe part). At ~80 % GPU-active and ~0.65 time-weighted average kernel bandwidth, brae realizes roughly
-half of the H100's total HBM bandwidth over a full run (derived estimate); the offloads realize about 1–2 %. That
+half of the H100's total HBM bandwidth over a full run (derived estimate); the offloads realize about 1-2 %. That
 order-of-magnitude gap in realized bandwidth is the mechanism behind the wall-clock gap.
 
 **Where the offloads' GPU time goes.** nsys shows the offloads spend much of their small GPU time rebuilding the AMG
 hierarchy every iteration rather than solving: AMGX's aggregation setup (`fill_A`, `compute_sparsity`,
 `findStrongestNeighbour`) is ~21 % of its GPU kernel time, and PETSc's GAMG shows device radix-sort / scan / `csrgeam`
-CSR-assembly kernels — because a newly assembled matrix arrives from the host each iteration. brae assembles and keeps
+CSR-assembly kernels, because a newly assembled matrix arrives from the host each iteration. brae assembles and keeps
 its matrix and hierarchy resident, so it pays that cost once.
 
 **Why brae leads SPUMA, though both are device-resident.** SPUMA runs the loop through one generic lambda wrapper
 launched about 1600 times per iteration; most launches are small and latency-bound (mean 7 % of HBM), a few reach
 76 %. brae instead fuses the work into a few large kernels that each saturate HBM (SpMV at 85 %). SPUMA's continuous
-stream of tiny kernels is also why coarse `nvidia-smi` sampling reported it as "more utilized" — it is busy, but with
-low-efficiency work, which is why it is 3–6× slower than brae.
+stream of tiny kernels is also why coarse `nvidia-smi` sampling reported it as "more utilized", it is busy, but with
+low-efficiency work, which is why it is 3-6× slower than brae.
 
 **SPUMA configuration note (discrete-GPU requirement).** SPUMA's default GAMG smoother, `GaussSeidel`, is sequential
 and runs on the CPU. On a discrete GPU that drags the managed pressure/velocity fields back over PCIe every iteration:
@@ -216,10 +213,10 @@ memory (CPU access to managed memory is free there) but essential on a discrete 
 
 ---
 
-## 6. Cost — $ per 100 SIMPLE iterations at $3/h
+## 6. Cost, $ per 100 SIMPLE iterations at $3/h
 
 Cost per 100 iterations = per-iteration wall × 100 × ($3 / 3600 s). A steady simpleFoam run typically needs a few
-hundred iterations, so a converged run costs 2–5× these figures — identically for every runner, so the ratios are the
+hundred iterations, so a converged run costs 2-5× these figures, identically for every runner, so the ratios are the
 point.
 
 | cells | brae | OpenFOAM-CPU (24c) | SPUMA | OpenFOAM+AMGX | OpenFOAM+PETSc-GPU |
@@ -231,7 +228,7 @@ point.
 
 At 4.9 M a run costs about 30× less on brae than on OpenFOAM+PETSc-GPU, 26× less than on OpenFOAM+AMGX, 3.9× less than
 on SPUMA, and 2.5× less than on all 24 CPU cores. The linear-solve offloads cost roughly 12× more per run than the CPU
-alone ($0.66 vs $0.054 at 4.9 M): at 1–5 % duty cycle the GPU is a net cost increase over the CPU for this workload.
+alone ($0.66 vs $0.054 at 4.9 M): at 1-5 % duty cycle the GPU is a net cost increase over the CPU for this workload.
 Only the device-resident engines make the H100 pay off.
 
 ---
@@ -241,7 +238,7 @@ Only the device-resident engines make the H100 pay off.
 - H100 **PCIe** (~2 TB/s HBM2e), not SXM (~3.35 TB/s). The ~2 TB/s peak is corroborated by ncu (brae's SpMV at 1731
   GB/s = 84.9 %).
 - OpenFOAM-CPU is a host-CPU reference, not a cost-matched comparison. It runs on 24 vCPUs of a KVM guest; a bare-metal
-  EPYC would be faster, so the ~2.2–2.5× brae-vs-CPU margin is indicative, not exact.
+  EPYC would be faster, so the ~2.2-2.5× brae-vs-CPU margin is indicative, not exact.
 - The performance case is laminar and physically unsteady, so it is a timing workload (identical work per iteration),
   not a field-comparison case. Field accuracy is validated separately on the converged turbulent case (§3).
 - The GPU-active figures come from a clean idle-machine sweep. The ncu/nsys per-kernel runs were taken while another
@@ -258,13 +255,13 @@ Only the device-resident engines make the H100 pay off.
 ## 8. How to reproduce
 
 One script prints the per-iteration times and the brae speedup ratios. It builds each mesh in a scratch dir, times
-the run, and deletes it — no output data is kept.
+the run, and deletes it, no output data is kept.
 
 ```bash
 # 1. build brae (see the repo README) and source OpenFOAM v2412:
 source /usr/lib/openfoam/openfoam2412/etc/bashrc
 
-# 2. (optional) build the GPU offloads / SPUMA so their columns appear — all for sm_90:
+# 2. (optional) build the GPU offloads / SPUMA so their columns appear, all for sm_90:
 ../setup_of_petsc.sh      # OpenFOAM + PETSc-GPU  -> libpetscFoam.so
 ../setup_of_amgx.sh       # OpenFOAM + AMGX       -> libamgxFoam.so
 ../setup_spuma.sh         # SPUMA (needs nvc++ / NVIDIA HPC SDK)
