@@ -17,6 +17,7 @@
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
 #include "foam_dict.cuh"
+#include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 
@@ -36,8 +37,35 @@
 
 using namespace brae;
 
+static void printUsage() {
+    std::printf(
+"brae, a GPU-native, OpenFOAM-compatible CFD solver (steady incompressible, simpleFoam).\n"
+"The whole SIMPLE loop runs on one GPU; reads a standard OpenFOAM case and writes standard time dirs.\n\n"
+"Usage:\n"
+"  brae [-case <dir>]             solve an OpenFOAM case (default: the current directory)\n"
+"  brae -partition [-case <dir>]  build + cache the mesh and AMG hierarchy, then exit (no solve)\n"
+"  brae -cases <d1> <d2> ...      run several cases at once, one per GPU (mesh/parameter study)\n"
+"  brae --help                    show this message\n\n"
+"A case is a standard OpenFOAM directory (0/ constant/ system/, ASCII or binary mesh). No decomposePar\n"
+"needed; brae auto-partitions for the GPU. With -cases, extra cases queue as GPUs free up.\n\n"
+"Environment:\n"
+"  BRAE_GPUS=N        override the detected GPU count (for -cases)\n"
+"  BRAE_JOBS=N        how many cases to run at once with -cases (default: number of GPUs)\n"
+"  BRAE_PCG_DEVICE=0  disable the device-resident PCG (on by default)\n"
+"  BRAE_AMG_FP32=0    use the FP64 AMG preconditioner instead of FP32 (on by default)\n\n"
+"Docs and benchmarks: https://github.com/simd-ai/brae\n");
+}
+
 int main(int argc, char** argv) {
     try {
+        for (int i = 1; i < argc; ++i) { const std::string h = argv[i]; if (h == "--help" || h == "-h") { printUsage(); return 0; } }
+        // -cases c1 c2 ... : run several cases at once, one per GPU (mesh/parameter study). The parent
+        // orchestrates (forks one child `brae -case cX` per GPU, no CUDA here); a plain -case is unaffected.
+        for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "-cases") {
+            std::vector<std::string> sweep;
+            for (int j = i + 1; j < argc && argv[j][0] != '-'; ++j) sweep.push_back(argv[j]);
+            if (!sweep.empty()) return braesweep::runSweepCases(sweep);
+        }
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
         for (int i = 1; i < argc; ++i) { const std::string a = argv[i];

@@ -144,18 +144,18 @@ The [**fast path**](docs/performance.md) (device-resident solver + mixed-precisi
 
 ### Run several cases across GPUs
 
-For a mesh-independence study or a parameter sweep, `tools/brae-sweep` runs several cases at once, one per GPU
+For a mesh-independence study or a parameter sweep, run several cases at once, one per GPU, straight from brae
 (each case fully device-resident on its own card; extra cases queue as GPUs free up):
 
 ```bash
-tools/brae-sweep mesh_coarse mesh_medium mesh_fine   # one case per GPU
-tools/brae-sweep --jobs 2 caseA caseB caseC          # cap how many run at once
+brae -cases mesh_coarse mesh_medium mesh_fine   # one case per GPU
+BRAE_JOBS=2 brae -cases caseA caseB caseC       # cap how many run at once
 ```
 
-On a terminal you get one live OpenFOAM-style residual panel per GPU; piped to a file the same lines are tagged
-`[GPUn case]` so the log stays greppable. It finishes with a summary table (cells, iterations, residuals, wall time,
-and a Cd mesh-convergence delta when a case writes force coefficients). If there are more cases than GPUs it prints a
-warning and queues the extras. On a single-GPU machine the same command just runs the cases back to back.
+Each case's OpenFOAM-style residual output is tagged `[GPUn case]` so the combined log stays greppable, and it
+finishes with a per-case summary table (cells, iterations, residuals, wall time, status). If there are more cases
+than GPUs it prints a warning and queues the extras. On a single-GPU machine the same command runs the cases back to
+back. Override the detected GPU count with `BRAE_GPUS`.
 
 ---
 
