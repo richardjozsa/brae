@@ -29,3 +29,7 @@ validation/*
 
 # CTest-generated output (regenerated on every ctest run)
 Testing/
+
+# python bytecode
+__pycache__/
+*.pyc

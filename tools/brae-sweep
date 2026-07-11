@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+brae-sweep: run several brae cases at once, one per GPU, for mesh and parameter studies.
+
+Each case runs fully device-resident on its own GPU (pinned with CUDA_VISIBLE_DEVICES).
+Cases beyond the GPU count queue and start as GPUs free up. On a terminal you get one live
+OpenFOAM-style residual panel per GPU; piped to a file you get the same lines tagged
+[GPUn case] so the log stays greppable. At the end it prints a mesh-independence summary.
+
+This is a launcher around the normal single-GPU brae binary. It does not change the solver.
+
+Usage:
+  brae-sweep [options] case1 case2 case3 ...
+
+Options:
+  --brae PATH   path to the brae binary (default: 'brae' on PATH, else ./build/brae)
+  --jobs N      how many cases to run at once (default: number of GPUs found)
+  --metric M    quantity to compare in the summary: auto | Cd | p (default: auto)
+"""
+import argparse, glob, os, re, shutil, subprocess, sys, threading, time
+from collections import OrderedDict
+from queue import Queue, Empty
+
+RE_TIME  = re.compile(r'^Time = (\S+)')
+RE_SOLVE = re.compile(r'Solving for (\w+), Initial residual = (\S+?),')
+RE_CONT  = re.compile(r'continuity errors : sum local = (\S+?),')
+ANSI_HOME_CLEAR = "\033[H\033[J"
+SEP = "-" * 92
+
+def ncells(case):
+    try:
+        head = open(os.path.join(case, "constant/polyMesh/owner"), "rb").read(2048).decode("latin1")
+        m = re.search(r'nCells:\s*(\d+)', head)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+def endtime(case):
+    try:
+        txt = open(os.path.join(case, "system/controlDict")).read()
+        m = re.search(r'^\s*endTime\s+(\S+?)\s*;', txt, re.M)
+        return int(float(m.group(1))) if m else None
+    except Exception:
+        return None
+
+def find_cd(case):
+    for p in sorted(glob.glob(os.path.join(case, "postProcessing", "**", "*.dat"), recursive=True)):
+        try:
+            hdr, data = [], []
+            for l in open(p):
+                (hdr if l.startswith("#") else data).append(l)
+            data = [l for l in data if l.strip()]
+            if not data or not hdr:
+                continue
+            cols = hdr[-1].lstrip("#").split()
+            if "Cd" in cols:
+                return float(data[-1].split()[cols.index("Cd")])
+        except Exception:
+            pass
+    return None
+
+def human(n):
+    if n is None: return "?"
+    return f"{n/1e6:.2f}M" if n >= 1e5 else f"{n/1e3:.0f}k"
+
+def hms(s):
+    s = int(s); return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+
+def run_case(case, gpu, brae, st, tagged):
+    st["gpu"], st["status"], st["t0"] = gpu, "running", time.time()
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
+    tag = f"[GPU{gpu} {st['name']}]"
+    block = []
+    try:
+        logf = open(os.path.join(case, "log.brae-sweep"), "w")
+        proc = subprocess.Popen([brae, "-case", case], env=env, text=True, bufsize=1,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except Exception as e:
+        st["status"] = "failed"; st["err"] = str(e); st["t1"] = time.time(); return
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        logf.write(line + "\n")
+        if tagged and line.strip():
+            print(f"{tag}  {line}", flush=True)
+        m = RE_TIME.match(line)
+        if m:
+            try: st["iter"] = int(float(m.group(1)))
+            except ValueError: pass
+        m = RE_SOLVE.search(line)
+        if m:
+            if m.group(1) == "Ux": st["ux"] = m.group(2)
+            if m.group(1) == "p":  st["p"]  = m.group(2)
+        m = RE_CONT.search(line)
+        if m: st["cont"] = m.group(1)
+        if line.strip() and (line.startswith(("Time =", "smoothSolver", "GAMG", "AMG", "time step", "DIL", "PCG", "BiCG"))):
+            block.append(line); st["block"] = block[-6:]
+    rc = proc.wait(); logf.close()
+    st["t1"] = time.time()
+    st["status"] = "done" if rc == 0 else "failed"
+    if "-nan" in "".join(st.get("block", [])) or st.get("p") == "nan":
+        st["status"] = "diverged"
+
+def render(state, start, ngpu, jobs):
+    out = [f"brae mesh study   |   {ngpu} GPU(s), {jobs} parallel   |   elapsed {hms(time.time()-start)}"]
+    for st in state.values():
+        it, end = st.get("iter", 0), st.get("end")
+        prog = f"iter {it}/{end}" if end else (f"iter {it}" if it else "queued")
+        out.append(SEP)
+        out.append(f"GPU {st.get('gpu','-')}   {st['name']} ({human(st['cells'])})   {prog}   {st['status']}")
+        for bl in st.get("block", []):
+            out.append("  " + bl)
+    out.append(SEP)
+    sys.stdout.write(ANSI_HOME_CLEAR + "\n".join(out) + "\n"); sys.stdout.flush()
+
+def summary(state, metric):
+    rows = sorted(state.values(), key=lambda s: (s["cells"] or 0))
+    print("\n" + "=" * 92)
+    total = max((s.get("t1", 0) for s in state.values()), default=0) - min((s.get("t0", 1e18) for s in state.values()), default=0)
+    print(f"mesh study complete   ({len(rows)} cases, wall {hms(total)})\n")
+    use_cd = metric in ("auto", "Cd") and all(s.get("cd") is not None for s in rows) and len(rows) > 1
+    hdr = f"  {'case':<16}{'GPU':>4}{'cells':>9}{'iters':>7}{'p resid':>11}"
+    hdr += f"{'Cd':>9}{'dCd vs finer':>15}" if use_cd else f"{'Ux resid':>11}"
+    hdr += f"{'wall':>9}   status"
+    print(hdr); print("  " + "-" * (len(hdr) - 2))
+    for i, s in enumerate(rows):
+        wall = hms((s.get("t1", 0) - s.get("t0", 0)))
+        line = f"  {s['name']:<16}{s.get('gpu','-'):>4}{human(s['cells']):>9}{s.get('iter',0):>7}{s.get('p','-'):>11}"
+        if use_cd:
+            finer = rows[i+1] if i+1 < len(rows) else None
+            d = "reference" if finer is None else f"{100*(s['cd']-finer['cd'])/finer['cd']:+.1f}%"
+            line += f"{s['cd']:>9.4f}{d:>15}"
+        else:
+            line += f"{s.get('ux','-'):>11}"
+        line += f"{wall:>9}   {s['status']}"
+        print(line)
+    if use_cd and len(rows) >= 2:
+        d = 100*abs(rows[-1]["cd"]-rows[-2]["cd"])/rows[-1]["cd"]
+        print(f"\n  {rows[-2]['name']} and {rows[-1]['name']} agree within {d:.1f}% on Cd"
+              + (f". {rows[-2]['name']} is likely sufficient." if d < 2 else ". consider a finer mesh."))
+    else:
+        print("\n  (no force metric found; add a forceCoeffs functionObject for a Cd mesh-convergence delta)")
+    print("  full fields + logs written to each case folder.")
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("cases", nargs="+")
+    ap.add_argument("--brae", default=None)
+    ap.add_argument("--jobs", type=int, default=None)
+    ap.add_argument("--metric", default="auto", choices=["auto", "Cd", "p"])
+    a = ap.parse_args()
+
+    brae = a.brae or shutil.which("brae") or os.path.join(os.path.dirname(__file__), "..", "build", "brae")
+    brae = os.path.abspath(brae)
+    if not os.path.exists(brae):
+        sys.exit(f"brae binary not found (looked at {brae}); pass --brae PATH")
+    cases = [c.rstrip("/") for c in a.cases]
+    for c in cases:
+        if not os.path.isdir(c): sys.exit(f"not a case dir: {c}")
+
+    try:
+        ngpu = len([l for l in subprocess.check_output(["nvidia-smi", "-L"], text=True).splitlines() if l.strip()])
+    except Exception:
+        ngpu = 1
+    ngpu = max(ngpu, 1)
+    jobs = a.jobs or ngpu
+
+    state = OrderedDict()
+    for c in cases:
+        state[c] = {"name": os.path.basename(c), "cells": ncells(c), "end": endtime(c),
+                    "iter": 0, "status": "queued", "block": [], "cd": None}
+    tty = sys.stdout.isatty()
+    print(f"brae mesh study: {len(cases)} case(s), {ngpu} GPU(s) found, running {jobs} at a time"
+          + ("" if tty else "  (piped: tagged output)"), flush=True)
+    if len(cases) > ngpu and jobs <= ngpu:
+        print(f"  WARNING: {len(cases)} cases but only {ngpu} GPU(s); {ngpu} run at once, the other "
+              f"{len(cases)-ngpu} queue. add {len(cases)-ngpu} more GPU(s) to run them all in parallel.", flush=True)
+    if jobs > ngpu:
+        print(f"  WARNING: --jobs {jobs} exceeds the {ngpu} GPU(s) found; cases will share GPUs "
+              f"and may run out of GPU memory.", flush=True)
+
+    q = Queue()
+    for c in cases: q.put(c)
+    def worker(wid):
+        gpu = wid % ngpu
+        while True:
+            try: c = q.get_nowait()
+            except Empty: return
+            run_case(c, gpu, brae, state[c], tagged=not tty)
+            state[c]["cd"] = find_cd(c)
+    threads = [threading.Thread(target=worker, args=(w,), daemon=True) for w in range(jobs)]
+    start = time.time()
+    for t in threads: t.start()
+    if tty:
+        while any(t.is_alive() for t in threads):
+            render(state, start, ngpu, jobs); time.sleep(0.5)
+        render(state, start, ngpu, jobs)
+    for t in threads: t.join()
+    summary(state, a.metric)
+
+if __name__ == "__main__":
+    main()
