@@ -40,7 +40,7 @@ struct AMGLevel {
     DeviceBuffer<label>  cOwn, cNei, cOwnerStart, cLosort, cLosortStart;  // grid-(k+1) addressing (SpMV gather)
     DeviceBuffer<label>  faceRestrict, faceFlip;               // grid-k face -> grid-(k+1) face (>=0) / -1-coarseCell
     DeviceBuffer<scalar> cDiag, cUpper, cLower;                // grid-(k+1) matrix (rebuilt by Galerkin)
-    // --- SMOOTHED AGGREGATION (BRAE_AMG_SA) ---------------------------------------------------------------------
+    // SMOOTHED AGGREGATION (BRAE_AMG_SA)
     // The tentative prolongator (= map) smoothed by one Jacobi step P=(I-omega D^-1 A)P_tent, stored sparse (CSR by
     // fine row). Built ONCE from the geometric (face-weight) proxy Laplacian; sparsity + values are fixed, so the
     // restrict/prolong kernels stay graph-capturable. The coarse matrix is then the GENERAL Galerkin A_c=P^T A P,
@@ -125,7 +125,7 @@ void amgGalerkin(AMGData& A, const DeviceBuffer<scalar>& fineDiag, const DeviceB
 // corrScaling: enable OF-GAMG coarse-correction scaling in the V-cycle (a per-level line-search that fixes the
 // unsmoothed-aggregation correction magnitude, the dominant cycle-count lever at scale). It makes the
 // preconditioner NONLINEAR, so it switches the Krylov accelerator to flexible CG (Polak-Ribiere+ beta). Default
-// false → plain injection + standard CG (bit-identical to before); the SIMPLE loop opts in (validated vs OpenFOAM).
+// false -> plain injection + standard CG (bit-identical to before); the SIMPLE loop opts in (validated vs OpenFOAM).
 DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const DeviceBuffer<scalar>& b,
                               DeviceBuffer<scalar>& psi, scalar normFactor, scalar tol, scalar relTol, int maxIter,
                               bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false);
