@@ -1,13 +1,2 @@
-# GitHub language stats (Linguist) tuning. Does NOT affect the build, tests, or CI,
-# only the language breakdown bar shown on the repo page.
-
-# The ctest fixtures under validation/ are OpenFOAM case files (meshes, dictionaries,
-# reference oracles). Every one carries an Emacs "-*- C++ -*-" modeline in its header,
-# so Linguist counts ~114 MB of them as C++ and drowns out the ~1.4 MB of actual CUDA
-# code (the repo reads as mostly C++ / ~3% Cuda). Mark them as vendored so they are
-# excluded from the stats; the real source then dominates as it should.
-validation/** linguist-vendored
-
-# Be explicit that the CUDA sources are Cuda.
 *.cu  linguist-language=Cuda
 *.cuh linguist-language=Cuda
