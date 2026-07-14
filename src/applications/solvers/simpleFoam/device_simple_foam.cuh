@@ -39,7 +39,8 @@
 
 namespace brae {
 
-struct DeviceSimpleControls {
+struct DeviceSimpleControls
+{
     scalar nu = 1e-5, relaxU = 0.7, relaxP = 0.3, relaxK = 0.7, relaxEps = 0.7;
     vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
     scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
@@ -68,31 +69,43 @@ struct DeviceSimpleControls {
     bool   sa = false;                             // RASModel SpalartAllmaras (one-equation: the "k" slot holds nuTilda; no 2nd scalar).
     SpalartAllmarasCoeffs saCoeffs;                // SA coeffs (default = OF) + nutUSpaldingWallFunction E/kappa.
     bool   needRef = false;                        // no fixedValue-p patch -> singular pressure: adjustPhi + setReference.
-    label  pRefCell = 0; scalar pRefValue = 0.0;   // pressure reference (fvSolution SIMPLE.pRefCell/pRefValue).
+    label  pRefCell = 0;
+    scalar pRefValue = 0.0;                        // pressure reference (fvSolution SIMPLE.pRefCell/pRefValue).
     int    pcgCheckEvery = 1;      // pressure AMG-PCG residual-read cadence (BRAE_PCG_CHECK_EVERY). 1 = exact per-iter
                                    // (bit-identical); K>1 cuts (K-1)/K of the PCG host syncs (overshoots conv by <K).
     bool   corrScaling = false;    // AMG coarse-correction scaling + flexible CG (BRAE_CORR_SCALING). Cuts AMG cycles
-                                   // ~2× at scale (graded meshes); nonlinear precond -> not bit-identical to off.
+                                   // ~2x at scale (graded meshes); nonlinear precond -> not bit-identical to off.
     std::string caseDir = ".";     // case directory, for the AMG hierarchy cache (constant/polyMesh/.brae_amgcache).
     bool   writeCache = false;     // write the mesh + AMG caches this run (set by -partition or BRAE_MESH_CACHE).
 };
 // OF-style per-field solve report for one SIMPLE step (matches OpenFOAM's "Solving for Ux/Uy/Uz/p" + continuity block).
-struct DeviceSimpleResidual {
+struct DeviceSimpleResidual
+{
     scalar Ux = 0, Uy = 0, Uz = 0, p = 0, pFinal = 0;
-    scalar UxFinal = 0, UyFinal = 0, UzFinal = 0;  int UxIters = 0, UyIters = 0, UzIters = 0;  // U per-component final + nIter
+    scalar UxFinal = 0, UyFinal = 0, UzFinal = 0;
+    int UxIters = 0, UyIters = 0, UzIters = 0;     // U per-component final + nIter
     int pIters = 0;
     scalar contLocal = 0, contGlobal = 0;          // time step continuity errors, raw (driver applies deltaT + cumulative)
 };
 
-class DeviceSimpleSolver {
+class DeviceSimpleSolver
+{
 public:
-    DeviceSimpleSolver(const PrimitiveMesh& m, const FvGeometry& g, const std::vector<FvPatch>& fvp,
-                       const GeometricField<vector>& U, const GeometricField<scalar>& p, const SurfaceScalarField& phi,
-                       const DeviceSimpleControls& ctl,
-                       const GeometricField<scalar>* k = nullptr, const GeometricField<scalar>* eps = nullptr,
-                       const GeometricField<scalar>* nut = nullptr,
-                       const GeometricField<scalar>* ReThetat = nullptr, const GeometricField<scalar>* gammaInt = nullptr)
-        : fvp_(fvp), ctl_(ctl), nC_(m.nCells()), nIf_(m.nInternalFaces()) {
+    DeviceSimpleSolver(
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<FvPatch>& fvp,
+        const GeometricField<vector>& U,
+        const GeometricField<scalar>& p,
+        const SurfaceScalarField& phi,
+        const DeviceSimpleControls& ctl,
+        const GeometricField<scalar>* k = nullptr,
+        const GeometricField<scalar>* eps = nullptr,
+        const GeometricField<scalar>* nut = nullptr,
+        const GeometricField<scalar>* ReThetat = nullptr,
+        const GeometricField<scalar>* gammaInt = nullptr)
+        : fvp_(fvp), ctl_(ctl), nC_(m.nCells()), nIf_(m.nInternalFaces())
+    {
         // cyclic (periodic) interfaces: a SEPARATE lduInterface (OF cyclicFvPatchField::updateInterfaceMatrix),
         // NOT merged into the owner-sorted LDU. Both sides of each pair are stored (symmetric coupling).
         const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);
@@ -109,36 +122,89 @@ public:
         dbP_  = buildDeviceBoundary(p, fvp, g);
         wall_ = buildDeviceWallData(m, g, fvp, U);
         // all-extrapolated boundary -> gathers a cell field to boundary faces (nuEff_bnd = adjacent cell value)
-        { std::vector<label> ty, fc; std::vector<scalar> ref, dc, ms;
-          for (std::size_t pi = 0; pi < fvp.size(); ++pi) { if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
-            for (label i = 0; i < fvp[pi].size; ++i) {
-              ty.push_back(0); fc.push_back(fvp[pi].faceCells[i]); ref.push_back(0.0);
-              dc.push_back(fvp[pi].deltaCoeffs[i]); ms.push_back(g.magSf()[fvp[pi].start + i]); } }
-          dbExtrap_.n = (int)ty.size(); dbExtrap_.bcType.copyFrom(ty); dbExtrap_.refValue.copyFrom(ref);
-          dbExtrap_.deltaCoeffs.copyFrom(dc); dbExtrap_.magSf.copyFrom(ms); dbExtrap_.faceCell.copyFrom(fc);
-          dbExtrap_.valueFraction.copyFrom(std::vector<scalar>(ty.size(), 0.0)); dbExtrap_.mixedMask.copyFrom(std::vector<label>(ty.size(), 0)); }
+        {
+            std::vector<label> ty, fc;
+            std::vector<scalar> ref, dc, ms;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    ty.push_back(0);
+                    fc.push_back(fvp[pi].faceCells[i]);
+                    ref.push_back(0.0);
+                    dc.push_back(fvp[pi].deltaCoeffs[i]);
+                    ms.push_back(g.magSf()[fvp[pi].start + i]);
+                }
+            }
+            dbExtrap_.n = (int)ty.size();
+            dbExtrap_.bcType.copyFrom(ty);
+            dbExtrap_.refValue.copyFrom(ref);
+            dbExtrap_.deltaCoeffs.copyFrom(dc);
+            dbExtrap_.magSf.copyFrom(ms);
+            dbExtrap_.faceCell.copyFrom(fc);
+            dbExtrap_.valueFraction.copyFrom(std::vector<scalar>(ty.size(), 0.0));
+            dbExtrap_.mixedMask.copyFrom(std::vector<label>(ty.size(), 0));
+        }
         // any freestreamVelocity/Pressure (mixed) far-field patch present -> run the per-step valueFraction update.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            if (U.boundary[pi]->bcCategory() == 5 || p.boundary[pi]->bcCategory() == 5) { hasMixed_ = true; break; }
+            if (U.boundary[pi]->bcCategory() == 5 || p.boundary[pi]->bcCategory() == 5)
+            {
+                hasMixed_ = true;
+                break;
+            }
         // any pressureInletOutletVelocity (directionMixed) U patch present -> run its per-step updateCoeffs.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            if (U.boundary[pi]->bcCategory() == 6) { hasPiov_ = true; break; }
+            if (U.boundary[pi]->bcCategory() == 6)
+            {
+                hasPiov_ = true;
+                break;
+            }
         // any slip/symmetry U patch -> run its per-step updateCoeffs (general non-axis-aligned normal).
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            if (U.boundary[pi]->isSymmetry()) { hasSym_ = true; break; }
+            if (U.boundary[pi]->isSymmetry())
+            {
+                hasSym_ = true;
+                break;
+            }
         // any totalPressure p patch -> recompute its fixedValue refValue each step from the patch velocity + flux.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            if (p.boundary[pi]->bcCategory() == 7) { hasTotalP_ = true; break; }
+            if (p.boundary[pi]->bcCategory() == 7)
+            {
+                hasTotalP_ = true;
+                break;
+            }
         // per-boundary-face wall mask + nearWallDist y (for the true boundary nut = nutkWallFunction at walls).
-        { const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
-          std::vector<label> isW; std::vector<scalar> yv;
-          for (std::size_t pi = 0; pi < fvp.size(); ++pi) { if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue; const bool wall = (fvp[pi].type == "wall");
-              for (label i = 0; i < fvp[pi].size; ++i) { isW.push_back(wall ? 1 : 0); yv.push_back(wall ? yW[pi][i] : 0.0); } }
-          bndIsWall_.copyFrom(isW); bndY_.copyFrom(yv); }
+        {
+            const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
+            std::vector<label> isW;
+            std::vector<scalar> yv;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                const bool wall = (fvp[pi].type == "wall");
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    isW.push_back(wall ? 1 : 0);
+                    yv.push_back(wall ? yW[pi][i] : 0.0);
+                }
+            }
+            bndIsWall_.copyFrom(isW);
+            bndY_.copyFrom(yv);
+        }
         // adjustPhi adjustable mask (patch order = phiBnd_ order): a face is adjustable iff its U patch does NOT
         // fix the flux (zeroGradient/inletOutlet/calculated) -> OF "!fixesValue || isA<inletOutlet>".
-        { std::vector<label> adj; for (std::size_t pi = 0; pi < fvp.size(); ++pi) { if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue; const bool fixed = U.boundary[pi]->fixesValue();
-              for (label i = 0; i < fvp[pi].size; ++i) adj.push_back(fixed ? 0 : 1); } adjustMask_.copyFrom(adj); }
+        {
+            std::vector<label> adj;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                const bool fixed = U.boundary[pi]->fixesValue();
+                for (label i = 0; i < fvp[pi].size; ++i)
+                    adj.push_back(fixed ? 0 : 1);
+            }
+            adjustMask_.copyFrom(adj);
+        }
         nuBndConst_.copyFrom(std::vector<scalar>(dbExtrap_.n, ctl.nu));
         // AMG hierarchy for the pressure Laplacian (static: faceWeights = |Sf|), built from the mesh internal faces.
         // The cyclic interface is NOT in the AMG: a Galerkin coarse operator built from the internal-face restriction
@@ -148,16 +214,27 @@ public:
         // host cyclicPCG. cyclicGAMGInterface is the deferred perf path; for now AMG is only used on non-cyclic cases.
         const std::vector<label> ownerInt(m.owner().begin(), m.owner().begin() + nIf_), neiInt(m.neighbour());
         std::vector<scalar> fwAMG(g.magSf().begin(), g.magSf().begin() + nIf_);   // default: geometric face area (bit-identical)
-        if (std::getenv("BRAE_AMG_SOC")) {   // SoC ON: weight = LAPLACIAN coupling magSf*deltaCoeffs (the real matrix strength,
+        if (std::getenv("BRAE_AMG_SOC"))   // SoC ON: weight = LAPLACIAN coupling magSf*deltaCoeffs (the real matrix strength,
+        {
             const auto& dcg = g.deltaCoeffs();                                    // up to ~constant rAU) so agglomerate()'s
-            for (label f = 0; f < nIf_; ++f) fwAMG[f] *= dcg[f];                  // strong-face filter sees the true anisotropy
+            for (label f = 0; f < nIf_; ++f)
+                fwAMG[f] *= dcg[f];                  // strong-face filter sees the true anisotropy
         }
         amg_ = buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
 
         // initial device state.
-        { std::vector<scalar> ux(nC_), uy(nC_), uz(nC_);
-          for (label c = 0; c < nC_; ++c) { ux[c]=U.internal[c].x; uy[c]=U.internal[c].y; uz[c]=U.internal[c].z; }
-          Uk_[0].copyFrom(ux); Uk_[1].copyFrom(uy); Uk_[2].copyFrom(uz); }
+        {
+            std::vector<scalar> ux(nC_), uy(nC_), uz(nC_);
+            for (label c = 0; c < nC_; ++c)
+            {
+                ux[c]=U.internal[c].x;
+                uy[c]=U.internal[c].y;
+                uz[c]=U.internal[c].z;
+            }
+            Uk_[0].copyFrom(ux);
+            Uk_[1].copyFrom(uy);
+            Uk_[2].copyFrom(uz);
+        }
         dp_.copyFrom(p.internal);
         phiInt_.copyFrom(phi.internal);             // internal-face flux (cyclic flux is held separately in cyc_.phi)
         // initialise the persistent cyclic-face flux. The host phi was built with the cyclic patch as a zeroGradient
@@ -165,23 +242,39 @@ public:
         // for rotational it is NOT conservative). Recompute it on the device from U_init with the proper coupled +
         // rotated interpolation (deviceCyclicFlux[Rot] is conservative) so the first momentum convection + continuity
         // see the correct periodic flux. (For a rest start U=0 this is 0 either way; it matters for a swirling init.)
-        if (hasCyclic_) {
+        if (hasCyclic_)
+        {
             if (cyc_.rotational) deviceCyclicFluxRot(cyc_, Uk_[0], Uk_[1], Uk_[2]);
             else                 deviceCyclicFlux   (cyc_, Uk_[0], Uk_[1], Uk_[2]);
         }
         if (hasAMI_) deviceAmiFlux(ami_, Uk_[0], Uk_[1], Uk_[2]);   // conservative initial AMI flux from U_init
-        { std::vector<scalar> o; for (std::size_t pi = 0; pi < fvp.size(); ++pi) { if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
-              o.insert(o.end(), phi.boundary[pi].begin(), phi.boundary[pi].end()); } phiBnd_.copyFrom(o); }
+        {
+            std::vector<scalar> o;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                o.insert(o.end(), phi.boundary[pi].begin(), phi.boundary[pi].end());
+            }
+            phiBnd_.copyFrom(o);
+        }
         std::vector<scalar> nv(nC_, 0.0);
-        if (ctl_.turbulent) {
+        if (ctl_.turbulent)
+        {
             dbK_   = buildDeviceBoundary(*k, fvp, g);        // SA: the "k" slot holds nuTilda
             dk_.copyFrom(k->internal);
-            if (!ctl_.sa) { dbEps_ = buildDeviceBoundary(*eps, fvp, g); de_.copyFrom(eps->internal); }   // 2nd scalar (omega/eps); SA has none
+            if (!ctl_.sa)
+            {
+                dbEps_ = buildDeviceBoundary(*eps, fvp, g);
+                de_.copyFrom(eps->internal);   // 2nd scalar (omega/eps); SA has none
+            }
             nv = nut->internal;
             if (ctl_.sst || ctl_.sa) y_.copyFrom(cellWallDist(m, g, fvp));   // wall distance (SST F1/F2/F3; SA dTilda)
-            if (ctl_.lm && ReThetat && gammaInt) {   // kOmegaSSTLM transition fields
-                dbReThetat_ = buildDeviceBoundary(*ReThetat, fvp, g); ReThetat_.copyFrom(ReThetat->internal);
-                dbGammaInt_ = buildDeviceBoundary(*gammaInt, fvp, g); gammaInt_.copyFrom(gammaInt->internal);
+            if (ctl_.lm && ReThetat && gammaInt)   // kOmegaSSTLM transition fields
+            {
+                dbReThetat_ = buildDeviceBoundary(*ReThetat, fvp, g);
+                ReThetat_.copyFrom(ReThetat->internal);
+                dbGammaInt_ = buildDeviceBoundary(*gammaInt, fvp, g);
+                gammaInt_.copyFrom(gammaInt->internal);
                 gammaIntEff_.copyFrom(std::vector<scalar>(nC_, 0.0));   // OF kOmegaSSTLM ctor: gammaIntEff_ = Zero (no Pk on iter 1, before correctReThetatGammaInt updates it)
             }
         }
@@ -200,28 +293,39 @@ public:
     // iter 1. Without (2) the FIRST momentum predictor runs with nut straight from 0/nut, which is `uniform 0` in
     // motorBike AND pitzDaily, i.e. fully laminar; harmless on attached flows but the seed of divergence on high-Re
     // skewed meshes. kMin_/epsilonMin_/omegaMin_ default to SMALL (= 1e-15), matching the floors used in correct().
-    void validateTurbulence() {
+    void validateTurbulence()
+    {
         if (!ctl_.turbulent) return;
         const DeviceMesh& dm = dm_;
         deviceBoundField(dm, dk_, 1e-15);                              // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
         if (!ctl_.sa) deviceBoundField(dm, de_, 1e-15);               // bound(omega_|epsilon_, ...Min_)
         // validate() -> correctNut(): recompute internal nut from the bounded fields + the initial U.
-        if (ctl_.sa) {
+        if (ctl_.sa)
+        {
             deviceNutSA(dk_, ctl_.nu, ctl_.saCoeffs.Cv1, dnut_);     // nut = nuTilda*fv1(nuTilda)
-        } else if (ctl_.sst) {
-            DeviceBuffer<scalar> gradU; deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU,
-                                                    hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+        }
+        else if (ctl_.sst)
+        {
+            DeviceBuffer<scalar> gradU;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU,
+                        hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
             if (ctl_.gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK);   // OF grad(U) cellLimited (validate correctNut)
-            DeviceBuffer<scalar> S2; deviceS2(gradU, nC_, S2);
-            DeviceBuffer<scalar> F2; deviceF2(dk_, de_, y_, ctl_.nu, ctl_.ksstCoeffs, F2);
+            DeviceBuffer<scalar> S2;
+            deviceS2(gradU, nC_, S2);
+            DeviceBuffer<scalar> F2;
+            deviceF2(dk_, de_, y_, ctl_.nu, ctl_.ksstCoeffs, F2);
             deviceNutSST(dk_, de_, F2, S2, ctl_.ksstCoeffs, dnut_);   // nut = a1*k/max(a1*omega, b1*F2*sqrt(S2))
-        } else {
+        }
+        else
+        {
             deviceNut(dk_, de_, dnut_, ctl_.keCoeffs);               // nut = Cmu*k^2/eps
         }
     }
 
-    DeviceSimpleResidual step() {
-        const DeviceMesh& dm = dm_; const scalar tol = ctl_.tolU;
+    DeviceSimpleResidual step()
+    {
+        const DeviceMesh& dm = dm_;
+        const scalar tol = ctl_.tolU;
         DeviceSimpleResidual res;
         // Non-orth pressure-correction limiter (OF fv::limitedSnGrad). The explicit corrVec.grad(p) correction in the
         // pressure equation is LAGGED by one outer iteration; on extreme-aspect-ratio + high-non-orth meshes (T3A:
@@ -237,101 +341,155 @@ public:
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);
         deviceUpdateInletOutlet(dbP_, phiBnd_);
-        if (ctl_.turbulent) { deviceUpdateInletOutlet(dbK_, phiBnd_); deviceUpdateInletOutlet(dbEps_, phiBnd_);
-            if (ctl_.lm) { deviceUpdateInletOutlet(dbReThetat_, phiBnd_); deviceUpdateInletOutlet(dbGammaInt_, phiBnd_); } }
+        if (ctl_.turbulent)
+        {
+            deviceUpdateInletOutlet(dbK_, phiBnd_);
+            deviceUpdateInletOutlet(dbEps_, phiBnd_);
+            if (ctl_.lm)
+            {
+                deviceUpdateInletOutlet(dbReThetat_, phiBnd_);
+                deviceUpdateInletOutlet(dbGammaInt_, phiBnd_);
+            }
+        }
         // mixed freestreamVelocity/Pressure: recompute the per-face valueFraction from the (lagged) flow angle.
         if (hasMixed_) deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         // totalPressure p: recompute refValue = p0 - 0.5*neg(phi)|U_b|^2 from the boundary velocity (deviceBCValue
         // reflects the just-updated U BCs above, e.g. pressureInletOutletVelocity) + the boundary flux.
-        if (hasTotalP_) { DeviceBuffer<scalar> ubx, uby, ubz;
-            deviceBCValue(dbU_.comp[0], Uk_[0], ubx); deviceBCValue(dbU_.comp[1], Uk_[1], uby); deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
-            deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz); }
+        if (hasTotalP_)
+        {
+            DeviceBuffer<scalar> ubx, uby, ubz;
+            deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
+            deviceBCValue(dbU_.comp[1], Uk_[1], uby);
+            deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
+            deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz);
+        }
 
-        DeviceBuffer<scalar> nuEff; deviceCopy(nuEff, dnut_); deviceAxpy(1.0, nuConst_, nuEff);   // nuEff = nu + nut
-        DeviceBuffer<scalar> nuEff_f; deviceInterpolate(dm, nuEff, nuEff_f);
+        DeviceBuffer<scalar> nuEff;
+        deviceCopy(nuEff, dnut_);
+        deviceAxpy(1.0, nuConst_, nuEff);   // nuEff = nu + nut
+        DeviceBuffer<scalar> nuEff_f;
+        deviceInterpolate(dm, nuEff, nuEff_f);
         // nuEff at boundary FACES: turbulent uses the TRUE wall nut (nutkWallFunction), not the cell value, so the
         // wall shear matches OpenFOAM; laminar/non-wall faces use the adjacent cell value.
         DeviceBuffer<scalar> nuEffBnd;
-        if (ctl_.turbulent) {
+        if (ctl_.turbulent)
+        {
             deviceCopy(nuEffBnd, nuBndConst_);
-            if (ctl_.sa) {   // SA wall nut via nutUSpaldingWallFunction (Newton uTau); other faces = adjacent cell nut
+            if (ctl_.sa)   // SA wall nut via nutUSpaldingWallFunction (Newton uTau); other faces = adjacent cell nut
+            {
                 deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
                 deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
-            } else {         // k-eps / kOmegaSST: nutkWallFunction (k-based) at walls
-                DeviceBuffer<scalar> nutBnd; deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs);
+            }
+            else   // k-eps / kOmegaSST: nutkWallFunction (k-based) at walls
+            {
+                DeviceBuffer<scalar> nutBnd;
+                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs);
                 deviceAxpy(1.0, nutBnd, nuEffBnd);
             }
         }
-        else deviceBCValue(dbExtrap_, nuEff, nuEffBnd);                                   // laminar: adjacent-cell value
+        else
+            deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
         // explicit divDevReff stress (uses the incoming U; coupled across the 3 components)
-        DeviceBuffer<scalar> ddrX, ddrY, ddrZ; deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEff, nuEffBnd, ddrX, ddrY, ddrZ, hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+        DeviceBuffer<scalar> ddrX, ddrY, ddrZ;
+        deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEff, nuEffBnd, ddrX, ddrY, ddrZ, hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
         DeviceBuffer<scalar>* ddr[3] = { &ddrX, &ddrY, &ddrZ };
 
-        DeviceBuffer<scalar> pbv; deviceBCValue(dbP_, dp_, pbv);
-        DeviceBuffer<scalar> gx, gy, gz; deviceGaussGrad(dm, dp_, pbv, gx, gy, gz);
+        DeviceBuffer<scalar> pbv;
+        deviceBCValue(dbP_, dp_, pbv);
+        DeviceBuffer<scalar> gx, gy, gz;
+        deviceGaussGrad(dm, dp_, pbv, gx, gy, gz);
         if (hasCyclic_) deviceCyclicAddGrad(cyc_, dp_, dm.V, gx, gy, gz);   // cyclic-face contribution to grad(p) in the momentum source
         if (hasAMI_)    deviceAmiAddGrad(ami_, dp_, dm.V, gx, gy, gz);       // AMI-face contribution to grad(p)
         DeviceBuffer<scalar> mDiag, mUp, mLo, lD, lU, lL;
-        deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo); deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
-        deviceAxpy(-1.0,lD,mDiag); deviceAxpy(-1.0,lU,mUp); deviceAxpy(-1.0,lL,mLo);
+        deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
+        deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
+        deviceAxpy(-1.0,lD,mDiag);
+        deviceAxpy(-1.0,lU,mUp);
+        deviceAxpy(-1.0,lL,mLo);
         // bounded Gauss upwind: - fvm::Sp(fvc::div(phi), U). mDiag -= V*div(phi). Stabilises the rest-start
         // transient (vanishes at convergence); matches OF's bounded scheme + the CPU simpleStep.
         // div(phi) MUST include the cyclic-face flux (OF's fvc::div sums ALL faces). Without it the cyclic cells
-        // see the un-cancelled cyclic flux ∓φ/V as a spurious divergence, so the bounded term injects ∓φ into the
-        // diagonal, asymmetric by 2φ between the inflow/outflow cyclic sides → asymmetric rAU/HbyA → non-axisym p.
-        if (ctl_.bounded) { DeviceBuffer<scalar> dphiM; deviceDiv(dm, phiInt_, phiBnd_, dphiM);
-          if (hasCyclic_) deviceCyclicAddDiv(cyc_, dm.V, dphiM);
-          if (hasAMI_)    deviceAmiAddDiv(ami_, dm.V, dphiM);
-          DeviceBuffer<scalar> bM; deviceHadamard(bM, dphiM, dm.V); deviceAxpy(-1.0, bM, mDiag); }
+        // see the un-cancelled cyclic flux -/+phi/V as a spurious divergence, so the bounded term injects -/+phi into the
+        // diagonal, asymmetric by 2phi between the inflow/outflow cyclic sides -> asymmetric rAU/HbyA -> non-axisym p.
+        if (ctl_.bounded)
+        {
+            DeviceBuffer<scalar> dphiM;
+            deviceDiv(dm, phiInt_, phiBnd_, dphiM);
+            if (hasCyclic_) deviceCyclicAddDiv(cyc_, dm.V, dphiM);
+            if (hasAMI_)    deviceAmiAddDiv(ami_, dm.V, dphiM);
+            DeviceBuffer<scalar> bM;
+            deviceHadamard(bM, dphiM, dm.V);
+            deviceAxpy(-1.0, bM, mDiag);
+        }
         // cyclic (periodic) momentum coupling M = div(phi,U) - laplacian(nuEff,U): folds the interface diagonal into
         // mDiag + builds cyc_.ifCoeff (off-diag) from the current cyclic flux; cycSumOff feeds the relax dominance.
         DeviceBuffer<scalar> cycSumOff;
-        if (hasCyclic_) { deviceCyclicAssembleMomentum(cyc_, nuEff, mDiag);
-            cycSumOff.copyFrom(std::vector<scalar>(nC_, 0.0)); deviceCyclicOffDiagSum(cyc_, cycSumOff);
-            if (cyc_.rotational) deviceCyclicScaleImplicit(cyc_); }   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
+        if (hasCyclic_)
+        {
+            deviceCyclicAssembleMomentum(cyc_, nuEff, mDiag);
+            cycSumOff.copyFrom(std::vector<scalar>(nC_, 0.0));
+            deviceCyclicOffDiagSum(cyc_, cycSumOff);
+            if (cyc_.rotational) deviceCyclicScaleImplicit(cyc_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
+        }
         DeviceBuffer<scalar> amiSumOff;                              // cyclicAMI momentum coupling (translational)
-        if (hasAMI_) { deviceAmiAssembleMomentum(ami_, nuEff, mDiag);
-            amiSumOff.copyFrom(std::vector<scalar>(nC_, 0.0)); deviceAmiOffDiagSum(ami_, amiSumOff);
-            if (ami_.rotational) deviceAmiScaleImplicit(ami_); }   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
+        if (hasAMI_)
+        {
+            deviceAmiAssembleMomentum(ami_, nuEff, mDiag);
+            amiSumOff.copyFrom(std::vector<scalar>(nC_, 0.0));
+            deviceAmiOffDiagSum(ami_, amiSumOff);
+            if (ami_.rotational) deviceAmiScaleImplicit(ami_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
+        }
         if (fvoMomSp_.size()) deviceAxpy(-1.0, fvoMomSp_, mDiag);   // fvOptions implicit momentum Sp: diag -= Sp*V (== fvm::Sp)
         // explicitPorositySource (DarcyForchheimer): isotropic resistance into the diagonal (mDiag += V*tr(Cd)); the
         // anisotropic remainder is added to relaxSrc per component below. Uses the LAMINAR nu (OF mu/rho, not nuEff).
         if (por_.active) deviceFvoPorosityDiag(por_, ctl_.nu, dm.V, Uk_[0], Uk_[1], Uk_[2], mDiag);
         DeviceBuffer<scalar>* gg[3] = { &gx, &gy, &gz };
-        DeviceBuffer<scalar> r0IC,r0BC,r0lIC,r0lBC; deviceBCDivCoeffs(dbU_.comp[0], phiBnd_, r0IC, r0BC);
-        deviceBCLaplacianCoeffsFace(dbU_.comp[0], nuEffBnd, r0lIC, r0lBC); deviceAxpy(-1.0,r0lIC,r0IC);
+        DeviceBuffer<scalar> r0IC,r0BC,r0lIC,r0lBC;
+        deviceBCDivCoeffs(dbU_.comp[0], phiBnd_, r0IC, r0BC);
+        deviceBCLaplacianCoeffsFace(dbU_.comp[0], nuEffBnd, r0lIC, r0lBC);
+        deviceAxpy(-1.0,r0lIC,r0IC);
         // slip/symmetry: the boundary diagonal differs per component (vf_k=|n_k|), so the SHARED relax/rAU diagonal
         // must use OF's cmptMax(cmptMag(iC0,iC1,iC2)), not comp[0] alone (== comp[0] when components are equal, so
         // every other BC is unaffected). Compute the per-component boundary iC and the per-face max magnitude.
         DeviceBuffer<scalar> iCmaxMag;
-        if (hasSym_) {
+        if (hasSym_)
+        {
             DeviceBuffer<scalar> r1IC,r1BC,r1lIC,r1lBC, r2IC,r2BC,r2lIC,r2lBC;
-            deviceBCDivCoeffs(dbU_.comp[1], phiBnd_, r1IC, r1BC); deviceBCLaplacianCoeffsFace(dbU_.comp[1], nuEffBnd, r1lIC, r1lBC); deviceAxpy(-1.0,r1lIC,r1IC);
-            deviceBCDivCoeffs(dbU_.comp[2], phiBnd_, r2IC, r2BC); deviceBCLaplacianCoeffsFace(dbU_.comp[2], nuEffBnd, r2lIC, r2lBC); deviceAxpy(-1.0,r2lIC,r2IC);
+            deviceBCDivCoeffs(dbU_.comp[1], phiBnd_, r1IC, r1BC);
+            deviceBCLaplacianCoeffsFace(dbU_.comp[1], nuEffBnd, r1lIC, r1lBC);
+            deviceAxpy(-1.0,r1lIC,r1IC);
+            deviceBCDivCoeffs(dbU_.comp[2], phiBnd_, r2IC, r2BC);
+            deviceBCLaplacianCoeffsFace(dbU_.comp[2], nuEffBnd, r2lIC, r2lBC);
+            deviceAxpy(-1.0,r2lIC,r2IC);
             deviceCmptMaxMag3(r0IC, r1IC, r2IC, iCmaxMag);   // OF fvMatrix::relax adds cmptMax(cmptMag(iC)) to the diagonal
         }
-        DeviceBuffer<scalar> mDiagR, delta; deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.relaxU, mDiagR, delta,
-                                                           hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
-                                                           hasSym_ ? iCmaxMag.data() : nullptr);
+        DeviceBuffer<scalar> mDiagR, delta;
+        deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.relaxU, mDiagR, delta,
+                        hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
+                        hasSym_ ? iCmaxMag.data() : nullptr);
         // velocityDampingConstraint: OF fvOptions.constrain(UEqn) runs AFTER UEqn.relax() and adds an implicit diagonal
         // sink (no source) where |U|>UMax. Add to the relaxed diagonal so it feeds the predictor AND rAU/HbyA (= OF A()).
         if (vdcActive_) deviceFvoVelocityDamping(vdcCells_, vdcUMax_, vdcC_, dm.V, Uk_[0], Uk_[1], Uk_[2], mDiagR);
         const DeviceLduView Uview = deviceLduView(dm, mDiagR, mUp, mLo);
         DeviceBuffer<scalar> iC[3], bCb[3], relaxSrc[3];
         // rotational cyclic: snapshot U_old so the deferred rotation MIXING is built from ONE consistent field for
-        // all three components. OF evaluates the cyclic patchNeighbourField (forwardT·U[nbr]) ONCE at UEqn assembly,
+        // all three components. OF evaluates the cyclic patchNeighbourField (forwardT.U[nbr]) ONCE at UEqn assembly,
         // from U_old, for the whole vector. cf solves the 3 components SEQUENTIALLY in place (Uk_[kk] is the solution
         // vector), so reading the live Uk_ inside the loop would feed component kk the freshly-solved earlier
-        // components -> the x↔y rotation mixing becomes asymmetric -> spurious cross-component coupling that breaks
+        // components -> the x<->y rotation mixing becomes asymmetric -> spurious cross-component coupling that breaks
         // the rotational (axi)symmetry and drifts the converged field. The snapshot makes it order-independent.
         DeviceBuffer<scalar> Usnap[3];
-        if ((hasCyclic_ && cyc_.rotational) || (hasAMI_ && ami_.rotational)) for (int kk = 0; kk < 3; ++kk) deviceCopy(Usnap[kk], Uk_[kk]);
+        if ((hasCyclic_ && cyc_.rotational) || (hasAMI_ && ami_.rotational))
+            for (int kk = 0; kk < 3; ++kk)
+                deviceCopy(Usnap[kk], Uk_[kk]);
         // rotational AMI deferred: the UN-rotated AMI-interpolated neighbour of the U_old snapshot (per src face),
         // consistent across components (the deferred mixing reads it, not the live Uk_).
         DeviceBuffer<scalar> Uint[3];
-        if (hasAMI_ && ami_.rotational) for (int l = 0; l < 3; ++l) deviceAmiInterpolate(ami_, Usnap[l], Uint[l]);
+        if (hasAMI_ && ami_.rotational)
+            for (int l = 0; l < 3; ++l)
+                deviceAmiInterpolate(ami_, Usnap[l], Uint[l]);
         // linearUpwind / non-orth need grad(U). Precompute ALL 3 component gradients HERE (Uk_ is still all-old at this
         // point, none solved yet), cyclic-inclusive: the cyclic linearUpwind reconstruction rotates gradU[nbr], so it
         // needs every component from a consistent field (computing per-kk inside the loop would read freshly-solved
@@ -340,22 +498,32 @@ public:
         DeviceBuffer<scalar> amiURot[3];   // rotated AMI-interp of the CURRENT U (gradient face value + linearUpwind/non-orth nbr)
         if ((ctl_.linearUpwind || ctl_.lust || ctl_.nonOrth) && hasAMI_ && ami_.rotational)
             deviceAmiInterpolateVec(ami_, Uk_[0], Uk_[1], Uk_[2], amiURot[0], amiURot[1], amiURot[2]);
-        if (ctl_.linearUpwind || ctl_.lust || ctl_.nonOrth) for (int l = 0; l < 3; ++l) {
-            DeviceBuffer<scalar> ubv; deviceBCValue(dbU_.comp[l], Uk_[l], ubv);
-            deviceGaussGrad(dm, Uk_[l], ubv, gUx[l], gUy[l], gUz[l]);
-            if (hasCyclic_) { if (cyc_.rotational) deviceCyclicAddGradRot(cyc_, Uk_[0], Uk_[1], Uk_[2], l, dm.V, gUx[l], gUy[l], gUz[l]);
-                              else deviceCyclicAddGrad(cyc_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]); }
-            if (hasAMI_) { if (ami_.rotational) deviceAmiAddGradRot(ami_, Uk_[l], amiURot[l], dm.V, gUx[l], gUy[l], gUz[l]);
-                           else deviceAmiAddGrad(ami_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]); }
-            // grad(U) cellLimited Gauss linear <k>: clamp this component's gradient so the linearUpwind/non-orth
-            // reconstruction stays bounded, OF's primary stabiliser on skewed (snappy) meshes. (min/max gather is
-            // over internal + non-cyclic boundary neighbours; interface neighbours not included, fine off-interface.)
-            if (ctl_.gradULimitK > 0.0) deviceCellLimitGrad(dm, Uk_[l], ubv, gUx[l], gUy[l], gUz[l], ctl_.gradULimitK);
-        }
+        if (ctl_.linearUpwind || ctl_.lust || ctl_.nonOrth)
+            for (int l = 0; l < 3; ++l)
+            {
+                DeviceBuffer<scalar> ubv;
+                deviceBCValue(dbU_.comp[l], Uk_[l], ubv);
+                deviceGaussGrad(dm, Uk_[l], ubv, gUx[l], gUy[l], gUz[l]);
+                if (hasCyclic_)
+                {
+                    if (cyc_.rotational) deviceCyclicAddGradRot(cyc_, Uk_[0], Uk_[1], Uk_[2], l, dm.V, gUx[l], gUy[l], gUz[l]);
+                    else deviceCyclicAddGrad(cyc_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]);
+                }
+                if (hasAMI_)
+                {
+                    if (ami_.rotational) deviceAmiAddGradRot(ami_, Uk_[l], amiURot[l], dm.V, gUx[l], gUy[l], gUz[l]);
+                    else deviceAmiAddGrad(ami_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]);
+                }
+                // grad(U) cellLimited Gauss linear <k>: clamp this component's gradient so the linearUpwind/non-orth
+                // reconstruction stays bounded, OF's primary stabiliser on skewed (snappy) meshes. (min/max gather is
+                // over internal + non-cyclic boundary neighbours; interface neighbours not included, fine off-interface.)
+                if (ctl_.gradULimitK > 0.0) deviceCellLimitGrad(dm, Uk_[l], ubv, gUx[l], gUy[l], gUz[l], ctl_.gradULimitK);
+            }
         // actuationDiskSource (Froude): T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), Uref = mean U over the monitor cells
         // (lagged). Computed once per iter; distributed over the disk cells (V[c]/Vtot) into relaxSrc below.
         scalar adT = 0;
-        if (adActive_) {
+        if (adActive_)
+        {
             const scalar ud = (deviceDot(Uk_[0], adMonMask01_)*adDiskDir_.x + deviceDot(Uk_[1], adMonMask01_)*adDiskDir_.y
                              + deviceDot(Uk_[2], adMonMask01_)*adDiskDir_.z) / adNmon_;   // Uref . diskDir
             adT = 2.0 * adArea_ * ud*ud * adA_ * (1.0 - adA_);
@@ -367,30 +535,45 @@ public:
         // here (the plain per-component linearUpwind path stays inside the kk loop below).
         DeviceBuffer<scalar> corrV[3];
         if (ctl_.linearUpwindV) deviceLinearUpwindVCorr(dm, phiInt_, gUx, gUy, gUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
-        for (int kk = 0; kk < 3; ++kk) {   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136× SLOWER, reverted)
-            DeviceBuffer<scalar> dIC,dBC,lIC,lBC; deviceBCDivCoeffs(dbU_.comp[kk],phiBnd_,dIC,dBC); deviceBCLaplacianCoeffsFace(dbU_.comp[kk],nuEffBnd,lIC,lBC);
-            deviceAxpy(-1.0,lIC,dIC); deviceAxpy(-1.0,lBC,dBC); iC[kk]=std::move(dIC); bCb[kk]=std::move(dBC);
+        for (int kk = 0; kk < 3; ++kk)   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136x SLOWER, reverted)
+        {
+            DeviceBuffer<scalar> dIC,dBC,lIC,lBC;
+            deviceBCDivCoeffs(dbU_.comp[kk],phiBnd_,dIC,dBC);
+            deviceBCLaplacianCoeffsFace(dbU_.comp[kk],nuEffBnd,lIC,lBC);
+            deviceAxpy(-1.0,lIC,dIC);
+            deviceAxpy(-1.0,lBC,dBC);
+            iC[kk]=std::move(dIC);
+            bCb[kk]=std::move(dBC);
             deviceHadamard(relaxSrc[kk], delta, Uk_[kk]);
             deviceAxpy(1.0, *ddr[kk], relaxSrc[kk]);                                  // += explicit divDevReff stress
             if (mrf_.active) deviceMrfCoriolis(mrf_, dm.V, Uk_[0], Uk_[1], Uk_[2], kk, relaxSrc[kk]);   // MRF Coriolis: -V*(Omega x U)_kk on zone cells
             // Explicit momentum corrections (linearUpwind deferred + non-orth laplacian) go into relaxSrc so they
             // feed BOTH the predictor solve AND H()/HbyA, OF's UEqn.H() includes them. Adding them only to the
             // predictor source leaves the corrector inconsistent and the U residual plateaus (does NOT reach 1e-6).
-            if (ctl_.linearUpwind || ctl_.lust) {   // deferred correction: source -= div(phi * grad(U_kk)_upwind.(Cf-C_up))
+            if (ctl_.linearUpwind || ctl_.lust)   // deferred correction: source -= div(phi * grad(U_kk)_upwind.(Cf-C_up))
+            {
                 DeviceBuffer<scalar> corr;
                 if (ctl_.linearUpwindV) corr = std::move(corrV[kk]);                          // vector-limited (computed once above)
                 else                    deviceLinearUpwindCorr(dm, phiInt_, gUx[kk], gUy[kk], gUz[kk], corr);
                 if (hasCyclic_) deviceCyclicAddLinUpwindCorr(cyc_, kk, gUx, gUy, gUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
                 if (hasAMI_)    deviceAmiAddLinUpwindCorr(ami_, kk, gUx, gUy, gUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
-                if (ctl_.lust) {   // OF LUST.H = 0.75*linear + 0.25*linearUpwind: scale the lU corr 0.25, add 0.75*linear corr
+                if (ctl_.lust)   // OF LUST.H = 0.75*linear + 0.25*linearUpwind: scale the lU corr 0.25, add 0.75*linear corr
+                {
                     deviceScale(corr, 0.25);
-                    DeviceBuffer<scalar> lc; deviceLinearCorr(dm, phiInt_, Uk_[kk], lc); deviceAxpy(0.75, lc, corr); }   // (cyclic linear part omitted; LUST cases are non-cyclic)
-                deviceAxpy(-1.0, corr, relaxSrc[kk]); }
-            if (ctl_.nonOrth) {        // -fvm::laplacian source correction: -= lapCorr(nuEff, grad(U_kk))
-                DeviceBuffer<scalar> lc; deviceLaplacianCorr(dm, nuEff_f, gUx[kk], gUy[kk], gUz[kk], lc);
+                    DeviceBuffer<scalar> lc;
+                    deviceLinearCorr(dm, phiInt_, Uk_[kk], lc);
+                    deviceAxpy(0.75, lc, corr);   // (cyclic linear part omitted; LUST cases are non-cyclic)
+                }
+                deviceAxpy(-1.0, corr, relaxSrc[kk]);
+            }
+            if (ctl_.nonOrth)   // -fvm::laplacian source correction: -= lapCorr(nuEff, grad(U_kk))
+            {
+                DeviceBuffer<scalar> lc;
+                deviceLaplacianCorr(dm, nuEff_f, gUx[kk], gUy[kk], gUz[kk], lc);
                 if (hasCyclic_) deviceCyclicAddLapCorr(cyc_, kk, nuEff, gUx, gUy, gUz, lc);   // + cyclic-face non-orth (rotated tensor)
                 if (hasAMI_)    deviceAmiAddLapCorr(ami_, kk, nuEff, gUx, gUy, gUz, lc);       // + AMI-face non-orth (rotated tensor stencil)
-                deviceAxpy(-nonOrthRelaxU, lc, relaxSrc[kk]); }
+                deviceAxpy(-nonOrthRelaxU, lc, relaxSrc[kk]);
+            }
             // constant body force (drives periodic channels) is an explicit momentum SOURCE: it must go into relaxSrc
             // so it feeds BOTH the predictor AND H()/HbyA (OF UEqn.H() includes fvOptions sources). Adding it only to
             // the predictor leaves HbyA short by rAU*g -> the corrector U = HbyA - rAU*grad(p) converges ~(1-relax) low.
@@ -403,15 +586,19 @@ public:
             // which mirrors meanVelocityForce's eqn += Su) -> relaxSrc -= (V/Vtot)*T*diskDir (a momentum sink/turbine).
             if (adActive_) deviceAxpy(-adT*(kk==0?adDiskDir_.x:kk==1?adDiskDir_.y:adDiskDir_.z)/adVtot_, adMaskVDisk_, relaxSrc[kk]);
             if (rotor_.active) deviceAxpy(-1.0, *rotorF[kk], relaxSrc[kk]);   // rotorDiskSource: relaxSrc -= force (OF eqn -= force)
-            DeviceBuffer<scalar> s; deviceHadamard(s, dm.V, *gg[kk]); deviceScale(s,-1.0); deviceAxpy(1.0,relaxSrc[kk],s);   // s = -V*grad(p) + relaxSrc (incl. body force)
-            // rotational cyclic deferred split (PREDICTOR only): the diag-implicit off-diagonal (ifCoeffC = ifCoeff·
-            // forwardT[kk][kk]) plus this off-diagonal MIXING term reconstructs the full-rotation coupling -ifCoeff·
-            // (forwardT·U[nbr])[kk] in the predictor RHS, but with a consistent (diagonal-dominant) matrix that
+            DeviceBuffer<scalar> s;
+            deviceHadamard(s, dm.V, *gg[kk]);
+            deviceScale(s,-1.0);
+            deviceAxpy(1.0,relaxSrc[kk],s);   // s = -V*grad(p) + relaxSrc (incl. body force)
+            // rotational cyclic deferred split (PREDICTOR only): the diag-implicit off-diagonal (ifCoeffC = ifCoeff.
+            // forwardT[kk][kk]) plus this off-diagonal MIXING term reconstructs the full-rotation coupling -ifCoeff.
+            // (forwardT.U[nbr])[kk] in the predictor RHS, but with a consistent (diagonal-dominant) matrix that
             // converges where OF's full-implicit limit-cycles in cf's segregated SIMPLE. Built from the U_old snapshot
             // (order-independent). H() below uses the FULL rotation on the post-solve U (OF-faithful), NOT this term.
             if (hasCyclic_ && cyc_.rotational) deviceCyclicAddDeferredRot(cyc_, Usnap[0], Usnap[1], Usnap[2], kk, s);
             if (hasAMI_ && ami_.rotational)    deviceAmiAddDeferredRot(ami_, Uint[0], Uint[1], Uint[2], kk, s);
-            DeviceBuffer<scalar> diagC,b; deviceFold(dm, mDiagR, s, iC[kk], bCb[kk], diagC, b);
+            DeviceBuffer<scalar> diagC,b;
+            deviceFold(dm, mDiagR, s, iC[kk], bCb[kk], diagC, b);
             // rotational: the implicit off-diagonal for component kk is scaled by forwardT[kk][kk] (OF transformCoupleField).
             const scalar* mIfc = !hasCyclic_ ? nullptr : (cyc_.rotational ? cyc_.ifCoeffC[kk].data() : cyc_.ifCoeff.data());
             const DeviceLduView mv = hasCyclic_
@@ -424,10 +611,12 @@ public:
             // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver (smoothSolver
             // /GaussSeidel for motorBike). Route through deviceSymGaussSeidel when fvSolution asks for it (robust on
             // anisotropic snappy cells where Jacobi-BiCGStab under-solves the loose relTol); interface LDUs keep BiCGStab.
-            scalar ur; DeviceSolverPerf uperf;
+            scalar ur;
+            DeviceSolverPerf uperf;
             if (ctl_.gsU && !hasCyclic_ && !hasAMI_)
                 ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.relTolU, 5000, &uperf);
-            else {
+            else
+            {
                 uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.relTolU, 5000, ctl_.bicgCheckEvery);
                 ur = uperf.initialResidual;
             }
@@ -442,88 +631,143 @@ public:
         // misses the constrained-component diagonal (bottom symmetry iC=(0,iC_v,0): iC[0]=0 but cmptAv=iC_v/3), which
         // on high-AR cells made rAU wildly too large -> catastrophic slip blowup. Reused below as the H() cmptAv term.
         DeviceBuffer<scalar> cmptAvIC;
-        if (hasSym_) { deviceCopy(cmptAvIC, iC[0]); deviceAxpy(1.0, iC[1], cmptAvIC); deviceAxpy(1.0, iC[2], cmptAvIC); deviceScale(cmptAvIC, 1.0/3.0); }
-        DeviceBuffer<scalar> diagA,dumb,rAU; deviceFold(dm,mDiagR,zeroSrc_, hasSym_ ? cmptAvIC : iC[0], zeroBndU_,diagA,dumb); deviceReciprocalV(dm,diagA,rAU);
+        if (hasSym_)
+        {
+            deviceCopy(cmptAvIC, iC[0]);
+            deviceAxpy(1.0, iC[1], cmptAvIC);
+            deviceAxpy(1.0, iC[2], cmptAvIC);
+            deviceScale(cmptAvIC, 1.0/3.0);
+        }
+        DeviceBuffer<scalar> diagA,dumb,rAU;
+        deviceFold(dm,mDiagR,zeroSrc_, hasSym_ ? cmptAvIC : iC[0], zeroBndU_,diagA,dumb);
+        deviceReciprocalV(dm,diagA,rAU);
         // SIMPLEC: rAtU = 1/(1/rAU - H1) = V/max(A*1, 0.1*diagA) (A*1 = row sum = deviceAmul with ones). drAtU = rAtU - rAU.
         DeviceBuffer<scalar> rAtU, drAtU;
-        if (ctl_.consistent) {
-            DeviceBuffer<scalar> rowSum; deviceAmul(hasCyclic_
+        if (ctl_.consistent)
+        {
+            DeviceBuffer<scalar> rowSum;
+            deviceAmul(hasCyclic_
                 ? deviceLduViewCyclic(dm, diagA, mUp, mLo, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
                 : deviceLduView(dm, diagA, mUp, mLo), ones_, rowSum);
             deviceSimplecRAtU(dm, rowSum, diagA, rAtU);
-            deviceCopy(drAtU, rAtU); deviceAxpy(-1.0, rAU, drAtU);
-        } else deviceCopy(rAtU, rAU);
+            deviceCopy(drAtU, rAtU);
+            deviceAxpy(-1.0, rAU, drAtU);
+        }
+        else
+            deviceCopy(rAtU, rAU);
         // meanVelocityForce.correct (after the predictor, before H()/HbyA, like OF fvOptions.correct(U) in UEqn.H):
         // dGradP = relax*(|Ubar| - magUbarAve)/rAUave; accumulate gradP_; correct U += flowDir*rAU*dGradP. Reductions
         // and the body force/correction use maskV/mask01 so selectionMode all (whole field) and cellZone both work.
-        if (mvfActive_) {
+        if (mvfActive_)
+        {
             const scalar magUbarAve = (mvfFlowDir_.x*deviceDot(Uk_[0], mvfMaskV_) + mvfFlowDir_.y*deviceDot(Uk_[1], mvfMaskV_)
                                      + mvfFlowDir_.z*deviceDot(Uk_[2], mvfMaskV_)) / mvfVtot_;
             const scalar rAUave = deviceDot(rAU, mvfMaskV_) / mvfVtot_;
             const scalar dGradP = mvfRelax_ * (mvfUbarMag_ - magUbarAve) / rAUave;
             mvfGradP_ += dGradP;
             if (std::getenv("BRAE_MVF_DEBUG")) std::printf("    mvf: magUbarAve=%.6g rAUave=%.6g dGradP=%.6g gradP=%.6g\n", magUbarAve, rAUave, dGradP, mvfGradP_);
-            DeviceBuffer<scalar> rAUm; deviceHadamard(rAUm, rAU, mvfMask01_);              // rAU in the selection, 0 else
-            deviceAxpy(mvfFlowDir_.x*dGradP, rAUm, Uk_[0]); deviceAxpy(mvfFlowDir_.y*dGradP, rAUm, Uk_[1]); deviceAxpy(mvfFlowDir_.z*dGradP, rAUm, Uk_[2]);
+            DeviceBuffer<scalar> rAUm;
+            deviceHadamard(rAUm, rAU, mvfMask01_);              // rAU in the selection, 0 else
+            deviceAxpy(mvfFlowDir_.x*dGradP, rAUm, Uk_[0]);
+            deviceAxpy(mvfFlowDir_.y*dGradP, rAUm, Uk_[1]);
+            deviceAxpy(mvfFlowDir_.z*dGradP, rAUm, Uk_[2]);
         }
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);   // limitVelocity on the predictor U (OF fvOptions.correct) -> feeds H()/HbyA
         // slip/symmetry H() consistency term: OF UEqn.H() adds (cmptAv(iC) - iC_cmpt)*psi_cmpt per component, where
         // cmptAv = mean of the 3 boundary internalCoeffs (fvMatrix::H + addCmptAvBoundaryDiag). Zero for every
         // component-independent BC (iC_cmpt == cmptAv), nonzero ONLY for slip (per-component vf=|n_k|), it supplies
-        // the HbyA↔rAU consistency that a single scalar rAU otherwise breaks at a non-axis-aligned wall.
+        // the HbyA<->rAU consistency that a single scalar rAU otherwise breaks at a non-axis-aligned wall.
         DeviceBuffer<scalar>& cmptAvH = cmptAvIC;   // same cmptAv(iC) already computed for the rAU diagonal above
         DeviceBuffer<scalar> HbyA[3];
-        { DeviceBuffer<scalar> Hk[3];
-          // cyclicAMI H: precompute the AMI-interpolated (rotated) neighbour U once for the vector, then H[own] -=
-          // ifCoeff*UNbr[kk]/V per component (= OF UEqn.H() with the AMI weighted stencil).
-          DeviceBuffer<scalar> UNx, UNy, UNz;
-          if (hasAMI_) deviceAmiInterpolateVec(ami_, Uk_[0], Uk_[1], Uk_[2], UNx, UNy, UNz);
-          DeviceBuffer<scalar>* UN[3] = { &UNx, &UNy, &UNz };
-          for (int kk = 0; kk < 3; ++kk) {
-              DeviceBuffer<scalar> bdH;   // slip: bdDiag = cmptAv(iC) - iC[kk] (OF H() term); else zero (bit-identical)
-              if (hasSym_) { deviceCopy(bdH, cmptAvH); deviceAxpy(-1.0, iC[kk], bdH); }
-              deviceMatrixH(Uview, dm, Uk_[kk], relaxSrc[kk], hasSym_ ? bdH : zeroBndU_, bCb[kk], Hk[kk]);
-              if (hasCyclic_ && !cyc_.rotational) deviceCyclicAddH(cyc_, Uk_[kk], dm.V, Hk[kk]);   // translational off-diag
-              if (hasAMI_) deviceAmiAddH(ami_, *UN[kk], dm.V, Hk[kk]); }
-          // rotational cyclic H: the FULL rotation -ifCoeff·(forwardT·U[nbr])[kk] on the POST-solve U, evaluated once
-          // for the whole vector (matches OF UEqn.H(), which re-evaluates patchNeighbourField from the new U). The
-          // deferred mixing fed only the PREDICTOR; H is the exact full-rotation explicit coupling, consistent across
-          // components, so HbyA/phiHbyA carry the true rotated neighbour momentum, not a per-component-stale value.
-          if (hasCyclic_ && cyc_.rotational) deviceCyclicAddHRot(cyc_, Uk_[0], Uk_[1], Uk_[2], dm.V, Hk[0], Hk[1], Hk[2]);
-          for (int kk = 0; kk < 3; ++kk) deviceHadamard(HbyA[kk], rAU, Hk[kk]); }
-        DeviceBuffer<scalar> phiHi; deviceVectorFlux(dm, HbyA[0], HbyA[1], HbyA[2], phiHi);   // flux of the ORIGINAL HbyA
-        if (hasCyclic_) { if (cyc_.rotational) deviceCyclicFluxRot(cyc_, HbyA[0], HbyA[1], HbyA[2]);   // rotate the neighbour HbyA
-                          else deviceCyclicFlux(cyc_, HbyA[0], HbyA[1], HbyA[2]); }   // cyclic-face phiHbyA = interp(HbyA).Sf -> cyc_.phi
-        if (hasAMI_) deviceAmiFlux(ami_, HbyA[0], HbyA[1], HbyA[2]);   // AMI-face phiHbyA = (w*HbyA[own]+(1-w)*interp(HbyA[nbr]))·Sf
-        DeviceBuffer<scalar> hxb,hyb,hzb; deviceBCValue(dbU_.comp[0],HbyA[0],hxb); deviceBCValue(dbU_.comp[1],HbyA[1],hyb); deviceBCValue(dbU_.comp[2],HbyA[2],hzb);
+        {
+            DeviceBuffer<scalar> Hk[3];
+            // cyclicAMI H: precompute the AMI-interpolated (rotated) neighbour U once for the vector, then H[own] -=
+            // ifCoeff*UNbr[kk]/V per component (= OF UEqn.H() with the AMI weighted stencil).
+            DeviceBuffer<scalar> UNx, UNy, UNz;
+            if (hasAMI_) deviceAmiInterpolateVec(ami_, Uk_[0], Uk_[1], Uk_[2], UNx, UNy, UNz);
+            DeviceBuffer<scalar>* UN[3] = { &UNx, &UNy, &UNz };
+            for (int kk = 0; kk < 3; ++kk)
+            {
+                DeviceBuffer<scalar> bdH;   // slip: bdDiag = cmptAv(iC) - iC[kk] (OF H() term); else zero (bit-identical)
+                if (hasSym_)
+                {
+                    deviceCopy(bdH, cmptAvH);
+                    deviceAxpy(-1.0, iC[kk], bdH);
+                }
+                deviceMatrixH(Uview, dm, Uk_[kk], relaxSrc[kk], hasSym_ ? bdH : zeroBndU_, bCb[kk], Hk[kk]);
+                if (hasCyclic_ && !cyc_.rotational) deviceCyclicAddH(cyc_, Uk_[kk], dm.V, Hk[kk]);   // translational off-diag
+                if (hasAMI_) deviceAmiAddH(ami_, *UN[kk], dm.V, Hk[kk]);
+            }
+            // rotational cyclic H: the FULL rotation -ifCoeff.(forwardT.U[nbr])[kk] on the POST-solve U, evaluated once
+            // for the whole vector (matches OF UEqn.H(), which re-evaluates patchNeighbourField from the new U). The
+            // deferred mixing fed only the PREDICTOR; H is the exact full-rotation explicit coupling, consistent across
+            // components, so HbyA/phiHbyA carry the true rotated neighbour momentum, not a per-component-stale value.
+            if (hasCyclic_ && cyc_.rotational) deviceCyclicAddHRot(cyc_, Uk_[0], Uk_[1], Uk_[2], dm.V, Hk[0], Hk[1], Hk[2]);
+            for (int kk = 0; kk < 3; ++kk)
+                deviceHadamard(HbyA[kk], rAU, Hk[kk]);
+        }
+        DeviceBuffer<scalar> phiHi;
+        deviceVectorFlux(dm, HbyA[0], HbyA[1], HbyA[2], phiHi);   // flux of the ORIGINAL HbyA
+        if (hasCyclic_)
+        {
+            if (cyc_.rotational) deviceCyclicFluxRot(cyc_, HbyA[0], HbyA[1], HbyA[2]);   // rotate the neighbour HbyA
+            else deviceCyclicFlux(cyc_, HbyA[0], HbyA[1], HbyA[2]);   // cyclic-face phiHbyA = interp(HbyA).Sf -> cyc_.phi
+        }
+        if (hasAMI_) deviceAmiFlux(ami_, HbyA[0], HbyA[1], HbyA[2]);   // AMI-face phiHbyA = (w*HbyA[own]+(1-w)*interp(HbyA[nbr])).Sf
+        DeviceBuffer<scalar> hxb,hyb,hzb;
+        deviceBCValue(dbU_.comp[0],HbyA[0],hxb);
+        deviceBCValue(dbU_.comp[1],HbyA[1],hyb);
+        deviceBCValue(dbU_.comp[2],HbyA[2],hzb);
         // constrainHbyA at mixed velocity faces (OF resets phiHbyA_b = U_b.Sf at fixesValue patches): use U_b not HbyA_b.
         if (hasMixed_) deviceConstrainMixedHbyA(dbU_, Uk_[0], Uk_[1], Uk_[2], hxb, hyb, hzb);
         // slip/symmetry: OF constrainHbyA sets HbyA_b = U_b (= U.boundaryField, the slipped velocity) at every
         // non-assignable patch, NOT the projected HbyA. Project the cell U (HbyA_b = U_c - n(n.U_c) = U_b), matching
         // OF byte-for-byte and the mixed path above (both use U_b). Wall flux is still exactly 0 (normal removed).
         if (hasSym_) deviceConstrainSymmetryHbyA(dbU_, Uk_[0], Uk_[1], Uk_[2], hxb, hyb, hzb);
-        DeviceBuffer<scalar> phiHb; deviceBoundaryFlux(dm,hxb,hyb,hzb,phiHb);
+        DeviceBuffer<scalar> phiHb;
+        deviceBoundaryFlux(dm,hxb,hyb,hzb,phiHb);
         if (mrf_.active) deviceMrfApplyFrameFlux(mrf_, +1.0, phiHi, phiHb);   // MRF.makeRelative(phiHbyA) before pressure
         // adjustPhi (OF order: after flux(HbyA), before the SIMPLEC correction): enforce global continuity by
         // scaling the adjustable outflow when there is no pressure reference (closed/all-velocity domains).
         if (ctl_.needRef) deviceAdjustPhi(adjustMask_, phiHb);
-        if (ctl_.consistent) {
+        if (ctl_.consistent)
+        {
             // phiHbyA += interpolate(rAtU-rAU)*snGrad(p)*magSf = laplacian(interp(drAtU), p).flux()  (NOT via HbyA flux)
-            DeviceBuffer<scalar> drAtUf; deviceInterpolate(dm, drAtU, drAtUf);
-            DeviceBuffer<scalar> ld, lu, ll; deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
-            DeviceBuffer<scalar> fInt; deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), dp_, fInt); deviceAxpy(1.0, fInt, phiHi);
+            DeviceBuffer<scalar> drAtUf;
+            deviceInterpolate(dm, drAtU, drAtUf);
+            DeviceBuffer<scalar> ld, lu, ll;
+            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
+            DeviceBuffer<scalar> fInt;
+            deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), dp_, fInt);
+            deviceAxpy(1.0, fInt, phiHi);
             // OF's term is interp(rAtU-rAU)*fvc::snGrad(p)*magSf, and snGrad(p) is the CORRECTED snGrad (orth + non-orth).
-            // The orth part is the laplacian flux above; add the non-orth part interp(drAtU)*(corrVec·grad(p)_f)*magSf so
-            // the SIMPLEC flux correction is complete on non-orthogonal meshes (no-op when orthogonal: corrVec≈0).
-            if (ctl_.nonOrth) { DeviceBuffer<scalar> ffcS; deviceLaplacianCorrFlux(dm, drAtUf, gx, gy, gz, ffcS); deviceAxpy(1.0, ffcS, phiHi); }
-            DeviceBuffer<scalar> dIC, dBC; deviceBCLaplacianCoeffs(dbP_, drAtU, dIC, dBC);
-            DeviceBuffer<scalar> fBnd; deviceMatrixFluxBoundary(dbP_, dIC, dBC, dp_, fBnd); deviceAxpy(1.0, fBnd, phiHb);
+            // The orth part is the laplacian flux above; add the non-orth part interp(drAtU)*(corrVec.grad(p)_f)*magSf so
+            // the SIMPLEC flux correction is complete on non-orthogonal meshes (no-op when orthogonal: corrVec~=0).
+            if (ctl_.nonOrth)
+            {
+                DeviceBuffer<scalar> ffcS;
+                deviceLaplacianCorrFlux(dm, drAtUf, gx, gy, gz, ffcS);
+                deviceAxpy(1.0, ffcS, phiHi);
+            }
+            DeviceBuffer<scalar> dIC, dBC;
+            deviceBCLaplacianCoeffs(dbP_, drAtU, dIC, dBC);
+            DeviceBuffer<scalar> fBnd;
+            deviceMatrixFluxBoundary(dbP_, dIC, dBC, dp_, fBnd);
+            deviceAxpy(1.0, fBnd, phiHb);
             // HbyA adjustment AFTER the flux (feeds the velocity corrector only): HbyA -= (rAU-rAtU)*grad(p)
-            for (int kk = 0; kk < 3; ++kk) { DeviceBuffer<scalar> t; deviceHadamard(t, drAtU, *gg[kk]); deviceAxpy(1.0, t, HbyA[kk]); } }
-        DeviceBuffer<scalar> rAUf; deviceInterpolate(dm,rAtU,rAUf);
+            for (int kk = 0; kk < 3; ++kk)
+            {
+                DeviceBuffer<scalar> t;
+                deviceHadamard(t, drAtU, *gg[kk]);
+                deviceAxpy(1.0, t, HbyA[kk]);
+            }
+        }
+        DeviceBuffer<scalar> rAUf;
+        deviceInterpolate(dm,rAtU,rAUf);
         // pressure matrix buffers are PERSISTENT members: their addresses stay fixed across SIMPLE steps (only the
         // values change), so the V-cycle CUDA graph (keyed on diagCp_) is captured once and replayed every step.
-        DeviceBuffer<scalar> pPrev; deviceCopy(pPrev, dp_);   // p entering the pressure step (for relaxation), captured once
+        DeviceBuffer<scalar> pPrev;
+        deviceCopy(pPrev, dp_);   // p entering the pressure step (for relaxation), captured once
         // nNonOrthogonalCorrectors (OF SIMPLE, pEqn.H `while (simple.correctNonOrthogonal())`): re-solve
         // laplacian(rAtU,p) == div(phiHbyA) (nNonOrth+1) times, recomputing the EXPLICIT non-orthogonal correction
         // (corrVec.grad(p)) from the UPDATED p each pass; the conservative flux is committed only on the final pass.
@@ -535,16 +779,20 @@ public:
         const int nPass = (ctl_.nonOrth ? ctl_.nNonOrth : 0) + 1;
         DeviceBuffer<scalar> pIC, pBC, ffcP, ffcPcyc, ffcPami;
         DeviceSolverPerf pp, pp0;
-        for (int nonOrthPass = 0; nonOrthPass < nPass; ++nonOrthPass) {
-            if (nonOrthPass > 0) {   // recompute grad(p) from the just-solved p (pass 0 uses the entry grad in gx/gy/gz)
-                DeviceBuffer<scalar> pbvN; deviceBCValue(dbP_, dp_, pbvN);
+        for (int nonOrthPass = 0; nonOrthPass < nPass; ++nonOrthPass)
+        {
+            if (nonOrthPass > 0)   // recompute grad(p) from the just-solved p (pass 0 uses the entry grad in gx/gy/gz)
+            {
+                DeviceBuffer<scalar> pbvN;
+                deviceBCValue(dbP_, dp_, pbvN);
                 deviceGaussGrad(dm, dp_, pbvN, gx, gy, gz);
                 if (hasCyclic_) deviceCyclicAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
                 if (hasAMI_)    deviceAmiAddGrad(ami_, dp_, dm.V, gx, gy, gz);
             }
             deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth);
             deviceBCLaplacianCoeffs(dbP_, rAtU, pIC, pBC);
-            DeviceBuffer<scalar> divPhiH; deviceDiv(dm, phiHi, phiHb, divPhiH);
+            DeviceBuffer<scalar> divPhiH;
+            deviceDiv(dm, phiHi, phiHb, divPhiH);
             if (hasCyclic_) deviceCyclicAddDiv(cyc_, dm.V, divPhiH);            // + cyclic-face flux into continuity div(phiHbyA)
             if (hasAMI_)    deviceAmiAddDiv(ami_, dm.V, divPhiH);               // + AMI-face flux into continuity div(phiHbyA)
             deviceFoldPressure(dm, pD_, divPhiH, pIC, pBC, diagCp_, bp_);
@@ -553,18 +801,31 @@ public:
             if (hasAMI_)    deviceAmiAssembleLaplacian(ami_, rAtU, diagCp_, /*addToDiag*/true);   // AMI pressure laplacian
             // explicit non-orth correction: faceFluxCorr from grad(p) for THIS pass; add -V*div(ffc) to b, and subtract
             // ffc from the reconstructed flux below (so div(phi)=0 on non-orth faces). gx/gy/gz = grad(p) this pass.
-            ffcP = DeviceBuffer<scalar>(); ffcPcyc = DeviceBuffer<scalar>(); ffcPami = DeviceBuffer<scalar>();
-            if (ctl_.nonOrth) { deviceLaplacianCorrFluxLimited(dm, rAUf, dp_, gx, gy, gz, nonOrthLimitP, ffcP);
-                DeviceBuffer<scalar> sc; deviceFaceDivSource(dm, ffcP, sc); deviceAxpy(1.0, sc, bp_);
+            ffcP = DeviceBuffer<scalar>();
+            ffcPcyc = DeviceBuffer<scalar>();
+            ffcPami = DeviceBuffer<scalar>();
+            if (ctl_.nonOrth)
+            {
+                deviceLaplacianCorrFluxLimited(dm, rAUf, dp_, gx, gy, gz, nonOrthLimitP, ffcP);
+                DeviceBuffer<scalar> sc;
+                deviceFaceDivSource(dm, ffcP, sc);
+                deviceAxpy(1.0, sc, bp_);
                 if (hasCyclic_) deviceCyclicLapCorrP(cyc_, rAtU, gx, gy, gz, bp_, ffcPcyc);
-                if (hasAMI_)    deviceAmiLapCorrP(ami_, rAtU, gx, gy, gz, bp_, ffcPami); }
+                if (hasAMI_)    deviceAmiLapCorrP(ami_, rAtU, gx, gy, gz, bp_, ffcPami);
+            }
             // No fixedValue-p patch -> singular all-Neumann pressure. cyclic/AMI use a tiny SYMMETRIC diagonal shift
             // (the periodic RHS is zero-mean); non-cyclic keeps the OF single-cell setReference (doubles a fresh diag).
-            if (ctl_.needRef) {
-                if (hasCyclic_ || hasAMI_) { const scalar eps = -1e-10 * (deviceSumMag(diagCp_) / nC_); deviceAxpy(eps, ones_, diagCp_); }
+            if (ctl_.needRef)
+            {
+                if (hasCyclic_ || hasAMI_)
+                {
+                    const scalar eps = -1e-10 * (deviceSumMag(diagCp_) / nC_);
+                    deviceAxpy(eps, ones_, diagCp_);
+                }
                 else deviceSetReference(diagCp_, bp_, ctl_.pRefCell, ctl_.pRefValue);
             }
-            if (hasCyclic_ || hasAMI_) {
+            if (hasCyclic_ || hasAMI_)
+            {
                 // Periodic/AMI: interface-coupled operator solved with Jacobi-PCG (no AMG; the internal-face Galerkin
                 // coarse operator cannot represent the interface edges).
                 const DeviceLduView pvc = hasCyclic_
@@ -572,43 +833,63 @@ public:
                     : deviceLduViewAmi(dm,diagCp_,pU_,pL_, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
                 const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
                 pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000);
-            } else {
+            }
+            else
+            {
                 const scalar nfp = deviceNormFactor(deviceLduView(dm,diagCp_,pU_,pL_), dp_, bp_, ones_);
                 amgGalerkin(amg_, diagCp_, pU_, pL_);                                      // re-coarsen the pressure matrix
                 pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pL_), amg_, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000, ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling);
             }
             if (nonOrthPass == 0) pp0 = pp;   // SIMPLE residualControl uses the FIRST pass's initial residual (OF convention)
         }
-        res.p = pp0.initialResidual; res.pFinal = pp.finalResidual; res.pIters = pp.nIterations;
+        res.p = pp0.initialResidual;
+        res.pFinal = pp.finalResidual;
+        res.pIters = pp.nIterations;
         if (std::getenv("BRAE_SOLVER_DEBUG")) std::printf("    p %s iters=%d  init=%.2e final=%.2e\n",
                                                         (hasCyclic_||hasAMI_)?"Jacobi-PCG":"AMG-PCG", pp.nIterations, pp.initialResidual, pp.finalResidual);
         const DeviceLduView pview = deviceLduView(dm,diagCp_,pU_,pL_);
-        DeviceBuffer<scalar> pfi; deviceMatrixFluxInternal(pview, dp_, pfi); deviceCopy(phiInt_, phiHi); deviceAxpy(-1.0, pfi, phiInt_);
+        DeviceBuffer<scalar> pfi;
+        deviceMatrixFluxInternal(pview, dp_, pfi);
+        deviceCopy(phiInt_, phiHi);
+        deviceAxpy(-1.0, pfi, phiInt_);
         if (ctl_.nonOrth) deviceAxpy(-1.0, ffcP, phiInt_);   // phi -= faceFluxCorrection (continuity on non-orth faces)
-        DeviceBuffer<scalar> pfb; deviceMatrixFluxBoundary(dbP_, pIC, pBC, dp_, pfb); deviceCopy(phiBnd_, phiHb); deviceAxpy(-1.0, pfb, phiBnd_);
+        DeviceBuffer<scalar> pfb;
+        deviceMatrixFluxBoundary(dbP_, pIC, pBC, dp_, pfb);
+        deviceCopy(phiBnd_, phiHb);
+        deviceAxpy(-1.0, pfb, phiBnd_);
         if (hasCyclic_) deviceCyclicCorrectFlux(cyc_, dp_);   // cyc_.phi -= ifCoeff*(p_nbr - p_own) : conservative periodic flux (pre-relax dp_)
         if (hasAMI_)    deviceAmiCorrectFlux(ami_, dp_);       // ami_.phi -= ifCoeff*(interp(p_nbr) - p_own)
         if (hasCyclic_ && ctl_.nonOrth && ffcPcyc.size()) deviceAxpy(-1.0, ffcPcyc, cyc_.phi);   // cyclic-face non-orth flux correction (matches phiInt_ -= ffcP)
         if (hasAMI_ && ctl_.nonOrth && ffcPami.size()) deviceAxpy(-1.0, ffcPami, ami_.phi);       // AMI-face non-orth flux correction
-        deviceScale(dp_, ctl_.relaxP); deviceAxpy(1.0 - ctl_.relaxP, pPrev, dp_);
-        DeviceBuffer<scalar> pbv2; deviceBCValue(dbP_, dp_, pbv2);
-        DeviceBuffer<scalar> gnx,gny,gnz; deviceGaussGrad(dm, dp_, pbv2, gnx,gny,gnz);
+        deviceScale(dp_, ctl_.relaxP);
+        deviceAxpy(1.0 - ctl_.relaxP, pPrev, dp_);
+        DeviceBuffer<scalar> pbv2;
+        deviceBCValue(dbP_, dp_, pbv2);
+        DeviceBuffer<scalar> gnx,gny,gnz;
+        deviceGaussGrad(dm, dp_, pbv2, gnx,gny,gnz);
         if (hasCyclic_) deviceCyclicAddGrad(cyc_, dp_, dm.V, gnx,gny,gnz);   // + cyclic-face contribution to grad(p)
         if (hasAMI_)    deviceAmiAddGrad(ami_, dp_, dm.V, gnx,gny,gnz);       // + AMI-face contribution to grad(p)
         DeviceBuffer<scalar>* gn[3]={&gnx,&gny,&gnz};
-        for (int kk = 0; kk < 3; ++kk) { DeviceBuffer<scalar> Un; deviceCorrector(HbyA[kk], rAtU, *gn[kk], Un); Uk_[kk]=std::move(Un); }   // SIMPLEC: rAtU
+        for (int kk = 0; kk < 3; ++kk)   // SIMPLEC: rAtU
+        {
+            DeviceBuffer<scalar> Un;
+            deviceCorrector(HbyA[kk], rAtU, *gn[kk], Un);
+            Uk_[kk]=std::move(Un);
+        }
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);
 
         clearTurbulenceReport();   // OF-style report: collect this step's turbulence solves (Solving for k/omega/...)
-        if (ctl_.turbulent) {
+        if (ctl_.turbulent)
+        {
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
                                              ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-            else if (ctl_.sst) {   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
+            else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
+            {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                        phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
                                        ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
@@ -629,8 +910,10 @@ public:
         // OF continuityErrs.H: contErr = fvc::div(phi) on the CORRECTED flux; sum local = sum(V|contErr|)/sumV,
         // global = sum(V contErr)/sumV. deviceDiv gives Sum(phi)/V per cell, so R = V*div = the cell flux balance.
         {
-            DeviceBuffer<scalar> divPhi; deviceDiv(dm, phiInt_, phiBnd_, divPhi);
-            DeviceBuffer<scalar> R; deviceHadamard(R, divPhi, dm.V);
+            DeviceBuffer<scalar> divPhi;
+            deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            DeviceBuffer<scalar> R;
+            deviceHadamard(R, divPhi, dm.V);
             const scalar sumV = deviceDot(dm.V, ones_) + 1e-300;
             res.contLocal  = deviceSumMag(R) / sumV;
             res.contGlobal = deviceDot(R, ones_) / sumV;
@@ -640,71 +923,126 @@ public:
 
     // Enable an MRF rotating zone: builds the device frame data + makes the resident flux RELATIVE (so the
     // momentum/pressure are solved in the rotating frame). Call once after construction, before stepping.
-    void setMRF(const MRFZone& z, const PrimitiveMesh& m, const FvGeometry& g,
-                const std::vector<std::string>& nonRotating = {}) {
+    void setMRF(
+        const MRFZone& z,
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<std::string>& nonRotating = {})
+    {
         mrf_ = buildDeviceMRF(z, m, g, fvp_, nonRotating);
         deviceMrfApplyFrameFlux(mrf_, +1.0, phiInt_, phiBnd_);     // initial phi -> relative (OF createFields)
         // NOTE: MRF is NOT applied to the cyclic/cyclicAMI interface flux. Ground truth: OF never combines MRF with
         // cyclicAMI (0/12 MRF tutorials use AMI, all use conformal multi-zone meshes; rotating AMI is done by a
-        // MOVING MESH in transient solvers, not MRF). So there is no MRF×AMI pattern to support here.
+        // MOVING MESH in transient solvers, not MRF). So there is no MRF x AMI pattern to support here.
     }
 
     // Enable fvOptions (system/fvOptions). Empty data -> every hook below stays a no-op (bit-identical to no file),
     // exactly like fv::options::New on a case without the dict. Copies the precomputed per-cell source terms to the
     // device. Call once after construction. The momentum source feeds relaxSrc (so it reaches BOTH the predictor and
     // H()/HbyA, like the body force / OF UEqn.H fvOptions(U)); the implicit Sp lowers the momentum diagonal.
-    void setFvOptions(const FvOptionsData& fo) {
+    void setFvOptions(const FvOptionsData& fo)
+    {
         hasFvoMom_ = fo.hasMomentum;
-        if (fo.hasMomentum) {
-            for (int c = 0; c < 3; ++c) fvoMomSu_[c].copyFrom(fo.momSu[c]);
+        if (fo.hasMomentum)
+        {
+            for (int c = 0; c < 3; ++c)
+                fvoMomSu_[c].copyFrom(fo.momSu[c]);
             if (!fo.momSp.empty()) fvoMomSp_.copyFrom(fo.momSp);
         }
-        for (const auto& s : fo.scaSu) fvoScaSu_[s.first].copyFrom(s.second);   // scalar (k/epsilon/…) sources
-        for (const auto& s : fo.scaSp) fvoScaSp_[s.first].copyFrom(s.second);
-        if (fo.porActive) { por_.active = true; por_.d = fo.porD; por_.f = fo.porF; por_.cells.copyFrom(fo.porCells); }
-        if (fo.mvfActive) {
-            mvfActive_ = true; mvfRelax_ = fo.mvfRelax;
+        for (const auto& s : fo.scaSu)
+            fvoScaSu_[s.first].copyFrom(s.second);   // scalar (k/epsilon/...) sources
+        for (const auto& s : fo.scaSp)
+            fvoScaSp_[s.first].copyFrom(s.second);
+        if (fo.porActive)
+        {
+            por_.active = true;
+            por_.d = fo.porD;
+            por_.f = fo.porF;
+            por_.cells.copyFrom(fo.porCells);
+        }
+        if (fo.mvfActive)
+        {
+            mvfActive_ = true;
+            mvfRelax_ = fo.mvfRelax;
             const scalar m = std::sqrt(fo.mvfUbar.x*fo.mvfUbar.x + fo.mvfUbar.y*fo.mvfUbar.y + fo.mvfUbar.z*fo.mvfUbar.z);
-            mvfUbarMag_ = m; mvfFlowDir_ = m > 0 ? vector{fo.mvfUbar.x/m, fo.mvfUbar.y/m, fo.mvfUbar.z/m} : vector{1,0,0};
+            mvfUbarMag_ = m;
+            mvfFlowDir_ = m > 0 ? vector{fo.mvfUbar.x/m, fo.mvfUbar.y/m, fo.mvfUbar.z/m} : vector{1,0,0};
             std::vector<scalar> m01(nC_, fo.mvfCells.empty() ? 1.0 : 0.0);   // selectionMode all -> ones; cellZone -> 1 in zone
-            for (label c : fo.mvfCells) if (c >= 0 && c < nC_) m01[c] = 1.0;
+            for (label c : fo.mvfCells)
+                if (c >= 0 && c < nC_) m01[c] = 1.0;
             mvfMask01_.copyFrom(m01);
             deviceHadamard(mvfMaskV_, dm_.V, mvfMask01_);                     // maskV = V in the selection (0 else)
             mvfVtot_ = deviceSumMag(mvfMaskV_);                               // total selection volume
         }
-        if (fo.limUActive) {
-            limUActive_ = true; limUMax_ = fo.limUMax;
+        if (fo.limUActive)
+        {
+            limUActive_ = true;
+            limUMax_ = fo.limUMax;
             std::vector<label> lc = fo.limUCells;
-            if (lc.empty()) { lc.resize(nC_); for (label c = 0; c < nC_; ++c) lc[c] = c; }   // selectionMode all
+            if (lc.empty())   // selectionMode all
+            {
+                lc.resize(nC_);
+                for (label c = 0; c < nC_; ++c)
+                    lc[c] = c;
+            }
             limUCells_.copyFrom(lc);
         }
-        if (fo.vdcActive) {
-            vdcActive_ = true; vdcUMax_ = fo.vdcUMax; vdcC_ = fo.vdcC;
+        if (fo.vdcActive)
+        {
+            vdcActive_ = true;
+            vdcUMax_ = fo.vdcUMax;
+            vdcC_ = fo.vdcC;
             std::vector<label> vc = fo.vdcCells;
-            if (vc.empty()) { vc.resize(nC_); for (label c = 0; c < nC_; ++c) vc[c] = c; }   // selectionMode all
+            if (vc.empty())   // selectionMode all
+            {
+                vc.resize(nC_);
+                for (label c = 0; c < nC_; ++c)
+                    vc[c] = c;
+            }
             vdcCells_.copyFrom(vc);
         }
-        if (fo.adActive) {
-            adActive_ = true; adDiskDir_ = fo.adDiskDir; adArea_ = fo.adArea; adA_ = fo.adA;
-            std::vector<scalar> dm01(nC_, 0.0); for (label c : fo.adDiskCells) if (c>=0 && c<nC_) dm01[c] = 1.0;
-            DeviceBuffer<scalar> dmask; dmask.copyFrom(dm01);
-            deviceHadamard(adMaskVDisk_, dm_.V, dmask); adVtot_ = deviceSumMag(adMaskVDisk_);   // V in disk / total disk volume
-            std::vector<scalar> mon(nC_, 0.0); for (label c : fo.adMonitorCells) if (c>=0 && c<nC_) mon[c] = 1.0;
-            adMonMask01_.copyFrom(mon); adNmon_ = (scalar)fo.adMonitorCells.size();
+        if (fo.adActive)
+        {
+            adActive_ = true;
+            adDiskDir_ = fo.adDiskDir;
+            adArea_ = fo.adArea;
+            adA_ = fo.adA;
+            std::vector<scalar> dm01(nC_, 0.0);
+            for (label c : fo.adDiskCells)
+                if (c>=0 && c<nC_) dm01[c] = 1.0;
+            DeviceBuffer<scalar> dmask;
+            dmask.copyFrom(dm01);
+            deviceHadamard(adMaskVDisk_, dm_.V, dmask);
+            adVtot_ = deviceSumMag(adMaskVDisk_);   // V in disk / total disk volume
+            std::vector<scalar> mon(nC_, 0.0);
+            for (label c : fo.adMonitorCells)
+                if (c>=0 && c<nC_) mon[c] = 1.0;
+            adMonMask01_.copyFrom(mon);
+            adNmon_ = (scalar)fo.adMonitorCells.size();
         }
         fvoCount_ = fo.count;
     }
     // rotorDiskSource (BEM): the device rotor is built from the mesh in gpuSimpleFoam and handed over here.
     void setRotorDisk(DeviceRotorDisk r) { rotor_ = std::move(r); }
-    // fvOptions scalar source for a transported scalar field (k/epsilon/…): src += Su, diag -= Sp.  No-op when absent.
-    void fvOptionsAddSupScalar(const std::string& field, DeviceBuffer<scalar>* src, DeviceBuffer<scalar>* diag) {
+    // fvOptions scalar source for a transported scalar field (k/epsilon/...): src += Su, diag -= Sp.  No-op when absent.
+    void fvOptionsAddSupScalar(
+        const std::string& field,
+        DeviceBuffer<scalar>* src,
+        DeviceBuffer<scalar>* diag)
+    {
         if (auto it = fvoScaSu_.find(field); it != fvoScaSu_.end() && src) deviceAxpy(1.0, it->second, *src);
         if (auto it = fvoScaSp_.find(field); it != fvoScaSp_.end() && diag) deviceAxpy(-1.0, it->second, *diag);
     }
 
     // pull device fields back to host (reconstruct for output / validation).
-    std::vector<vector> U() const { const auto x=Uk_[0].host(), y=Uk_[1].host(), z=Uk_[2].host();
-        std::vector<vector> u(nC_); for (label c=0;c<nC_;++c) u[c]={x[c],y[c],z[c]}; return u; }
+    std::vector<vector> U() const
+    {
+        const auto x=Uk_[0].host(), y=Uk_[1].host(), z=Uk_[2].host();
+        std::vector<vector> u(nC_);
+        for (label c=0;c<nC_;++c)
+            u[c]={x[c],y[c],z[c]};
+        return u;
+    }
     std::vector<scalar> p()   const { return dp_.host(); }
     std::vector<scalar> k()   const { return dk_.host(); }
     std::vector<scalar> eps() const { return de_.host(); }
@@ -729,17 +1067,26 @@ private:
     DeviceMRF mrf_;                       // optional rotating zone (inactive by default)
     // fvOptions (empty by default -> no-op). Momentum source per component (relaxSrc) + implicit Sp (diagonal);
     // scalar sources keyed by field name. See setFvOptions / the unconditional hooks in step().
-    bool   hasFvoMom_ = false; int fvoCount_ = 0;
+    bool   hasFvoMom_ = false;
+    int fvoCount_ = 0;
     DeviceBuffer<scalar> fvoMomSu_[3], fvoMomSp_;
     std::map<std::string, DeviceBuffer<scalar>> fvoScaSu_, fvoScaSp_;
     DevicePorosity por_;                  // explicitPorositySource (DarcyForchheimer), evaluated each iter
     // meanVelocityForce: accumulated pressure gradient gradP_ driving the mean velocity to Ubar (channel flow).
-    bool   mvfActive_ = false; vector mvfFlowDir_{0,0,0}; scalar mvfUbarMag_ = 0, mvfRelax_ = 1.0, mvfGradP_ = 0, mvfVtot_ = 0;
+    bool   mvfActive_ = false;
+    vector mvfFlowDir_{0,0,0};
+    scalar mvfUbarMag_ = 0, mvfRelax_ = 1.0, mvfGradP_ = 0, mvfVtot_ = 0;
     DeviceBuffer<scalar> mvfMaskV_, mvfMask01_;   // V (and 1) in the zone, 0 else (= V / ones for selectionMode all)
-    bool   limUActive_ = false; scalar limUMax_ = 0; DeviceBuffer<label> limUCells_;   // limitVelocity clamp
-    bool   vdcActive_ = false; scalar vdcUMax_ = 0, vdcC_ = 1; DeviceBuffer<label> vdcCells_;   // velocityDampingConstraint
+    bool   limUActive_ = false;
+    scalar limUMax_ = 0;
+    DeviceBuffer<label> limUCells_;   // limitVelocity clamp
+    bool   vdcActive_ = false;
+    scalar vdcUMax_ = 0, vdcC_ = 1;
+    DeviceBuffer<label> vdcCells_;   // velocityDampingConstraint
     // actuationDiskSource (Froude): thrust over a disk cellZone, computed each iter from the monitored upstream U.
-    bool   adActive_ = false; vector adDiskDir_{1,0,0}; scalar adArea_ = 0, adA_ = 0, adVtot_ = 0, adNmon_ = 0;
+    bool   adActive_ = false;
+    vector adDiskDir_{1,0,0};
+    scalar adArea_ = 0, adA_ = 0, adVtot_ = 0, adNmon_ = 0;
     DeviceBuffer<scalar> adMaskVDisk_, adMonMask01_;   // V in disk cells / 1 in monitor cells
     DeviceRotorDisk rotor_;                            // rotorDiskSource (BEM); per-cell force recomputed each iter
     DeviceBuffer<scalar> rotorFx_, rotorFy_, rotorFz_;
