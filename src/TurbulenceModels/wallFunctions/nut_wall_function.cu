@@ -4,21 +4,28 @@
 namespace brae {
 namespace {
 // yPlusLam: fixed-point solution of yPlusLam = log(E*yPlusLam)/kappa (OF wallFunctionCoefficients).
-scalar yPlusLam(scalar kappa, scalar E) {
+scalar yPlusLam(scalar kappa, scalar E)
+{
     scalar ypl = 11.0;
     for (int i = 0; i < 10; ++i) ypl = std::log(std::fmax(E * ypl, 1.0)) / kappa;
     return ypl;
 }
-}
+} // namespace
 
-std::vector<scalar> nutkWallFunction(const FvPatch& wall,
-                                     const std::vector<scalar>& y,
-                                     const std::vector<scalar>& kInternal,
-                                     scalar nu, scalar Cmu, scalar kappa, scalar E) {
+std::vector<scalar> nutkWallFunction(
+    const FvPatch& wall,
+    const std::vector<scalar>& y,
+    const std::vector<scalar>& kInternal,
+    scalar nu,
+    scalar Cmu,
+    scalar kappa,
+    scalar E)
+{
     const scalar Cmu25   = std::pow(Cmu, 0.25);
     const scalar yplLam  = yPlusLam(kappa, E);
     std::vector<scalar> nutw(wall.size);
-    for (label i = 0; i < wall.size; ++i) {
+    for (label i = 0; i < wall.size; ++i)
+    {
         const scalar kc    = kInternal[wall.faceCells[i]];
         nutw[i] = nutkWallFunctionValue(yPlusWall(Cmu25, y[i], kc, nu), nu, yplLam, kappa, E);
     }
