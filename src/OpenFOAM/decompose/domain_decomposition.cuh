@@ -15,11 +15,13 @@
 
 namespace brae {
 
-class DomainDecomposition {
+class DomainDecomposition
+{
 public:
-    DomainDecomposition(const PrimitiveMesh& global,
-                        const std::vector<label>& cellToPart,
-                        int myPart);
+    DomainDecomposition(
+        const PrimitiveMesh& global,
+        const std::vector<label>& cellToPart,
+        int myPart);
 
     label nLocalCells()         const { return static_cast<label>(cellProcAddr_.size()); }
     label nLocalInternalFaces() const { return nLocalInternal_; }

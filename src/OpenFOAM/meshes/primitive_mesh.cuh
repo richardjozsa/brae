@@ -10,7 +10,8 @@
 
 namespace brae {
 
-struct PatchInfo {
+struct PatchInfo
+{
     std::string name;
     std::string type;
     label       start = 0;  // first face index (startFace)
@@ -22,18 +23,30 @@ struct PatchInfo {
     vector      rotationCentre{0, 0, 0};  // cyclic rotational: a point on the axis
 };
 
-class PrimitiveMesh {
+class PrimitiveMesh
+{
 public:
     // Read points/faces/owner/neighbour/boundary from a constant/polyMesh directory.
     void read(const std::string& polyMeshDir);
 
     // Construct in memory (e.g. a decomposePar local mesh). Faces must be ordered internal-first
     // (upper-triangular by owner) then boundary faces grouped by patch, exactly as read().
-    void assign(std::vector<vector> points, std::vector<label> faceVerts, std::vector<label> faceOffsets,
-                std::vector<label> owner, std::vector<label> neighbour, std::vector<PatchInfo> patches,
-                label nCells) {
-        points_ = std::move(points); faceVerts_ = std::move(faceVerts); faceOffsets_ = std::move(faceOffsets);
-        owner_ = std::move(owner); neighbour_ = std::move(neighbour); patches_ = std::move(patches); nCells_ = nCells;
+    void assign(
+        std::vector<vector> points,
+        std::vector<label> faceVerts,
+        std::vector<label> faceOffsets,
+        std::vector<label> owner,
+        std::vector<label> neighbour,
+        std::vector<PatchInfo> patches,
+        label nCells)
+    {
+        points_ = std::move(points);
+        faceVerts_ = std::move(faceVerts);
+        faceOffsets_ = std::move(faceOffsets);
+        owner_ = std::move(owner);
+        neighbour_ = std::move(neighbour);
+        patches_ = std::move(patches);
+        nCells_ = nCells;
     }
 
     label nPoints()        const { return static_cast<label>(points_.size()); }

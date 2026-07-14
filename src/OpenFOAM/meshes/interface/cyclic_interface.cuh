@@ -19,7 +19,8 @@
 
 namespace brae {
 
-struct CyclicInterface {
+struct CyclicInterface
+{
     label patch = -1, nbrPatch = -1;        // this cyclic patch and its paired neighbour (fv patch indices)
     std::vector<label>  faceCells;          // owner cells of this patch's faces
     std::vector<label>  nbrFaceCells;       // owner cells of the matched neighbour faces (coupling target)
@@ -34,7 +35,8 @@ struct CyclicInterface {
 };
 
 // Rodrigues rotation tensor R about a unit-normalised axis by `angle` (R & v rotates v right-handed).
-inline tensor rotationTensor(const vector& axis, scalar angle) {
+inline tensor rotationTensor(const vector& axis, scalar angle)
+{
     const vector a = axis / mag(axis);
     const scalar c = std::cos(angle), s = std::sin(angle), t = 1.0 - c;
     return { c + t*a.x*a.x,     t*a.x*a.y - s*a.z, t*a.x*a.z + s*a.y,
@@ -46,28 +48,39 @@ inline tensor rotationTensor(const vector& axis, scalar angle) {
 // patches so face i pairs with neighbour face i); the constant separation vector is recorded so callers
 // can verify the match geometrically.
 inline std::vector<CyclicInterface> buildCyclicInterfaces(
-    const PrimitiveMesh& m, const FvGeometry& g, const std::vector<FvPatch>& fvp) {
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
     std::map<std::string, label> nameToIdx;
     for (label pi = 0; pi < (label)fvp.size(); ++pi) nameToIdx[fvp[pi].name] = pi;
     const std::vector<PatchInfo>& pinfo = m.patches();
 
     std::vector<CyclicInterface> out;
-    for (label pi = 0; pi < (label)fvp.size(); ++pi) {
+    for (label pi = 0; pi < (label)fvp.size(); ++pi)
+    {
         if (fvp[pi].type != "cyclic") continue;
-        CyclicInterface ci; ci.patch = pi;
+        CyclicInterface ci;
+        ci.patch = pi;
         const std::string nbrName = pinfo[pi].neighbourPatch;
         const auto it = nameToIdx.find(nbrName);
         if (it == nameToIdx.end()) throw std::runtime_error("cyclic: neighbourPatch '" + nbrName + "' not found");
         ci.nbrPatch = it->second;
         ci.translational = (pinfo[pi].transform != "rotational");
-        const FvPatch& P = fvp[pi]; const FvPatch& N = fvp[ci.nbrPatch];
+        const FvPatch& P = fvp[pi];
+        const FvPatch& N = fvp[ci.nbrPatch];
         if (P.size != N.size) throw std::runtime_error("cyclic: patch/neighbour face-count mismatch");
-        ci.faceCells = P.faceCells; ci.nbrFaceCells = N.faceCells;
-        ci.deltaCoeffs.resize(P.size); ci.weights.resize(P.size);
-        ci.dOwn.resize(P.size); ci.dNbr.resize(P.size); ci.corrVec.resize(P.size);
+        ci.faceCells = P.faceCells;
+        ci.nbrFaceCells = N.faceCells;
+        ci.deltaCoeffs.resize(P.size);
+        ci.weights.resize(P.size);
+        ci.dOwn.resize(P.size);
+        ci.dNbr.resize(P.size);
+        ci.corrVec.resize(P.size);
 
         // Rotational: the nbr->own rotation tensor forwardT, angle from a matched face pair about the axis.
-        if (!ci.translational) {
+        if (!ci.translational)
+        {
             const vector a = pinfo[pi].rotationAxis / mag(pinfo[pi].rotationAxis);
             const vector ctr = pinfo[pi].rotationCentre;
             const vector po = g.Cf()[P.start] - ctr, pn = g.Cf()[N.start] - ctr;
@@ -76,7 +89,8 @@ inline std::vector<CyclicInterface> buildCyclicInterfaces(
             ci.forwardT = rotationTensor(a, angle);
         }
 
-        for (label i = 0; i < P.size; ++i) {
+        for (label i = 0; i < P.size; ++i)
+        {
             const vector nfo = g.Sf()[P.start + i] / g.magSf()[P.start + i];   // own outward unit normal
             const vector nfn = g.Sf()[N.start + i] / g.magSf()[N.start + i];   // neighbour outward unit normal
             const vector patchD = g.Cf()[P.start + i] - g.C()[P.faceCells[i]];
@@ -87,7 +101,8 @@ inline std::vector<CyclicInterface> buildCyclicInterfaces(
             ci.weights[i]     = dni / (di + dni);
             ci.deltaCoeffs[i] = 1.0 / std::fmax(dot(nfo, delta), 0.05 * mag(delta));
             ci.corrVec[i] = nfo - delta * ci.deltaCoeffs[i];   // laplacian non-orth correction vector (k = nf - delta*dc)
-            ci.dOwn[i] = patchD; ci.dNbr[i] = nbrD;   // linearUpwind face deltas (Cf-C_own ; Cf_nbr-C_nbr, un-rotated)
+            ci.dOwn[i] = patchD;
+            ci.dNbr[i] = nbrD;   // linearUpwind face deltas (Cf-C_own ; Cf_nbr-C_nbr, un-rotated)
             if (i == 0) ci.separation = g.Cf()[N.start + i] - g.Cf()[P.start + i];
         }
         out.push_back(std::move(ci));

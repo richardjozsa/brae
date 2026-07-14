@@ -9,7 +9,8 @@
 
 namespace brae {
 
-class ProcessorInterface : public lduInterface {
+class ProcessorInterface : public lduInterface
+{
 public:
     ProcessorInterface(int myPart, int nbrPart, std::vector<label> faceCells, int tag = 0);
 
@@ -19,8 +20,7 @@ public:
 
     const std::vector<label>& faceCells() const override { return faceCells_; }
 
-    void interfaceInternalField(const scalar* psi,
-                                std::vector<scalar>& out) const override;
+    void interfaceInternalField(const scalar* psi, std::vector<scalar>& out) const override;
     void initInterfaceMatrixUpdate(const scalar* psi) override;       // posts irecv + isend
     void updateInterfaceMatrix(scalar* result, const scalar* coeffs) override;
 

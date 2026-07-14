@@ -13,13 +13,18 @@
 
 namespace brae {
 
-SolverPerformance gamg(const FvScalarMatrix& M,
-                       std::vector<scalar>& psi,
-                       const PrimitiveMesh& m,
-                       const FvGeometry& g,
-                       const std::vector<FvPatch>& patches,
-                       scalar tolerance, scalar relTol, int maxIter,
-                       int nCellsInCoarsest = 10,
-                       int nPreSweeps = 0, int nPostSweeps = 2, int nFinestSweeps = 2);
+SolverPerformance gamg(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int nCellsInCoarsest = 10,
+    int nPreSweeps = 0,
+    int nPostSweeps = 2,
+    int nFinestSweeps = 2);
 
 } // namespace brae

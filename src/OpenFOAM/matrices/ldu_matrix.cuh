@@ -8,7 +8,8 @@
 namespace brae {
 
 template <typename T>
-struct FvMatrix {
+struct FvMatrix
+{
     std::vector<scalar> diag;     // nCells (raw, before boundary diag)
     std::vector<scalar> upper;    // nInternalFaces
     std::vector<scalar> lower;    // nInternalFaces
@@ -23,13 +24,15 @@ using FvVectorMatrix = FvMatrix<vector>;
 
 // In-place matrix combination (e.g. fvm::div(phi,U) - fvm::laplacian(nuEff,U)). Same addressing.
 template <typename T>
-inline void addEqual(FvMatrix<T>& a, const FvMatrix<T>& b, scalar s) {
+inline void addEqual(FvMatrix<T>& a, const FvMatrix<T>& b, scalar s)
+{
     for (std::size_t i = 0; i < a.diag.size();   ++i) a.diag[i]   += s * b.diag[i];
     for (std::size_t i = 0; i < a.upper.size();  ++i) a.upper[i]  += s * b.upper[i];
     for (std::size_t i = 0; i < a.lower.size();  ++i) a.lower[i]  += s * b.lower[i];
     for (std::size_t i = 0; i < a.source.size(); ++i) a.source[i] += s * b.source[i];
     for (std::size_t p = 0; p < a.internalCoeffs.size(); ++p)
-        for (std::size_t i = 0; i < a.internalCoeffs[p].size(); ++i) {
+        for (std::size_t i = 0; i < a.internalCoeffs[p].size(); ++i)
+        {
             a.internalCoeffs[p][i] += s * b.internalCoeffs[p][i];
             a.boundaryCoeffs[p][i] += s * b.boundaryCoeffs[p][i];
         }
