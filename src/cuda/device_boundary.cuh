@@ -15,7 +15,8 @@
 
 namespace brae {
 
-struct DeviceBoundary {
+struct DeviceBoundary
+{
     int n = 0;                              // total boundary faces (patch order = DeviceMesh bndCell order)
     DeviceBuffer<label>  bcType;            // 0 extrapolated, 1 fixedValue, 2 calculated (3=inletOutlet -> resolved
                                             // to 0|1 per face each step by deviceUpdateInletOutlet; 5=mixed/Robin)
@@ -30,27 +31,51 @@ struct DeviceBoundary {
     DeviceBuffer<label>  faceCell;
 };
 
-inline DeviceBoundary buildDeviceBoundary(const GeometricField<scalar>& f, const std::vector<FvPatch>& fvp, const FvGeometry& g) {
-    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp; std::vector<scalar> ref, dc, ms, vf, p0;
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi) {
+inline DeviceBoundary buildDeviceBoundary(
+    const GeometricField<scalar>& f,
+    const std::vector<FvPatch>& fvp,
+    const FvGeometry& g)
+{
+    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp;
+    std::vector<scalar> ref, dc, ms, vf, p0;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
         if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;                     // cyclic = internal-like (handled by appended faces)
         const int cat = f.boundary[pi]->bcCategory();
         const std::vector<scalar>& val = f.boundary[pi]->value();   // inletOutlet/outletInlet/mixed: value() = refValue; totalPressure: p0
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
-        for (label i = 0; i < fvp[pi].size; ++i) {
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
             ty.push_back((cat == 3 || cat == 4 || cat == 7) ? 1 : cat);   // io/oio/totalPressure init fixedValue (resolved per-step); 5 stays mixed
-            io.push_back(cat == 3 ? 1 : 0); oio.push_back(cat == 4 ? 1 : 0); mx.push_back(cat == 5 ? 1 : 0); pv.push_back(0); sm.push_back(0);
-            tp.push_back(cat == 7 ? 1 : 0); p0.push_back(cat == 7 ? val[i] : 0.0);   // totalPressure: mask + the reference p0
+            io.push_back(cat == 3 ? 1 : 0);
+            oio.push_back(cat == 4 ? 1 : 0);
+            mx.push_back(cat == 5 ? 1 : 0);
+            pv.push_back(0);
+            sm.push_back(0);
+            tp.push_back(cat == 7 ? 1 : 0);
+            p0.push_back(cat == 7 ? val[i] : 0.0);   // totalPressure: mask + the reference p0
             vf.push_back((cat == 5 && vfp) ? (*vfp)[i] : 0.0);
-            ref.push_back(val[i]); dc.push_back(fvp[pi].deltaCoeffs[i]);
-            ms.push_back(g.magSf()[fvp[pi].start + i]); fc.push_back(fvp[pi].faceCells[i]);
+            ref.push_back(val[i]);
+            dc.push_back(fvp[pi].deltaCoeffs[i]);
+            ms.push_back(g.magSf()[fvp[pi].start + i]);
+            fc.push_back(fvp[pi].faceCells[i]);
         }
     }
-    DeviceBoundary db; db.n = static_cast<int>(ty.size());
-    db.bcType.copyFrom(ty); db.ioMask.copyFrom(io); db.oioMask.copyFrom(oio); db.mixedMask.copyFrom(mx); db.piovMask.copyFrom(pv); db.symMask.copyFrom(sm);
-    db.tpMask.copyFrom(tp); db.p0.copyFrom(p0);
-    db.valueFraction.copyFrom(vf); db.refValue.copyFrom(ref);
-    db.deltaCoeffs.copyFrom(dc); db.magSf.copyFrom(ms); db.faceCell.copyFrom(fc);
+    DeviceBoundary db;
+    db.n = static_cast<int>(ty.size());
+    db.bcType.copyFrom(ty);
+    db.ioMask.copyFrom(io);
+    db.oioMask.copyFrom(oio);
+    db.mixedMask.copyFrom(mx);
+    db.piovMask.copyFrom(pv);
+    db.symMask.copyFrom(sm);
+    db.tpMask.copyFrom(tp);
+    db.p0.copyFrom(p0);
+    db.valueFraction.copyFrom(vf);
+    db.refValue.copyFrom(ref);
+    db.deltaCoeffs.copyFrom(dc);
+    db.magSf.copyFrom(ms);
+    db.faceCell.copyFrom(fc);
     return db;
 }
 
@@ -73,11 +98,18 @@ void deviceMatrixFluxBoundary(const DeviceBoundary& db, const DeviceBuffer<scala
 // A vector field's BC is three scalar boundaries (one per component): the laplacian/div internalCoeffs are
 // isotropic (component-independent), only the refValue-dependent boundaryCoeffs / value differ by component.
 // So the per-component momentum boundary coeffs reuse the scalar kernels on comp[k].
-struct DeviceVectorBoundary { DeviceBoundary comp[3]; int n = 0; DeviceBuffer<scalar> nx, ny, nz; };   // nx/ny/nz = unit face normal (pressureInletOutletVelocity)
+struct DeviceVectorBoundary
+{
+    DeviceBoundary comp[3];
+    int n = 0;
+    DeviceBuffer<scalar> nx, ny, nz;   // nx/ny/nz = unit face normal (pressureInletOutletVelocity)
+};
 
 // inletOutlet on a vector field: same patch flux for all 3 components -> update each component's bcType.
-inline void deviceUpdateInletOutlet(DeviceVectorBoundary& db, const DeviceBuffer<scalar>& phiBnd) {
-    for (int k = 0; k < 3; ++k) deviceUpdateInletOutlet(db.comp[k], phiBnd);
+inline void deviceUpdateInletOutlet(DeviceVectorBoundary& db, const DeviceBuffer<scalar>& phiBnd)
+{
+    for (int k = 0; k < 3; ++k)
+        deviceUpdateInletOutlet(db.comp[k], phiBnd);
 }
 
 // mixed (Robin) freestreamVelocity/Pressure updateCoeffs: recompute per-face vf from the flow angle. The normal
@@ -120,39 +152,79 @@ void deviceUpdateSymmetry(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>&
 void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& Uxb,
                                const DeviceBuffer<scalar>& Uyb, const DeviceBuffer<scalar>& Uzb);
 
-inline DeviceVectorBoundary buildDeviceVectorBoundary(const GeometricField<vector>& f, const std::vector<FvPatch>& fvp, const FvGeometry& g) {
-    std::vector<label> ty[3], fc, io, oio, mx, pv, sm; std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3];
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi) {
+inline DeviceVectorBoundary buildDeviceVectorBoundary(
+    const GeometricField<vector>& f,
+    const std::vector<FvPatch>& fvp,
+    const FvGeometry& g)
+{
+    std::vector<label> ty[3], fc, io, oio, mx, pv, sm;
+    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3];
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
         if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;                     // cyclic = internal-like (handled by appended faces)
         const int cat = f.boundary[pi]->bcCategory();
         const bool sym = f.boundary[pi]->isSymmetry();
         const std::vector<vector>& val = f.boundary[pi]->value();   // inletOutlet/mixed: value() = freestreamValue (= refValue)
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
-        for (label i = 0; i < fvp[pi].size; ++i) {
-            fc.push_back(fvp[pi].faceCells[i]); dc.push_back(fvp[pi].deltaCoeffs[i]); ms.push_back(g.magSf()[fvp[pi].start + i]);
-            io.push_back(cat == 3 ? 1 : 0); oio.push_back(cat == 4 ? 1 : 0);   // inletOutlet / outletInlet (same flux for all 3 comps)
-            mx.push_back(cat == 5 ? 1 : 0); pv.push_back(cat == 6 ? 1 : 0); sm.push_back(sym ? 1 : 0);   // mixed / piov / symmetry masks
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
+            fc.push_back(fvp[pi].faceCells[i]);
+            dc.push_back(fvp[pi].deltaCoeffs[i]);
+            ms.push_back(g.magSf()[fvp[pi].start + i]);
+            io.push_back(cat == 3 ? 1 : 0);
+            oio.push_back(cat == 4 ? 1 : 0);   // inletOutlet / outletInlet (same flux for all 3 comps)
+            mx.push_back(cat == 5 ? 1 : 0);
+            pv.push_back(cat == 6 ? 1 : 0);
+            sm.push_back(sym ? 1 : 0);   // mixed / piov / symmetry masks
             const scalar seedVf = (cat == 5 && vfp) ? (*vfp)[i] : 0.0;
-            { const vector Sf = g.Sf()[fvp[pi].start + i]; const scalar mg = g.magSf()[fvp[pi].start + i];   // unit face normal
-              const scalar inv = mg > 0 ? 1.0 / mg : 0.0; nrm[0].push_back(Sf.x * inv); nrm[1].push_back(Sf.y * inv); nrm[2].push_back(Sf.z * inv); }
+            {
+                const vector Sf = g.Sf()[fvp[pi].start + i];
+                const scalar mg = g.magSf()[fvp[pi].start + i];   // unit face normal
+                const scalar inv = mg > 0 ? 1.0 / mg : 0.0;
+                nrm[0].push_back(Sf.x * inv);
+                nrm[1].push_back(Sf.y * inv);
+                nrm[2].push_back(Sf.z * inv);
+            }
             const scalar rv[3] = { val[i].x, val[i].y, val[i].z };
-            if (sym) {   // mixed kernels; vf_k=|n_k|, ref recomputed per step (init = host value v - n(n.v))
-                for (int k = 0; k < 3; ++k) { ty[k].push_back(5); vf[k].push_back(std::fabs(nrm[k].back())); ref[k].push_back(rv[k]); }
-            } else {
-                for (int k = 0; k < 3; ++k) {
+            if (sym)   // mixed kernels; vf_k=|n_k|, ref recomputed per step (init = host value v - n(n.v))
+            {
+                for (int k = 0; k < 3; ++k)
+                {
+                    ty[k].push_back(5);
+                    vf[k].push_back(std::fabs(nrm[k].back()));
+                    ref[k].push_back(rv[k]);
+                }
+            }
+            else
+            {
+                for (int k = 0; k < 3; ++k)
+                {
                     ty[k].push_back((cat == 3 || cat == 4) ? 1 : (cat == 6 ? 0 : cat));   // io/oio fixedValue init; piov zeroGradient init (device sets per-step)
-                    vf[k].push_back(seedVf); ref[k].push_back(rv[k]);
+                    vf[k].push_back(seedVf);
+                    ref[k].push_back(rv[k]);
                 }
             }
         }
     }
-    DeviceVectorBoundary db; db.n = static_cast<int>(fc.size());
-    db.nx.copyFrom(nrm[0]); db.ny.copyFrom(nrm[1]); db.nz.copyFrom(nrm[2]);
-    for (int k = 0; k < 3; ++k) {
-        db.comp[k].n = db.n; db.comp[k].bcType.copyFrom(ty[k]); db.comp[k].ioMask.copyFrom(io); db.comp[k].oioMask.copyFrom(oio);
-        db.comp[k].mixedMask.copyFrom(mx); db.comp[k].piovMask.copyFrom(pv); db.comp[k].symMask.copyFrom(sm); db.comp[k].valueFraction.copyFrom(vf[k]);
-        db.comp[k].refValue.copyFrom(ref[k]); db.comp[k].deltaCoeffs.copyFrom(dc);
-        db.comp[k].magSf.copyFrom(ms); db.comp[k].faceCell.copyFrom(fc);
+    DeviceVectorBoundary db;
+    db.n = static_cast<int>(fc.size());
+    db.nx.copyFrom(nrm[0]);
+    db.ny.copyFrom(nrm[1]);
+    db.nz.copyFrom(nrm[2]);
+    for (int k = 0; k < 3; ++k)
+    {
+        db.comp[k].n = db.n;
+        db.comp[k].bcType.copyFrom(ty[k]);
+        db.comp[k].ioMask.copyFrom(io);
+        db.comp[k].oioMask.copyFrom(oio);
+        db.comp[k].mixedMask.copyFrom(mx);
+        db.comp[k].piovMask.copyFrom(pv);
+        db.comp[k].symMask.copyFrom(sm);
+        db.comp[k].valueFraction.copyFrom(vf[k]);
+        db.comp[k].refValue.copyFrom(ref[k]);
+        db.comp[k].deltaCoeffs.copyFrom(dc);
+        db.comp[k].magSf.copyFrom(ms);
+        db.comp[k].faceCell.copyFrom(fc);
     }
     return db;
 }

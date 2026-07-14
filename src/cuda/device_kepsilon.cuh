@@ -27,7 +27,11 @@ struct DeviceCyclic;  // cyclic interface     (scalar-transport coupling, option
 // OF-style turbulence residual reporting. Every turbulence scalar solve (k / epsilon / omega / nuTilda / ReThetat /
 // gammaInt) appends its field name + solve perf here, in solve order, so the SIMPLE driver can print an
 // "smoothSolver:  Solving for <field>, Initial residual = ..." block exactly like OpenFOAM. Cleared once per SIMPLE step.
-struct ScalarSolveEntry { std::string field; DeviceSolverPerf perf; };
+struct ScalarSolveEntry
+{
+    std::string field;
+    DeviceSolverPerf perf;
+};
 void clearTurbulenceReport();
 const std::vector<ScalarSolveEntry>& turbulenceReport();
 
@@ -58,27 +62,56 @@ void deviceNut(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps, D
 void deviceBoundField(const DeviceMesh& dm, DeviceBuffer<scalar>& x, scalar floor);
 
 // Static wall geometry for the wall functions (nearWallDist y, wall-face cell/deltaCoeffs/velocity, 1/nWallFaces).
-struct DeviceWallData {
+struct DeviceWallData
+{
     int nWF = 0;
     DeviceBuffer<label>  wfCell, isWallCell;
     DeviceBuffer<scalar> wfY, wfDc, wfUwx, wfUwy, wfUwz, invNw;
 };
-inline DeviceWallData buildDeviceWallData(const PrimitiveMesh& m, const FvGeometry& g,
-                                          const std::vector<FvPatch>& fvp, const GeometricField<vector>& U) {
+inline DeviceWallData buildDeviceWallData(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    const GeometricField<vector>& U)
+{
     const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
-    std::vector<label> wfCell; std::vector<scalar> wfY, wfDc, wux, wuy, wuz; std::vector<label> nw(m.nCells(), 0);
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi) if (fvp[pi].type == "wall") {
-        const std::vector<vector>& uv = U.boundary[pi]->value();
-        for (label i = 0; i < fvp[pi].size; ++i) { const label c = fvp[pi].faceCells[i];
-            wfCell.push_back(c); wfY.push_back(yW[pi][i]); wfDc.push_back(fvp[pi].deltaCoeffs[i]);
-            wux.push_back(uv[i].x); wuy.push_back(uv[i].y); wuz.push_back(uv[i].z); ++nw[c]; }
-    }
-    std::vector<scalar> invNw(m.nCells(), 0.0); std::vector<label> isW(m.nCells(), 0);
-    for (label c = 0; c < m.nCells(); ++c) if (nw[c] > 0) { invNw[c] = 1.0 / nw[c]; isW[c] = 1; }
-    DeviceWallData w; w.nWF = static_cast<int>(wfCell.size());
-    w.wfCell.copyFrom(wfCell); w.wfY.copyFrom(wfY); w.wfDc.copyFrom(wfDc);
-    w.wfUwx.copyFrom(wux); w.wfUwy.copyFrom(wuy); w.wfUwz.copyFrom(wuz);
-    w.invNw.copyFrom(invNw); w.isWallCell.copyFrom(isW);
+    std::vector<label> wfCell;
+    std::vector<scalar> wfY, wfDc, wux, wuy, wuz;
+    std::vector<label> nw(m.nCells(), 0);
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        if (fvp[pi].type == "wall")
+        {
+            const std::vector<vector>& uv = U.boundary[pi]->value();
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const label c = fvp[pi].faceCells[i];
+                wfCell.push_back(c);
+                wfY.push_back(yW[pi][i]);
+                wfDc.push_back(fvp[pi].deltaCoeffs[i]);
+                wux.push_back(uv[i].x);
+                wuy.push_back(uv[i].y);
+                wuz.push_back(uv[i].z);
+                ++nw[c];
+            }
+        }
+    std::vector<scalar> invNw(m.nCells(), 0.0);
+    std::vector<label> isW(m.nCells(), 0);
+    for (label c = 0; c < m.nCells(); ++c)
+        if (nw[c] > 0)
+        {
+            invNw[c] = 1.0 / nw[c];
+            isW[c] = 1;
+        }
+    DeviceWallData w;
+    w.nWF = static_cast<int>(wfCell.size());
+    w.wfCell.copyFrom(wfCell);
+    w.wfY.copyFrom(wfY);
+    w.wfDc.copyFrom(wfDc);
+    w.wfUwx.copyFrom(wux);
+    w.wfUwy.copyFrom(wuy);
+    w.wfUwz.copyFrom(wuz);
+    w.invNw.copyFrom(invNw);
+    w.isWallCell.copyFrom(isW);
     return w;
 }
 
@@ -119,7 +152,7 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
-// limiter). y = precomputed cell wall distance (cellWallDist). All blocks reuse the C①-⑥ validated kernels +
+// limiter). y = precomputed cell wall distance (cellWallDist). All blocks reuse the C1-6 validated kernels +
 // the shared deviceSolveScalarTransport scaffold. Updates k/omega/nut in place. Mirrors kOmegaSSTBase::correct().
 void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, const DeviceBoundary& dbOmega,
                             const DeviceBoundary& dbK, const DeviceVectorBoundary& dbU,
