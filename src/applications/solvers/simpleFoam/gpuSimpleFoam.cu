@@ -37,7 +37,8 @@
 
 using namespace brae;
 
-static void printUsage() {
+static void printUsage()
+{
     std::printf(
 "brae, a GPU-native, OpenFOAM-compatible CFD solver (steady incompressible, simpleFoam).\n"
 "The whole SIMPLE loop runs on one GPU; reads a standard OpenFOAM case and writes standard time dirs.\n\n"
@@ -56,27 +57,46 @@ static void printUsage() {
 "Docs and benchmarks: https://github.com/simd-ai/brae\n");
 }
 
-int main(int argc, char** argv) {
-    try {
-        for (int i = 1; i < argc; ++i) { const std::string h = argv[i]; if (h == "--help" || h == "-h") { printUsage(); return 0; } }
+int main(int argc, char** argv)
+{
+    try
+    {
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string h = argv[i];
+            if (h == "--help" || h == "-h")
+            {
+                printUsage();
+                return 0;
+            }
+        }
         // -cases c1 c2 ... : run several cases at once, one per GPU (mesh/parameter study). The parent
         // orchestrates (forks one child `brae -case cX` per GPU, no CUDA here); a plain -case is unaffected.
-        for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "-cases") {
-            std::vector<std::string> sweep;
-            for (int j = i + 1; j < argc && argv[j][0] != '-'; ++j) sweep.push_back(argv[j]);
-            if (!sweep.empty()) return braesweep::runSweepCases(sweep);
-        }
+        for (int i = 1; i < argc; ++i)
+            if (std::string(argv[i]) == "-cases")
+            {
+                std::vector<std::string> sweep;
+                for (int j = i + 1; j < argc && argv[j][0] != '-'; ++j)
+                    sweep.push_back(argv[j]);
+                if (!sweep.empty()) return braesweep::runSweepCases(sweep);
+            }
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
-        for (int i = 1; i < argc; ++i) { const std::string a = argv[i];
-            if (a == "-case" && i + 1 < argc) caseDir = argv[++i];
-            else if (a == "-partition") partition = true;
-            else if (a[0] != '-') caseDir = a; }
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string a = argv[i];
+            if (a == "-case" && i + 1 < argc)
+                caseDir = argv[++i];
+            else if (a == "-partition")
+                partition = true;
+            else if (a[0] != '-')
+                caseDir = a;
+        }
         // -partition is cf's analogue of OF decomposePar: do the one-time prep (parse mesh + build AMG hierarchy) and
         // persist it to constant/polyMesh/.brae_mesh|amgcache, so the actual run reloads it warm. Forces the cache write.
         if (partition) setenv("BRAE_MESH_CACHE", "1", 1);
 
-        // ---- controls from the case dictionaries ----
+        // controls from the case dictionaries
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
         const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
         const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
@@ -85,13 +105,16 @@ int main(int argc, char** argv) {
         const std::string startStr = controlDict.wordOr("startTime", "0");
         // OF `restore0Dir` convention (NOT a solver fallback): tutorials needing a mesh-prep step (snappyHexMesh /
         // setFields / changeDictionary, e.g. motorBike) ship the flow fields in <startTime>.orig, because
-        // snappyHexMesh writes mesh-level fields (cellLevel/pointLevel/…) INTO <startTime>. OpenFOAM's Allrun copies
+        // snappyHexMesh writes mesh-level fields (cellLevel/pointLevel/...) INTO <startTime>. OpenFOAM's Allrun copies
         // 0.orig -> 0 before solving; cf does exactly the same SETUP step here (only when <startTime> has no U), so the
         // solver then reads <startTime> identically to OF, behaviour unchanged vs OF, no read-from-.orig special case.
-        {   namespace fs = std::filesystem; std::error_code ec;
+        {
+            namespace fs = std::filesystem;
+            std::error_code ec;
             const std::string d0 = caseDir + "/" + startStr, dOrig = d0 + ".orig";
             const bool haveU = fs::exists(d0 + "/U") || fs::exists(d0 + "/U.gz");
-            if (!haveU && (fs::exists(dOrig + "/U") || fs::exists(dOrig + "/U.gz"))) {
+            if (!haveU && (fs::exists(dOrig + "/U") || fs::exists(dOrig + "/U.gz")))
+            {
                 std::fprintf(stderr, "brae: %s/U not found -> restoring %s/* into %s (OpenFOAM restore0Dir convention)\n",
                              d0.c_str(), dOrig.c_str(), d0.c_str());
                 fs::create_directories(d0, ec);
@@ -110,83 +133,130 @@ int main(int argc, char** argv) {
         ctl.nu = transport.scalarOr("nu", 1e-5);
         // read schemes: div(phi,U) "bounded" -> -Sp(div(phi),.); "linearUpwind" -> deferred gradient correction;
         // laplacian/snGrad "corrected" -> non-orthogonal correction (nonOrthDeltaCoeffs implicit + corrVec.grad explicit).
-        { std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes")); std::string ln;  // $var expanded ($turbulence)
-          auto hasWord = [](const std::string& s, const std::string& w) {     // whole-word match (so "uncorrected" != "corrected")
-              for (std::size_t p = s.find(w); p != std::string::npos; p = s.find(w, p + 1)) {
-                  const bool lb = (p == 0 || !std::isalpha((unsigned char)s[p-1]));
-                  const bool rb = (p + w.size() >= s.size() || !std::isalpha((unsigned char)s[p+w.size()]));
-                  if (lb && rb) return true; }
-              return false; };
-          // "limitedLinear <k_>" on a div line -> twoByk = 2/max(k_,SMALL); returns 0 if the scheme is absent.
-          auto limitedTwoByk = [](const std::string& s) -> scalar {
-              const std::size_t p = s.find("limitedLinear");
-              if (p == std::string::npos) return 0.0;
-              scalar kc = 1.0; std::sscanf(s.c_str() + p + 13, "%lf", &kc);   // coefficient after "limitedLinear"
-              return 2.0 / std::max(kc, (scalar)1e-30); };
-          // the interpolation-scheme word after "Gauss" on a div(phi,*) line (OF: "[bounded] Gauss <scheme> [args]").
-          auto divSchemeWord = [](const std::string& s) -> std::string {
-              const std::size_t g = s.find("Gauss");
-              if (g == std::string::npos) return std::string();
-              const char* p = s.c_str() + g + 5; while (*p && std::isspace((unsigned char)*p)) ++p;
-              std::string w; while (*p && !std::isspace((unsigned char)*p) && *p != ';') { w += *p; ++p; }
-              return w; };
-          // OF-faithful fail-fast (mirrors surfaceInterpolationScheme::New "Unknown discretisation scheme ... Valid
-          // schemes are : (...)" + exit(FatalIOError)): throw on a scheme cf models nothing close to; warn loudly on
-          // one cf only APPROXIMATES (so the route is detected, never silently covered). `ok` = exact; `approx` = warned.
-          auto checkDiv = [&](const std::string& s, const char* field,
-                              std::initializer_list<const char*> ok, std::initializer_list<const char*> approx) {
-              const std::string w = divSchemeWord(s);
-              for (const char* o : ok)     if (w == o) return;
-              for (const char* o : approx) if (w == o) {
-                  std::fprintf(stderr, "brae WARNING: div(phi,%s) 'Gauss %s' has no exact cf kernel -- run as a near-equivalent "
-                               "(NOT OF-bit-identical). Set the scheme to an exact one to avoid this.\n", field, w.c_str());
-                  return; }
-              std::string valid; for (const char* o : ok) (valid += " ") += o; for (const char* o : approx) (valid += " ") += o;
-              throw std::runtime_error(std::string("brae: unknown/unsupported div(phi,") + field +
-                  ") scheme 'Gauss " + w + "'; cf supports : (" + valid + " )"); };
-          while (std::getline(fsch, ln)) {
-              if (ln.find("div(phi,U)") != std::string::npos) {
-                  checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST"}, {"limitedLinear", "limitedLinearV"});
-                  if (ln.find("bounded") != std::string::npos)      ctl.bounded = true;
-                  if (ln.find("linearUpwind") != std::string::npos) ctl.linearUpwind = true;   // linearUpwindV contains this -> upwind matrix + gradients
-                  if (ln.find("linearUpwindV") != std::string::npos) ctl.linearUpwindV = true; // + OF vector direction limiter
-                  if (ln.find("LUST") != std::string::npos)         ctl.lust = true; }   // 0.75 linear + 0.25 linearUpwind
-              // grad(U) cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>): k is the first number after
-              // "cellLimited" (the basicScheme between has no digits). 0 = unlimited. cellMDLimited not yet handled.
-              if (ln.find("grad(U)") != std::string::npos && hasWord(ln, "cellLimited")) {
-                  ctl.gradULimitK = 1.0;
-                  const char* s = ln.c_str() + ln.find("cellLimited") + 11;
-                  while (*s && !(std::isdigit((unsigned char)*s) || *s == '.')) ++s;
-                  scalar kc; if (std::sscanf(s, "%lf", &kc) == 1) ctl.gradULimitK = kc; }
-              if (std::getenv("BRAE_SCHEME_DEBUG") && ln.find("div(phi,") != std::string::npos) std::fprintf(stderr, "[scheme] %s\n", ln.c_str());
-              if (ln.find("div(phi,k)") != std::string::npos) {
-                  checkDiv(ln, "k", {"upwind", "linearUpwind", "limitedLinear"}, {});
-                  const scalar t = limitedTwoByk(ln); if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
-                  if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true; }
-              if (ln.find("div(phi,epsilon)") != std::string::npos || ln.find("div(phi,omega)") != std::string::npos) {
-                  checkDiv(ln, "epsilon|omega", {"upwind", "linearUpwind", "limitedLinear"}, {});
-                  const scalar t = limitedTwoByk(ln); if (t > 0.0) { ctl.limitedEps = true; ctl.twoBykEps = t; }   // 2nd turb scalar (eps|omega)
-                  if (ln.find("linearUpwind") != std::string::npos) ctl.luEps = true; }
-              if (ln.find("div(phi,nuTilda)") != std::string::npos) {   // SA: nuTilda uses the k-slot scheme flags
-                  checkDiv(ln, "nuTilda", {"upwind", "linearUpwind", "limitedLinear"}, {});
-                  const scalar t = limitedTwoByk(ln); if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
-                  if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true; }
-              if (ln.find("Gauss") != std::string::npos || ln.find("snGrad") != std::string::npos ||
-                  ln.find("laplacian") != std::string::npos || ln.find("default") != std::string::npos) {
-                  if (hasWord(ln, "corrected")) ctl.nonOrth = true;     // unlimited non-orth correction (psi = 1)
-                  // OF fv::limitedSnGrad "limited [<correctedScheme>] <psi>" (psi in [0,1]): non-orth correction
-                  // capped per-face. hasWord avoids matching "unlimited" and "limitedLinear" (a div scheme); the coeff
-                  // is the next numeric token after "limited" (skip an optional scheme word like "corrected").
-                  if (hasWord(ln, "limited")) {
-                      ctl.nonOrth = true; scalar psi = 1.0;
-                      const char* s = ln.c_str() + ln.find("limited") + 7;
-                      while (*s && !(std::isdigit((unsigned char)*s) || *s == '.')) ++s;   // skip to the coefficient
-                      if (std::sscanf(s, "%lf", &psi) == 1) ctl.nonOrthLimit = psi; } } } }
+        {
+            std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));   // $var expanded ($turbulence)
+            std::string ln;
+            auto hasWord = [](const std::string& s, const std::string& w)   // whole-word match (so "uncorrected" != "corrected")
+            {
+                for (std::size_t p = s.find(w); p != std::string::npos; p = s.find(w, p + 1))
+                {
+                    const bool lb = (p == 0 || !std::isalpha((unsigned char)s[p-1]));
+                    const bool rb = (p + w.size() >= s.size() || !std::isalpha((unsigned char)s[p+w.size()]));
+                    if (lb && rb) return true;
+                }
+                return false;
+            };
+            // "limitedLinear <k_>" on a div line -> twoByk = 2/max(k_,SMALL); returns 0 if the scheme is absent.
+            auto limitedTwoByk = [](const std::string& s) -> scalar
+            {
+                const std::size_t p = s.find("limitedLinear");
+                if (p == std::string::npos) return 0.0;
+                scalar kc = 1.0;
+                std::sscanf(s.c_str() + p + 13, "%lf", &kc);   // coefficient after "limitedLinear"
+                return 2.0 / std::max(kc, (scalar)1e-30);
+            };
+            // the interpolation-scheme word after "Gauss" on a div(phi,*) line (OF: "[bounded] Gauss <scheme> [args]").
+            auto divSchemeWord = [](const std::string& s) -> std::string
+            {
+                const std::size_t g = s.find("Gauss");
+                if (g == std::string::npos) return std::string();
+                const char* p = s.c_str() + g + 5;
+                while (*p && std::isspace((unsigned char)*p)) ++p;
+                std::string w;
+                while (*p && !std::isspace((unsigned char)*p) && *p != ';') { w += *p; ++p; }
+                return w;
+            };
+            // OF-faithful fail-fast (mirrors surfaceInterpolationScheme::New "Unknown discretisation scheme ... Valid
+            // schemes are : (...)" + exit(FatalIOError)): throw on a scheme cf models nothing close to; warn loudly on
+            // one cf only APPROXIMATES (so the route is detected, never silently covered). `ok` = exact; `approx` = warned.
+            auto checkDiv = [&](
+                const std::string& s,
+                const char* field,
+                std::initializer_list<const char*> ok,
+                std::initializer_list<const char*> approx)
+            {
+                const std::string w = divSchemeWord(s);
+                for (const char* o : ok)
+                    if (w == o) return;
+                for (const char* o : approx)
+                    if (w == o)
+                    {
+                        std::fprintf(stderr, "brae WARNING: div(phi,%s) 'Gauss %s' has no exact cf kernel -- run as a near-equivalent "
+                                     "(NOT OF-bit-identical). Set the scheme to an exact one to avoid this.\n", field, w.c_str());
+                        return;
+                    }
+                std::string valid;
+                for (const char* o : ok)     (valid += " ") += o;
+                for (const char* o : approx) (valid += " ") += o;
+                throw std::runtime_error(std::string("brae: unknown/unsupported div(phi,") + field +
+                    ") scheme 'Gauss " + w + "'; cf supports : (" + valid + " )");
+            };
+            while (std::getline(fsch, ln))
+            {
+                if (ln.find("div(phi,U)") != std::string::npos)
+                {
+                    checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST"}, {"limitedLinear", "limitedLinearV"});
+                    if (ln.find("bounded") != std::string::npos)      ctl.bounded = true;
+                    if (ln.find("linearUpwind") != std::string::npos) ctl.linearUpwind = true;   // linearUpwindV contains this -> upwind matrix + gradients
+                    if (ln.find("linearUpwindV") != std::string::npos) ctl.linearUpwindV = true; // + OF vector direction limiter
+                    if (ln.find("LUST") != std::string::npos)         ctl.lust = true;   // 0.75 linear + 0.25 linearUpwind
+                }
+                // grad(U) cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>): k is the first number after
+                // "cellLimited" (the basicScheme between has no digits). 0 = unlimited. cellMDLimited not yet handled.
+                if (ln.find("grad(U)") != std::string::npos && hasWord(ln, "cellLimited"))
+                {
+                    ctl.gradULimitK = 1.0;
+                    const char* s = ln.c_str() + ln.find("cellLimited") + 11;
+                    while (*s && !(std::isdigit((unsigned char)*s) || *s == '.')) ++s;
+                    scalar kc;
+                    if (std::sscanf(s, "%lf", &kc) == 1) ctl.gradULimitK = kc;
+                }
+                if (std::getenv("BRAE_SCHEME_DEBUG") && ln.find("div(phi,") != std::string::npos) std::fprintf(stderr, "[scheme] %s\n", ln.c_str());
+                if (ln.find("div(phi,k)") != std::string::npos)
+                {
+                    checkDiv(ln, "k", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    const scalar t = limitedTwoByk(ln);
+                    if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
+                    if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
+                }
+                if (ln.find("div(phi,epsilon)") != std::string::npos || ln.find("div(phi,omega)") != std::string::npos)
+                {
+                    checkDiv(ln, "epsilon|omega", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    const scalar t = limitedTwoByk(ln);
+                    if (t > 0.0) { ctl.limitedEps = true; ctl.twoBykEps = t; }   // 2nd turb scalar (eps|omega)
+                    if (ln.find("linearUpwind") != std::string::npos) ctl.luEps = true;
+                }
+                if (ln.find("div(phi,nuTilda)") != std::string::npos)   // SA: nuTilda uses the k-slot scheme flags
+                {
+                    checkDiv(ln, "nuTilda", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    const scalar t = limitedTwoByk(ln);
+                    if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
+                    if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
+                }
+                if (ln.find("Gauss") != std::string::npos || ln.find("snGrad") != std::string::npos ||
+                    ln.find("laplacian") != std::string::npos || ln.find("default") != std::string::npos)
+                {
+                    if (hasWord(ln, "corrected")) ctl.nonOrth = true;     // unlimited non-orth correction (psi = 1)
+                    // OF fv::limitedSnGrad "limited [<correctedScheme>] <psi>" (psi in [0,1]): non-orth correction
+                    // capped per-face. hasWord avoids matching "unlimited" and "limitedLinear" (a div scheme); the coeff
+                    // is the next numeric token after "limited" (skip an optional scheme word like "corrected").
+                    if (hasWord(ln, "limited"))
+                    {
+                        ctl.nonOrth = true;
+                        scalar psi = 1.0;
+                        const char* s = ln.c_str() + ln.find("limited") + 7;
+                        while (*s && !(std::isdigit((unsigned char)*s) || *s == '.')) ++s;   // skip to the coefficient
+                        if (std::sscanf(s, "%lf", &psi) == 1) ctl.nonOrthLimit = psi;
+                    }
+                }
+            }
+        }
         const std::string simType = turbProps.wordOr("simulationType", "laminar");
         ctl.turbulent = (simType == "RAS");
         if (simType != "RAS" && simType != "laminar")
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' (RAS or laminar)");
-        if (ctl.turbulent) {
+        if (ctl.turbulent)
+        {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
             ctl.lm  = (model == "kOmegaSSTLM");                 // Langtry-Menter transition = kOmegaSST + gamma-ReThetat
@@ -195,48 +265,70 @@ int main(int argc, char** argv) {
             const bool rke = (model == "realizableKE");
             if (model != "kEpsilon" && !rke && !ctl.sst && !ctl.sa)
                 throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
-            if (ctl.sa) {
+            if (ctl.sa)
+            {
                 // Spalart-Allmaras: OF defaults (coeffs read from RAS.SpalartAllmarasCoeffs would override; not needed here).
                 const SpalartAllmarasCoeffs& c = ctl.saCoeffs;
                 std::printf("  SpalartAllmaras (OF defaults): sigmaNut=%.4g kappa=%.4g Cb1=%.4g Cb2=%.4g Cw1=%.4g Cw2=%.3g Cw3=%.3g Cv1=%.3g Cs=%.3g\n",
                             c.sigmaNut, c.kappa, c.Cb1, c.Cb2, c.Cw1(), c.Cw2, c.Cw3, c.Cv1, c.Cs);
-            } else if (ctl.sst) {
+            }
+            else if (ctl.sst)
+            {
                 // kOmegaSST coefficients: OF turbulenceProperties RAS.kOmegaSSTCoeffs (absent keys keep OF defaults).
                 readKOmegaSSTCoeffs(ras, ctl.ksstCoeffs);
                 const KOmegaSSTCoeffs& c = ctl.ksstCoeffs;
                 std::printf("  kOmegaSSTCoeffs: a1=%.4g betaStar=%.4g alphaK1=%.4g alphaOmega1=%.4g gamma1=%.4g beta1=%.4g\n",
                             c.a1, c.betaStar, c.alphaK1, c.alphaOmega1, c.gamma1, c.beta1);
-            } else {
+            }
+            else
+            {
                 // k-eps coefficients: RAS.kEpsilonCoeffs (kappa/E wall-function coeffs accepted if present).
                 KEpsilonCoeffs& c = ctl.keCoeffs;
-                if (rke) {   // realizableKE: variable Cmu + strain production; OF defaults A0=4, C2=1.9, sigmak=1, sigmaEps=1.2
-                    c.realizable = true; c.A0 = 4.0; c.C2 = 1.9; c.sigmaK = 1.0; c.sigmaEps = 1.2;
-                    if (const FoamDict* rkc = ras ? ras->subDict("realizableKECoeffs") : nullptr) {
-                        c.A0 = rkc->scalarOr("A0", c.A0); c.C2 = rkc->scalarOr("C2", c.C2);
-                        c.sigmaK = rkc->scalarOr("sigmak", c.sigmaK); c.sigmaEps = rkc->scalarOr("sigmaEps", c.sigmaEps);
-                        c.kappa = rkc->scalarOr("kappa", c.kappa); c.E = rkc->scalarOr("E", c.E);
+                if (rke)   // realizableKE: variable Cmu + strain production; OF defaults A0=4, C2=1.9, sigmak=1, sigmaEps=1.2
+                {
+                    c.realizable = true;
+                    c.A0 = 4.0;
+                    c.C2 = 1.9;
+                    c.sigmaK = 1.0;
+                    c.sigmaEps = 1.2;
+                    if (const FoamDict* rkc = ras ? ras->subDict("realizableKECoeffs") : nullptr)
+                    {
+                        c.A0 = rkc->scalarOr("A0", c.A0);
+                        c.C2 = rkc->scalarOr("C2", c.C2);
+                        c.sigmaK = rkc->scalarOr("sigmak", c.sigmaK);
+                        c.sigmaEps = rkc->scalarOr("sigmaEps", c.sigmaEps);
+                        c.kappa = rkc->scalarOr("kappa", c.kappa);
+                        c.E = rkc->scalarOr("E", c.E);
                     }
                     std::printf("  realizableKECoeffs: A0=%.4g C2=%.4g sigmak=%.4g sigmaEps=%.4g kappa=%.4g E=%.4g (variable Cmu)\n",
                                 c.A0, c.C2, c.sigmaK, c.sigmaEps, c.kappa, c.E);
-                } else {
-                const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr;
-                if (kec) {
-                    c.Cmu = kec->scalarOr("Cmu", c.Cmu); c.C1 = kec->scalarOr("C1", c.C1); c.C2 = kec->scalarOr("C2", c.C2);
-                    c.C3 = kec->scalarOr("C3", c.C3); c.sigmaK = kec->scalarOr("sigmak", c.sigmaK);
-                    c.sigmaEps = kec->scalarOr("sigmaEps", c.sigmaEps); c.kappa = kec->scalarOr("kappa", c.kappa);
-                    c.E = kec->scalarOr("E", c.E);
                 }
-                std::printf("  kEpsilonCoeffs%s: Cmu=%.4g C1=%.4g C2=%.4g C3=%.4g sigmak=%.4g sigmaEps=%.4g kappa=%.4g E=%.4g\n",
-                            kec ? " (from dict)" : " (OF defaults)", c.Cmu, c.C1, c.C2, c.C3, c.sigmaK, c.sigmaEps, c.kappa, c.E);
+                else
+                {
+                    const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr;
+                    if (kec)
+                    {
+                        c.Cmu = kec->scalarOr("Cmu", c.Cmu);
+                        c.C1 = kec->scalarOr("C1", c.C1);
+                        c.C2 = kec->scalarOr("C2", c.C2);
+                        c.C3 = kec->scalarOr("C3", c.C3);
+                        c.sigmaK = kec->scalarOr("sigmak", c.sigmaK);
+                        c.sigmaEps = kec->scalarOr("sigmaEps", c.sigmaEps);
+                        c.kappa = kec->scalarOr("kappa", c.kappa);
+                        c.E = kec->scalarOr("E", c.E);
+                    }
+                    std::printf("  kEpsilonCoeffs%s: Cmu=%.4g C1=%.4g C2=%.4g C3=%.4g sigmak=%.4g sigmaEps=%.4g kappa=%.4g E=%.4g\n",
+                                kec ? " (from dict)" : " (OF defaults)", c.Cmu, c.C1, c.C2, c.C3, c.sigmaK, c.sigmaEps, c.kappa, c.E);
                 }
             }
         }
 
         // Scalar linearUpwind (deferred correction) is implemented in the scalar scaffold but currently DEGRADES
         // turbulence accuracy (explicit lagged correction + loose under-relaxed turb solve + steep near-wall
-        // gradients): airFoil2D SA overshoots ν̃ (Cd worse), pitzDaily SST k/p worse than the upwind baseline.
+        // gradients): airFoil2D SA overshoots nuTilda (Cd worse), pitzDaily SST k/p worse than the upwind baseline.
         // Default OFF -> scalars use upwind (the validated behavior). BRAE_SCALAR_LINEARUPWIND=1 honours the scheme (A/B).
-        if (!std::getenv("BRAE_SCALAR_LINEARUPWIND")) {
+        if (!std::getenv("BRAE_SCALAR_LINEARUPWIND"))
+        {
             // Detect-the-route: if fvSchemes ASKED for linearUpwind on a turbulence scalar, say loudly that cf is
             // running upwind instead (do not silently honour-then-ignore). The gating is deliberate (accuracy), but
             // the user must see that the requested scheme is not the one being applied.
@@ -244,7 +336,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "brae WARNING: div(phi,<turbulence scalar>) requested 'linearUpwind' but cf is running "
                              "UPWIND (default: the scalar linearUpwind deferred correction degrades turbulence accuracy vs "
                              "OF). Set BRAE_SCALAR_LINEARUPWIND=1 to honour the requested scheme.\n");
-            ctl.luK = false; ctl.luEps = false;
+            ctl.luK = false;
+            ctl.luEps = false;
         }
 
         const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
@@ -256,14 +349,22 @@ int main(int argc, char** argv) {
         ctl.relaxP   = fld ? fld->scalarOr("p", 1.0) : 1.0;
 
         const FoamDict* solvers = fvSolution.subDict("solvers");
-        auto solverTol = [&](const std::string& f, scalar def) {
-            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr; return s ? s->scalarOr("tolerance", def) : def; };
-        auto solverRelTol = [&](const std::string& f) {           // SIMPLE only needs a loose per-step solve
-            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr; return s ? s->scalarOr("relTol", 0.0) : 0.0; };
-        ctl.tolP = solverTol("p", 1e-6); ctl.tolU = solverTol("U", 1e-8);
+        auto solverTol = [&](const std::string& f, scalar def)
+        {
+            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+            return s ? s->scalarOr("tolerance", def) : def;
+        };
+        auto solverRelTol = [&](const std::string& f)   // SIMPLE only needs a loose per-step solve
+        {
+            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+            return s ? s->scalarOr("relTol", 0.0) : 0.0;
+        };
+        ctl.tolP = solverTol("p", 1e-6);
+        ctl.tolU = solverTol("U", 1e-8);
         const std::string second = ctl.sst ? "omega" : "epsilon";
         ctl.tolKE = ctl.sa ? solverTol("nuTilda", 1e-8) : std::fmin(solverTol("k", 1e-8), solverTol(second, 1e-8));
-        ctl.relTolP = solverRelTol("p"); ctl.relTolU = solverRelTol("U");
+        ctl.relTolP = solverRelTol("p");
+        ctl.relTolU = solverRelTol("U");
         ctl.relTolKE = ctl.sa ? solverRelTol("nuTilda")                     // SA: single nuTilda solve
                               : std::fmin(solverRelTol("k"), solverRelTol(second));   // OF solves k/(eps|omega) loosely per SIMPLE step
         // Per-field scalar linear solver from fvSolution, EXACTLY as OF selects it: solver smoothSolver +
@@ -271,11 +372,13 @@ int main(int argc, char** argv) {
         // OF smoothSolver with a GaussSeidel-family smoother (GaussSeidel = forward sweep, symGaussSeidel = fwd+bwd);
         // cf maps BOTH to its symmetric multicolor deviceSymGaussSeidel (a superset of forward GaussSeidel). Other
         // solvers (PBiCG[Stab]/GAMG/...) keep BiCGStab. motorBike uses "GaussSeidel" for U/k/omega; pitzDaily "symGaussSeidel".
-        auto useSymGS = [&](const std::string& f) {
+        auto useSymGS = [&](const std::string& f)
+        {
             const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
             if (!s || s->wordOr("solver", "") != "smoothSolver") return false;
             const std::string sm = s->wordOr("smoother", "");
-            return sm == "symGaussSeidel" || sm == "GaussSeidel"; };
+            return sm == "symGaussSeidel" || sm == "GaussSeidel";
+        };
         ctl.gsK   = useSymGS(ctl.sa ? "nuTilda" : "k");
         ctl.gsEps = ctl.sa ? false : useSymGS(second);
         // Momentum solver READ FROM fvSolution exactly like OF (fvVectorMatrix::solveSegregated solves each U component
@@ -289,9 +392,17 @@ int main(int argc, char** argv) {
         // BiCGStab batched convergence DEFAULT OFF: measured net-NEGATIVE once relTol makes the solves few-iter
         // (overshoot to the K-boundary costs more than the saved syncs). Kept behind the env for tight-tol cases
         // (many inner iters), where it would help like the pressure pcgCheckEvery does.
-        if (const char* be = std::getenv("BRAE_BICG_CHECK_EVERY")) { const int k = std::atoi(be); if (k >= 1) ctl.bicgCheckEvery = k; }
+        if (const char* be = std::getenv("BRAE_BICG_CHECK_EVERY"))
+        {
+            const int k = std::atoi(be);
+            if (k >= 1) ctl.bicgCheckEvery = k;
+        }
         ctl.pcgCheckEvery = 4;   // application default: batched PCG residual read (1.30x; OF-validated identical to K=1).
-        if (const char* ce = std::getenv("BRAE_PCG_CHECK_EVERY")) { const int k = std::atoi(ce); if (k >= 1) ctl.pcgCheckEvery = k; }   // override (1 = exact)
+        if (const char* ce = std::getenv("BRAE_PCG_CHECK_EVERY"))
+        {
+            const int k = std::atoi(ce);
+            if (k >= 1) ctl.pcgCheckEvery = k;   // override (1 = exact)
+        }
         if (const char* cs = std::getenv("BRAE_CORR_SCALING")) ctl.corrScaling = (std::atoi(cs) != 0);   // AMG corr-scaling + flexible CG
         if (const char* ug = std::getenv("BRAE_USE_GRAPH")) ctl.useGraph = (std::atoi(ug) != 0);          // V-cycle graph replay toggle (debug)
 
@@ -299,11 +410,15 @@ int main(int argc, char** argv) {
         const FoamDict* resCtl = simple ? simple->subDict("residualControl") : nullptr;
         const bool hasRC = (resCtl != nullptr);
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1, rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
-        { const std::string cons = simple ? simple->wordOr("consistent", "no") : "no";
-          ctl.consistent = (cons == "yes" || cons == "true" || cons == "on" || cons == "1"); }   // SIMPLEC
+        {
+            const std::string cons = simple ? simple->wordOr("consistent", "no") : "no";
+            ctl.consistent = (cons == "yes" || cons == "true" || cons == "on" || cons == "1");   // SIMPLEC
+        }
         ctl.nNonOrth = simple ? simple->intOr("nNonOrthogonalCorrectors", 0) : 0;   // extra pressure passes on non-orthogonal meshes
-        { const std::vector<scalar> bf = simple ? simple->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
-          if (bf.size() >= 3) ctl.bodyForce = vector{bf[0], bf[1], bf[2]}; }   // constant momentum source (drives cyclic/periodic channels)
+        {
+            const std::vector<scalar> bf = simple ? simple->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
+            if (bf.size() >= 3) ctl.bodyForce = vector{bf[0], bf[1], bf[2]};   // constant momentum source (drives cyclic/periodic channels)
+        }
 
         std::printf("brae (device-resident) | case=%s | %s%s | nu=%.3g\n", caseDir.c_str(),
                     simType.c_str(), ctl.turbulent ? (ctl.sst ? " (kOmegaSST)" : " (kEpsilon)") : "", ctl.nu);
@@ -314,24 +429,43 @@ int main(int argc, char** argv) {
         std::printf("  grad(U) cellLimited k=%.3g (0=unlimited)\n", ctl.gradULimitK);
         std::printf("  linear solver (GaussSeidel from fvSolution; else BiCGStab): U=%d k|nuTilda=%d eps|omega=%d\n", ctl.gsU, ctl.gsK, ctl.gsEps);
 
-        // ---- mesh + start fields (single GPU: read directly, no decomposition) ----
+        // mesh + start fields (single GPU: read directly, no decomposition)
         const bool timeStartup = std::getenv("BRAE_TIME_STARTUP") != nullptr;
         auto _tsClk = std::chrono::high_resolution_clock::now();
-        auto _tsLap = [&](const char* what){ if (timeStartup) { auto n = std::chrono::high_resolution_clock::now();
-            std::fprintf(stderr, "[startup] %-22s %6.2f s\n", what, std::chrono::duration<double>(n-_tsClk).count()); _tsClk = n; } };
-        PrimitiveMesh m; m.read(caseDir + "/constant/polyMesh");                    _tsLap("mesh read");
-        FvGeometry g; g.build(m);                                                   _tsLap("geometry build");
+        auto _tsLap = [&](const char* what)
+        {
+            if (timeStartup)
+            {
+                auto n = std::chrono::high_resolution_clock::now();
+                std::fprintf(stderr, "[startup] %-22s %6.2f s\n", what, std::chrono::duration<double>(n-_tsClk).count());
+                _tsClk = n;
+            }
+        };
+        PrimitiveMesh m;
+        m.read(caseDir + "/constant/polyMesh");
+        _tsLap("mesh read");
+        FvGeometry g;
+        g.build(m);
+        _tsLap("geometry build");
         const std::vector<FvPatch> fvp = buildPatches(m, g);
         const label nC = m.nCells();
 
-        GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
-        GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC); p.evaluateBoundary();
+        GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC);
+        U.evaluateBoundary();
+        GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC);
+        p.evaluateBoundary();
         // pressure needs a reference iff NO p patch fixes the value (singular all-Neumann system, e.g. closed
         // lid-driven cavity / fixedFluxPressure-walled domains). Then adjustPhi + pEqn.setReference (OF needReference).
         ctl.needRef = true;
         // a fixedValue-p OR a freestreamPressure (outletInlet, cat 4: fixedValue at outflow) references the pressure.
-        for (const auto& bf : p.boundary) if (bf->fixesValue() || bf->bcCategory() == 4) { ctl.needRef = false; break; }
-        if (ctl.needRef) {
+        for (const auto& bf : p.boundary)
+            if (bf->fixesValue() || bf->bcCategory() == 4)
+            {
+                ctl.needRef = false;
+                break;
+            }
+        if (ctl.needRef)
+        {
             ctl.pRefCell  = simple ? (label)simple->intOr("pRefCell", 0) : 0;
             ctl.pRefValue = simple ? simple->scalarOr("pRefValue", 0.0) : 0.0;
             std::printf("  pressure needs reference (no fixedValue-p): pRefCell=%d pRefValue=%.4g\n",
@@ -341,18 +475,29 @@ int main(int argc, char** argv) {
 
         const std::string secondName = ctl.sst ? "omega" : "epsilon";   // the 2nd turbulence scalar
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
-        if (ctl.sa) {   // Spalart-Allmaras (one-equation): nuTilda -> the "k" slot, nut. BCs (freestream + fixedValue-0 wall) need no inlet calc.
-            k   = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC); k.evaluateBoundary();
-            nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, nC);     nut.evaluateBoundary();
-        } else if (ctl.turbulent) {
+        if (ctl.sa)   // Spalart-Allmaras (one-equation): nuTilda -> the "k" slot, nut. BCs (freestream + fixedValue-0 wall) need no inlet calc.
+        {
+            k   = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC);
+            k.evaluateBoundary();
+            nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, nC);
+            nut.evaluateBoundary();
+        }
+        else if (ctl.turbulent)
+        {
             const FieldData<scalar> kFD = readField<scalar>(fieldDir + "/k");
             const FieldData<scalar> sFD = readField<scalar>(fieldDir + "/" + secondName);
-            k   = buildField<scalar>(kFD, fvp, nC);                                                k.evaluateBoundary();
-            eps = buildField<scalar>(sFD, fvp, nC);                                                eps.evaluateBoundary();
-            nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, nC); nut.evaluateBoundary();
-            if (ctl.lm) {   // kOmegaSSTLM transition fields
-                ReThetat = buildField<scalar>(readField<scalar>(fieldDir + "/ReThetat"), fvp, nC); ReThetat.evaluateBoundary();
-                gammaInt = buildField<scalar>(readField<scalar>(fieldDir + "/gammaInt"), fvp, nC); gammaInt.evaluateBoundary();
+            k   = buildField<scalar>(kFD, fvp, nC);
+            k.evaluateBoundary();
+            eps = buildField<scalar>(sFD, fvp, nC);
+            eps.evaluateBoundary();
+            nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, nC);
+            nut.evaluateBoundary();
+            if (ctl.lm)   // kOmegaSSTLM transition fields
+            {
+                ReThetat = buildField<scalar>(readField<scalar>(fieldDir + "/ReThetat"), fvp, nC);
+                ReThetat.evaluateBoundary();
+                gammaInt = buildField<scalar>(readField<scalar>(fieldDir + "/gammaInt"), fvp, nC);
+                gammaInt.evaluateBoundary();
                 std::printf("  kOmegaSSTLM (Langtry-Menter transition): + ReThetat + gammaInt transport\n");
             }
             // turbulent-inlet BCs: inflow value computed from U (k) then from k (epsilon/omega).
@@ -361,14 +506,20 @@ int main(int argc, char** argv) {
             applyTurbulentInletSecond(eps, sFD, k, wCmu, fvp);
         }
 
-        // ---- MRF rotating zone (constant/MRFProperties + polyMesh/cellZones), if present ----
+        // MRF rotating zone (constant/MRFProperties + polyMesh/cellZones), if present
         const MRFConfig mrfCfg = readMRFProperties(caseDir + "/constant");
         MRFZone mrfZone;
-        if (mrfCfg.active) {
+        if (mrfCfg.active)
+        {
             const auto zones = readCellZones(caseDir + "/constant/polyMesh");
             const auto it = zones.find(mrfCfg.cellZone);
             std::vector<label> zoneCells = (it != zones.end()) ? it->second : std::vector<label>{};
-            if (zoneCells.empty()) { zoneCells.resize(nC); for (label c = 0; c < nC; ++c) zoneCells[c] = c; }   // whole-mesh fallback
+            if (zoneCells.empty())   // whole-mesh fallback
+            {
+                zoneCells.resize(nC);
+                for (label c = 0; c < nC; ++c)
+                    zoneCells[c] = c;
+            }
             mrfZone = buildMRFZone(m, zoneCells, mrfCfg.axis, mrfCfg.omega, mrfCfg.origin);
             mrfCorrectBoundaryVelocity(U, mrfZone, g, fvp, mrfCfg.nonRotatingPatches);   // in-zone walls -> Omega x r
             phi = fvc::flux(U, m, g, fvp);                                               // re-flux (absolute; setMRF makes it relative)
@@ -377,27 +528,31 @@ int main(int argc, char** argv) {
                         mrfCfg.origin.x, mrfCfg.origin.y, mrfCfg.origin.z, mrfCfg.nonRotatingPatches.size(), zoneCells.size());
         }
 
-        // ---- device-resident SIMPLE loop ----
+        // device-resident SIMPLE loop
         _tsLap("fields + patches");
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                                   ctl.turbulent ? &k : nullptr, (ctl.turbulent && !ctl.sa) ? &eps : nullptr, ctl.turbulent ? &nut : nullptr,
                                   ctl.lm ? &ReThetat : nullptr, ctl.lm ? &gammaInt : nullptr);
         _tsLap("solver ctor (incl AMG)");
-        if (partition) {   // caches written by the mesh read + the AMG build above; done, like decomposePar finishing.
+        if (partition)   // caches written by the mesh read + the AMG build above; done, like decomposePar finishing.
+        {
             std::printf("brae -partition: mesh + AMG hierarchy cached to %s/constant/polyMesh/ (.brae_meshcache + .brae_amgcache).\n"
                         "  Run the solve normally; it will reload them warm.\n", caseDir.c_str());
             return 0;
         }
         if (mrfCfg.active) solver.setMRF(mrfZone, m, g, mrfCfg.nonRotatingPatches);
 
-        // ---- fvOptions (system/fvOptions or constant/fvOptions), if present (else an empty no-op list) ----
-        // Read cellZones only when an fvOptions file exists (avoids touching cellZones on cases that have none ,
+        // fvOptions (system/fvOptions or constant/fvOptions), if present (else an empty no-op list)
+        // Read cellZones only when an fvOptions file exists (avoids touching cellZones on cases that have none,
         // and a binary cellZones, which readCellZones does not parse).
         std::map<std::string, std::vector<label>> fvoZones;
-        { std::ifstream a(caseDir + "/system/fvOptions"), b(caseDir + "/constant/fvOptions");
-          if (a.good() || b.good()) fvoZones = readCellZones(caseDir + "/constant/polyMesh"); }
+        {
+            std::ifstream a(caseDir + "/system/fvOptions"), b(caseDir + "/constant/fvOptions");
+            if (a.good() || b.good()) fvoZones = readCellZones(caseDir + "/constant/polyMesh");
+        }
         const FvOptionsData fvo = readFvOptions(caseDir, fvoZones, g.V(), nC, g.C());
-        if (!fvo.empty()) {
+        if (!fvo.empty())
+        {
             solver.setFvOptions(fvo);
             if (fvo.rotor.active)   // build the BEM rotor geometry from the mesh (cell centres + face areas) and hand it over
                 solver.setRotorDisk(buildDeviceRotorDisk(fvo.rotor, g.C(), g.Sf(), m.owner(), m.neighbour(), m.nInternalFaces()));
@@ -406,71 +561,98 @@ int main(int argc, char** argv) {
                         fvo.limUActive ? " limitVelocity" : "", fvo.adActive ? " actuationDiskSource" : "",
                         fvo.rotor.active ? " rotorDiskSource" : "", fvo.vdcActive ? " velocityDampingConstraint" : "",
                         (!fvo.scaSu.empty() || !fvo.scaSp.empty()) ? " scalar(WARN: turbulence-field sources read but not yet applied per-model)" : "");
-        } else {
+        }
+        else
+        {
             std::printf("  No finite volume options present\n");   // OF createFvOptions.H message
         }
         auto ok = [](scalar res, scalar ctlv) { return ctlv < 0 || res < ctlv; };
-        // ---- OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time) ----
+        // OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time)
         const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
         const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);   // OF default GREAT -> only the final state
         const int    purgeWrite    = std::max(0, controlDict.intOr("purgeWrite", 0));
         const scalar deltaT        = controlDict.scalarOr("deltaT", 1.0);
         const scalar startTimeVal  = controlDict.scalarOr("startTime", 0.0);
         long writeTimeIndex = 0;
-        auto timeName = [](scalar t) -> std::string {                               // integer name for whole times (deltaT=1), else %g
+        auto timeName = [](scalar t) -> std::string   // integer name for whole times (deltaT=1), else %g
+        {
             if (t == std::floor(t) && std::fabs((double)t) < 1e15) return std::to_string((long long)std::llround((double)t));
-            char b[64]; std::snprintf(b, sizeof b, "%g", (double)t); return std::string(b); };
-        auto isWriteTime = [&](int it, scalar tval) -> bool {                       // Foam::Time::operator++ write switch
+            char b[64];
+            std::snprintf(b, sizeof b, "%g", (double)t);
+            return std::string(b);
+        };
+        auto isWriteTime = [&](int it, scalar tval) -> bool   // Foam::Time::operator++ write switch
+        {
             if (writeControl == "timeStep")
                 return writeInterval >= 1 && (it % (long)writeInterval) == 0;       // Time.C: !(timeIndex % writeInterval)
-            if (writeControl == "runTime" || writeControl == "adjustable" || writeControl == "adjustableRunTime") {
+            if (writeControl == "runTime" || writeControl == "adjustable" || writeControl == "adjustableRunTime")
+            {
                 const long wi = (long)(((tval - startTimeVal) + 0.5 * deltaT) / writeInterval);
-                if (wi > writeTimeIndex) { writeTimeIndex = wi; return true; }
-                return false; }
+                if (wi > writeTimeIndex)
+                {
+                    writeTimeIndex = wi;
+                    return true;
+                }
+                return false;
+            }
             return false;   // none / clockTime / cpuTime: only the final state (written after the loop)
         };
         std::deque<std::string> writtenTimes;                                       // purgeWrite FIFO (keep the last N)
         const std::string wsrc = fieldDir + "/";
-        auto writeTimeDir = [&](const std::string& tname) {                         // reconstruct + write one time directory
+        auto writeTimeDir = [&](const std::string& tname)   // reconstruct + write one time directory
+        {
             const std::string outDir = caseDir + "/" + tname;
             std::filesystem::create_directories(outDir);
             // The written fields keep the source field's `#include "include/..."` directives (resolved relative to the
             // time dir). Copy the startTime include/ dir alongside so OpenFOAM readers (paraFoam, postProcess, foamToVTK)
             // resolve them, otherwise the field points at a nonexistent <time>/include/ and fails to load.
-            { std::error_code ec2; if (std::filesystem::exists(fieldDir + "/include"))
-                std::filesystem::copy(fieldDir + "/include", outDir + "/include",
-                    std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec2); }
+            {
+                std::error_code ec2;
+                if (std::filesystem::exists(fieldDir + "/include"))
+                    std::filesystem::copy(fieldDir + "/include", outDir + "/include",
+                        std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec2);
+            }
             writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, precision);
             writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, precision);
-            if (ctl.sa) {                                                           // one-equation: the k slot holds nuTilda
+            if (ctl.sa)   // one-equation: the k slot holds nuTilda
+            {
                 writeVolField(wsrc + "nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
                 writeVolField(wsrc + "nut",     outDir + "/nut",     solver.nut(), fvp, precision);
-            } else if (ctl.turbulent) {
+            }
+            else if (ctl.turbulent)
+            {
                 writeVolField(wsrc + "k", outDir + "/k", solver.k(), fvp, precision);
                 writeVolField(wsrc + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision);
                 writeVolField(wsrc + "nut", outDir + "/nut", solver.nut(), fvp, precision);
-                if (ctl.lm) {                                                       // kOmegaSSTLM transition fields
+                if (ctl.lm)   // kOmegaSSTLM transition fields
+                {
                     writeVolField(wsrc + "ReThetat", outDir + "/ReThetat", solver.ReThetat(), fvp, precision);
                     writeVolField(wsrc + "gammaInt", outDir + "/gammaInt", solver.gammaInt(), fvp, precision);
                 }
             }
             std::printf("written %s/{U,p%s}\n", outDir.c_str(),
                         ctl.turbulent ? (ctl.sa ? ",nuTilda,nut" : ctl.sst ? ",k,omega,nut" : ",k,epsilon,nut") : "");
-            if (purgeWrite > 0) {                                                   // Foam::Time TimeIO: keep only the last purgeWrite dirs
+            if (purgeWrite > 0)   // Foam::Time TimeIO: keep only the last purgeWrite dirs
+            {
                 if (writtenTimes.empty() || writtenTimes.back() != tname) writtenTimes.push_back(tname);
-                while ((int)writtenTimes.size() > purgeWrite) {
-                    std::error_code pec; std::filesystem::remove_all(caseDir + "/" + writtenTimes.front(), pec);
+                while ((int)writtenTimes.size() > purgeWrite)
+                {
+                    std::error_code pec;
+                    std::filesystem::remove_all(caseDir + "/" + writtenTimes.front(), pec);
                     writtenTimes.pop_front();
                 }
             }
         };
 
-        int iter = 0; bool converged = false;
+        int iter = 0;
+        bool converged = false;
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
-        for (iter = 1; iter <= endTime && !converged; ++iter) {
+        for (iter = 1; iter <= endTime && !converged; ++iter)
+        {
             const DeviceSimpleResidual r = solver.step();
-            {   // OpenFOAM-style per-iteration report: Time, per-field solver residuals, continuity, turbulence, ExecutionTime.
+            {
+                // OpenFOAM-style per-iteration report: Time, per-field solver residuals, continuity, turbulence, ExecutionTime.
                 const double _et = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - _runStart).count();
                 const double cl = (double)deltaT * r.contLocal, cg = (double)deltaT * r.contGlobal;
                 _cumCont += cg;
@@ -497,45 +679,91 @@ int main(int argc, char** argv) {
 
         // BRAE_DUMP_CONTINUITY: localise the per-cell continuity imbalance R[c]=sum_f phi_f and bucket sum|R| by
         // region (wall-adjacent / farfield-adjacent / interior) to find WHERE continuity fails to close.
-        if (std::getenv("BRAE_DUMP_CONTINUITY")) {
+        if (std::getenv("BRAE_DUMP_CONTINUITY"))
+        {
             const std::vector<scalar> phiI = solver.phiInternal(), phiB = solver.phiBoundary();
             std::vector<scalar> R(nC, 0.0);
-            for (label f = 0; f < m.nInternalFaces(); ++f) { R[m.owner()[f]] += phiI[f]; R[m.neighbour()[f]] -= phiI[f]; }
-            { label bi = 0; for (const auto& pp : fvp) for (label i = 0; i < pp.size; ++i) R[pp.faceCells[i]] += phiB[bi++]; }
+            for (label f = 0; f < m.nInternalFaces(); ++f)
+            {
+                R[m.owner()[f]] += phiI[f];
+                R[m.neighbour()[f]] -= phiI[f];
+            }
+            {
+                label bi = 0;
+                for (const auto& pp : fvp)
+                    for (label i = 0; i < pp.size; ++i)
+                        R[pp.faceCells[i]] += phiB[bi++];
+            }
             std::vector<int> tag(nC, 0);   // 0=interior 1=wall-adjacent 2=farfield(patch)-adjacent
-            for (const auto& pp : fvp) { const int t = (pp.type == "wall") ? 1 : (pp.type == "patch" ? 2 : 0);
-                if (t) for (label i = 0; i < pp.size; ++i) tag[pp.faceCells[i]] = std::max(tag[pp.faceCells[i]], t); }
-            double sAll = 0, sW = 0, sF = 0, sI = 0, mx = 0; label mxc = 0;
-            for (label c = 0; c < nC; ++c) { const double a = std::fabs(R[c]); sAll += a;
-                if (tag[c] == 1) sW += a; else if (tag[c] == 2) sF += a; else sI += a; if (a > mx) { mx = a; mxc = c; } }
+            for (const auto& pp : fvp)
+            {
+                const int t = (pp.type == "wall") ? 1 : (pp.type == "patch" ? 2 : 0);
+                if (t)
+                    for (label i = 0; i < pp.size; ++i)
+                        tag[pp.faceCells[i]] = std::max(tag[pp.faceCells[i]], t);
+            }
+            double sAll = 0, sW = 0, sF = 0, sI = 0, mx = 0;
+            label mxc = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                const double a = std::fabs(R[c]);
+                sAll += a;
+                if (tag[c] == 1) sW += a;
+                else if (tag[c] == 2) sF += a;
+                else sI += a;
+                if (a > mx) { mx = a; mxc = c; }
+            }
             const double inv = sAll > 0 ? 100.0 / sAll : 0.0;
             std::printf("CONTINUITY: sum|div phi|=%.4e  max=%.4e @cell %d  | region share: wall=%.1f%% farfield=%.1f%% interior=%.1f%%\n",
                         sAll, mx, (int)mxc, sW * inv, sF * inv, sI * inv);
-            std::vector<label> idx(nC); for (label c = 0; c < nC; ++c) idx[c] = c;
+            std::vector<label> idx(nC);
+            for (label c = 0; c < nC; ++c)
+                idx[c] = c;
             const label topN = std::min<label>(12, nC);
             std::partial_sort(idx.begin(), idx.begin() + topN, idx.end(), [&](label a, label b){ return std::fabs(R[a]) > std::fabs(R[b]); });
             std::printf("  top cells (|imbalance|, tag, centroid):\n");
-            for (label q = 0; q < topN; ++q) { const label c = idx[q]; const vector cc = g.C()[c];
-                std::printf("    cell %6d  |R|=%.3e  tag=%d  C=(%.4f %.4f %.4f)\n", (int)c, std::fabs(R[c]), tag[c], cc.x, cc.y, cc.z); }
+            for (label q = 0; q < topN; ++q)
+            {
+                const label c = idx[q];
+                const vector cc = g.C()[c];
+                std::printf("    cell %6d  |R|=%.3e  tag=%d  C=(%.4f %.4f %.4f)\n", (int)c, std::fabs(R[c]), tag[c], cc.x, cc.y, cc.z);
+            }
         }
 
-        if (std::getenv("BRAE_DUMP_Y") && ctl.turbulent) {   // cell wall distance stats vs OF wallDist (SA destruction ~ 1/y^2)
+        if (std::getenv("BRAE_DUMP_Y") && ctl.turbulent)   // cell wall distance stats vs OF wallDist (SA destruction ~ 1/y^2)
+        {
             const std::vector<scalar> yv = solver.cellY();
-            if (!yv.empty()) { double mn = 1e300, mx = 0, sm = 0; for (scalar v : yv) { mn = std::min(mn, (double)v); mx = std::max(mx, (double)v); sm += v; }
-                std::printf("cellY: min=%.4e max=%.4e mean=%.4e (n=%zu)\n", mn, mx, sm / yv.size(), yv.size()); } }
+            if (!yv.empty())
+            {
+                double mn = 1e300, mx = 0, sm = 0;
+                for (scalar v : yv)
+                {
+                    mn = std::min(mn, (double)v);
+                    mx = std::max(mx, (double)v);
+                    sm += v;
+                }
+                std::printf("cellY: min=%.4e max=%.4e mean=%.4e (n=%zu)\n", mn, mx, sm / yv.size(), yv.size());
+            }
+        }
 
-        // ---- always write the final (converged / endTime) state; matches OF's writeAndEnd, and feeds purgeWrite ----
+        // always write the final (converged / endTime) state; matches OF's writeAndEnd, and feeds purgeWrite
         writeTimeDir(timeName(startTimeVal + (scalar)nIter * deltaT));
         const std::vector<vector> Ug = solver.U();   // converged fields, reused by the force calculation below
         const std::vector<scalar> pg = solver.p();
 
         // forces on wall patches (OF functionObjects::forces; kinematic, rhoInf=1). Validated vs OF (ctest forces).
-        if (ctl.turbulent) {
+        if (ctl.turbulent)
+        {
             std::vector<std::string> walls;
-            for (const auto& q : fvp) if (q.type == "wall") walls.push_back(q.name);
-            if (!walls.empty()) {
-                for (label c = 0; c < nC; ++c) U.internal[c] = Ug[c];   // converged fields -> evaluate wall BCs
-                p.internal = pg; U.evaluateBoundary(); p.evaluateBoundary();
+            for (const auto& q : fvp)
+                if (q.type == "wall") walls.push_back(q.name);
+            if (!walls.empty())
+            {
+                for (label c = 0; c < nC; ++c)
+                    U.internal[c] = Ug[c];   // converged fields -> evaluate wall BCs
+                p.internal = pg;
+                U.evaluateBoundary();
+                p.evaluateBoundary();
                 const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
                 const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
                 const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
@@ -549,8 +777,15 @@ int main(int argc, char** argv) {
                 // forceCoeffs (Cd/Cl/Cm) if the case defines a forceCoeffs functionObject (controlDict.functions).
                 const FoamDict* funcs = controlDict.subDict("functions");
                 const FoamDict* fcd = nullptr;
-                if (funcs) for (const auto& s : funcs->subs) if (s.second.wordOr("type", "") == "forceCoeffs") { fcd = &s.second; break; }
-                if (fcd) {
+                if (funcs)
+                    for (const auto& s : funcs->subs)
+                        if (s.second.wordOr("type", "") == "forceCoeffs")
+                        {
+                            fcd = &s.second;
+                            break;
+                        }
+                if (fcd)
+                {
                     auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
                     const std::vector<std::string> fcP = fcd->wordListOr("patches", walls);
                     const scalar rhoInf = fcd->scalarOr("rhoInf", 1.0), magUInf = fcd->scalarOr("magUInf", 1.0);
@@ -566,7 +801,9 @@ int main(int argc, char** argv) {
                 }
             }
         }
-    } catch (const std::exception& e) {
+    }
+    catch (const std::exception& e)
+    {
         std::fprintf(stderr, "brae ERROR: %s\n", e.what());
         return 1;
     }
