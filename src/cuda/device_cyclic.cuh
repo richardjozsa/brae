@@ -18,7 +18,8 @@
 
 namespace brae {
 
-struct DeviceCyclic {
+struct DeviceCyclic
+{
     int n = 0;                                  // total cyclic faces (BOTH sides of every pair)
     DeviceBuffer<label>  ownCell, nbrCell;      // this-side cell, periodic-neighbour cell
     DeviceBuffer<scalar> deltaCoeffs, weights, magSf;   // face geometry (own weight w; |Sf|; 1/|delta|)
@@ -38,43 +39,81 @@ struct DeviceCyclic {
 };
 
 // Flatten every cyclic interface (both patches of each pair) into device arrays.
-inline DeviceCyclic buildDeviceCyclic(const std::vector<CyclicInterface>& cyclics,
-                                      const FvGeometry& g, const std::vector<FvPatch>& fvp) {
-    std::vector<label> oc, nc; std::vector<scalar> dc, w, ms, sfx, sfy, sfz;
+inline DeviceCyclic buildDeviceCyclic(
+    const std::vector<CyclicInterface>& cyclics,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
+    std::vector<label> oc, nc;
+    std::vector<scalar> dc, w, ms, sfx, sfy, sfz;
     std::vector<scalar> dox, doy, doz, dnx, dny, dnz, cvx, cvy, cvz;
     bool rot = false;
-    for (const auto& c : cyclics) { if (!c.translational) rot = true; }
-    for (const auto& c : cyclics) {
+    for (const auto& c : cyclics)
+    {
+        if (!c.translational) rot = true;
+    }
+    for (const auto& c : cyclics)
+    {
         const FvPatch& P = fvp[c.patch];
-        for (std::size_t i = 0; i < c.faceCells.size(); ++i) {
+        for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+        {
             const label gf = P.start + (label)i;
-            oc.push_back(c.faceCells[i]); nc.push_back(c.nbrFaceCells[i]);
-            dc.push_back(c.deltaCoeffs[i]); w.push_back(c.weights[i]); ms.push_back(g.magSf()[gf]);
-            sfx.push_back(g.Sf()[gf].x); sfy.push_back(g.Sf()[gf].y); sfz.push_back(g.Sf()[gf].z);
-            dox.push_back(c.dOwn[i].x); doy.push_back(c.dOwn[i].y); doz.push_back(c.dOwn[i].z);
-            dnx.push_back(c.dNbr[i].x); dny.push_back(c.dNbr[i].y); dnz.push_back(c.dNbr[i].z);
-            cvx.push_back(c.corrVec[i].x); cvy.push_back(c.corrVec[i].y); cvz.push_back(c.corrVec[i].z);
+            oc.push_back(c.faceCells[i]);
+            nc.push_back(c.nbrFaceCells[i]);
+            dc.push_back(c.deltaCoeffs[i]);
+            w.push_back(c.weights[i]);
+            ms.push_back(g.magSf()[gf]);
+            sfx.push_back(g.Sf()[gf].x);
+            sfy.push_back(g.Sf()[gf].y);
+            sfz.push_back(g.Sf()[gf].z);
+            dox.push_back(c.dOwn[i].x);
+            doy.push_back(c.dOwn[i].y);
+            doz.push_back(c.dOwn[i].z);
+            dnx.push_back(c.dNbr[i].x);
+            dny.push_back(c.dNbr[i].y);
+            dnz.push_back(c.dNbr[i].z);
+            cvx.push_back(c.corrVec[i].x);
+            cvy.push_back(c.corrVec[i].y);
+            cvz.push_back(c.corrVec[i].z);
         }
     }
-    DeviceCyclic d; d.n = (int)oc.size(); d.rotational = rot;
-    d.ownCell.copyFrom(oc); d.nbrCell.copyFrom(nc);
-    d.deltaCoeffs.copyFrom(dc); d.weights.copyFrom(w); d.magSf.copyFrom(ms);
-    d.Sfx.copyFrom(sfx); d.Sfy.copyFrom(sfy); d.Sfz.copyFrom(sfz);
-    d.dOwnX.copyFrom(dox); d.dOwnY.copyFrom(doy); d.dOwnZ.copyFrom(doz);
-    d.dNbrX.copyFrom(dnx); d.dNbrY.copyFrom(dny); d.dNbrZ.copyFrom(dnz);
-    d.corrVecX.copyFrom(cvx); d.corrVecY.copyFrom(cvy); d.corrVecZ.copyFrom(cvz);
-    d.ifCoeff.resize(d.n); d.phi.resize(d.n);
-    if (rot) {   // pack forwardT (9*n, component-major) + the per-component implicit scratch
+    DeviceCyclic d;
+    d.n = (int)oc.size();
+    d.rotational = rot;
+    d.ownCell.copyFrom(oc);
+    d.nbrCell.copyFrom(nc);
+    d.deltaCoeffs.copyFrom(dc);
+    d.weights.copyFrom(w);
+    d.magSf.copyFrom(ms);
+    d.Sfx.copyFrom(sfx);
+    d.Sfy.copyFrom(sfy);
+    d.Sfz.copyFrom(sfz);
+    d.dOwnX.copyFrom(dox);
+    d.dOwnY.copyFrom(doy);
+    d.dOwnZ.copyFrom(doz);
+    d.dNbrX.copyFrom(dnx);
+    d.dNbrY.copyFrom(dny);
+    d.dNbrZ.copyFrom(dnz);
+    d.corrVecX.copyFrom(cvx);
+    d.corrVecY.copyFrom(cvy);
+    d.corrVecZ.copyFrom(cvz);
+    d.ifCoeff.resize(d.n);
+    d.phi.resize(d.n);
+    if (rot)   // pack forwardT (9*n, component-major) + the per-component implicit scratch
+    {
         std::vector<scalar> ft((std::size_t)9 * d.n);
         std::size_t f = 0;
-        for (const auto& c : cyclics) {
+        for (const auto& c : cyclics)
+        {
             const tensor& T = c.forwardT;
             const scalar tc[9] = { T.xx, T.xy, T.xz, T.yx, T.yy, T.yz, T.zx, T.zy, T.zz };
             for (std::size_t i = 0; i < c.faceCells.size(); ++i, ++f)
-                for (int k = 0; k < 9; ++k) ft[(std::size_t)k * d.n + f] = tc[k];
+                for (int k = 0; k < 9; ++k)
+                    ft[(std::size_t)k * d.n + f] = tc[k];
         }
         d.fT.copyFrom(ft);
-        for (int k = 0; k < 3; ++k) d.ifCoeffC[k].resize(d.n);
+        for (int k = 0; k < 3; ++k)
+            d.ifCoeffC[k].resize(d.n);
     }
     return d;
 }
@@ -109,21 +148,21 @@ void deviceCyclicOffDiagSum(const DeviceCyclic& cyc, DeviceBuffer<scalar>& sumOf
 void deviceCyclicFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& Hx, const DeviceBuffer<scalar>& Hy,
                       const DeviceBuffer<scalar>& Hz);
 
-// ---- ROTATIONAL (Phase 1), only the VECTOR (U/HbyA) couplings differ; scalars use the functions above ----
+// ROTATIONAL (Phase 1), only the VECTOR (U/HbyA) couplings differ; scalars use the functions above
 // fill the per-component implicit off-diagonal ifCoeffC[kk] = ifCoeff * forwardT[kk][kk] (call after AssembleMomentum).
 void deviceCyclicScaleImplicit(DeviceCyclic& cyc);
-// rotational HbyA flux: the neighbour vector is rotated, phi = (w*H[own] + (1-w)*forwardT·H[nbr]) · Sf.
+// rotational HbyA flux: the neighbour vector is rotated, phi = (w*H[own] + (1-w)*forwardT.H[nbr]) . Sf.
 void deviceCyclicFluxRot(DeviceCyclic& cyc, const DeviceBuffer<scalar>& Hx, const DeviceBuffer<scalar>& Hy,
                          const DeviceBuffer<scalar>& Hz);
-// rotational H (full rotation, mixes components): H[kk][own] -= ifCoeff * (forwardT·U[nbr])[kk] / V[own], all 3 kk.
+// rotational H (full rotation, mixes components): H[kk][own] -= ifCoeff * (forwardT.U[nbr])[kk] / V[own], all 3 kk.
 void deviceCyclicAddHRot(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
                          const DeviceBuffer<scalar>& Uz, const DeviceBuffer<scalar>& V,
                          DeviceBuffer<scalar>& Hx, DeviceBuffer<scalar>& Hy, DeviceBuffer<scalar>& Hz);
-// rotational gaussGrad of vector component `comp`: grad[own] += Sf * (w*U[comp][own] + (1-w)*(forwardT·U[nbr])[comp]) / V.
+// rotational gaussGrad of vector component `comp`: grad[own] += Sf * (w*U[comp][own] + (1-w)*(forwardT.U[nbr])[comp]) / V.
 void deviceCyclicAddGradRot(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
                             const DeviceBuffer<scalar>& Uz, int comp, const DeviceBuffer<scalar>& V,
                             DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
-// DEFERRED rotation correction (component comp) into the momentum source: src[own] -= ifCoeff*[(forwardT·U[nbr])[comp]
+// DEFERRED rotation correction (component comp) into the momentum source: src[own] -= ifCoeff*[(forwardT.U[nbr])[comp]
 //   - forwardT[comp][comp]*U[comp][nbr]] (the off-diagonal component-MIXING the diag-only implicit drops). With this in
 // the source AND the diagonal H (deviceCyclicAddHDiag), the predictor + H both carry the FULL rotation -> consistent ->
 // converges. Mirrors the standard deferred-correction split of a non-implementable implicit term. NOT /V (matrixH does).
@@ -152,7 +191,7 @@ void deviceCyclicAddLinUpwindCorr(const DeviceCyclic& cyc, int comp,
 // non-orth laplacian "corrected" correction at the cyclic interface (component comp). Per face the explicit face-flux
 // correction is ffc = gammaFace*magSf*(corrVec . grad(U_comp)_face), gathered as src[own] -= ffc (owner side), and the
 // caller does relaxSrc -= src (mirrors the internal deviceLaplacianCorr). The neighbour gradient ROTATES as a tensor:
-// grad((forwardT·U)_comp) = (forwardT · gradU[nbr] · forwardTᵀ)[comp][:], so it needs ALL 3 component gradients.
+// grad((forwardT.U)_comp) = (forwardT . gradU[nbr] . forwardT^T)[comp][:], so it needs ALL 3 component gradients.
 // gammaCell = nuEff per cell (interpolated to the face by w). corr is the SAME buffer the internal corr was written to.
 void deviceCyclicAddLapCorr(const DeviceCyclic& cyc, int comp, const DeviceBuffer<scalar>& gammaCell,
                             const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy,

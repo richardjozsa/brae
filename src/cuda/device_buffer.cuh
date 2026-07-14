@@ -13,7 +13,8 @@
 
 namespace brae {
 
-inline void cudaCheck(cudaError_t e, const char* what) {
+inline void cudaCheck(cudaError_t e, const char* what)
+{
     if (e != cudaSuccess) throw std::runtime_error(std::string("brae cuda: ") + what + ": " + cudaGetErrorString(e));
 }
 
@@ -26,18 +27,29 @@ namespace detail {
 // Single-threaded use (cf runs one solve on one host thread; the GPU path is not entered concurrently). Disable
 // with BRAE_NO_DEVICE_POOL=1 to A/B against the raw-cudaMalloc behaviour. The pool is intentionally leaked (never
 // destructed) so there is no static-destruction-order hazard and no cudaFree after the CUDA context is torn down.
-class DevicePool {
+class DevicePool
+{
 public:
     DevicePool() : enabled_(std::getenv("BRAE_NO_DEVICE_POOL") == nullptr) {}
-    void* take(std::size_t bytes) {
+    void* take(std::size_t bytes)
+    {
         if (bytes == 0) return nullptr;
-        if (enabled_) {
+        if (enabled_)
+        {
             auto it = free_.find(bytes);
-            if (it != free_.end() && !it->second.empty()) { void* p = it->second.back(); it->second.pop_back(); return p; }
+            if (it != free_.end() && !it->second.empty())
+            {
+                void* p = it->second.back();
+                it->second.pop_back();
+                return p;
+            }
         }
-        void* p = nullptr; cudaCheck(cudaMalloc(&p, bytes), "pool cudaMalloc"); return p;
+        void* p = nullptr;
+        cudaCheck(cudaMalloc(&p, bytes), "pool cudaMalloc");
+        return p;
     }
-    void give(void* p, std::size_t bytes) {
+    void give(void* p, std::size_t bytes)
+    {
         if (!p) return;
         if (enabled_ && bytes) free_[bytes].push_back(p);      // retain for reuse; no cudaFree during the run
         else cudaFree(p);
@@ -50,7 +62,8 @@ inline DevicePool& devicePool() { static DevicePool* p = new DevicePool(); retur
 } // namespace detail
 
 template <typename T>
-class DeviceBuffer {
+class DeviceBuffer
+{
 public:
     DeviceBuffer() = default;
     explicit DeviceBuffer(std::size_t n) { resize(n); }
@@ -60,21 +73,34 @@ public:
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
     DeviceBuffer(DeviceBuffer&& o) noexcept : d_(o.d_), n_(o.n_) { o.d_ = nullptr; o.n_ = 0; }
-    DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
-        if (this != &o) { if (d_) detail::devicePool().give(d_, n_ * sizeof(T));
-                          d_ = o.d_; n_ = o.n_; o.d_ = nullptr; o.n_ = 0; } return *this; }
+    DeviceBuffer& operator=(DeviceBuffer&& o) noexcept
+    {
+        if (this != &o)
+        {
+            if (d_) detail::devicePool().give(d_, n_ * sizeof(T));
+            d_ = o.d_;
+            n_ = o.n_;
+            o.d_ = nullptr;
+            o.n_ = 0;
+        }
+        return *this;
+    }
 
-    void resize(std::size_t n) {
+    void resize(std::size_t n)
+    {
         if (n == n_) return;
         if (d_) detail::devicePool().give(d_, n_ * sizeof(T));            // return OLD block (OLD n_) to the pool
-        n_ = n; d_ = nullptr;
+        n_ = n;
+        d_ = nullptr;
         if (n_) d_ = static_cast<T*>(detail::devicePool().take(n_ * sizeof(T)));
     }
-    void copyFrom(const std::vector<T>& h) {                              // H2D
+    void copyFrom(const std::vector<T>& h)                                // H2D
+    {
         if (h.size() != n_) resize(h.size());
         cudaCheck(cudaMemcpy(d_, h.data(), n_ * sizeof(T), cudaMemcpyHostToDevice), "H2D");
     }
-    void copyTo(std::vector<T>& h) const {                               // D2H
+    void copyTo(std::vector<T>& h) const                                 // D2H
+    {
         h.resize(n_);
         cudaCheck(cudaMemcpy(h.data(), d_, n_ * sizeof(T), cudaMemcpyDeviceToHost), "D2H");
     }
