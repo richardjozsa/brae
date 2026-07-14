@@ -17,10 +17,10 @@ std::string foamFormat(const std::string& path);
 // is always an ASCII dictionary, so it uses TokenStream regardless of format.
 std::vector<vector> readBinaryPoints(const std::string& path);
 std::vector<label>  readBinaryLabelList(const std::string& path);
-void readBinaryCompactFaces(const std::string& path,
-                            std::vector<label>& offsets, std::vector<label>& verts);
+void readBinaryCompactFaces(const std::string& path, std::vector<label>& offsets, std::vector<label>& verts);
 
-class TokenStream {
+class TokenStream
+{
 public:
     // expandVars: also expand OpenFOAM in-file $variable macros (e.g. `Uinlet (0 1 0); ... $Uinlet`) after the
     // #include expansion. Off by default (mesh/polyMesh files have no macros and skip the cost); the field reader
