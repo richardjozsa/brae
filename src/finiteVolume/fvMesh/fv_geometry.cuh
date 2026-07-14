@@ -12,7 +12,8 @@
 
 namespace brae {
 
-class FvGeometry {
+class FvGeometry
+{
 public:
     void build(const PrimitiveMesh& m);
 

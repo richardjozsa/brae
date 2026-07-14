@@ -17,11 +17,17 @@
 namespace brae {
 
 // k's turbulentIntensityKineticEnergyInlet patches -> inletOutlet(1.5*(intensity*|U|)^2). Rebuilds k.boundary.
-inline void applyTurbulentInletK(GeometricField<scalar>& k, const FieldData<scalar>& kFD,
-                                 const GeometricField<vector>& U, const std::vector<FvPatch>& fvp) {
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi) {
+inline void applyTurbulentInletK(
+    GeometricField<scalar>& k,
+    const FieldData<scalar>& kFD,
+    const GeometricField<vector>& U,
+    const std::vector<FvPatch>& fvp)
+{
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
         const PatchFieldData<scalar>* b = nullptr;
-        for (const auto& bd : kFD.boundary) if (bd.name == fvp[pi].name) { b = &bd; break; }
+        for (const auto& bd : kFD.boundary)
+            if (bd.name == fvp[pi].name) { b = &bd; break; }
         if (!b || b->type != "turbulentIntensityKineticEnergyInlet") continue;
         const std::vector<vector>& Uin = U.boundary[pi]->value();
         std::vector<scalar> kin(fvp[pi].size);
@@ -32,12 +38,19 @@ inline void applyTurbulentInletK(GeometricField<scalar>& k, const FieldData<scal
 }
 
 // 2nd-scalar (epsilon|omega) turbulentMixingLength*Inlet patches, from the (already-computed) inlet k.
-inline void applyTurbulentInletSecond(GeometricField<scalar>& second, const FieldData<scalar>& sFD,
-                                      const GeometricField<scalar>& k, scalar Cmu, const std::vector<FvPatch>& fvp) {
+inline void applyTurbulentInletSecond(
+    GeometricField<scalar>& second,
+    const FieldData<scalar>& sFD,
+    const GeometricField<scalar>& k,
+    scalar Cmu,
+    const std::vector<FvPatch>& fvp)
+{
     const scalar Cmu75 = std::pow(Cmu, 0.75), Cmu25 = std::pow(Cmu, 0.25);
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi) {
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
         const PatchFieldData<scalar>* b = nullptr;
-        for (const auto& bd : sFD.boundary) if (bd.name == fvp[pi].name) { b = &bd; break; }
+        for (const auto& bd : sFD.boundary)
+            if (bd.name == fvp[pi].name) { b = &bd; break; }
         if (!b) continue;
         const bool eps = (b->type == "turbulentMixingLengthDissipationRateInlet");
         const bool om  = (b->type == "turbulentMixingLengthFrequencyInlet");

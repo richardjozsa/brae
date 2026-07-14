@@ -11,7 +11,8 @@
 
 namespace brae {
 
-struct FvPatch {
+struct FvPatch
+{
     std::string         name;
     std::string         type;
     std::vector<std::string> inGroups;  // groups this patch belongs to (boundaryField group-keyword match)

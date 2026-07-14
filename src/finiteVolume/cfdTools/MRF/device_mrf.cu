@@ -10,31 +10,56 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 // src[c] -= V[c]*(Omega x U)_kk on zone cells.  (Omega x U)_x = oy*Uz-oz*Uy, etc.
-__global__ void mrfCoriolisKernel(int nC, const label* __restrict__ zc, const scalar* __restrict__ V,
-                                  const scalar* __restrict__ Ux, const scalar* __restrict__ Uy, const scalar* __restrict__ Uz,
-                                  scalar ox, scalar oy, scalar oz, int kk, scalar* __restrict__ src) {
+__global__
+void mrfCoriolisKernel(
+    int nC,
+    const label* __restrict__ zc,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    scalar ox,
+    scalar oy,
+    scalar oz,
+    int kk,
+    scalar* __restrict__ src)
+{
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC || !zc[c]) return;
+
     const scalar comp = (kk == 0) ? (oy*Uz[c] - oz*Uy[c])
                       : (kk == 1) ? (oz*Ux[c] - ox*Uz[c])
                                   : (ox*Uy[c] - oy*Ux[c]);
     src[c] -= V[c] * comp;
 }
-__global__ void mrfFrameFluxKernel(int n, const scalar* __restrict__ ff, scalar sign, scalar* __restrict__ phi) {
+__global__
+void mrfFrameFluxKernel(int n, const scalar* __restrict__ ff, scalar sign, scalar* __restrict__ phi)
+{
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f < n) phi[f] -= sign * ff[f];
 }
 } // namespace
 
-void deviceMrfCoriolis(const DeviceMRF& mrf, const DeviceBuffer<scalar>& V,
-                       const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                       int kk, DeviceBuffer<scalar>& src) {
+void deviceMrfCoriolis(
+    const DeviceMRF& mrf,
+    const DeviceBuffer<scalar>& V,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    int kk,
+    DeviceBuffer<scalar>& src)
+{
     const int nC = static_cast<int>(V.size());
     mrfCoriolisKernel<<<nBlocks(nC), TPB>>>(nC, mrf.zoneCell.data(), V.data(), Ux.data(), Uy.data(), Uz.data(),
                                             mrf.Omega.x, mrf.Omega.y, mrf.Omega.z, kk, src.data());
     cudaCheck(cudaGetLastError(), "mrfCoriolis");
 }
-void deviceMrfApplyFrameFlux(const DeviceMRF& mrf, scalar sign, DeviceBuffer<scalar>& phiInt, DeviceBuffer<scalar>& phiBnd) {
+void deviceMrfApplyFrameFlux(
+    const DeviceMRF& mrf,
+    scalar sign,
+    DeviceBuffer<scalar>& phiInt,
+    DeviceBuffer<scalar>& phiBnd)
+{
     const int nIf = static_cast<int>(mrf.frameFluxInt.size()), nB = static_cast<int>(mrf.frameFluxBnd.size());
     if (nIf) mrfFrameFluxKernel<<<nBlocks(nIf), TPB>>>(nIf, mrf.frameFluxInt.data(), sign, phiInt.data());
     if (nB)  mrfFrameFluxKernel<<<nBlocks(nB),  TPB>>>(nB,  mrf.frameFluxBnd.data(), sign, phiBnd.data());

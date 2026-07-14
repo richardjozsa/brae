@@ -14,14 +14,22 @@ namespace brae {
 // wallNoSlip: give "wall" patches a NoSlipPatchField (value 0), used for velocity-like fields so the
 // fvm operators get the correct wall coefficients. Scalars (p, rAU) keep zeroGradient walls.
 template <typename T>
-GeometricField<T> buildCyclicField(const std::vector<T>& cells, const std::vector<FvPatch>& fvp,
-                                   const std::vector<CyclicInterface>& cyclics, bool wallNoSlip = false) {
-    GeometricField<T> gf; gf.internal = cells;
-    for (label pi = 0; pi < (label)fvp.size(); ++pi) {
+GeometricField<T> buildCyclicField(
+    const std::vector<T>& cells,
+    const std::vector<FvPatch>& fvp,
+    const std::vector<CyclicInterface>& cyclics,
+    bool wallNoSlip = false)
+{
+    GeometricField<T> gf;
+    gf.internal = cells;
+    for (label pi = 0; pi < (label)fvp.size(); ++pi)
+    {
         const FvPatch& p = fvp[pi];
         const CyclicInterface* ci = nullptr;
-        for (const CyclicInterface& c : cyclics) if (c.patch == pi) { ci = &c; break; }
-        if (ci) {
+        for (const CyclicInterface& c : cyclics)
+            if (c.patch == pi) { ci = &c; break; }
+        if (ci)
+        {
             auto pf = std::make_unique<CyclicFvPatchField<T>>(p, ci->nbrFaceCells, ci->weights);
             if (!ci->translational) pf->setTransform(ci->forwardT);   // vectors rotate; scalars ignore it
             gf.boundary.push_back(std::move(pf));

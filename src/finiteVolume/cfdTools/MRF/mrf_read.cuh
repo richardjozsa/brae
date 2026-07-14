@@ -18,23 +18,39 @@
 namespace brae {
 
 // cellZone name -> cell labels (constant/polyMesh/cellZones). Empty if the file is absent.
-inline std::map<std::string, std::vector<label>> readCellZones(const std::string& polyMeshDir) {
+inline std::map<std::string, std::vector<label>> readCellZones(const std::string& polyMeshDir)
+{
     std::map<std::string, std::vector<label>> zones;
-    { std::ifstream f(polyMeshDir + "/cellZones"); if (!f.good()) return zones; }
+    {
+        std::ifstream f(polyMeshDir + "/cellZones");
+        if (!f.good()) return zones;
+    }
     TokenStream ts(polyMeshDir + "/cellZones");
-    const label nz = ts.nextLabel(); ts.expect("(");
-    for (label z = 0; z < nz; ++z) {
+    const label nz = ts.nextLabel();
+    ts.expect("(");
+    for (label z = 0; z < nz; ++z)
+    {
         const std::string name = ts.next();
         ts.expect("{");
         std::vector<label> cells;
-        while (ts.peek() != "}") {
+        while (ts.peek() != "}")
+        {
             const std::string key = ts.next();
-            if (key == "cellLabels") {
+            if (key == "cellLabels")
+            {
                 ts.next();                              // "List<label>"
-                const label n = ts.nextLabel(); ts.expect("(");
-                cells.resize(n); for (label i = 0; i < n; ++i) cells[i] = ts.nextLabel();
-                ts.expect(")"); ts.expect(";");
-            } else { while (ts.peek() != ";") ts.next(); ts.expect(";"); }   // skip type etc.
+                const label n = ts.nextLabel();
+                ts.expect("(");
+                cells.resize(n);
+                for (label i = 0; i < n; ++i) cells[i] = ts.nextLabel();
+                ts.expect(")");
+                ts.expect(";");
+            }
+            else
+            {
+                while (ts.peek() != ";") ts.next();
+                ts.expect(";");
+            }   // skip type etc.
         }
         ts.expect("}");
         zones[name] = std::move(cells);
@@ -42,7 +58,8 @@ inline std::map<std::string, std::vector<label>> readCellZones(const std::string
     return zones;
 }
 
-struct MRFConfig {
+struct MRFConfig
+{
     bool active = false;
     std::string cellZone;
     scalar omega = 0;
@@ -51,12 +68,20 @@ struct MRFConfig {
 };
 
 // First active MRF entry in constant/MRFProperties. active=false if absent/inactive.
-inline MRFConfig readMRFProperties(const std::string& constantDir) {
+inline MRFConfig readMRFProperties(const std::string& constantDir)
+{
     MRFConfig c;
-    { std::ifstream f(constantDir + "/MRFProperties"); if (!f.good()) return c; }
+    {
+        std::ifstream f(constantDir + "/MRFProperties");
+        if (!f.good()) return c;
+    }
     const FoamDict d = readDict(constantDir + "/MRFProperties");
-    auto v3 = [](const std::vector<scalar>& a, vector dflt){ return a.size() >= 3 ? vector{a[0], a[1], a[2]} : dflt; };
-    for (const auto& s : d.subs) {
+    auto v3 = [](const std::vector<scalar>& a, vector dflt)
+    {
+        return a.size() >= 3 ? vector{a[0], a[1], a[2]} : dflt;
+    };
+    for (const auto& s : d.subs)
+    {
         const FoamDict& mrf = s.second;
         const std::string act = mrf.wordOr("active", "yes");
         if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;
@@ -74,14 +99,24 @@ inline MRFConfig readMRFProperties(const std::string& constantDir) {
 // OF MRF.correctBoundaryVelocity: in-zone, velocity-fixing patches that are NOT nonRotating take the absolute
 // frame velocity U = Omega x (Cf - origin) (e.g. a noSlip wall rotating with the frame). Leaves nonRotating
 // patches (stationary in the absolute frame) and non-fixed patches untouched.
-inline void mrfCorrectBoundaryVelocity(GeometricField<vector>& U, const MRFZone& z, const FvGeometry& g,
-                                       const std::vector<FvPatch>& fvp, const std::vector<std::string>& nonRotating) {
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi) {
+inline void mrfCorrectBoundaryVelocity(
+    GeometricField<vector>& U,
+    const MRFZone& z,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    const std::vector<std::string>& nonRotating)
+{
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
         const FvPatch& p = fvp[pi];
         if (p.type == "empty" || p.size == 0 || !U.boundary[pi]->fixesValue()) continue;
-        bool skip = false; for (const auto& nm : nonRotating) if (p.name == nm) { skip = true; break; }
+        bool skip = false;
+        for (const auto& nm : nonRotating)
+            if (p.name == nm) { skip = true; break; }
         if (skip) continue;
-        bool inZone = true; for (label i = 0; i < p.size; ++i) if (!z.inZone[p.faceCells[i]]) { inZone = false; break; }
+        bool inZone = true;
+        for (label i = 0; i < p.size; ++i)
+            if (!z.inZone[p.faceCells[i]]) { inZone = false; break; }
         if (!inZone) continue;
         std::vector<vector> wv(p.size);
         for (label i = 0; i < p.size; ++i) wv[i] = cross(z.Omega, g.Cf()[p.start + i] - z.origin);

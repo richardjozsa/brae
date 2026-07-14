@@ -8,22 +8,27 @@ namespace {
 }
 
 // primitiveMeshTools::updateFaceCentresAndAreas (triangle special-case + triangle fan).
-void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m) {
+void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m)
+{
     const label nF = m.nFaces();
     const std::vector<vector>& P = m.points();
     Cf_.resize(nF);
     Sf_.resize(nF);
 
-    for (label f = 0; f < nF; ++f) {
+    for (label f = 0; f < nF; ++f)
+    {
         const label k = m.faceSize(f);
 
-        if (k == 3) {
+        if (k == 3)
+        {
             const vector& a = P[m.faceVert(f, 0)];
             const vector& b = P[m.faceVert(f, 1)];
             const vector& c = P[m.faceVert(f, 2)];
             Cf_[f] = (a + b + c) / 3.0;
             Sf_[f] = 0.5 * cross(b - a, c - a);
-        } else {
+        }
+        else
+        {
             vector fCentre = P[m.faceVert(f, 0)];
             for (label pi = 1; pi < k; ++pi) fCentre += P[m.faceVert(f, pi)];
             fCentre = fCentre / static_cast<scalar>(k);
@@ -31,7 +36,8 @@ void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m) {
             vector sumN  = {0, 0, 0};
             scalar sumA  = 0.0;
             vector sumAc = {0, 0, 0};
-            for (label pi = 0; pi < k; ++pi) {
+            for (label pi = 0; pi < k; ++pi)
+            {
                 const vector& thisP = P[m.faceVert(f, pi)];
                 const vector& nextP = P[m.faceVert(f, pi == k - 1 ? 0 : pi + 1)];
                 const vector c = thisP + nextP + fCentre;
@@ -42,10 +48,13 @@ void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m) {
                 sumAc += a * c;
             }
 
-            if (sumA < ROOTVSMALL) {
+            if (sumA < ROOTVSMALL)
+            {
                 Cf_[f] = fCentre;
                 Sf_[f] = {0, 0, 0};
-            } else {
+            }
+            else
+            {
                 Cf_[f] = (1.0 / 3.0) * (sumAc / sumA);
                 Sf_[f] = 0.5 * sumN;
             }
@@ -58,7 +67,8 @@ void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m) {
 
 // primitiveMeshTools::makeCellCentresAndVols (estimate centre from face centres, then
 // pyramid decomposition), accumulated face-by-face over owner/neighbour.
-void FvGeometry::makeCellCentresAndVols(const PrimitiveMesh& m) {
+void FvGeometry::makeCellCentresAndVols(const PrimitiveMesh& m)
+{
     const label nC  = m.nCells();
     const label nF  = m.nFaces();
     const label nIf = m.nInternalFaces();
@@ -70,14 +80,23 @@ void FvGeometry::makeCellCentresAndVols(const PrimitiveMesh& m) {
     // summation order matches OF (matters on ill-conditioned, large-coordinate meshes).
     std::vector<vector> cEst(nC, vector{0, 0, 0});
     std::vector<label>  nCellFaces(nC, 0);
-    for (label f = 0; f < nF;  ++f) { cEst[own[f]] += Cf_[f]; ++nCellFaces[own[f]]; }
-    for (label f = 0; f < nIf; ++f) { cEst[nei[f]] += Cf_[f]; ++nCellFaces[nei[f]]; }
+    for (label f = 0; f < nF;  ++f)
+    {
+        cEst[own[f]] += Cf_[f];
+        ++nCellFaces[own[f]];
+    }
+    for (label f = 0; f < nIf; ++f)
+    {
+        cEst[nei[f]] += Cf_[f];
+        ++nCellFaces[nei[f]];
+    }
     for (label c = 0; c < nC; ++c) cEst[c] = cEst[c] / static_cast<scalar>(nCellFaces[c]);
 
     C_.assign(nC, vector{0, 0, 0});
     V_.assign(nC, 0.0);
     // Owner pyramid pass (all faces).
-    for (label f = 0; f < nF; ++f) {
+    for (label f = 0; f < nF; ++f)
+    {
         const label o = own[f];
         const scalar pyr3Vol = dot(Sf_[f], Cf_[f] - cEst[o]);
         const vector pc      = 0.75 * Cf_[f] + 0.25 * cEst[o];
@@ -85,7 +104,8 @@ void FvGeometry::makeCellCentresAndVols(const PrimitiveMesh& m) {
         V_[o] += pyr3Vol;
     }
     // Neighbour pyramid pass (internal faces).
-    for (label f = 0; f < nIf; ++f) {
+    for (label f = 0; f < nIf; ++f)
+    {
         const label n = nei[f];
         const scalar pyr3Vol = dot(Sf_[f], cEst[n] - Cf_[f]);
         const vector pc      = 0.75 * Cf_[f] + 0.25 * cEst[n];
@@ -98,7 +118,8 @@ void FvGeometry::makeCellCentresAndVols(const PrimitiveMesh& m) {
 }
 
 // basicFvGeometryScheme: weights, deltaCoeffs, nonOrthDeltaCoeffs, nonOrthCorrectionVectors.
-void FvGeometry::makeInterpolation(const PrimitiveMesh& m) {
+void FvGeometry::makeInterpolation(const PrimitiveMesh& m)
+{
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
@@ -108,7 +129,8 @@ void FvGeometry::makeInterpolation(const PrimitiveMesh& m) {
     nonOrthDeltaCoeffs_.resize(nIf);
     nonOrthCorr_.resize(nIf);
 
-    for (label f = 0; f < nIf; ++f) {
+    for (label f = 0; f < nIf; ++f)
+    {
         const label o = own[f], n = nei[f];
 
         const scalar SfdOwn = std::fabs(dot(Sf_[f], Cf_[f] - C_[o]));
@@ -126,7 +148,8 @@ void FvGeometry::makeInterpolation(const PrimitiveMesh& m) {
     }
 }
 
-void FvGeometry::build(const PrimitiveMesh& m) {
+void FvGeometry::build(const PrimitiveMesh& m)
+{
     makeFaceCentresAndAreas(m);
     makeCellCentresAndVols(m);
     makeInterpolation(m);
