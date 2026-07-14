@@ -1,5 +1,5 @@
 #pragma once
-// k-omega SST blending + strain functions on the device (C③). Pointwise per-cell formulas, verbatim from
+// k-omega SST blending + strain functions on the device (C3). Pointwise per-cell formulas, verbatim from
 // kOmegaSSTBase.C (OpenFOAM v2412):
 //   S2       = 2*magSqr(symm(gradU))
 //   CDkOmega = (2*alphaOmega2)*(grad k . grad omega)/omega          (raw; max(.,1e-10) applied inside F1)
@@ -35,8 +35,7 @@ void deviceF2(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, 
 // out = F1*(psi1-psi2)+psi2 (gamma/beta/alphaK/alphaOmega blends).
 void deviceBlend(const DeviceBuffer<scalar>& F1, scalar psi1, scalar psi2, DeviceBuffer<scalar>& out);
 
-// --- C④ limiters (kOmegaSSTBase.C correctNut / Pk / GbyNu) ---
-
+// C4 limiters (kOmegaSSTBase.C correctNut / Pk / GbyNu)
 // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F23*sqrt(S2)), F23 = F2 (F3 off).
 void deviceNutSST(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& F2,
                   const DeviceBuffer<scalar>& S2, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& nut);
@@ -50,8 +49,7 @@ void deviceGbyNuLimit(const DeviceBuffer<scalar>& GbyNu0, const DeviceBuffer<sca
                       const DeviceBuffer<scalar>& F2, const DeviceBuffer<scalar>& S2,
                       const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& GbyNu);
 
-// --- C⑤ omega equation ---
-
+// C5 omega equation
 // Effective diffusivity D = blend(F1, alpha1, alpha2)*nut + nu  (DomegaEff: alphaOmega1/2; DkEff: alphaK1/2).
 void deviceDEff(const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& nut, scalar alpha1, scalar alpha2,
                 scalar nu, DeviceBuffer<scalar>& D);
@@ -65,13 +63,12 @@ void deviceOmegaReaction(const DeviceBuffer<scalar>& V, const DeviceBuffer<scala
                          DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
 
 // omega wall function (BINOMIAL n=2): omega0 = sqrt(omegaVis^2 + omegaLog^2) scattered to wall cells (cornerWeight
-// invNw), G0 identical to the epsilon wall function. Zeroes omega0/G0 then scatters. (Validated end-to-end at C⑦.)
+// invNw), G0 identical to the epsilon wall function. Zeroes omega0/G0 then scatters. (Validated end-to-end at C7.)
 void deviceWallOmegaG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& Ux,
                        const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                        DeviceBuffer<scalar>& omega0, DeviceBuffer<scalar>& G0, const KOmegaSSTCoeffs& co);
 
-// --- C⑥ k equation ---
-
+// C6 k equation
 // k reaction (adds to diag + source). Mirrors the k block of kOmegaSSTBase::correct() (incompressible):
 // production Pk(G)=min(G, c1*betaStar*k*omega) (Su) - SuSp((2/3)divU) - Sp(betaStar*omega) [= epsilonByk]. This is
 // the k-eps kReaction with eps/k -> betaStar*omega and G -> Pk(G).
