@@ -3,7 +3,7 @@
 // OF (incompressible) porosityModels::DarcyForchheimer::apply, mu=nu_laminar, rho=1:
 //   Cd = nu*diag(d) + |U|*diag(0.5 f);  isoCd = tr(Cd)
 //   diag[c]            += V*isoCd                       (implicit, isotropic part)
-//   relaxSrc[comp][c]  -= V*((Cd - I*isoCd)·U)[comp]    (explicit, anisotropic remainder)
+//   relaxSrc[comp][c]  -= V*((Cd - I*isoCd).U)[comp]    (explicit, anisotropic remainder)
 // Diagonal d/f only (identity coordinateSystem). Cells are a cellZone (unique) -> no atomics needed.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
@@ -20,7 +20,7 @@ struct DevicePorosity {
 void deviceFvoPorosityDiag(const DevicePorosity& por, scalar nu, const DeviceBuffer<scalar>& V,
                            const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                            DeviceBuffer<scalar>& diag);
-// relaxSrc[c] += V*(isoCd - c_comp)*U_comp for the porous cells (= the explicit -V*((Cd-I*isoCd)·U)[comp]).
+// relaxSrc[c] += V*(isoCd - c_comp)*U_comp for the porous cells (= the explicit -V*((Cd-I*isoCd).U)[comp]).
 void deviceFvoPorositySource(const DevicePorosity& por, int comp, scalar nu, const DeviceBuffer<scalar>& V,
                              const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                              DeviceBuffer<scalar>& src);
