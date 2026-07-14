@@ -3,10 +3,12 @@
 
 namespace brae {
 
-std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g) {
+std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
+{
     std::vector<FvPatch> patches;
     patches.reserve(m.patches().size());
-    for (const PatchInfo& pi : m.patches()) {
+    for (const PatchInfo& pi : m.patches())
+    {
         FvPatch p;
         p.name     = pi.name;
         p.type     = pi.type;
@@ -17,7 +19,8 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g) {
         p.deltaCoeffs.resize(pi.size);
         p.nf.resize(pi.size);
         p.Cf.resize(pi.size);
-        for (label i = 0; i < pi.size; ++i) {
+        for (label i = 0; i < pi.size; ++i)
+        {
             const label f = pi.start + i;
             const label c = m.owner()[f];          // boundary face owner = adjacent cell
             p.faceCells[i] = c;
