@@ -15,7 +15,8 @@ namespace brae {
 enum class ReduceOp { Sum, Min, Max };
 
 // All-static facade over the active parallel transport.
-class Pstream {
+class Pstream
+{
 public:
     static void init(int& argc, char**& argv);
     static void finalize();
