@@ -7,24 +7,53 @@ namespace {
 constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
-__global__ void amiInterpKernel(int n, const label* __restrict__ off, const label* __restrict__ nbr,
-                                const scalar* __restrict__ w, const scalar* __restrict__ psi, scalar* __restrict__ out) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+
+__global__
+void amiInterpKernel(
+    int n,
+    const label* __restrict__ off,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ psi,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
     scalar s = 0;
-    for (label k = off[i]; k < off[i+1]; ++k) s += w[k] * psi[nbr[k]];   // sum_k weight*psi[nbrCell]
+    for (label k = off[i]; k < off[i+1]; ++k)
+        s += w[k] * psi[nbr[k]];   // sum_k weight*psi[nbrCell]
     out[i] = s;
 }
-__global__ void amiInterpVecKernel(int n, const label* __restrict__ off, const label* __restrict__ nbr,
-                                   const scalar* __restrict__ w, const scalar* __restrict__ Ux,
-                                   const scalar* __restrict__ Uy, const scalar* __restrict__ Uz,
-                                   const scalar* __restrict__ fT, int rotational,
-                                   scalar* __restrict__ oX, scalar* __restrict__ oY, scalar* __restrict__ oZ) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+
+
+__global__
+void amiInterpVecKernel(
+    int n,
+    const label* __restrict__ off,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    const scalar* __restrict__ fT,
+    int rotational,
+    scalar* __restrict__ oX,
+    scalar* __restrict__ oY,
+    scalar* __restrict__ oZ)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
     scalar sx = 0, sy = 0, sz = 0;
-    for (label k = off[i]; k < off[i+1]; ++k) {        // sum_k w * (forwardT · U[nbrCell]) ; transform BEFORE the weighted sum
-        const int c = nbr[k]; const scalar wk = w[k];
+    // sum_k w * (forwardT . U[nbrCell]) ; transform BEFORE the weighted sum
+    for (label k = off[i]; k < off[i+1]; ++k)
+    {
+        const int c = nbr[k];
+        const scalar wk = w[k];
         scalar vx = Ux[c], vy = Uy[c], vz = Uz[c];
-        if (rotational) {                              // forwardT for THIS source face i (per-face packed)
+        if (rotational)   // forwardT for THIS source face i (per-face packed)
+        {
             const scalar rx = fT[(0*3+0)*n+i]*vx + fT[(0*3+1)*n+i]*vy + fT[(0*3+2)*n+i]*vz;
             const scalar ry = fT[(1*3+0)*n+i]*vx + fT[(1*3+1)*n+i]*vy + fT[(1*3+2)*n+i]*vz;
             const scalar rz = fT[(2*3+0)*n+i]*vx + fT[(2*3+1)*n+i]*vy + fT[(2*3+2)*n+i]*vz;
@@ -34,285 +63,707 @@ __global__ void amiInterpVecKernel(int n, const label* __restrict__ off, const l
     }
     oX[i] = sx; oY[i] = sy; oZ[i] = sz;
 }
-__global__ void amiAmulKernel(int n, const label* __restrict__ own, const label* __restrict__ off,
-                              const label* __restrict__ nbr, const scalar* __restrict__ w,
-                              const scalar* __restrict__ ifc, const scalar* __restrict__ psi, scalar* __restrict__ Apsi) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+
+
+__global__
+void amiAmulKernel(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ off,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ ifc,
+    const scalar* __restrict__ psi,
+    scalar* __restrict__ Apsi)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
     scalar s = 0;
-    for (label k = off[i]; k < off[i+1]; ++k) s += w[k] * psi[nbr[k]];   // interpolate-to-source
-    atomicAdd(&Apsi[own[i]], ifc[i] * s);                                // scale by the interface coefficient
+    for (label k = off[i]; k < off[i+1]; ++k)
+        s += w[k] * psi[nbr[k]];   // interpolate-to-source
+    atomicAdd(&Apsi[own[i]], ifc[i] * s);   // scale by the interface coefficient
 }
 } // namespace
 
-void deviceAmiAmul(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi) {
+
+void deviceAmiAmul(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi)
+{
     if (ami.n == 0) return;
     amiAmulKernel<<<nBlocks(ami.n), TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
                                            ami.weight.data(), ami.ifCoeff.data(), psi.data(), Apsi.data());
     cudaCheck(cudaGetLastError(), "amiAmul");
 }
 
+
 namespace {
-__global__ void amiMomKernel(int n, const label* __restrict__ own, const scalar* __restrict__ nu,
-        const scalar* __restrict__ nuN, const scalar* __restrict__ dc, const scalar* __restrict__ w,
-        const scalar* __restrict__ magSf, const scalar* __restrict__ phi, scalar* __restrict__ ifc, scalar* __restrict__ diag) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i];
-    const scalar lap = (w[i]*nu[o] + (1.0-w[i])*nuN[i]) * dc[i] * magSf[i]; const scalar p = phi[i];
-    ifc[i] = -lap + (p<0.0?p:0.0); atomicAdd(&diag[o], lap + (p>0.0?p:0.0));
+__global__
+void amiMomKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ nu,
+    const scalar* __restrict__ nuN,
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ phi,
+    scalar* __restrict__ ifc,
+    scalar* __restrict__ diag)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
+    const scalar lap = (w[i]*nu[o] + (1.0-w[i])*nuN[i]) * dc[i] * magSf[i];
+    const scalar p = phi[i];
+    ifc[i] = -lap + (p<0.0?p:0.0);
+    atomicAdd(&diag[o], lap + (p>0.0?p:0.0));
 }
-__global__ void amiLaplKernel(int n, const label* __restrict__ own, const scalar* __restrict__ ga,
-        const scalar* __restrict__ gaN, const scalar* __restrict__ dc, const scalar* __restrict__ w,
-        const scalar* __restrict__ magSf, scalar* __restrict__ ifc, scalar* __restrict__ diag, int addToDiag) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i];
+
+
+__global__
+void amiLaplKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ ga,
+    const scalar* __restrict__ gaN,
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ magSf,
+    scalar* __restrict__ ifc,
+    scalar* __restrict__ diag,
+    int addToDiag)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
     const scalar c = (w[i]*ga[o] + (1.0-w[i])*gaN[i]) * dc[i] * magSf[i];
-    ifc[i] = c; if (addToDiag) atomicAdd(&diag[o], -c);
+    ifc[i] = c;
+    if (addToDiag) atomicAdd(&diag[o], -c);
 }
-__global__ void amiOffSumKernel(int n, const label* __restrict__ own, const scalar* __restrict__ ifc,
-        const scalar* __restrict__ wsum, scalar* __restrict__ sumOff) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; atomicAdd(&sumOff[own[i]], fabs(ifc[i])*wsum[i]);
+
+
+__global__
+void amiOffSumKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ ifc,
+    const scalar* __restrict__ wsum,
+    scalar* __restrict__ sumOff)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    atomicAdd(&sumOff[own[i]], fabs(ifc[i])*wsum[i]);
 }
-__global__ void amiAddHKernel(int n, const label* __restrict__ own, const scalar* __restrict__ ifc,
-        const scalar* __restrict__ Un, const scalar* __restrict__ V, scalar* __restrict__ H) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i];
+
+
+__global__
+void amiAddHKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ ifc,
+    const scalar* __restrict__ Un,
+    const scalar* __restrict__ V,
+    scalar* __restrict__ H)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
     atomicAdd(&H[o], -ifc[i]*Un[i]/V[o]);
 }
-__global__ void amiFluxKernel(int n, const label* __restrict__ own, const scalar* __restrict__ w,
-        const scalar* __restrict__ Hx, const scalar* __restrict__ Hy, const scalar* __restrict__ Hz,
-        const scalar* __restrict__ Hnx, const scalar* __restrict__ Hny, const scalar* __restrict__ Hnz,
-        const scalar* __restrict__ sfx, const scalar* __restrict__ sfy, const scalar* __restrict__ sfz, scalar* __restrict__ phi) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i]; const scalar wj=w[i], wn=1.0-wj;
+
+
+__global__
+void amiFluxKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ Hx,
+    const scalar* __restrict__ Hy,
+    const scalar* __restrict__ Hz,
+    const scalar* __restrict__ Hnx,
+    const scalar* __restrict__ Hny,
+    const scalar* __restrict__ Hnz,
+    const scalar* __restrict__ sfx,
+    const scalar* __restrict__ sfy,
+    const scalar* __restrict__ sfz,
+    scalar* __restrict__ phi)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
+    const scalar wj=w[i], wn=1.0-wj;
     phi[i] = (wj*Hx[o]+wn*Hnx[i])*sfx[i] + (wj*Hy[o]+wn*Hny[i])*sfy[i] + (wj*Hz[o]+wn*Hnz[i])*sfz[i];
 }
-__global__ void amiDivAddKernel(int n, const label* __restrict__ own, const scalar* __restrict__ phi,
-        const scalar* __restrict__ V, scalar* __restrict__ div) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; atomicAdd(&div[own[i]], phi[i]/V[own[i]]);
+
+
+__global__
+void amiDivAddKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ V,
+    scalar* __restrict__ div)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    atomicAdd(&div[own[i]], phi[i]/V[own[i]]);
 }
-__global__ void amiGradAddKernel(int n, const label* __restrict__ own, const scalar* __restrict__ w,
-        const scalar* __restrict__ psi, const scalar* __restrict__ pN, const scalar* __restrict__ sfx,
-        const scalar* __restrict__ sfy, const scalar* __restrict__ sfz, const scalar* __restrict__ V,
-        scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i];
+
+
+__global__
+void amiGradAddKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ psi,
+    const scalar* __restrict__ pN,
+    const scalar* __restrict__ sfx,
+    const scalar* __restrict__ sfy,
+    const scalar* __restrict__ sfz,
+    const scalar* __restrict__ V,
+    scalar* __restrict__ gx,
+    scalar* __restrict__ gy,
+    scalar* __restrict__ gz)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
     const scalar fv = (w[i]*psi[o] + (1.0-w[i])*pN[i]) / V[o];
-    atomicAdd(&gx[o], sfx[i]*fv); atomicAdd(&gy[o], sfy[i]*fv); atomicAdd(&gz[o], sfz[i]*fv);
+    atomicAdd(&gx[o], sfx[i]*fv);
+    atomicAdd(&gy[o], sfy[i]*fv);
+    atomicAdd(&gz[o], sfz[i]*fv);
 }
-__global__ void amiFluxCorrKernel(int n, const label* __restrict__ own, const scalar* __restrict__ ifc,
-        const scalar* __restrict__ pN, const scalar* __restrict__ p, scalar* __restrict__ phi) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; phi[i] -= ifc[i]*(pN[i] - p[own[i]]);
+
+
+__global__
+void amiFluxCorrKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ ifc,
+    const scalar* __restrict__ pN,
+    const scalar* __restrict__ p,
+    scalar* __restrict__ phi)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    phi[i] -= ifc[i]*(pN[i] - p[own[i]]);
 }
 } // namespace
-void deviceAmiAssembleMomentum(DeviceAMI& ami, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag) {
-    if (ami.n==0) return; DeviceBuffer<scalar> nuN; deviceAmiInterpolate(ami, nuEffCell, nuN);
+
+
+void deviceAmiAssembleMomentum(DeviceAMI& ami, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag)
+{
+    if (ami.n==0) return;
+    DeviceBuffer<scalar> nuN;
+    deviceAmiInterpolate(ami, nuEffCell, nuN);
     amiMomKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), nuEffCell.data(), nuN.data(), ami.deltaCoeffs.data(),
         ami.weights.data(), ami.magSf.data(), ami.phi.data(), ami.ifCoeff.data(), diag.data());
     cudaCheck(cudaGetLastError(),"amiMom");
 }
-void deviceAmiAssembleLaplacian(DeviceAMI& ami, const DeviceBuffer<scalar>& gammaCell, DeviceBuffer<scalar>& diag, bool addToDiag) {
-    if (ami.n==0) return; DeviceBuffer<scalar> gN; deviceAmiInterpolate(ami, gammaCell, gN);
+
+
+void deviceAmiAssembleLaplacian(DeviceAMI& ami, const DeviceBuffer<scalar>& gammaCell, DeviceBuffer<scalar>& diag, bool addToDiag)
+{
+    if (ami.n==0) return;
+    DeviceBuffer<scalar> gN;
+    deviceAmiInterpolate(ami, gammaCell, gN);
     amiLaplKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), gammaCell.data(), gN.data(), ami.deltaCoeffs.data(),
         ami.weights.data(), ami.magSf.data(), ami.ifCoeff.data(), diag.data(), addToDiag?1:0);
     cudaCheck(cudaGetLastError(),"amiLapl");
 }
-void deviceAmiOffDiagSum(const DeviceAMI& ami, DeviceBuffer<scalar>& sumOff) {
+
+
+void deviceAmiOffDiagSum(const DeviceAMI& ami, DeviceBuffer<scalar>& sumOff)
+{
     if (ami.n==0) return;
     amiOffSumKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.ifCoeff.data(), ami.weightsSum.data(), sumOff.data());
     cudaCheck(cudaGetLastError(),"amiOffSum");
 }
-void deviceAmiAddH(const DeviceAMI& ami, const DeviceBuffer<scalar>& UkNbr, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& H) {
+
+
+void deviceAmiAddH(const DeviceAMI& ami, const DeviceBuffer<scalar>& UkNbr, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& H)
+{
     if (ami.n==0) return;
     amiAddHKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.ifCoeff.data(), UkNbr.data(), V.data(), H.data());
     cudaCheck(cudaGetLastError(),"amiAddH");
 }
-void deviceAmiFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& Hx, const DeviceBuffer<scalar>& Hy, const DeviceBuffer<scalar>& Hz) {
-    if (ami.n==0) return; DeviceBuffer<scalar> Hnx,Hny,Hnz; deviceAmiInterpolateVec(ami, Hx,Hy,Hz, Hnx,Hny,Hnz);
+
+
+void deviceAmiFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& Hx, const DeviceBuffer<scalar>& Hy, const DeviceBuffer<scalar>& Hz)
+{
+    if (ami.n==0) return;
+    DeviceBuffer<scalar> Hnx,Hny,Hnz;
+    deviceAmiInterpolateVec(ami, Hx,Hy,Hz, Hnx,Hny,Hnz);
     amiFluxKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(), Hx.data(),Hy.data(),Hz.data(),
         Hnx.data(),Hny.data(),Hnz.data(), ami.Sfx.data(),ami.Sfy.data(),ami.Sfz.data(), ami.phi.data());
     cudaCheck(cudaGetLastError(),"amiFlux");
 }
-void deviceAmiAddDiv(const DeviceAMI& ami, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div) {
+
+
+void deviceAmiAddDiv(const DeviceAMI& ami, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
+{
     if (ami.n==0) return;
     amiDivAddKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.phi.data(), V.data(), div.data());
     cudaCheck(cudaGetLastError(),"amiDiv");
 }
-namespace { __global__ void amiZeroWallKernel(int n, const label* __restrict__ own, const label* __restrict__ isW, scalar* __restrict__ ifc) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i<n && isW[own[i]]) ifc[i]=0.0; } }
+
+
+namespace {
+__global__
+void amiZeroWallKernel(int n, const label* __restrict__ own, const label* __restrict__ isW, scalar* __restrict__ ifc)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<n && isW[own[i]]) ifc[i]=0.0;
+}
+} // namespace
+
+
 // epsilon setValues: a wall cell's eps is fixed (eps0), so the interface off-diagonal must not perturb it (the
 // internal-face setValues already zeros internal off-diagonals; do the same for the AMI interface coupling).
-void deviceAmiZeroWallIfCoeff(DeviceAMI& ami, const DeviceBuffer<label>& isWallCell) {
+void deviceAmiZeroWallIfCoeff(DeviceAMI& ami, const DeviceBuffer<label>& isWallCell)
+{
     if (ami.n==0) return;
     amiZeroWallKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), isWallCell.data(), ami.ifCoeff.data());
     cudaCheck(cudaGetLastError(),"amiZeroWall");
 }
-void deviceAmiAddGrad(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi, const DeviceBuffer<scalar>& V,
-                      DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz) {
-    if (ami.n==0) return; DeviceBuffer<scalar> pN; deviceAmiInterpolate(ami, psi, pN);
+
+
+void deviceAmiAddGrad(
+    const DeviceAMI& ami,
+    const DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& V,
+    DeviceBuffer<scalar>& gx,
+    DeviceBuffer<scalar>& gy,
+    DeviceBuffer<scalar>& gz)
+{
+    if (ami.n==0) return;
+    DeviceBuffer<scalar> pN;
+    deviceAmiInterpolate(ami, psi, pN);
     amiGradAddKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(), psi.data(), pN.data(),
         ami.Sfx.data(),ami.Sfy.data(),ami.Sfz.data(), V.data(), gx.data(),gy.data(),gz.data());
     cudaCheck(cudaGetLastError(),"amiGrad");
 }
+
+
 namespace {
-__global__ void amiTensorDivKernel(int n, const label* __restrict__ own, const label* __restrict__ off,
-        const label* __restrict__ nbr, const scalar* __restrict__ w, const scalar* __restrict__ wf,
-        const scalar* __restrict__ sfx, const scalar* __restrict__ sfy, const scalar* __restrict__ sfz,
-        const scalar* __restrict__ sigmaC, int nC, const scalar* __restrict__ fT, int rotational,
-        scalar* __restrict__ dX, scalar* __restrict__ dY, scalar* __restrict__ dZ) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i];
-    scalar sn[9]; for (int q=0;q<9;++q) sn[q]=0.0;
-    scalar R[9]; if (rotational) for (int q=0;q<9;++q) R[q]=fT[q*n+i];
-    for (label k=off[i]; k<off[i+1]; ++k) {                       // interp neighbour sigma (rotated for rotational)
-        const int nb=nbr[k]; const scalar wk=w[k];
-        scalar s[9]; for (int q=0;q<9;++q) s[q]=sigmaC[q*nC+nb];
-        if (rotational) {                                        // sigma' = R*sigma*R^T
-            scalar M[9]; for (int a=0;a<3;++a) for (int l=0;l<3;++l){ scalar t=0; for (int c=0;c<3;++c) t+=R[3*a+c]*s[3*c+l]; M[3*a+l]=t; }
-            for (int a=0;a<3;++a) for (int b=0;b<3;++b){ scalar t=0; for (int l=0;l<3;++l) t+=M[3*a+l]*R[3*b+l]; s[3*a+b]=t; }
+__global__
+void amiTensorDivKernel(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ off,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ wf,
+    const scalar* __restrict__ sfx,
+    const scalar* __restrict__ sfy,
+    const scalar* __restrict__ sfz,
+    const scalar* __restrict__ sigmaC,
+    int nC,
+    const scalar* __restrict__ fT,
+    int rotational,
+    scalar* __restrict__ dX,
+    scalar* __restrict__ dY,
+    scalar* __restrict__ dZ)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
+    scalar sn[9];
+    for (int q=0;q<9;++q)
+        sn[q]=0.0;
+    scalar R[9];
+    if (rotational)
+        for (int q=0;q<9;++q)
+            R[q]=fT[q*n+i];
+    // interp neighbour sigma (rotated for rotational)
+    for (label k=off[i]; k<off[i+1]; ++k)
+    {
+        const int nb=nbr[k];
+        const scalar wk=w[k];
+        scalar s[9];
+        for (int q=0;q<9;++q)
+            s[q]=sigmaC[q*nC+nb];
+        if (rotational)   // sigma' = R*sigma*R^T
+        {
+            scalar M[9];
+            for (int a=0;a<3;++a)
+                for (int l=0;l<3;++l)
+                {
+                    scalar t=0;
+                    for (int c=0;c<3;++c)
+                        t+=R[3*a+c]*s[3*c+l];
+                    M[3*a+l]=t;
+                }
+            for (int a=0;a<3;++a)
+                for (int b=0;b<3;++b)
+                {
+                    scalar t=0;
+                    for (int l=0;l<3;++l)
+                        t+=M[3*a+l]*R[3*b+l];
+                    s[3*a+b]=t;
+                }
         }
-        for (int q=0;q<9;++q) sn[q] += wk*s[q];
+        for (int q=0;q<9;++q)
+            sn[q] += wk*s[q];
     }
-    const scalar w0=wf[i], w1=1.0-w0; scalar d[3];
-    for (int jc=0;jc<3;++jc) {
+    const scalar w0=wf[i], w1=1.0-w0;
+    scalar d[3];
+    for (int jc=0;jc<3;++jc)
+    {
         const scalar s0=w0*sigmaC[(0*3+jc)*nC+o]+w1*sn[0*3+jc];
         const scalar s1=w0*sigmaC[(1*3+jc)*nC+o]+w1*sn[1*3+jc];
         const scalar s2=w0*sigmaC[(2*3+jc)*nC+o]+w1*sn[2*3+jc];
         d[jc]=sfx[i]*s0 + sfy[i]*s1 + sfz[i]*s2;
     }
-    atomicAdd(&dX[o],d[0]); atomicAdd(&dY[o],d[1]); atomicAdd(&dZ[o],d[2]);
+    atomicAdd(&dX[o],d[0]);
+    atomicAdd(&dY[o],d[1]);
+    atomicAdd(&dZ[o],d[2]);
 }
 } // namespace
 namespace {
-__global__ void amiScaleImplicitKernel(int n, const scalar* __restrict__ ifc, const scalar* __restrict__ fT,
-        scalar* __restrict__ ic0, scalar* __restrict__ ic1, scalar* __restrict__ ic2) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return;
-    ic0[i]=ifc[i]*fT[0*n+i]; ic1[i]=ifc[i]*fT[4*n+i]; ic2[i]=ifc[i]*fT[8*n+i];   // *forwardT[kk][kk]
+__global__
+void amiScaleImplicitKernel(
+    int n,
+    const scalar* __restrict__ ifc,
+    const scalar* __restrict__ fT,
+    scalar* __restrict__ ic0,
+    scalar* __restrict__ ic1,
+    scalar* __restrict__ ic2)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    ic0[i]=ifc[i]*fT[0*n+i];   // *forwardT[kk][kk]
+    ic1[i]=ifc[i]*fT[4*n+i];
+    ic2[i]=ifc[i]*fT[8*n+i];
 }
-__global__ void amiDeferredRotKernel(int n, const label* __restrict__ own, const scalar* __restrict__ ifc,
-        const scalar* __restrict__ fT, int comp, const scalar* __restrict__ uiX, const scalar* __restrict__ uiY,
-        const scalar* __restrict__ uiZ, scalar* __restrict__ src) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return;
+
+
+__global__
+void amiDeferredRotKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ ifc,
+    const scalar* __restrict__ fT,
+    int comp,
+    const scalar* __restrict__ uiX,
+    const scalar* __restrict__ uiY,
+    const scalar* __restrict__ uiZ,
+    scalar* __restrict__ src)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
     const scalar ux=uiX[i], uy=uiY[i], uz=uiZ[i];
-    const scalar rComp = fT[(3*comp+0)*n+i]*ux + fT[(3*comp+1)*n+i]*uy + fT[(3*comp+2)*n+i]*uz;  // (forwardT·U_interp)[comp]
+    const scalar rComp = fT[(3*comp+0)*n+i]*ux + fT[(3*comp+1)*n+i]*uy + fT[(3*comp+2)*n+i]*uz;  // (forwardT.U_interp)[comp]
     const scalar diag  = fT[(3*comp+comp)*n+i];
     const scalar uComp = (comp==0)?ux:(comp==1)?uy:uz;
     atomicAdd(&src[own[i]], -ifc[i]*(rComp - diag*uComp));
 }
-__global__ void amiGradRotKernel(int n, const label* __restrict__ own, const scalar* __restrict__ w,
-        const scalar* __restrict__ Uown, const scalar* __restrict__ UNbr, const scalar* __restrict__ sfx,
-        const scalar* __restrict__ sfy, const scalar* __restrict__ sfz, const scalar* __restrict__ V,
-        scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i];
+
+
+__global__
+void amiGradRotKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ Uown,
+    const scalar* __restrict__ UNbr,
+    const scalar* __restrict__ sfx,
+    const scalar* __restrict__ sfy,
+    const scalar* __restrict__ sfz,
+    const scalar* __restrict__ V,
+    scalar* __restrict__ gx,
+    scalar* __restrict__ gy,
+    scalar* __restrict__ gz)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
     const scalar fv = (w[i]*Uown[o] + (1.0-w[i])*UNbr[i]) / V[o];
-    atomicAdd(&gx[o], sfx[i]*fv); atomicAdd(&gy[o], sfy[i]*fv); atomicAdd(&gz[o], sfz[i]*fv);
+    atomicAdd(&gx[o], sfx[i]*fv);
+    atomicAdd(&gy[o], sfy[i]*fv);
+    atomicAdd(&gz[o], sfz[i]*fv);
 }
 } // namespace
-void deviceAmiScaleImplicit(DeviceAMI& ami) {
+
+
+void deviceAmiScaleImplicit(DeviceAMI& ami)
+{
     if (ami.n==0) return;
     amiScaleImplicitKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ifCoeff.data(), ami.fT.data(),
         ami.ifCoeffC[0].data(), ami.ifCoeffC[1].data(), ami.ifCoeffC[2].data());
     cudaCheck(cudaGetLastError(),"amiScaleImplicit");
 }
-void deviceAmiAddDeferredRot(const DeviceAMI& ami, const DeviceBuffer<scalar>& uiX, const DeviceBuffer<scalar>& uiY,
-                             const DeviceBuffer<scalar>& uiZ, int comp, DeviceBuffer<scalar>& src) {
+
+
+void deviceAmiAddDeferredRot(
+    const DeviceAMI& ami,
+    const DeviceBuffer<scalar>& uiX,
+    const DeviceBuffer<scalar>& uiY,
+    const DeviceBuffer<scalar>& uiZ,
+    int comp,
+    DeviceBuffer<scalar>& src)
+{
     if (ami.n==0) return;
     amiDeferredRotKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.ifCoeff.data(), ami.fT.data(), comp,
         uiX.data(), uiY.data(), uiZ.data(), src.data());
     cudaCheck(cudaGetLastError(),"amiDeferredRot");
 }
-void deviceAmiAddGradRot(const DeviceAMI& ami, const DeviceBuffer<scalar>& Uown, const DeviceBuffer<scalar>& UNbr,
-                         const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz) {
+
+
+void deviceAmiAddGradRot(
+    const DeviceAMI& ami,
+    const DeviceBuffer<scalar>& Uown,
+    const DeviceBuffer<scalar>& UNbr,
+    const DeviceBuffer<scalar>& V,
+    DeviceBuffer<scalar>& gx,
+    DeviceBuffer<scalar>& gy,
+    DeviceBuffer<scalar>& gz)
+{
     if (ami.n==0) return;
     amiGradRotKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(), Uown.data(), UNbr.data(),
         ami.Sfx.data(), ami.Sfy.data(), ami.Sfz.data(), V.data(), gx.data(), gy.data(), gz.data());
     cudaCheck(cudaGetLastError(),"amiGradRot");
 }
-void deviceAmiAddTensorDiv(const DeviceAMI& ami, const DeviceBuffer<scalar>& sigmaC, int nC,
-                           DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ) {
+
+
+void deviceAmiAddTensorDiv(
+    const DeviceAMI& ami,
+    const DeviceBuffer<scalar>& sigmaC,
+    int nC,
+    DeviceBuffer<scalar>& srcX,
+    DeviceBuffer<scalar>& srcY,
+    DeviceBuffer<scalar>& srcZ)
+{
     if (ami.n==0) return;
     amiTensorDivKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
         ami.weight.data(), ami.weights.data(), ami.Sfx.data(), ami.Sfy.data(), ami.Sfz.data(),
         sigmaC.data(), nC, ami.rotational?ami.fT.data():nullptr, ami.rotational?1:0, srcX.data(), srcY.data(), srcZ.data());
     cudaCheck(cudaGetLastError(),"amiTensorDiv");
 }
-void deviceAmiCorrectFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& p) {
-    if (ami.n==0) return; DeviceBuffer<scalar> pN; deviceAmiInterpolate(ami, p, pN);
+
+
+void deviceAmiCorrectFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& p)
+{
+    if (ami.n==0) return;
+    DeviceBuffer<scalar> pN;
+    deviceAmiInterpolate(ami, p, pN);
     amiFluxCorrKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.ifCoeff.data(), pN.data(), p.data(), ami.phi.data());
     cudaCheck(cudaGetLastError(),"amiFluxCorr");
 }
 
-void deviceAmiInterpolate(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& out) {
-    if (ami.n == 0) return; out.resize(ami.n);
+
+void deviceAmiInterpolate(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& out)
+{
+    if (ami.n == 0) return;
+    out.resize(ami.n);
     amiInterpKernel<<<nBlocks(ami.n), TPB>>>(ami.n, ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
                                              psi.data(), out.data());
     cudaCheck(cudaGetLastError(), "amiInterp");
 }
-void deviceAmiInterpolateVec(const DeviceAMI& ami, const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
-                             const DeviceBuffer<scalar>& Uz, DeviceBuffer<scalar>& oX, DeviceBuffer<scalar>& oY,
-                             DeviceBuffer<scalar>& oZ) {
-    if (ami.n == 0) return; oX.resize(ami.n); oY.resize(ami.n); oZ.resize(ami.n);
+
+
+void deviceAmiInterpolateVec(
+    const DeviceAMI& ami,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    DeviceBuffer<scalar>& oX,
+    DeviceBuffer<scalar>& oY,
+    DeviceBuffer<scalar>& oZ)
+{
+    if (ami.n == 0) return;
+    oX.resize(ami.n); oY.resize(ami.n); oZ.resize(ami.n);
     amiInterpVecKernel<<<nBlocks(ami.n), TPB>>>(ami.n, ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
         Ux.data(), Uy.data(), Uz.data(), ami.rotational ? ami.fT.data() : nullptr, ami.rotational ? 1 : 0,
         oX.data(), oY.data(), oZ.data());
     cudaCheck(cudaGetLastError(), "amiInterpVec");
 }
 
+
 namespace {
-__global__ void amiLinUpwindKernel(int n, const label* __restrict__ own, const label* __restrict__ off,
-        const label* __restrict__ nbr, const scalar* __restrict__ w, const scalar* __restrict__ phi,
-        const scalar* __restrict__ gx0, const scalar* __restrict__ gy0, const scalar* __restrict__ gz0,
-        const scalar* __restrict__ gx1, const scalar* __restrict__ gy1, const scalar* __restrict__ gz1,
-        const scalar* __restrict__ gx2, const scalar* __restrict__ gy2, const scalar* __restrict__ gz2,
-        const scalar* __restrict__ dox, const scalar* __restrict__ doy, const scalar* __restrict__ doz,
-        const scalar* __restrict__ dnx, const scalar* __restrict__ dny, const scalar* __restrict__ dnz,
-        const scalar* __restrict__ fT, int rotational, int comp, scalar* __restrict__ corr) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i]; const scalar pf=phi[i]; scalar c;
-    if (pf >= 0) {                                            // own upwind: grad(U_comp)[own] . dOwn
+__global__
+void amiLinUpwindKernel(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ off,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ gx0,
+    const scalar* __restrict__ gy0,
+    const scalar* __restrict__ gz0,
+    const scalar* __restrict__ gx1,
+    const scalar* __restrict__ gy1,
+    const scalar* __restrict__ gz1,
+    const scalar* __restrict__ gx2,
+    const scalar* __restrict__ gy2,
+    const scalar* __restrict__ gz2,
+    const scalar* __restrict__ dox,
+    const scalar* __restrict__ doy,
+    const scalar* __restrict__ doz,
+    const scalar* __restrict__ dnx,
+    const scalar* __restrict__ dny,
+    const scalar* __restrict__ dnz,
+    const scalar* __restrict__ fT,
+    int rotational,
+    int comp,
+    scalar* __restrict__ corr)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
+    const scalar pf=phi[i];
+    scalar c;
+    if (pf >= 0)   // own upwind: grad(U_comp)[own] . dOwn
+    {
         const scalar* gx=(comp==0)?gx0:(comp==1)?gx1:gx2;
         const scalar* gy=(comp==0)?gy0:(comp==1)?gy1:gy2;
         const scalar* gz=(comp==0)?gz0:(comp==1)?gz1:gz2;
         c = pf*(gx[o]*dox[i] + gy[o]*doy[i] + gz[o]*doz[i]);
-    } else {                                                 // nbr upwind: forwardT . (Σ_k w_k (gradU[nbr_k] . dNbr_k))
+    }
+    else   // nbr upwind: forwardT . (Sum_k w_k (gradU[nbr_k] . dNbr_k))
+    {
         scalar rl0=0, rl1=0, rl2=0;
-        for (label k=off[i]; k<off[i+1]; ++k) { const int nb=nbr[k]; const scalar wk=w[k], dx=dnx[k],dy=dny[k],dz=dnz[k];
+        for (label k=off[i]; k<off[i+1]; ++k)
+        {
+            const int nb=nbr[k];
+            const scalar wk=w[k], dx=dnx[k],dy=dny[k],dz=dnz[k];
             rl0 += wk*(gx0[nb]*dx+gy0[nb]*dy+gz0[nb]*dz);
             rl1 += wk*(gx1[nb]*dx+gy1[nb]*dy+gz1[nb]*dz);
-            rl2 += wk*(gx2[nb]*dx+gy2[nb]*dy+gz2[nb]*dz); }
+            rl2 += wk*(gx2[nb]*dx+gy2[nb]*dy+gz2[nb]*dz);
+        }
         c = rotational ? pf*(fT[(3*comp+0)*n+i]*rl0+fT[(3*comp+1)*n+i]*rl1+fT[(3*comp+2)*n+i]*rl2)
                        : pf*((comp==0)?rl0:(comp==1)?rl1:rl2);
     }
     atomicAdd(&corr[o], c);
 }
-__global__ void amiLapCorrKernel(int n, const label* __restrict__ own, const label* __restrict__ off,
-        const label* __restrict__ nbr, const scalar* __restrict__ w, const scalar* __restrict__ wf,
-        const scalar* __restrict__ nu, const scalar* __restrict__ nuN, const scalar* __restrict__ magSf,
-        const scalar* __restrict__ cvx, const scalar* __restrict__ cvy, const scalar* __restrict__ cvz,
-        const scalar* __restrict__ gx0, const scalar* __restrict__ gy0, const scalar* __restrict__ gz0,
-        const scalar* __restrict__ gx1, const scalar* __restrict__ gy1, const scalar* __restrict__ gz1,
-        const scalar* __restrict__ gx2, const scalar* __restrict__ gy2, const scalar* __restrict__ gz2,
-        const scalar* __restrict__ fT, int rotational, int comp, scalar* __restrict__ src) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i]; const scalar w0=wf[i], w1=1.0-w0;
+
+
+__global__
+void amiLapCorrKernel(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ off,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ wf,
+    const scalar* __restrict__ nu,
+    const scalar* __restrict__ nuN,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ cvx,
+    const scalar* __restrict__ cvy,
+    const scalar* __restrict__ cvz,
+    const scalar* __restrict__ gx0,
+    const scalar* __restrict__ gy0,
+    const scalar* __restrict__ gz0,
+    const scalar* __restrict__ gx1,
+    const scalar* __restrict__ gy1,
+    const scalar* __restrict__ gz1,
+    const scalar* __restrict__ gx2,
+    const scalar* __restrict__ gy2,
+    const scalar* __restrict__ gz2,
+    const scalar* __restrict__ fT,
+    int rotational,
+    int comp,
+    scalar* __restrict__ src)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
+    const scalar w0=wf[i], w1=1.0-w0;
     const scalar* gxc=(comp==0)?gx0:(comp==1)?gx1:gx2;        // own grad(U_comp): row `comp`, components x/y/z
     const scalar* gyc=(comp==0)?gy0:(comp==1)?gy1:gy2;
     const scalar* gzc=(comp==0)?gz0:(comp==1)?gz1:gz2;
-    scalar gn[3]={0,0,0}; scalar R[9]; if (rotational) for (int q=0;q<9;++q) R[q]=fT[q*n+i];
-    for (label k=off[i]; k<off[i+1]; ++k) { const int nb=nbr[k]; const scalar wk=w[k];
+    scalar gn[3]={0,0,0};
+    scalar R[9];
+    if (rotational)
+        for (int q=0;q<9;++q)
+            R[q]=fT[q*n+i];
+    for (label k=off[i]; k<off[i+1]; ++k)
+    {
+        const int nb=nbr[k];
+        const scalar wk=w[k];
         const scalar G[9]={gx0[nb],gy0[nb],gz0[nb], gx1[nb],gy1[nb],gz1[nb], gx2[nb],gy2[nb],gz2[nb]};
-        if (rotational) { for (int j=0;j<3;++j){ scalar s=0; for (int a=0;a<3;++a) for (int b=0;b<3;++b) s+=R[3*comp+a]*G[3*a+b]*R[3*j+b]; gn[j]+=wk*s; } }
-        else { gn[0]+=wk*G[3*comp+0]; gn[1]+=wk*G[3*comp+1]; gn[2]+=wk*G[3*comp+2]; } }
+        if (rotational)
+        {
+            for (int j=0;j<3;++j)
+            {
+                scalar s=0;
+                for (int a=0;a<3;++a)
+                    for (int b=0;b<3;++b)
+                        s+=R[3*comp+a]*G[3*a+b]*R[3*j+b];
+                gn[j]+=wk*s;
+            }
+        }
+        else
+        {
+            gn[0]+=wk*G[3*comp+0];
+            gn[1]+=wk*G[3*comp+1];
+            gn[2]+=wk*G[3*comp+2];
+        }
+    }
     const scalar gfx=w0*gxc[o]+w1*gn[0], gfy=w0*gyc[o]+w1*gn[1], gfz=w0*gzc[o]+w1*gn[2];
     const scalar gammaf=w0*nu[o]+w1*nuN[i];
     atomicAdd(&src[o], -(gammaf*magSf[i]*(cvx[i]*gfx + cvy[i]*gfy + cvz[i]*gfz)));
 }
-__global__ void amiLapCorrPKernel(int n, const label* __restrict__ own, const scalar* __restrict__ wf,
-        const scalar* __restrict__ ga, const scalar* __restrict__ gaN, const scalar* __restrict__ magSf,
-        const scalar* __restrict__ cvx, const scalar* __restrict__ cvy, const scalar* __restrict__ cvz,
-        const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
-        const scalar* __restrict__ gxN, const scalar* __restrict__ gyN, const scalar* __restrict__ gzN,
-        scalar* __restrict__ bp, scalar* __restrict__ ffcOut) {
-    const int i = blockIdx.x*blockDim.x+threadIdx.x; if (i>=n) return; const int o=own[i]; const scalar w0=wf[i], w1=1.0-w0;
+
+
+__global__
+void amiLapCorrPKernel(
+    int n,
+    const label* __restrict__ own,
+    const scalar* __restrict__ wf,
+    const scalar* __restrict__ ga,
+    const scalar* __restrict__ gaN,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ cvx,
+    const scalar* __restrict__ cvy,
+    const scalar* __restrict__ cvz,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    const scalar* __restrict__ gxN,
+    const scalar* __restrict__ gyN,
+    const scalar* __restrict__ gzN,
+    scalar* __restrict__ bp,
+    scalar* __restrict__ ffcOut)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+
+    const int o=own[i];
+    const scalar w0=wf[i], w1=1.0-w0;
     const scalar gfx=w0*gx[o]+w1*gxN[i], gfy=w0*gy[o]+w1*gyN[i], gfz=w0*gz[o]+w1*gzN[i];   // grad(p)_face (scalar field)
     const scalar gammaf=w0*ga[o]+w1*gaN[i];
     const scalar ffc=gammaf*magSf[i]*(cvx[i]*gfx + cvy[i]*gfy + cvz[i]*gfz);
-    ffcOut[i]=ffc; atomicAdd(&bp[o], -ffc);
+    ffcOut[i]=ffc;
+    atomicAdd(&bp[o], -ffc);
 }
 } // namespace
-void deviceAmiAddLinUpwindCorr(const DeviceAMI& ami, int comp, const DeviceBuffer<scalar>* gUx,
-                               const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz, DeviceBuffer<scalar>& corr) {
+
+
+void deviceAmiAddLinUpwindCorr(
+    const DeviceAMI& ami,
+    int comp,
+    const DeviceBuffer<scalar>* gUx,
+    const DeviceBuffer<scalar>* gUy,
+    const DeviceBuffer<scalar>* gUz,
+    DeviceBuffer<scalar>& corr)
+{
     if (ami.n==0) return;
     amiLinUpwindKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
         ami.weight.data(), ami.phi.data(), gUx[0].data(),gUy[0].data(),gUz[0].data(), gUx[1].data(),gUy[1].data(),gUz[1].data(),
@@ -320,19 +771,39 @@ void deviceAmiAddLinUpwindCorr(const DeviceAMI& ami, int comp, const DeviceBuffe
         ami.dNbrX.data(),ami.dNbrY.data(),ami.dNbrZ.data(), ami.rotational?ami.fT.data():nullptr, ami.rotational?1:0, comp, corr.data());
     cudaCheck(cudaGetLastError(),"amiLinUpwind");
 }
-void deviceAmiAddLapCorr(const DeviceAMI& ami, int comp, const DeviceBuffer<scalar>& gammaCell,
-                         const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz,
-                         DeviceBuffer<scalar>& corr) {
-    if (ami.n==0) return; DeviceBuffer<scalar> nuN; deviceAmiInterpolate(ami, gammaCell, nuN);
+
+
+void deviceAmiAddLapCorr(
+    const DeviceAMI& ami,
+    int comp,
+    const DeviceBuffer<scalar>& gammaCell,
+    const DeviceBuffer<scalar>* gUx,
+    const DeviceBuffer<scalar>* gUy,
+    const DeviceBuffer<scalar>* gUz,
+    DeviceBuffer<scalar>& corr)
+{
+    if (ami.n==0) return;
+    DeviceBuffer<scalar> nuN;
+    deviceAmiInterpolate(ami, gammaCell, nuN);
     amiLapCorrKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
         ami.weights.data(), gammaCell.data(), nuN.data(), ami.magSf.data(), ami.corrVecX.data(),ami.corrVecY.data(),ami.corrVecZ.data(),
         gUx[0].data(),gUy[0].data(),gUz[0].data(), gUx[1].data(),gUy[1].data(),gUz[1].data(), gUx[2].data(),gUy[2].data(),gUz[2].data(),
         ami.rotational?ami.fT.data():nullptr, ami.rotational?1:0, comp, corr.data());
     cudaCheck(cudaGetLastError(),"amiLapCorr");
 }
-void deviceAmiLapCorrP(const DeviceAMI& ami, const DeviceBuffer<scalar>& gammaCell, const DeviceBuffer<scalar>& gx,
-                       const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& bp, DeviceBuffer<scalar>& ffcOut) {
-    if (ami.n==0) return; ffcOut.resize(ami.n);
+
+
+void deviceAmiLapCorrP(
+    const DeviceAMI& ami,
+    const DeviceBuffer<scalar>& gammaCell,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>& bp,
+    DeviceBuffer<scalar>& ffcOut)
+{
+    if (ami.n==0) return;
+    ffcOut.resize(ami.n);
     DeviceBuffer<scalar> gaN, gxN, gyN, gzN;
     deviceAmiInterpolate(ami, gammaCell, gaN); deviceAmiInterpolate(ami, gx, gxN);
     deviceAmiInterpolate(ami, gy, gyN); deviceAmiInterpolate(ami, gz, gzN);
