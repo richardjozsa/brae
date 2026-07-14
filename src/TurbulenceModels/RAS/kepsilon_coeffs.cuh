@@ -8,7 +8,8 @@
 
 namespace brae {
 
-struct KEpsilonCoeffs {
+struct KEpsilonCoeffs
+{
     scalar Cmu = 0.09, C1 = 1.44, C2 = 1.92, C3 = 0.0;
     scalar sigmaK = 1.0, sigmaEps = 1.3;
     scalar kappa = 0.41, E = 9.8;
