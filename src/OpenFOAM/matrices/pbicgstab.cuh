@@ -11,10 +11,14 @@
 
 namespace brae {
 
-SolverPerformance pbicgstab(const FvScalarMatrix& M,
-                            std::vector<scalar>& psi,
-                            const PrimitiveMesh& m,
-                            const std::vector<FvPatch>& patches,
-                            scalar tolerance, scalar relTol, int maxIter, int minIter = 0);
+SolverPerformance pbicgstab(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter = 0);
 
 } // namespace brae
