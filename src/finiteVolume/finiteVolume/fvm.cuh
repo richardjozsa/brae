@@ -21,9 +21,13 @@ namespace fvm {
 
 // laplacian with a face-varying diffusivity gammaf (e.g. interpolate(rAU)) for the pEqn.
 template <typename T>
-FvMatrix<T> laplacian(const SurfaceScalarField& gammaf, const GeometricField<T>& vf,
-                      const PrimitiveMesh& m, const FvGeometry& g,
-                      const std::vector<FvPatch>& patches) {
+FvMatrix<T> laplacian(
+    const SurfaceScalarField& gammaf,
+    const GeometricField<T>& vf,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -36,20 +40,25 @@ FvMatrix<T> laplacian(const SurfaceScalarField& gammaf, const GeometricField<T>&
     M.source.assign(nC, T{});
     M.upper.resize(nIf);
     M.lower.resize(nIf);
-    for (label f = 0; f < nIf; ++f) {
+    for (label f = 0; f < nIf; ++f)
+    {
         const scalar coeff = dc[f] * gammaf.internal[f] * magSf[f];
-        M.upper[f] = coeff; M.lower[f] = coeff;
-        M.diag[own[f]] -= coeff; M.diag[nei[f]] -= coeff;
+        M.upper[f] = coeff;
+        M.lower[f] = coeff;
+        M.diag[own[f]] -= coeff;
+        M.diag[nei[f]] -= coeff;
     }
     M.internalCoeffs.resize(patches.size());
     M.boundaryCoeffs.resize(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi) {
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
         const FvPatch& fp = patches[pi];
         const std::vector<T> gIC = vf.boundary[pi]->gradientInternalCoeffs();
         const std::vector<T> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
         M.internalCoeffs[pi].resize(fp.size);
         M.boundaryCoeffs[pi].resize(fp.size);
-        for (label i = 0; i < fp.size; ++i) {
+        for (label i = 0; i < fp.size; ++i)
+        {
             const scalar pGamma = gammaf.boundary[pi][i] * magSf[fp.start + i];
             M.internalCoeffs[pi][i] =  pGamma * gIC[i];
             M.boundaryCoeffs[pi][i] = (-pGamma) * gBC[i];
@@ -59,9 +68,13 @@ FvMatrix<T> laplacian(const SurfaceScalarField& gammaf, const GeometricField<T>&
 }
 
 template <typename T>
-FvMatrix<T> laplacian(const GeometricField<T>& vf, scalar gamma,
-                      const PrimitiveMesh& m, const FvGeometry& g,
-                      const std::vector<FvPatch>& patches) {
+FvMatrix<T> laplacian(
+    const GeometricField<T>& vf,
+    scalar gamma,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -75,7 +88,8 @@ FvMatrix<T> laplacian(const GeometricField<T>& vf, scalar gamma,
     M.upper.resize(nIf);
     M.lower.resize(nIf);
 
-    for (label f = 0; f < nIf; ++f) {
+    for (label f = 0; f < nIf; ++f)
+    {
         const scalar coeff = dc[f] * gamma * magSf[f];
         M.upper[f] = coeff;
         M.lower[f] = coeff;
@@ -85,13 +99,15 @@ FvMatrix<T> laplacian(const GeometricField<T>& vf, scalar gamma,
 
     M.internalCoeffs.resize(patches.size());
     M.boundaryCoeffs.resize(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi) {
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
         const FvPatch& fp = patches[pi];
         const std::vector<T> gIC = vf.boundary[pi]->gradientInternalCoeffs();
         const std::vector<T> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
         M.internalCoeffs[pi].resize(fp.size);
         M.boundaryCoeffs[pi].resize(fp.size);
-        for (label i = 0; i < fp.size; ++i) {
+        for (label i = 0; i < fp.size; ++i)
+        {
             const scalar pGamma = gamma * magSf[fp.start + i];
             M.internalCoeffs[pi][i] =  pGamma * gIC[i];
             M.boundaryCoeffs[pi][i] = (-pGamma) * gBC[i];
@@ -101,11 +117,13 @@ FvMatrix<T> laplacian(const GeometricField<T>& vf, scalar gamma,
 }
 
 template <typename T>
-FvMatrix<T> div(const std::vector<scalar>& phiInternal,
-                const std::vector<std::vector<scalar>>& phiBoundary,
-                const GeometricField<T>& vf,
-                const PrimitiveMesh& m,
-                const std::vector<FvPatch>& patches) {
+FvMatrix<T> div(
+    const std::vector<scalar>& phiInternal,
+    const std::vector<std::vector<scalar>>& phiBoundary,
+    const GeometricField<T>& vf,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches)
+{
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -117,7 +135,8 @@ FvMatrix<T> div(const std::vector<scalar>& phiInternal,
     M.upper.resize(nIf);
     M.lower.resize(nIf);
 
-    for (label f = 0; f < nIf; ++f) {
+    for (label f = 0; f < nIf; ++f)
+    {
         const scalar phi = phiInternal[f];
         const scalar w   = (phi >= 0.0) ? 1.0 : 0.0;
         M.lower[f] = -w * phi;
@@ -128,13 +147,15 @@ FvMatrix<T> div(const std::vector<scalar>& phiInternal,
 
     M.internalCoeffs.resize(patches.size());
     M.boundaryCoeffs.resize(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi) {
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
         const FvPatch& fp = patches[pi];
         const std::vector<T> vIC = vf.boundary[pi]->valueInternalCoeffs();
         const std::vector<T> vBC = vf.boundary[pi]->valueBoundaryCoeffs();
         M.internalCoeffs[pi].resize(fp.size);
         M.boundaryCoeffs[pi].resize(fp.size);
-        for (label i = 0; i < fp.size; ++i) {
+        for (label i = 0; i < fp.size; ++i)
+        {
             const scalar pf = phiBoundary[pi][i];
             M.internalCoeffs[pi][i] =  pf * vIC[i];
             M.boundaryCoeffs[pi][i] = (-pf) * vBC[i];
