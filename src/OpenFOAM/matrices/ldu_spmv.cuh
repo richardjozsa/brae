@@ -14,8 +14,9 @@
 
 namespace brae {
 
-std::vector<scalar> Amul(const FvScalarMatrix& M,
-                         const std::vector<scalar>& psi,
-                         const PrimitiveMesh& m);
+std::vector<scalar> Amul(
+    const FvScalarMatrix& M,
+    const std::vector<scalar>& psi,
+    const PrimitiveMesh& m);
 
 } // namespace brae
