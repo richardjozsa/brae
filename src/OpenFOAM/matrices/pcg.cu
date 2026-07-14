@@ -3,11 +3,16 @@
 
 namespace brae {
 
-SolverPerformance pcg(const FvScalarMatrix& M,
-                      std::vector<scalar>& psi,
-                      const PrimitiveMesh& m,
-                      const std::vector<FvPatch>& patches,
-                      scalar tolerance, scalar relTol, int maxIter, int minIter) {
+SolverPerformance pcg(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter)
+{
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -19,21 +24,35 @@ SolverPerformance pcg(const FvScalarMatrix& M,
     std::vector<scalar> diagC = M.diag;
     std::vector<scalar> b     = M.source;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        for (label i = 0; i < patches[pi].size; ++i) {
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
             const label c = patches[pi].faceCells[i];
             diagC[c] += M.internalCoeffs[pi][i];
             b[c]     += M.boundaryCoeffs[pi][i];
         }
 
-    auto Amul = [&](const std::vector<scalar>& x, std::vector<scalar>& Ax) {
-        for (label c = 0; c < nC; ++c) Ax[c] = diagC[c] * x[c];
-        for (label f = 0; f < nIf; ++f) {
+    auto Amul = [&](const std::vector<scalar>& x, std::vector<scalar>& Ax)
+    {
+        for (label c = 0; c < nC; ++c)
+            Ax[c] = diagC[c] * x[c];
+        for (label f = 0; f < nIf; ++f)
+        {
             Ax[nei[f]] += lower[f] * x[own[f]];
             Ax[own[f]] += upper[f] * x[nei[f]];
         }
     };
-    auto sumMag  = [&](const std::vector<scalar>& x) { scalar s = 0; for (label c = 0; c < nC; ++c) s += std::fabs(x[c]); return s; };
-    auto sumProd = [&](const std::vector<scalar>& a, const std::vector<scalar>& c) { scalar s = 0; for (label i = 0; i < nC; ++i) s += a[i] * c[i]; return s; };
+    auto sumMag = [&](const std::vector<scalar>& x)
+    {
+        scalar s = 0;
+        for (label c = 0; c < nC; ++c) s += std::fabs(x[c]);
+        return s;
+    };
+    auto sumProd = [&](const std::vector<scalar>& a, const std::vector<scalar>& c)
+    {
+        scalar s = 0;
+        for (label i = 0; i < nC; ++i) s += a[i] * c[i];
+        return s;
+    };
 
     std::vector<scalar> pA(nC, 0.0), wA(nC, 0.0), rA(nC);
 
@@ -43,10 +62,17 @@ SolverPerformance pcg(const FvScalarMatrix& M,
     // normFactor = sum(|A.psi - sumA*xRef| + |b - sumA*xRef|) + small
     std::vector<scalar> sumA(nC);
     for (label c = 0; c < nC; ++c) sumA[c] = diagC[c];
-    for (label f = 0; f < nIf; ++f) { sumA[nei[f]] += lower[f]; sumA[own[f]] += upper[f]; }
-    scalar xRef = 0.0; for (label c = 0; c < nC; ++c) xRef += psi[c]; xRef /= nC;
+    for (label f = 0; f < nIf; ++f)
+    {
+        sumA[nei[f]] += lower[f];
+        sumA[own[f]] += upper[f];
+    }
+    scalar xRef = 0.0;
+    for (label c = 0; c < nC; ++c) xRef += psi[c];
+    xRef /= nC;
     scalar normFactor = 0.0;
-    for (label c = 0; c < nC; ++c) {
+    for (label c = 0; c < nC; ++c)
+    {
         const scalar t = sumA[c] * xRef;
         normFactor += std::fabs(wA[c] - t) + std::fabs(b[c] - t);
     }
@@ -61,14 +87,17 @@ SolverPerformance pcg(const FvScalarMatrix& M,
     for (label f = 0; f < nIf; ++f) rD[nei[f]] -= upper[f] * upper[f] / rD[own[f]];
     for (label c = 0; c < nC; ++c) rD[c] = 1.0 / rD[c];
 
-    auto converged = [&](scalar fr) {
+    auto converged = [&](scalar fr)
+    {
         return (fr < tolerance) || (relTol > 0.0 && fr < relTol * perf.initialResidual);
     };
 
     scalar wArA = 1e300, wArAold;
     int nIter = 0;
-    if (minIter > 0 || !converged(perf.finalResidual)) {
-        do {
+    if (minIter > 0 || !converged(perf.finalResidual))
+    {
+        do
+        {
             wArAold = wArA;
 
             // DIC precondition: wA = M^-1 rA  (forward then backward sweep)
@@ -78,12 +107,20 @@ SolverPerformance pcg(const FvScalarMatrix& M,
 
             wArA = sumProd(wA, rA);
             if (nIter == 0) pA = wA;
-            else { const scalar beta = wArA / wArAold; for (label c = 0; c < nC; ++c) pA[c] = wA[c] + beta * pA[c]; }
+            else
+            {
+                const scalar beta = wArA / wArAold;
+                for (label c = 0; c < nC; ++c) pA[c] = wA[c] + beta * pA[c];
+            }
 
             Amul(pA, wA);
             const scalar wApA  = sumProd(wA, pA);
             const scalar alpha = wArA / wApA;
-            for (label c = 0; c < nC; ++c) { psi[c] += alpha * pA[c]; rA[c] -= alpha * wA[c]; }
+            for (label c = 0; c < nC; ++c)
+            {
+                psi[c] += alpha * pA[c];
+                rA[c] -= alpha * wA[c];
+            }
 
             perf.finalResidual = sumMag(rA) / normFactor;
             ++nIter;

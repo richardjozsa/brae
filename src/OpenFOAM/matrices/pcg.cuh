@@ -11,16 +11,21 @@
 
 namespace brae {
 
-struct SolverPerformance {
+struct SolverPerformance
+{
     scalar initialResidual = 0.0;
     scalar finalResidual   = 0.0;
     int    nIterations      = 0;
 };
 
-SolverPerformance pcg(const FvScalarMatrix& M,
-                      std::vector<scalar>& psi,
-                      const PrimitiveMesh& m,
-                      const std::vector<FvPatch>& patches,
-                      scalar tolerance, scalar relTol, int maxIter, int minIter = 0);
+SolverPerformance pcg(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter = 0);
 
 } // namespace brae

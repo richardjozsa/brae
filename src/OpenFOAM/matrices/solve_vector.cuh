@@ -12,22 +12,33 @@
 
 namespace brae {
 
-inline SolverPerformance solveVector(const FvVectorMatrix& M, GeometricField<vector>& U,
-                                     const PrimitiveMesh& m, const std::vector<FvPatch>& patches,
-                                     scalar tolerance, scalar relTol, int maxIter) {
+inline SolverPerformance solveVector(
+    const FvVectorMatrix& M,
+    GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter)
+{
     const label nC = m.nCells();
     SolverPerformance perf;
-    for (int cmpt = 0; cmpt < 3; ++cmpt) {
+    for (int cmpt = 0; cmpt < 3; ++cmpt)
+    {
         FvScalarMatrix Mc;
-        Mc.diag = M.diag; Mc.upper = M.upper; Mc.lower = M.lower;
+        Mc.diag = M.diag;
+        Mc.upper = M.upper;
+        Mc.lower = M.lower;
         Mc.source.resize(nC);
         for (label c = 0; c < nC; ++c) Mc.source[c] = component(M.source[c], cmpt);
         Mc.internalCoeffs.resize(patches.size());
         Mc.boundaryCoeffs.resize(patches.size());
-        for (std::size_t pi = 0; pi < patches.size(); ++pi) {
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
             Mc.internalCoeffs[pi].resize(patches[pi].size);
             Mc.boundaryCoeffs[pi].resize(patches[pi].size);
-            for (label i = 0; i < patches[pi].size; ++i) {
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
                 Mc.internalCoeffs[pi][i] = component(M.internalCoeffs[pi][i], cmpt);
                 Mc.boundaryCoeffs[pi][i] = component(M.boundaryCoeffs[pi][i], cmpt);
             }

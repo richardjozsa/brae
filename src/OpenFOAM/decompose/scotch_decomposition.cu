@@ -6,7 +6,8 @@
 
 namespace brae {
 
-std::vector<label> scotchDecompose(const PrimitiveMesh& m, label nParts) {
+std::vector<label> scotchDecompose(const PrimitiveMesh& m, label nParts)
+{
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
 
@@ -17,12 +18,17 @@ std::vector<label> scotchDecompose(const PrimitiveMesh& m, label nParts) {
     const std::vector<label>& nei = m.neighbour();
 
     std::vector<SCOTCH_Num> xadj(nC + 1, 0);
-    for (label f = 0; f < nIf; ++f) { ++xadj[own[f] + 1]; ++xadj[nei[f] + 1]; }
+    for (label f = 0; f < nIf; ++f)
+    {
+        ++xadj[own[f] + 1];
+        ++xadj[nei[f] + 1];
+    }
     for (label c = 0; c < nC; ++c) xadj[c + 1] += xadj[c];
 
     std::vector<SCOTCH_Num> adjncy(xadj[nC]);
     std::vector<SCOTCH_Num> cursor(xadj.begin(), xadj.end() - 1);  // running insert position
-    for (label f = 0; f < nIf; ++f) {
+    for (label f = 0; f < nIf; ++f)
+    {
         const label o = own[f], n = nei[f];
         adjncy[cursor[o]++] = n;
         adjncy[cursor[n]++] = o;

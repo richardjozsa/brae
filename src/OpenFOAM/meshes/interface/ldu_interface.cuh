@@ -11,7 +11,8 @@
 
 namespace brae {
 
-class lduInterface {
+class lduInterface
+{
 public:
     virtual ~lduInterface() = default;
 
@@ -19,8 +20,7 @@ public:
     virtual const std::vector<label>& faceCells() const = 0;
 
     // Gather psi at faceCells into the interface's outgoing buffer.
-    virtual void interfaceInternalField(const scalar* psi,
-                                        std::vector<scalar>& out) const = 0;
+    virtual void interfaceInternalField(const scalar* psi, std::vector<scalar>& out) const = 0;
 
     // Post the exchange (transport-specific: MPI Isend/Irecv now, DSM write later).
     virtual void initInterfaceMatrixUpdate(const scalar* psi) = 0;
