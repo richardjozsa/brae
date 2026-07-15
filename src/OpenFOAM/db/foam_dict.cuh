@@ -156,7 +156,10 @@ inline FoamDict parseDictBody(TokenStream& ts, bool top)
 
 inline FoamDict readDict(const std::string& path)
 {
-    TokenStream ts(path);
+    // expandVars=true: expand $macros in constant/system dicts too, e.g. $RASturbModel / $nu pulled in from an
+    // #included system/include/caseDefinition. OF expands $variables in every dictionary (a field file is just a
+    // dictionary), so match that here rather than only in the field reader and fvSchemes.
+    TokenStream ts(path, /*expandVars=*/true);
     return parseDictBody(ts, true);
 }
 
