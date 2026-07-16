@@ -69,6 +69,10 @@ public:
         scalar* bval_d,
         cudaStream_t stream = cudaStreamPerThread);
 
+    // Device pointer to interface i's received neighbour values (valid after exchange/waitExchange). Lets
+    // callers fold the halo into their own kernels (e.g. the H() interface term) without a round-trip.
+    const scalar* recvData(int i) const { return recvBuf_.data() + recvOffset_[i]; }
+
     // Neighbour values received for interface i (D2H; syncs `stream` first). For validation / tests.
     std::vector<scalar> neighbourField(
         int i,

@@ -57,4 +57,18 @@ DeviceSolverPerf deviceParallelJacobiPCG(
     scalar relTol,
     int maxIter);
 
+// Distributed Jacobi-BiCGStab for the NON-symmetric momentum matrix (upwind convection -> upper != lower):
+// the device counterpart of host parallelPBiCGStab, and the distributed twin of deviceJacobiBiCGStab. Same
+// recurrence, with A*x via deviceParallelAmul and every dot / sumMag a GLOBAL reduction (tier-1).
+DeviceSolverPerf deviceParallelJacobiBiCGStab(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter);
+
 } // namespace brae
