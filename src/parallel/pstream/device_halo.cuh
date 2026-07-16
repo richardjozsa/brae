@@ -35,17 +35,22 @@ public:
 
     // Post the exchange: pack psi at the interface faceCells and put to the neighbours on `stream` (no wait).
     // Do the local product between postExchange and waitExchange to overlap it with the transfer.
-    void postExchange(const scalar* psi_d, cudaStream_t stream = 0);
+    //
+    // The default stream is cudaStreamPerThread, NOT 0: brae's kernels compile with --default-stream
+    // per-thread, so their implicit stream is the per-thread default; NVSHMEM (a precompiled library) would
+    // read a bare 0 as the LEGACY default stream -- a different stream -- and the put could then race the pack.
+    // Passing cudaStreamPerThread (0x2) makes both agree, so pack/put/local-product/barrier/scatter are ordered.
+    void postExchange(const scalar* psi_d, cudaStream_t stream = cudaStreamPerThread);
     // Complete the exchange (barrier). After the stream completes, recv region i holds the neighbour values.
-    void waitExchange(cudaStream_t stream = 0);
+    void waitExchange(cudaStream_t stream = cudaStreamPerThread);
     // postExchange + waitExchange as one call (standalone use, e.g. the halo unit test).
-    void exchange(const scalar* psi_d, cudaStream_t stream = 0);
+    void exchange(const scalar* psi_d, cudaStream_t stream = cudaStreamPerThread);
 
     // Interface i's off-diagonal coupling: result[faceCells[i][f]] -= coeff[f] * recvNeighbour[f].
-    void updateInterfaceMatrix(int i, scalar* result_d, const scalar* coeff_d, cudaStream_t stream = 0);
+    void updateInterfaceMatrix(int i, scalar* result_d, const scalar* coeff_d, cudaStream_t stream = cudaStreamPerThread);
 
     // Neighbour values received for interface i (D2H; syncs `stream` first). For validation / tests.
-    std::vector<scalar> neighbourField(int i, cudaStream_t stream = 0) const;
+    std::vector<scalar> neighbourField(int i, cudaStream_t stream = cudaStreamPerThread) const;
 
 private:
     int                              myPart_ = 0;

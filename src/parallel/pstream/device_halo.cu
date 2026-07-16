@@ -21,7 +21,9 @@ void packKernel(
     if (f < n) sendRegion[f] = psi[faceCells[f]];
 }
 
-// result[faceCells[f]] -= coeff[f] * recvRegion[f]  (the coupled-interface off-diagonal, OF A.psi convention)
+// result[faceCells[f]] -= coeff[f] * recvRegion[f]  (the coupled-interface off-diagonal, OF A.psi convention).
+// atomicAdd because a cell may own several faces on the SAME interface (multiple cut faces to one neighbour),
+// so distinct threads can target the same result cell -- exactly like device_spmv's cyclicAmulKernel.
 __global__
 void scatterKernel(
     scalar*       __restrict__ result,
@@ -31,7 +33,7 @@ void scatterKernel(
     int n)
 {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
-    if (f < n) result[faceCells[f]] -= coeff[f] * recvRegion[f];
+    if (f < n) atomicAdd(&result[faceCells[f]], -coeff[f] * recvRegion[f]);
 }
 } // namespace
 

@@ -212,6 +212,14 @@ already anticipates.
 
 ### Phase 2 -- Distributed device SpMV
 
+- **Status: DONE** (`test_gpu_parallel_spmv`, np=1/2/4/8 green; device distributed A*psi == serial oracle at
+  rel 3.7e-15). Implemented `deviceParallelAmul` (`device_spmv.cu`): `halo.postExchange` -> local `deviceAmul`
+  (overlaps) -> `halo.waitExchange` -> per-interface `updateInterfaceMatrix` scatter, mirroring host
+  `parallelAmul`. **Two bugs found and fixed (both matter for Phases 3-4):** (1) NVSHMEM on-stream ops must be
+  given `cudaStreamPerThread` explicitly -- a bare `0` is the LEGACY default stream to the precompiled NVSHMEM
+  lib, a different stream from brae's per-thread-default kernels, so the put raced the pack; (2) the interface
+  scatter must use `atomicAdd` -- a cell can own several cut faces on one interface, so distinct threads target
+  the same result cell (same reason `cyclicAmulKernel` is atomic). Both surfaced only at np>=4.
 - **Goal:** bring the halo-overlapped LDU product to the **device** SpMV. The host version (`ldu_spmv` +
   `parallelAmul`, tested by `test_parallel_spmv`) is the oracle; the new part is running it on `device_spmv`
   with the Phase 1 device interface. The lever: `deviceAmul` *already* does exactly this pattern for cyclic
