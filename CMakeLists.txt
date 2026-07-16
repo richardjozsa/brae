@@ -238,6 +238,29 @@ if(BRAE_WITH_NVSHMEM)
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
 
+    # Phase 4a L8: device distributed momentum PREDICTOR vs the host predictor
+    add_executable(test_gpu_parallel_predictor tests/test_gpu_parallel_predictor.cu)
+    target_include_directories(test_gpu_parallel_predictor PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_predictor PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_predictor_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_predictor>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
+
+    # Phase 4a L8 blocker: a processor face contributes ZERO matrix coeffs on device (bcType 8 = coupled)
+    add_executable(test_gpu_parallel_bc tests/test_gpu_parallel_bc.cu)
+    target_include_directories(test_gpu_parallel_bc PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(test_gpu_parallel_bc PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_bc_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_bc>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
+
     # Phase 4a L7: device processor-face pressure flux (pEqn.flux) vs host parallelMatrixFlux + conservation
     add_executable(test_gpu_parallel_pflux tests/test_gpu_parallel_pflux.cu)
     target_include_directories(test_gpu_parallel_pflux PRIVATE ${BRAE_HEADER_DIRS}
