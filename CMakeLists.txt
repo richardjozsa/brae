@@ -60,6 +60,7 @@ list(REMOVE_DUPLICATES BRAE_HEADER_DIRS)
 # ---------------------------------------------------------------------------
 add_library(brae_core STATIC
     src/parallel/pstream/cf_pstream.cu
+    src/parallel/pstream/device_halo.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
     src/OpenFOAM/meshes/primitive_mesh.cu
@@ -102,6 +103,37 @@ if(OpenMP_CXX_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
+# NVSHMEM device transport (multi-GPU, Phase 1+). Phase 1a is host-side only: the bootstrap
+# (nvshmemx_init_attr off MPI) and the symmetric heap (nvshmem_malloc) link against libnvshmem_host and need
+# NO relocatable device code. Phase 1b's device-initiated put adds -rdc + device-link on its own TU only.
+# Default ON; if NVSHMEM is not found the build falls back to the MPI backend (single-GPU still compiles).
+# Override the location with -DNVSHMEM_HOME=... or the NVSHMEM_HOME env var.
+# ---------------------------------------------------------------------------
+option(BRAE_WITH_NVSHMEM "Build the NVSHMEM device transport for multi-GPU" ON)
+if(BRAE_WITH_NVSHMEM)
+    find_path(NVSHMEM_INCLUDE_DIR NAMES nvshmem.h
+        HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
+        PATHS /opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/nvshmem
+        PATH_SUFFIXES include)
+    find_library(NVSHMEM_HOST_LIB NAMES nvshmem_host
+        HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
+        PATHS /opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/nvshmem
+        PATH_SUFFIXES lib)
+    if(NVSHMEM_INCLUDE_DIR AND NVSHMEM_HOST_LIB)
+        get_filename_component(NVSHMEM_LIB_DIR ${NVSHMEM_HOST_LIB} DIRECTORY)
+        message(STATUS "cf NVSHMEM: ${NVSHMEM_HOST_LIB} (hdr ${NVSHMEM_INCLUDE_DIR})")
+        target_include_directories(brae_core PUBLIC ${NVSHMEM_INCLUDE_DIR})
+        target_link_libraries(brae_core PUBLIC ${NVSHMEM_HOST_LIB})
+        target_compile_definitions(brae_core PUBLIC BRAE_WITH_NVSHMEM)
+        # Find libnvshmem_host.so.3 and the dlopen'd MPI bootstrap plugin at runtime.
+        list(APPEND CMAKE_BUILD_RPATH ${NVSHMEM_LIB_DIR})
+    else()
+        message(WARNING "cf NVSHMEM requested but not found; building the MPI backend only (single-GPU)")
+        set(BRAE_WITH_NVSHMEM OFF)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 enable_testing()
@@ -116,6 +148,63 @@ foreach(_np 1 2 4 8)
              COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
                      $<TARGET_FILE:test_interface_exchange>)
 endforeach()
+
+# Multi-GPU Phase 0a: rank <-> GPU binding in Pstream::init
+add_executable(test_gpu_bind tests/test_gpu_bind.cu)
+target_include_directories(test_gpu_bind PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_bind PRIVATE brae_core)
+foreach(_np 1 2 4 8)
+    add_test(NAME gpu_bind_np${_np}
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                     $<TARGET_FILE:test_gpu_bind>)
+endforeach()
+
+# Multi-GPU Phase 0b: per-rank DeviceMesh upload + device-path reconstruction
+add_executable(test_gpu_decompose tests/test_gpu_decompose.cu)
+target_include_directories(test_gpu_decompose PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_decompose PRIVATE brae_core)
+foreach(_np 1 2 4 8)
+    add_test(NAME gpu_decompose_np${_np}
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                     $<TARGET_FILE:test_gpu_decompose>
+                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily/constant/polyMesh)
+endforeach()
+
+# Multi-GPU Phase 1a: NVSHMEM bootstrap + symmetric heap (host-side) smoke test
+if(BRAE_WITH_NVSHMEM)
+    add_executable(test_nvshmem_smoke tests/test_nvshmem_smoke.cu)
+    target_include_directories(test_nvshmem_smoke PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(test_nvshmem_smoke PRIVATE brae_core)
+    foreach(_np 1 2 4)
+        add_test(NAME nvshmem_smoke_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_nvshmem_smoke>)
+    endforeach()
+
+    # Phase 1b: device halo exchange (DeviceHalo/NVSHMEM) vs the host interface oracle
+    add_executable(test_gpu_interface_exchange tests/test_gpu_interface_exchange.cu)
+    target_include_directories(test_gpu_interface_exchange PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(test_gpu_interface_exchange PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_interface_exchange_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_interface_exchange>)
+    endforeach()
+    # NOTE: full CUDA-graph capture of the exchange is deferred to Phase 5. NVSHMEM's on-stream barrier is not
+    # graph-capturable (fatal "operation not permitted when stream is capturing"); an in-graph exchange needs
+    # the device-initiated put+signal path (-rdc). See docs/multi-gpu.md Phase 1b/5.
+
+    # Phase 2: device distributed SpMV (deviceParallelAmul) vs the serial oracle
+    add_executable(test_gpu_parallel_spmv tests/test_gpu_parallel_spmv.cu)
+    target_include_directories(test_gpu_parallel_spmv PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(test_gpu_parallel_spmv PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_spmv_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_spmv>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
+endif()
 
 add_executable(test_mesh_topology tests/test_mesh_topology.cu)
 target_include_directories(test_mesh_topology PRIVATE ${BRAE_HEADER_DIRS})
