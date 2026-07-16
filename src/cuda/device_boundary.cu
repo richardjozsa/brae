@@ -24,7 +24,11 @@ void bcValueKernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    if (type[i] == 0)      value[i] = internal[fc[i]];                                   // extrapolated -> internal cell
+    if (type[i] == 8)      return;                                                       // coupled (processor): the
+                                                                                         // face value is the halo-
+                                                                                         // interpolated one, injected
+                                                                                         // by DeviceHalo::scatterBoundaryValues -- never derived from the local cell.
+    else if (type[i] == 0) value[i] = internal[fc[i]];                                   // extrapolated -> internal cell
     else if (type[i] == 5) value[i] = (1.0 - vf[i]) * internal[fc[i]] + vf[i] * ref[i];  // mixed (Robin)
     else                   value[i] = ref[i];                                            // fixedValue / calculated
 }
@@ -91,6 +95,16 @@ void bcDivKernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
+    // A COUPLED (processor) face contributes NOTHING as a boundary: its coupling is the interface off-diagonal
+    // (deviceMomentumInterface), so both coeffs are zero. Without this the default branch below would give
+    // vIC = 1 -> iC = phi, DOUBLE-COUNTING the interface diagonal. Mirrors host ProcessorFvPatchField, whose
+    // valueInternalCoeffs/valueBoundaryCoeffs are overridden to zero for exactly this reason.
+    if (type[i] == 8)
+    {
+        iC[i] = 0.0;
+        bC[i] = 0.0;
+        return;
+    }
     // valueInternalCoeffs: fixedValue 0, zeroGradient/calculated 1, mixed 1-vf. valueBoundaryCoeffs: fixedValue ref,
     // mixed vf*ref, else 0.
     const scalar vIC = (type[i] == 1) ? 0.0 : ((type[i] == 5) ? (1.0 - vf[i]) : 1.0);

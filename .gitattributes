@@ -1,2 +1,7 @@
 *.cu  linguist-language=Cuda
 *.cuh linguist-language=Cuda
+
+# validation/ and bench/ hold OpenFOAM reference cases + third-party benchmark utilities (.C/.H), not brae
+# source. Exclude them so the language stats describe brae itself.
+validation/** linguist-vendored
+bench/**      linguist-vendored
