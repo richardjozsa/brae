@@ -1,0 +1,59 @@
+#pragma once
+// brae DeviceHalo: device-resident processor halo exchange over NVSHMEM.
+//
+// Manages ALL of a rank's processor interfaces together (one symmetric send/recv buffer pair, one barrier) --
+// the device counterpart of the host ProcessorInterface loop (init-all / wait / update-all). The transport is
+// the NVSHMEM on-stream host API (nvshmemx_putmem_on_stream + nvshmemx_barrier_all_on_stream), so the pack and
+// scatter are plain CUDA kernels and NOTHING needs relocatable device code. The fully device-initiated,
+// pack-fused, signalled variant is a Phase-5 performance change behind this same interface.
+//
+// Symmetric-heap layout: the send/recv buffers are sized to the MAX total interface faces across ALL PEs, so
+// the collective nvshmem_malloc is symmetric and recvBuf.data() is the same symmetric address on every PE.
+// Interface i occupies [recvOffset_[i], +size_[i]). A one-time MPI offset exchange tells each neighbour where
+// in our recv buffer it should write (remoteOffset_[i] is where WE write in the neighbour's buffer).
+#include "cf_types.cuh"
+#include "cf_pstream.cuh"
+#include "sym_buffer.cuh"
+#include "device_buffer.cuh"
+#include <cuda_runtime.h>
+#include <vector>
+
+namespace brae {
+
+class DeviceHalo
+{
+public:
+    // Collective across all ranks. nbrParts[i] = neighbour partition of interface i; faceCells[i] = the local
+    // owner cell of each of that interface's faces (one interface per neighbour partition).
+    DeviceHalo(int myPart,
+               const std::vector<int>& nbrParts,
+               const std::vector<std::vector<label>>& faceCells);
+
+    int   nInterfaces() const { return static_cast<int>(nbr_.size()); }
+    int   neighbour(int i) const { return nbr_[i]; }
+    label size(int i)      const { return size_[i]; }
+
+    // Post the exchange: pack psi at the interface faceCells and put to the neighbours on `stream` (no wait).
+    // Do the local product between postExchange and waitExchange to overlap it with the transfer.
+    void postExchange(const scalar* psi_d, cudaStream_t stream = 0);
+    // Complete the exchange (barrier). After the stream completes, recv region i holds the neighbour values.
+    void waitExchange(cudaStream_t stream = 0);
+    // postExchange + waitExchange as one call (standalone use, e.g. the halo unit test).
+    void exchange(const scalar* psi_d, cudaStream_t stream = 0);
+
+    // Interface i's off-diagonal coupling: result[faceCells[i][f]] -= coeff[f] * recvNeighbour[f].
+    void updateInterfaceMatrix(int i, scalar* result_d, const scalar* coeff_d, cudaStream_t stream = 0);
+
+    // Neighbour values received for interface i (D2H; syncs `stream` first). For validation / tests.
+    std::vector<scalar> neighbourField(int i, cudaStream_t stream = 0) const;
+
+private:
+    int                              myPart_ = 0;
+    std::vector<int>                 nbr_;
+    std::vector<label>               size_, recvOffset_, remoteOffset_;
+    std::vector<DeviceBuffer<label>> faceCellsD_;
+    SymBuffer<scalar>                sendBuf_, recvBuf_;
+    label                            total_ = 0;
+};
+
+} // namespace brae
