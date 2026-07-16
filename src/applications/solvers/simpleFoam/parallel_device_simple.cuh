@@ -253,6 +253,11 @@ inline void deviceParallelMatrixH(
             Hk.data(),
             n);
     }
+    // REQUIRED: the interface kernels above READ the shared recv buffer. Without this barrier a neighbour's
+    // NEXT exchange (e.g. the following velocity component's H) can overwrite our recv buffer while these
+    // kernels are still reading it -- see the hazard note in device_halo.cuh. Calling H() per component in a
+    // loop hits this immediately.
+    halo.waitExchange(stream);
 }
 
 } // namespace brae
