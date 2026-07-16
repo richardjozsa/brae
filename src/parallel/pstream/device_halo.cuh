@@ -58,6 +58,17 @@ public:
         const scalar* coeff_d,
         cudaStream_t stream = cudaStreamPerThread);
 
+    // After exchange(psi_d), write the interpolated processor-face boundary values into `bval_d`, so the
+    // unchanged device explicit operators (grad/div/interpolate) treat a processor face as a coupled boundary:
+    //   bval[procStart[i] + f] = weights[i][f]*psi[faceCells[i][f]] + (1 - weights[i][f])*psiNeighbour[i][f]
+    // weights[i] and procStart[i] are this partition's processor patches, same order as `halo`'s interfaces.
+    void scatterBoundaryValues(
+        const scalar* psi_d,
+        const std::vector<DeviceBuffer<scalar>>& weights,
+        const std::vector<label>& procStart,
+        scalar* bval_d,
+        cudaStream_t stream = cudaStreamPerThread);
+
     // Neighbour values received for interface i (D2H; syncs `stream` first). For validation / tests.
     std::vector<scalar> neighbourField(
         int i,
