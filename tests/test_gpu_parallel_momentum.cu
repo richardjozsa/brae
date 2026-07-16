@@ -148,6 +148,38 @@ int main(int argc, char** argv)
         if (rUp   > 1e-11) { std::printf("[rank %d] FAIL upper rel=%.3e\n", rank, rUp); ++fails; }
         if (rLo   > 1e-11) { std::printf("[rank %d] FAIL lower rel=%.3e\n", rank, rLo); ++fails; }
         if (rIf   > 1e-11) { std::printf("[rank %d] FAIL ifCoeff rel=%.3e\n", rank, rIf); ++fails; }
+
+        // The pressure equation's coupling: a laplacian(gamma, .) interface (host assembleLocalLaplacianF).
+        const scalar gam = 0.5;
+        const std::vector<scalar> gammaF(m.nFaces(), gam);
+        const DistributedMatrix Lp = assembleLocalLaplacianF(P.Lm, lg, lp, P.procDelta, gammaF);
+
+        DeviceBuffer<scalar> gam_fd(std::vector<scalar>(nIf, gam));
+        DeviceBuffer<scalar> pD, pU, pL_;
+        deviceLaplacianCoeffs(dm, gam_fd, pD, pU, pL_, false);      // local internal-face laplacian
+        std::vector<DeviceBuffer<scalar>> pCoeffGeo;
+        pj = 0;
+        for (std::size_t pi = 0; pi < lp.size(); ++pi)
+        {
+            if (lp[pi].type != "processor") continue;
+            std::vector<scalar> cg(lp[pi].size);
+            for (label f = 0; f < lp[pi].size; ++f)
+                cg[f] = gam * lg.magSf()[lp[pi].start + f] * P.procDelta[pj][f];
+            DeviceBuffer<scalar> cgd;
+            cgd.copyFrom(cg);
+            pCoeffGeo.push_back(std::move(cgd));
+            ++pj;
+        }
+        std::vector<DeviceBuffer<scalar>> pIfCoeff;
+        deviceLaplacianInterface(halo, faceCellsD, pCoeffGeo, pD, pIfCoeff);
+        cudaDeviceSynchronize();
+
+        const scalar rpDiag = relDiff(pD.host(), Lp.diag);
+        scalar rpIf = 0;
+        for (int i = 0; i < halo.nInterfaces(); ++i)
+            if (halo.size(i) > 0) rpIf = std::fmax(rpIf, relDiff(pIfCoeff[i].host(), Lp.interfaceCoeffs[i]));
+        if (rpDiag > 1e-11) { std::printf("[rank %d] FAIL pEqn diag rel=%.3e\n", rank, rpDiag); ++fails; }
+        if (rpIf   > 1e-11) { std::printf("[rank %d] FAIL pEqn ifCoeff rel=%.3e\n", rank, rpIf); ++fails; }
     }
 
     const label totalFail = Pstream::allReduce(static_cast<label>(fails), ReduceOp::Sum);
