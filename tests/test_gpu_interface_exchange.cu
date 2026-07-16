@@ -38,8 +38,18 @@ int main(int argc, char** argv)
         std::vector<int>                nbr;
         std::vector<std::vector<label>> fc;
         int leftIdx = -1, rightIdx = -1;
-        if (rank > 0)         { leftIdx  = static_cast<int>(nbr.size()); nbr.push_back(rank - 1); fc.push_back({0});     }
-        if (rank < nproc - 1) { rightIdx = static_cast<int>(nbr.size()); nbr.push_back(rank + 1); fc.push_back({M - 1}); }
+        if (rank > 0)
+        {
+            leftIdx = static_cast<int>(nbr.size());
+            nbr.push_back(rank - 1);
+            fc.push_back({0});
+        }
+        if (rank < nproc - 1)
+        {
+            rightIdx = static_cast<int>(nbr.size());
+            nbr.push_back(rank + 1);
+            fc.push_back({M - 1});
+        }
 
         DeviceHalo halo(rank, nbr, fc);
         halo.exchange(psi.data());
@@ -50,13 +60,21 @@ int main(int argc, char** argv)
         {
             const scalar got = halo.neighbourField(leftIdx)[0];
             const scalar exp = static_cast<scalar>(rank * M - 1);
-            if (got != exp) { std::printf("[rank %d] FAIL left: got %.1f exp %.1f\n", rank, got, exp); ++failures; }
+            if (got != exp)
+            {
+                std::printf("[rank %d] FAIL left: got %.1f exp %.1f\n", rank, got, exp);
+                ++failures;
+            }
         }
         if (rightIdx >= 0)
         {
             const scalar got = halo.neighbourField(rightIdx)[0];
             const scalar exp = static_cast<scalar>(rank * M + M);
-            if (got != exp) { std::printf("[rank %d] FAIL right: got %.1f exp %.1f\n", rank, got, exp); ++failures; }
+            if (got != exp)
+            {
+                std::printf("[rank %d] FAIL right: got %.1f exp %.1f\n", rank, got, exp);
+                ++failures;
+            }
         }
 
         // (b) the three-call contract: a Laplacian-like stencil sum_nbr(psiNbr - psi_self) at the boundary
@@ -71,9 +89,15 @@ int main(int argc, char** argv)
         if (leftIdx  >= 0) lapH[0]     -= psiH[0];
         if (rightIdx >= 0) lapH[M - 1] -= psiH[M - 1];
         if (rank > 0 && lapH[0] != -1.0)
-        { std::printf("[rank %d] FAIL stencil[0]: got %.1f exp -1.0\n", rank, lapH[0]); ++failures; }
+        {
+            std::printf("[rank %d] FAIL stencil[0]: got %.1f exp -1.0\n", rank, lapH[0]);
+            ++failures;
+        }
         if (rank < nproc - 1 && lapH[M - 1] != 1.0)
-        { std::printf("[rank %d] FAIL stencil[M-1]: got %.1f exp 1.0\n", rank, lapH[M - 1]); ++failures; }
+        {
+            std::printf("[rank %d] FAIL stencil[M-1]: got %.1f exp 1.0\n", rank, lapH[M - 1]);
+            ++failures;
+        }
     }
 
     const label totalFail = Pstream::allReduce(static_cast<label>(failures), ReduceOp::Sum);

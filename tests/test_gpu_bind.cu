@@ -21,7 +21,11 @@ int main(int argc, char** argv)
     int failures = 0;
 
     int nDev = 0;
-    if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
+    if (cudaGetDeviceCount(&nDev) != cudaSuccess)
+    {
+        cudaGetLastError();
+        nDev = 0;
+    }
 
     const int bound = Pstream::deviceId();
 

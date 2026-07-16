@@ -33,7 +33,14 @@ public:
     SymBuffer(SymBuffer&& o) noexcept : d_(o.d_), n_(o.n_) { o.d_ = nullptr; o.n_ = 0; }
     SymBuffer& operator=(SymBuffer&& o) noexcept
     {
-        if (this != &o) { release(); d_ = o.d_; n_ = o.n_; o.d_ = nullptr; o.n_ = 0; }
+        if (this != &o)
+        {
+            release();
+            d_ = o.d_;
+            n_ = o.n_;
+            o.d_ = nullptr;
+            o.n_ = 0;
+        }
         return *this;
     }
 
@@ -58,7 +65,11 @@ private:
     {
         release();
         n_ = n;
-        if (!n_) { d_ = nullptr; return; }
+        if (!n_)
+        {
+            d_ = nullptr;
+            return;
+        }
 #ifdef BRAE_WITH_NVSHMEM
         d_ = static_cast<T*>(nvshmem_malloc(n_ * sizeof(T)));    // collective + symmetric across all PEs
         if (!d_) throw std::runtime_error("brae SymBuffer: nvshmem_malloc failed");

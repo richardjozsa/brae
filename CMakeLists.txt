@@ -204,6 +204,17 @@ if(BRAE_WITH_NVSHMEM)
                          $<TARGET_FILE:test_gpu_parallel_spmv>
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
+
+    # Phase 3: device distributed Jacobi-PCG (deviceParallelJacobiPCG) vs the single-GPU device PCG
+    add_executable(test_gpu_parallel_pcg tests/test_gpu_parallel_pcg.cu)
+    target_include_directories(test_gpu_parallel_pcg PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(test_gpu_parallel_pcg PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_pcg_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_pcg>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
 endif()
 
 add_executable(test_mesh_topology tests/test_mesh_topology.cu)

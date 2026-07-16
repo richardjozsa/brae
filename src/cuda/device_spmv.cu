@@ -103,9 +103,12 @@ void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceB
 
 // Distributed product: overlap the halo transfer with the local product, then apply the interface coupling.
 // Same ordering as host parallelAmul (post -> local -> wait -> update), all on the per-thread default stream.
-void deviceParallelAmul(const DeviceLduView& A, DeviceHalo& halo,
-                        const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
-                        const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi)
+void deviceParallelAmul(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& psi,
+    DeviceBuffer<scalar>& Apsi)
 {
     halo.postExchange(psi.data());          // pack + put (async)
     deviceAmul(A, psi, Apsi);               // local diag + upper/lower gather, overlaps the transfer

@@ -80,7 +80,11 @@ void Pstream::finalize()
     if (!g_requests.empty())
         waitAll();
 #ifdef BRAE_WITH_NVSHMEM
-    if (g_nvshmem) { nvshmemx_hostlib_finalize(); g_nvshmem = false; }   // before MPI_Finalize: NVSHMEM uses MPI
+    if (g_nvshmem)                       // before MPI_Finalize: NVSHMEM uses MPI
+    {
+        nvshmemx_hostlib_finalize();
+        g_nvshmem = false;
+    }
 #endif
     int finalized = 0;
     MPI_Finalized(&finalized);

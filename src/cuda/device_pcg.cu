@@ -2,6 +2,8 @@
 // preconditioner is Jacobi (wA = rA/diag) and every vector op is a device kernel.
 #include "device_pcg.cuh"
 #include "device_blas.cuh"
+#include "device_halo.cuh"
+#include "cf_pstream.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 
@@ -245,6 +247,88 @@ DeviceSolverPerf deviceJacobiBiCGStab(
                     break;
                 }
             }
+            ++nIter;
+        } while (nIter < maxIter && !converged(perf.finalResidual));
+    }
+    perf.nIterations = nIter;
+    return perf;
+}
+
+// ---- distributed (multi-GPU) Jacobi-PCG ------------------------------------------------------------------
+// The device counterpart of host parallelPCG: same recurrence as deviceJacobiPCG, but A*x uses the
+// interface-coupled deviceParallelAmul and every reduction is global (Pstream::allReduce, tier-1).
+
+scalar deviceParallelNormFactor(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& b,
+    const DeviceBuffer<scalar>& ones,
+    label globalNCells)
+{
+    const int nC = A.nCells;
+    DeviceBuffer<scalar> Apsi(nC), sumA(nC), tmp(nC), t(nC);
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Apsi);          // A*psi (with interface coupling)
+    deviceParallelAmul(A, halo, ifaceCoeffs, ones, sumA);         // rowSum(A) = A*1 (includes interfaces)
+    const scalar avgPsi = Pstream::allReduce(deviceDot(psi, ones), ReduceOp::Sum)
+                        / static_cast<scalar>(globalNCells);
+    deviceCopy(tmp, sumA);
+    deviceScale(tmp, avgPsi);                                     // tmp = sumA*avg(psi)
+    deviceCopy(t, Apsi);
+    deviceAxpy(-1.0, tmp, t);
+    const scalar n1 = Pstream::allReduce(deviceSumMag(t), ReduceOp::Sum);   // sum|A*psi - tmp|
+    deviceCopy(t, b);
+    deviceAxpy(-1.0, tmp, t);
+    const scalar n2 = Pstream::allReduce(deviceSumMag(t), ReduceOp::Sum);   // sum|b - tmp|
+    return n1 + n2 + 1e-20;
+}
+
+DeviceSolverPerf deviceParallelJacobiPCG(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter)
+{
+    const int nC = A.nCells;
+    DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
+
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);           // rA = b - A*psi
+    deviceCopy(rA, b);
+    deviceAxpy(-1.0, Ax, rA);
+
+    DeviceSolverPerf perf;
+    perf.initialResidual = Pstream::allReduce(deviceSumMag(rA), ReduceOp::Sum) / normFactor;
+    perf.finalResidual   = perf.initialResidual;
+    auto converged = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf.initialResidual); };
+
+    scalar wArA = 1e300, wArAold;
+    int nIter = 0;
+    if (!converged(perf.finalResidual))
+    {
+        do
+        {
+            wArAold = wArA;
+            deviceJacobi(wA, rA, A.diag);                        // wA = M^-1 rA (local Jacobi)
+            wArA = Pstream::allReduce(deviceDot(wA, rA), ReduceOp::Sum);
+            if (nIter == 0) deviceCopy(pA, wA);
+            else
+            {
+                const scalar beta = wArA / wArAold;
+                deviceScale(pA, beta);
+                deviceAxpy(1.0, wA, pA);
+            }
+            deviceParallelAmul(A, halo, ifaceCoeffs, pA, wA);    // wA = A*pA
+            const scalar wApA  = Pstream::allReduce(deviceDot(wA, pA), ReduceOp::Sum);
+            const scalar alpha = wArA / wApA;
+            deviceAxpy(alpha, pA, psi);
+            deviceAxpy(-alpha, wA, rA);
+            perf.finalResidual = Pstream::allReduce(deviceSumMag(rA), ReduceOp::Sum) / normFactor;
             ++nIter;
         } while (nIter < maxIter && !converged(perf.finalResidual));
     }
