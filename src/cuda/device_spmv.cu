@@ -1,6 +1,7 @@
 // cf GPU offload (G1): the device lduMatrix SpMV kernel (Amul). One thread per cell gathers the diagonal
 // plus the owner-ordered upper faces and the neighbour-sorted lower faces, race-free, deterministic.
 #include "device_ldu.cuh"
+#include "device_halo.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -98,6 +99,22 @@ void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceB
         amiAmulKernel<<<(A.nAmi + TPB - 1) / TPB, TPB>>>(A.nAmi, A.amiOwn, A.amiOff, A.amiNbr, A.amiW, A.amiIfc, psi.data(), Apsi.data());
         cudaCheck(cudaGetLastError(), "amiAmul");
     }
+}
+
+// Distributed product: overlap the halo transfer with the local product, then apply the interface coupling.
+// Same ordering as host parallelAmul (post -> local -> wait -> update), all on the per-thread default stream.
+void deviceParallelAmul(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& psi,
+    DeviceBuffer<scalar>& Apsi)
+{
+    halo.postExchange(psi.data());          // pack + put (async)
+    deviceAmul(A, psi, Apsi);               // local diag + upper/lower gather, overlaps the transfer
+    halo.waitExchange();                    // barrier: neighbour values now in the recv buffers
+    for (int i = 0; i < halo.nInterfaces(); ++i)
+        halo.updateInterfaceMatrix(i, Apsi.data(), ifaceCoeffs[i].data());   // Apsi[fc] -= coeff * psiNbr
 }
 
 } // namespace brae
