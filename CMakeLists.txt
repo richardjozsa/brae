@@ -226,6 +226,41 @@ if(BRAE_WITH_NVSHMEM)
                          $<TARGET_FILE:test_gpu_parallel_grad>
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
+
+    # Phase 4a L2: device distributed Jacobi-BiCGStab (non-symmetric) vs the single-GPU device BiCGStab
+    add_executable(test_gpu_parallel_bicgstab tests/test_gpu_parallel_bicgstab.cu)
+    target_include_directories(test_gpu_parallel_bicgstab PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(test_gpu_parallel_bicgstab PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_bicgstab_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_bicgstab>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
+
+    # Phase 4a L4: device distributed H() vs host parallelMatrixH
+    add_executable(test_gpu_parallel_h tests/test_gpu_parallel_h.cu)
+    target_include_directories(test_gpu_parallel_h PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_h PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_h_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_h>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
+
+    # Phase 4a L1: device momentum-matrix assembly (interface coeffs) vs host momentumDistributed
+    add_executable(test_gpu_parallel_momentum tests/test_gpu_parallel_momentum.cu)
+    target_include_directories(test_gpu_parallel_momentum PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_momentum PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_momentum_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_momentum>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
 endif()
 
 add_executable(test_mesh_topology tests/test_mesh_topology.cu)

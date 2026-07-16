@@ -336,4 +336,79 @@ DeviceSolverPerf deviceParallelJacobiPCG(
     return perf;
 }
 
+// Distributed Jacobi-BiCGStab (non-symmetric momentum matrix). Mirrors deviceJacobiBiCGStab's recurrence with
+// the interface-coupled product and global reductions. Breakdown guards follow OF checkSingularity (VSMALL).
+DeviceSolverPerf deviceParallelJacobiBiCGStab(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter)
+{
+    const int nC = A.nCells;
+    DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC), AyA(nC), sA(nC), zA(nC), tA(nC), Ax(nC);
+
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);           // rA = b - A*psi
+    deviceCopy(rA, b);
+    deviceAxpy(-1.0, Ax, rA);
+    deviceCopy(rA0, rA);
+
+    DeviceSolverPerf perf;
+    perf.initialResidual = Pstream::allReduce(deviceSumMag(rA), ReduceOp::Sum) / normFactor;
+    perf.finalResidual   = perf.initialResidual;
+    auto converged = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf.initialResidual); };
+
+    scalar rr = 1.0, rrOld = 1.0, alpha = 0.0, omega = 1.0;
+    int nIter = 0;
+    if (!converged(perf.finalResidual))
+    {
+        do
+        {
+            rrOld = rr;
+            rr = Pstream::allReduce(deviceDot(rA0, rA), ReduceOp::Sum);   // rA0rA
+            if (fabs(rr) < BICG_VSMALL) break;                            // OF checkSingularity(rA0rA)
+            if (nIter == 0) deviceCopy(pA, rA);
+            else
+            {
+                const scalar beta = (rr / rrOld) * (alpha / omega);
+                deviceAxpy(-omega, AyA, pA);                              // pA = rA + beta*(pA - omega*AyA)
+                deviceScale(pA, beta);
+                deviceAxpy(1.0, rA, pA);
+            }
+            deviceJacobi(yA, pA, A.diag);                                 // yA = M^-1 pA (local Jacobi)
+            deviceParallelAmul(A, halo, ifaceCoeffs, yA, AyA);
+            const scalar r0Ay = Pstream::allReduce(deviceDot(rA0, AyA), ReduceOp::Sum);
+            if (fabs(r0Ay) < BICG_VSMALL) break;
+            alpha = rr / r0Ay;
+            deviceCopy(sA, rA);
+            deviceAxpy(-alpha, AyA, sA);                                  // sA = rA - alpha*AyA
+            perf.finalResidual = Pstream::allReduce(deviceSumMag(sA), ReduceOp::Sum) / normFactor;
+            if (converged(perf.finalResidual))                            // mid-iteration early exit
+            {
+                deviceAxpy(alpha, yA, psi);
+                ++nIter;
+                break;
+            }
+            deviceJacobi(zA, sA, A.diag);                                 // zA = M^-1 sA
+            deviceParallelAmul(A, halo, ifaceCoeffs, zA, tA);
+            const scalar tt = Pstream::allReduce(deviceDot(tA, tA), ReduceOp::Sum);
+            const scalar ts = Pstream::allReduce(deviceDot(tA, sA), ReduceOp::Sum);
+            omega = (tt > BICG_VSMALL) ? ts / tt : 0.0;
+            deviceAxpy(alpha, yA, psi);                                   // psi += alpha*yA + omega*zA
+            deviceAxpy(omega, zA, psi);
+            deviceCopy(rA, sA);
+            deviceAxpy(-omega, tA, rA);                                   // rA = sA - omega*tA
+            perf.finalResidual = Pstream::allReduce(deviceSumMag(rA), ReduceOp::Sum) / normFactor;
+            ++nIter;
+            if (fabs(omega) < BICG_VSMALL) break;                         // OF checkSingularity(omega)
+        } while (nIter < maxIter && !converged(perf.finalResidual));
+    }
+    perf.nIterations = nIter;
+    return perf;
+}
+
 } // namespace brae
