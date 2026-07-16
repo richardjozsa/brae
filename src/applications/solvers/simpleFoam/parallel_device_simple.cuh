@@ -250,7 +250,8 @@ public:
         scalar relaxP,
         scalar tolU,
         scalar tolP,
-        int maxIter)
+        int maxIter,
+        bool bounded = false)
         : P_(part),
           nu_(nu),
           relaxU_(relaxU),
@@ -258,6 +259,7 @@ public:
           tolU_(tolU),
           tolP_(tolP),
           maxIter_(maxIter),
+          bounded_(bounded),
           lnC_(part.Lm.mesh.nCells()),
           nIf_(part.Lm.mesh.nInternalFaces()),
           dm_(buildDeviceMesh(part.Lm.mesh, part.lg, part.lp)),
@@ -280,6 +282,22 @@ public:
         dp_.copyFrom(p0.internal);
         ones_.copyFrom(std::vector<scalar>(lnC_, 1.0));
         zeroSrc_.copyFrom(std::vector<scalar>(lnC_, 0.0));
+
+        // validComponents (fvMesh::validComponents): an empty-patch direction is not solved, so it must not
+        // pollute the residualControl measure. Mirrors host parallelSimpleStepLaminar.
+        for (std::size_t pi = 0; pi < lp.size(); ++pi)
+            if (lp[pi].type == "empty" && lp[pi].size > 0)
+            {
+                scalar ax = 0, ay = 0, az = 0;
+                for (label i = 0; i < lp[pi].size; ++i)
+                {
+                    const vector& n = P_.lg.Sf()[lp[pi].start + i];
+                    ax += std::fabs(n.x);
+                    ay += std::fabs(n.y);
+                    az += std::fabs(n.z);
+                }
+                validC_[(ax >= ay && ax >= az) ? 0 : (ay >= az ? 1 : 2)] = false;
+            }
 
         // processor-patch offsets in the flattened boundary array + per-interface device addressing
         label bidx = 0;
@@ -313,8 +331,9 @@ public:
         dbRAU_  = buildDeviceBoundary(rAUfld_, part.lp, part.lg);
     }
 
-    // One distributed SIMPLE iteration. U/p/phi are updated in place on the device.
-    void step();
+    // One distributed SIMPLE iteration. U/p/phi are updated in place on the device. Returns the momentum and
+    // pressure INITIAL residuals -- OpenFOAM's SIMPLE convergence measure (fvSolution residualControl).
+    ParStepResidual step();
 
     std::vector<vector> U() const
     {
@@ -339,7 +358,9 @@ private:
     const Partition& P_;
     scalar nu_, relaxU_, relaxP_, tolU_, tolP_;
     int    maxIter_;
+    bool   bounded_ = false;
     label  lnC_, nIf_, nBnd_ = 0;
+    bool   validC_[3] = { true, true, true };
     DeviceMesh           dm_;
     DeviceVectorBoundary dbU_;
     DeviceBoundary       dbP_, dbRAU_;
@@ -393,8 +414,9 @@ inline void deviceParallelMatrixH(
 
 // One distributed SIMPLE iteration -- the sequence validated stage-by-stage against host
 // parallelSimpleStepLaminar in test_gpu_parallel_predictor.
-inline void ParallelDeviceSimple::step()
+inline ParStepResidual ParallelDeviceSimple::step()
 {
+    ParStepResidual res;
     const std::vector<FvPatch>& lp = P_.lp;
     const FvGeometry& lg = P_.lg;
 
@@ -406,6 +428,17 @@ inline void ParallelDeviceSimple::step()
     deviceAxpy(-1.0, lD, mDiag);
     deviceAxpy(-1.0, lU, mUp);
     deviceAxpy(-1.0, lL, mLo);
+
+    // bounded Gauss upwind: - fvm::Sp(fvc::div(phi), U). Diagonal gets -V*div(phi); it stabilises the
+    // transient (a rest-start cell where div(phi)!=0 at low nu blows up otherwise) and vanishes at
+    // convergence. Mirrors host parallelSimpleStepLaminar's `bounded` branch.
+    if (bounded_)
+    {
+        DeviceBuffer<scalar> divPhi, sp;
+        deviceDiv(dm_, phiInt_, phiBnd_, divPhi);
+        deviceHadamard(sp, dm_.V, divPhi);
+        deviceAxpy(-1.0, sp, mDiag);
+    }
 
     const std::vector<scalar> phiBndH = phiBnd_.host();
     std::vector<DeviceBuffer<scalar>> phiF, coeffGeo;
@@ -486,7 +519,9 @@ inline void ParallelDeviceSimple::step()
         deviceFold(dm_, mDiagR, s, iC[k], bC[k], diagC, b);
         const DeviceLduView mv = deviceLduView(dm_, diagC, mUp, mLo);
         const scalar nf = deviceParallelNormFactor(mv, halo_, ifCoeff, Uk_[k], b, ones_, P_.globalNCells);
-        deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_);
+        const DeviceSolverPerf up =
+            deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_);
+        if (validC_[k] && up.initialResidual > res.Ux) res.Ux = up.initialResidual;
     }
 
     // ---- rAU, HbyA ----
@@ -571,7 +606,8 @@ inline void ParallelDeviceSimple::step()
     deviceCopy(pSol, dp_);
     const DeviceLduView pv = deviceLduView(dm_, pDiagC, pU_, pL_);
     const scalar nfp = deviceParallelNormFactor(pv, halo_, pIfCoeff, pSol, pb, ones_, P_.globalNCells);
-    deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_);
+    const DeviceSolverPerf pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_);
+    res.p = pp.initialResidual;
 
     // ---- corrector: conservative phi, relax p, U = HbyA - rAU*grad(p) ----
     DeviceBuffer<scalar> pfluxInt, pfluxBnd;
@@ -604,6 +640,7 @@ inline void ParallelDeviceSimple::step()
         deviceCorrector(HbyA[k], rAU, *gn[k], Un);
         deviceCopy(Uk_[k], Un);
     }
+    return res;
 }
 
 } // namespace brae
