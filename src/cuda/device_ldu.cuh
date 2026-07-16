@@ -147,4 +147,17 @@ inline DeviceLduView deviceLduViewAmi(
 
 void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi);
 
+class DeviceHalo;   // forward (parallel/pstream/device_halo.cuh)
+
+// Distributed matrix-vector product: the local cell-gather Amul plus the processor-interface coupling over the
+// NVSHMEM halo (post exchange -> local product overlaps it -> wait -> interface scatter). ifaceCoeffs[i] holds
+// interface i's boundary coefficients (-upper on the owner side / -lower on the neighbour side), in the same
+// order as `halo`'s interfaces. Mirrors host parallelAmul.
+void deviceParallelAmul(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& psi,
+    DeviceBuffer<scalar>& Apsi);
+
 } // namespace brae
