@@ -20,6 +20,9 @@
 #include "device_ldu.cuh"
 #include "device_blas.cuh"
 #include "device_halo.cuh"
+#include "device_boundary.cuh"
+#include "device_simple.cuh"
+#include "parallel_matrix_ops.cuh"
 #include "device_buffer.cuh"
 #include "parallel_device_simple.cuh"
 #include "cf_pstream.cuh"
@@ -180,6 +183,40 @@ int main(int argc, char** argv)
             if (halo.size(i) > 0) rpIf = std::fmax(rpIf, relDiff(pIfCoeff[i].host(), Lp.interfaceCoeffs[i]));
         if (rpDiag > 1e-11) { std::printf("[rank %d] FAIL pEqn diag rel=%.3e\n", rank, rpDiag); ++fails; }
         if (rpIf   > 1e-11) { std::printf("[rank %d] FAIL pEqn ifCoeff rel=%.3e\n", rank, rpIf); ++fails; }
+
+        // fvMatrix::relax on the distributed matrix == host parallelRelaxMatrix. The processor interface must
+        // count toward diagonal dominance (deviceInterfaceOffDiagSum -> deviceRelaxDiag's cycSumOff hook), and
+        // the boundary iC must be ZERO on processor faces (bcType 8) or the diagonal double-counts.
+        const scalar relaxU = 0.7;
+        const DeviceVectorBoundary dbU = buildDeviceVectorBoundary(U, lp, lg);
+        std::vector<scalar> phiBndH, nuEffBndH;
+        for (std::size_t pi = 0; pi < lp.size(); ++pi)
+        {
+            if (lp[pi].type == "cyclic" || lp[pi].type == "cyclicAMI") continue;
+            for (label i = 0; i < lp[pi].size; ++i)
+            {
+                phiBndH.push_back(phi.boundary[pi][i]);
+                nuEffBndH.push_back(nu);
+            }
+        }
+        DeviceBuffer<scalar> phiBnd_d(phiBndH), nuEffBnd_d(nuEffBndH);
+        DeviceBuffer<scalar> r0IC, r0BC, r0lIC, r0lBC;
+        deviceBCDivCoeffs(dbU.comp[0], phiBnd_d, r0IC, r0BC);              // iC = divIC - lapIC  (as device_simple_foam)
+        deviceBCLaplacianCoeffsFace(dbU.comp[0], nuEffBnd_d, r0lIC, r0lBC);
+        deviceAxpy(-1.0, r0lIC, r0IC);
+
+        DeviceBuffer<scalar> sumOff(std::vector<scalar>(lnC, 0.0));
+        deviceInterfaceOffDiagSum(halo, faceCellsD, ifCoeff, sumOff);
+        DeviceBuffer<scalar> mDiagR, delta;
+        deviceRelaxDiag(deviceLduView(dm, mDiag, mUp, mLo), dm, r0IC, relaxU, mDiagR, delta, sumOff.data());
+        cudaDeviceSynchronize();
+
+        // Host oracle: parallelRelaxMatrix mutates L.diag in place (and Ml.source, unused here).
+        DistributedMatrix Lr = L;
+        FvVectorMatrix Mr = Ml;
+        parallelRelaxMatrix(Lr, Mr, U.internal, P.Lm, lp, relaxU);
+        const scalar rRelax = relDiff(mDiagR.host(), Lr.diag);
+        if (rRelax > 1e-11) { std::printf("[rank %d] FAIL relaxed diag rel=%.3e\n", rank, rRelax); ++fails; }
     }
 
     const label totalFail = Pstream::allReduce(static_cast<label>(fails), ReduceOp::Sum);

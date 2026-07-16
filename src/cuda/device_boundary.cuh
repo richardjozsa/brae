@@ -19,7 +19,8 @@ struct DeviceBoundary
 {
     int n = 0;                              // total boundary faces (patch order = DeviceMesh bndCell order)
     DeviceBuffer<label>  bcType;            // 0 extrapolated, 1 fixedValue, 2 calculated (3=inletOutlet -> resolved
-                                            // to 0|1 per face each step by deviceUpdateInletOutlet; 5=mixed/Robin)
+                                            // to 0|1 per face each step by deviceUpdateInletOutlet; 5=mixed/Robin;
+                                            // 8=COUPLED (processor): zero matrix coeffs, value injected by the halo)
     DeviceBuffer<label>  ioMask;            // 1 if the face is inletOutlet (bcType recomputed from the flux sign)
     DeviceBuffer<label>  oioMask;           // 1 if the face is outletInlet (freestreamPressure): opposite flux switch
     DeviceBuffer<label>  mixedMask;         // 1 if the face is mixed/Robin (freestreamVelocity/Pressure): vf recomputed
@@ -41,7 +42,12 @@ inline DeviceBoundary buildDeviceBoundary(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;                     // cyclic = internal-like (handled by appended faces)
-        const int cat = f.boundary[pi]->bcCategory();
+        // A processor patch is COUPLED: it stays in the boundary gather (the explicit operators need its bval
+        // slot, filled with the halo-interpolated face value by DeviceHalo::scatterBoundaryValues), but must
+        // contribute NO matrix coefficients -- its coupling is the interface off-diagonal. bcCategory() is NOT
+        // overridden on ProcessorFvPatchField, so it would otherwise report 0 (= zeroGradient) whose
+        // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
+        const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
         const std::vector<scalar>& val = f.boundary[pi]->value();   // inletOutlet/outletInlet/mixed: value() = refValue; totalPressure: p0
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         for (label i = 0; i < fvp[pi].size; ++i)
@@ -162,7 +168,12 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;                     // cyclic = internal-like (handled by appended faces)
-        const int cat = f.boundary[pi]->bcCategory();
+        // A processor patch is COUPLED: it stays in the boundary gather (the explicit operators need its bval
+        // slot, filled with the halo-interpolated face value by DeviceHalo::scatterBoundaryValues), but must
+        // contribute NO matrix coefficients -- its coupling is the interface off-diagonal. bcCategory() is NOT
+        // overridden on ProcessorFvPatchField, so it would otherwise report 0 (= zeroGradient) whose
+        // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
+        const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
         const bool sym = f.boundary[pi]->isSymmetry();
         const std::vector<vector>& val = f.boundary[pi]->value();   // inletOutlet/mixed: value() = freestreamValue (= refValue)
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed

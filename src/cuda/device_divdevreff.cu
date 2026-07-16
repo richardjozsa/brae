@@ -179,7 +179,8 @@ void deviceDivDevReff(
     DeviceBuffer<scalar>& srcY,
     DeviceBuffer<scalar>& srcZ,
     const DeviceCyclic* cyc,
-    const DeviceAMI* ami)
+    const DeviceAMI* ami,
+    const DeviceProcStress* proc)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
@@ -200,6 +201,12 @@ void deviceDivDevReff(
     {
         DeviceBuffer<scalar> bval;
         deviceBCValue(dbU.comp[i], *Uc[i], bval);
+        if (proc)   // processor faces are bcType 8: deviceBCValue leaves them, the halo supplies the value
+        {
+            proc->halo->exchange(Uc[i]->data());
+            proc->halo->scatterBoundaryValues(Uc[i]->data(), *proc->weights, *proc->procStart, bval.data());
+            proc->halo->waitExchange();   // recv buffer is reused by the next component -- see device_halo.cuh
+        }
         DeviceBuffer<scalar> gx, gy, gz;
         deviceGaussGrad(dm, *Uc[i], bval, gx, gy, gz);
 
@@ -234,6 +241,34 @@ void deviceDivDevReff(
     DeviceBuffer<scalar> sigmaB(static_cast<std::size_t>(9) * nB);
     sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());
     cudaCheck(cudaGetLastError(), "ddr sigmaB");
+
+    // Processor faces: OVERWRITE the sigmaB just computed from dev2(T(gradB)). A cut face is interior to the
+    // global mesh, so its stress is the INTERPOLATED cell sigma (host parallelDivDevReff reads it from
+    // distributeFromCells<tensor>(sigC, P)), not a boundary-gradient stress. Doing this per tensor component
+    // keeps the exchange on the existing scalar halo. The zero is required: scatterBoundaryValues atomicAdds.
+    if (proc)
+    {
+        for (int q = 0; q < 9; ++q)
+        {
+            for (int i = 0; i < proc->halo->nInterfaces(); ++i)
+            {
+                const std::size_t n = proc->halo->size(i);
+                if (n == 0) continue;
+                cudaCheck(
+                    cudaMemsetAsync(
+                        sigmaB.data() + static_cast<std::size_t>(q) * nB + (*proc->procStart)[i],
+                        0,
+                        n * sizeof(scalar),
+                        cudaStreamPerThread),
+                    "ddr sigmaB proc zero");
+            }
+            const scalar* sigC_q = sigmaC.data() + static_cast<std::size_t>(q) * nC;
+            proc->halo->exchange(sigC_q);
+            proc->halo->scatterBoundaryValues(sigC_q, *proc->weights, *proc->procStart,
+                                              sigmaB.data() + static_cast<std::size_t>(q) * nB);
+            proc->halo->waitExchange();   // the next component reuses the recv buffer
+        }
+    }
 
     // tensor divergence (= V*fvc::div)
     srcX.resize(nC);

@@ -238,6 +238,49 @@ if(BRAE_WITH_NVSHMEM)
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
 
+    # Phase 4a L8: device distributed momentum PREDICTOR vs the host predictor
+    add_executable(test_gpu_parallel_predictor tests/test_gpu_parallel_predictor.cu)
+    target_include_directories(test_gpu_parallel_predictor PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_predictor PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_predictor_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_predictor>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
+
+    # Phase 4a L8 driver: the device distributed SIMPLE LOOP (ParallelDeviceSimple, N iterations with a
+    # maintained phi) vs the host distributed loop, + reconstructField back to the global mesh
+    add_executable(test_gpu_parallel_loop tests/test_gpu_parallel_loop.cu)
+    target_include_directories(test_gpu_parallel_loop PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_loop PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_loop_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_loop>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
+
+    # Phase 4a EXIT GATE: the OOM proof -- a mesh too big for one GPU runs split across two. No ctest entry:
+    # the mesh size is hardware-specific (it must exceed ONE GPU's VRAM), so it is driven by hand.
+    add_executable(test_gpu_parallel_oom tests/test_gpu_parallel_oom.cu)
+    target_include_directories(test_gpu_parallel_oom PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_oom PRIVATE brae_core)
+
+    # Phase 4a L8 blocker: a processor face contributes ZERO matrix coeffs on device (bcType 8 = coupled)
+    add_executable(test_gpu_parallel_bc tests/test_gpu_parallel_bc.cu)
+    target_include_directories(test_gpu_parallel_bc PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(test_gpu_parallel_bc PRIVATE brae_core)
+    foreach(_np 1 2 4 8)
+        add_test(NAME gpu_parallel_bc_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_gpu_parallel_bc>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+    endforeach()
+
     # Phase 4a L7: device processor-face pressure flux (pEqn.flux) vs host parallelMatrixFlux + conservation
     add_executable(test_gpu_parallel_pflux tests/test_gpu_parallel_pflux.cu)
     target_include_directories(test_gpu_parallel_pflux PRIVATE ${BRAE_HEADER_DIRS}
