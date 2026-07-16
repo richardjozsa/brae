@@ -61,7 +61,7 @@ int main(int argc, char** argv)
         return 0;
     }
     const std::string caseDir = argv[1];
-    const scalar nu = 1e-3, relaxU = 0.7, tolU = 1e-9, tolP = 1e-9;
+    const scalar nu = 1e-3, relaxU = 0.7, relaxP = 0.3, tolU = 1e-9, tolP = 1e-9;
     const int maxIter = 3000;
 
     PrimitiveMesh gm;  gm.read(caseDir + "/constant/polyMesh");
@@ -91,6 +91,10 @@ int main(int argc, char** argv)
     nuEfff0.boundary = nuEffBndPatch;
     const std::vector<scalar> nuF(m.nFaces(), nu);
 
+    // The host block below MUTATES p (corrector: p = solved, then relaxed). The device block runs
+    // afterwards and reads p, so snapshot the original and restore it before the device path.
+    const std::vector<scalar> pOrig = p.internal;
+
     // ---- HOST predictor (the oracle) ----
     const std::vector<scalar> outPhi = outwardFlux(P, phi);
     FvVectorMatrix Ml = fvm::div(phi.internal, phi.boundary, U, m, lp);
@@ -101,7 +105,9 @@ int main(int argc, char** argv)
     std::vector<scalar> rAUhost(lnC);
     std::vector<vector> HbyAhost(lnC);
     SurfaceScalarField phiHbyAhost;
-    std::vector<scalar> phost, rAUfHost;
+    std::vector<scalar> phost, rAUfHost, pPrevHost, pRelaxHost;
+    SurfaceScalarField phiNewHost;
+    std::vector<vector> UnewHost(lnC);
     {
         std::vector<ProcessorInterface> ifs = P.ifs;
         const std::vector<vector> gP = fvc::gaussGrad(p, m, lg, lp);
@@ -194,13 +200,35 @@ int main(int argc, char** argv)
                 Lp.diagC[lp[pi].faceCells[i]] += Mpl.internalCoeffs[pi][i];
                 Lp.b[lp[pi].faceCells[i]]     += Mpl.boundaryCoeffs[pi][i];
             }
+        pPrevHost = p.internal;
         phost = p.internal;
         parallelPCG(Lp, phost, ifs, P.globalNCells, tolP, 0.0, maxIter);
+
+        // ---- corrector: conservative phi, relax p, U = HbyA - rAU*grad(p) ----
+        p.internal = phost;
+        p.evaluateBoundary();                                   // halo for parallelMatrixFlux
+        const SurfaceScalarField pfluxH = parallelMatrixFlux(Mpl, Lp, p, m, lp);
+        phiNewHost = phiHbyAhost;
+        for (label f = 0; f < nIf; ++f) phiNewHost.internal[f] -= pfluxH.internal[f];
+        for (std::size_t pi = 0; pi < lp.size(); ++pi)
+            for (label i = 0; i < lp[pi].size; ++i)
+                phiNewHost.boundary[pi][i] -= pfluxH.boundary[pi][i];
+
+        pRelaxHost.resize(lnC);
+        for (label c = 0; c < lnC; ++c) pRelaxHost[c] = pPrevHost[c] + relaxP * (phost[c] - pPrevHost[c]);
+        p.internal = pRelaxHost;
+        p.evaluateBoundary();
+        const std::vector<vector> gPn = fvc::gaussGrad(p, m, lg, lp);
+        for (label c = 0; c < lnC; ++c)
+            UnewHost[c] = HbyAhost[c] - rAUhost[c] * gPn[c];
     }
+
+    p.internal = pOrig;          // restore: the device path must start from the SAME state as the host
+    p.evaluateBoundary();
 
     // ---- DEVICE predictor ----
     scalar gMax = 0, gMag = 0;
-    scalar relRAU = 0, relHbyA = 0, relPhi = 0, relP = 0;
+    scalar relRAU = 0, relHbyA = 0, relPhi = 0, relP = 0, relPhiNew = 0, relUnew = 0;
     {
         const DeviceMesh dm = buildDeviceMesh(m, lg, lp);
         const DeviceVectorBoundary dbU = buildDeviceVectorBoundary(U, lp, lg);
@@ -425,6 +453,62 @@ int main(int argc, char** argv)
             relP = Pstream::allReduce(d4 > 0 ? n4 / d4 : n4, ReduceOp::Max);
         }
 
+        // ---- CORRECTOR: conservative phi, relax p, U = HbyA - rAU*grad(p) ----
+        // pEqn.flux(): internal from the matrix; real boundary from its coeffs (zero on processor faces, since
+        // bcType 8) and processor faces overwritten with -ifCoeff*(p_nbr - p_local), which cancels across a cut.
+        DeviceBuffer<scalar> pfluxInt, pfluxBnd;
+        deviceMatrixFluxInternal(pv, pSol, pfluxInt);
+        deviceMatrixFluxBoundary(dbP, piC, pbC, pSol, pfluxBnd);
+        deviceParallelMatrixFluxInterface(halo, faceCellsD, pIfCoeff, procStart, pSol, pfluxBnd);
+
+        DeviceBuffer<scalar> phiNewInt, phiNewBnd;                 // phi = phiHbyA - pflux
+        deviceCopy(phiNewInt, phiHbyAint);
+        deviceAxpy(-1.0, pfluxInt, phiNewInt);
+        deviceCopy(phiNewBnd, phiHbyAbnd);
+        deviceAxpy(-1.0, pfluxBnd, phiNewBnd);
+
+        DeviceBuffer<scalar> pRelax;                               // p = pPrev + relaxP*(pNew - pPrev)
+        deviceCopy(pRelax, pSol);
+        deviceAxpy(-1.0, dp, pRelax);                              // pNew - pPrev  (dp still holds pPrev)
+        deviceScale(pRelax, relaxP);
+        deviceAxpy(1.0, dp, pRelax);
+
+        DeviceBuffer<scalar> pbv2;                                 // grad of the RELAXED p, coupled boundary
+        deviceBCValue(dbP, pRelax, pbv2);
+        halo.exchange(pRelax.data());
+        halo.scatterBoundaryValues(pRelax.data(), weightsD, procStart, pbv2.data());
+        halo.waitExchange();
+        DeviceBuffer<scalar> gxn, gyn, gzn;
+        deviceGaussGrad(dm, pRelax, pbv2, gxn, gyn, gzn);
+        DeviceBuffer<scalar>* gn[3] = { &gxn, &gyn, &gzn };
+
+        DeviceBuffer<scalar> Unew[3];
+        for (int k = 0; k < 3; ++k)
+            deviceCorrector(HbyA[k], rAU, *gn[k], Unew[k]);        // U = HbyA - rAU*grad(p)
+        cudaDeviceSynchronize();
+
+        // compare the corrected phi and U to the host
+        {
+            const std::vector<scalar> pf = phiNewInt.host();
+            scalar n5 = 0, d5 = 0;
+            for (label f = 0; f < nIf; ++f)
+            {
+                n5 = std::fmax(n5, std::fabs(pf[f] - phiNewHost.internal[f]));
+                d5 = std::fmax(d5, std::fabs(phiNewHost.internal[f]));
+            }
+            relPhiNew = Pstream::allReduce(d5 > 0 ? n5 / d5 : n5, ReduceOp::Max);
+
+            const std::vector<scalar> ux = Unew[0].host(), uy = Unew[1].host(), uz = Unew[2].host();
+            scalar n6 = 0, d6 = 0;
+            for (label c = 0; c < lnC; ++c)
+            {
+                const vector dd{ux[c] - UnewHost[c].x, uy[c] - UnewHost[c].y, uz[c] - UnewHost[c].z};
+                n6 = std::fmax(n6, brae::mag(dd));
+                d6 = std::fmax(d6, brae::mag(UnewHost[c]));
+            }
+            relUnew = Pstream::allReduce(d6 > 0 ? n6 / d6 : n6, ReduceOp::Max);
+        }
+
         // ---- compare rAU / HbyA / phiHbyA to the host (EVERY stage is gated, not just printed) ----
         {
             const std::vector<scalar> rAUd = rAU.host();
@@ -472,11 +556,12 @@ int main(int argc, char** argv)
     // Every composed stage is gated. rAU is pure local arithmetic -> machine precision; U/HbyA/phiHbyA carry
     // the predictor's solver tolerance (host PBiCGStab/DILU vs device Jacobi-BiCGStab).
     const bool pass = (rel < 1e-6) && (relRAU < 1e-11) && (relHbyA < 1e-6) && (relPhi < 1e-6)
-                   && (relP < 1e-6);
+                   && (relP < 1e-6) && (relPhiNew < 1e-6) && (relUnew < 1e-6);
     if (Pstream::master())
     {
-        std::printf("test_gpu_parallel_predictor np=%d: U rel=%.3e | rAU rel=%.3e | HbyA rel=%.3e | "
-                    "phiHbyA rel=%.3e | p rel=%.3e\n", nproc, rel, relRAU, relHbyA, relPhi, relP);
+        std::printf("test_gpu_parallel_predictor np=%d: CLOSED STEP vs host\n"
+                    "    U(pred)=%.3e  rAU=%.3e  HbyA=%.3e  phiHbyA=%.3e  p=%.3e  phi(corr)=%.3e  U(corr)=%.3e\n",
+                    nproc, rel, relRAU, relHbyA, relPhi, relP, relPhiNew, relUnew);
         std::printf("%s\n", pass ? "PASS" : "FAIL");
     }
     Pstream::finalize();
