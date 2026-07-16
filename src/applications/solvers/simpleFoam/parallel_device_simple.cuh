@@ -77,6 +77,24 @@ void matrixFluxInterfaceKernel(
     fluxOut[f] = -ifCoeff[f] * (pNbr[f] - p[faceCells[f]]);
 }
 
+// The processor-interface coeffs of a laplacian(gamma, .) matrix -- the pressure equation's coupling. Mirrors
+// host assembleLocalLaplacianF, per cut face f (coeff = gammaF*magSf*procDelta):
+//   diag[faceCells[f]] -= coeff[f]      (atomic: a cell may own several interface faces)
+//   ifCoeff[f]          = -coeff[f]
+__global__
+void laplacianInterfaceKernel(
+    const label*  __restrict__ faceCells,
+    const scalar* __restrict__ coeff,
+    scalar*       __restrict__ diag,
+    scalar*       __restrict__ ifCoeff,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    ifCoeff[f] = -coeff[f];
+    atomicAdd(&diag[faceCells[f]], -coeff[f]);
+}
+
 } // namespace detail
 
 // Assemble the momentum matrix's processor coupling on `halo`'s interfaces: fold the convection+diffusion
@@ -102,6 +120,33 @@ inline void deviceMomentumInterface(
         detail::momentumInterfaceKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
             faceCells[i].data(),
             phiF[i].data(),
+            coeffGeo[i].data(),
+            diag.data(),
+            ifCoeff[i].data(),
+            n);
+    }
+}
+
+// Assemble a laplacian(gamma, .) matrix's processor coupling (the pressure equation): fold -coeff into `diag`
+// and produce `ifCoeff[i]` per interface. `coeffGeo[i] = gammaF*magSf*procDelta` of interface i.
+inline void deviceLaplacianInterface(
+    const DeviceHalo& halo,
+    const std::vector<DeviceBuffer<label>>& faceCells,
+    const std::vector<DeviceBuffer<scalar>>& coeffGeo,
+    DeviceBuffer<scalar>& diag,
+    std::vector<DeviceBuffer<scalar>>& ifCoeff,
+    cudaStream_t stream = cudaStreamPerThread)
+{
+    constexpr int TPB = 128;
+    const int nI = halo.nInterfaces();
+    ifCoeff.resize(nI);
+    for (int i = 0; i < nI; ++i)
+    {
+        const int n = static_cast<int>(halo.size(i));
+        if (n <= 0) continue;
+        ifCoeff[i].resize(n);
+        detail::laplacianInterfaceKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
+            faceCells[i].data(),
             coeffGeo[i].data(),
             diag.data(),
             ifCoeff[i].data(),
