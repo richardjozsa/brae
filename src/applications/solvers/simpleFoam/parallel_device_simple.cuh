@@ -95,6 +95,21 @@ void laplacianInterfaceKernel(
     atomicAdd(&diag[faceCells[f]], -coeff[f]);
 }
 
+// Per-cell sum of |processor off-diagonal|, for fvMatrix::relax's diagonal-dominance term. Host
+// parallelRelaxMatrix adds |interfaceCoeffs| into sumOff; on device this feeds deviceRelaxDiag's cycSumOff
+// hook (the same role the cyclic interface's off-diagonal sum plays).
+__global__
+void offDiagSumKernel(
+    const label*  __restrict__ faceCells,
+    const scalar* __restrict__ ifCoeff,
+    scalar*       __restrict__ sumOff,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    atomicAdd(&sumOff[faceCells[f]], fabs(ifCoeff[f]));
+}
+
 } // namespace detail
 
 // Assemble the momentum matrix's processor coupling on `halo`'s interfaces: fold the convection+diffusion
@@ -123,6 +138,29 @@ inline void deviceMomentumInterface(
             coeffGeo[i].data(),
             diag.data(),
             ifCoeff[i].data(),
+            n);
+    }
+}
+
+// sumOff[c] += sum over this rank's interface faces owned by c of |ifCoeff|. Pass the result to
+// deviceRelaxDiag's cycSumOff so the processor interface counts toward diagonal dominance, matching host
+// parallelRelaxMatrix. `sumOff` must be zeroed by the caller (size nCells).
+inline void deviceInterfaceOffDiagSum(
+    const DeviceHalo& halo,
+    const std::vector<DeviceBuffer<label>>& faceCells,
+    const std::vector<DeviceBuffer<scalar>>& ifCoeff,
+    DeviceBuffer<scalar>& sumOff,
+    cudaStream_t stream = cudaStreamPerThread)
+{
+    constexpr int TPB = 128;
+    for (int i = 0; i < halo.nInterfaces(); ++i)
+    {
+        const int n = static_cast<int>(halo.size(i));
+        if (n <= 0) continue;
+        detail::offDiagSumKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
+            faceCells[i].data(),
+            ifCoeff[i].data(),
+            sumOff.data(),
             n);
     }
 }
