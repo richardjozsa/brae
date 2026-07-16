@@ -33,7 +33,12 @@ int main(int argc, char** argv)
 {
     Pstream::init(argc, argv);
     const int rank = Pstream::myProcNo(), nproc = Pstream::nProcs();
-    if (argc < 2) { if (Pstream::master()) std::printf("usage: %s <caseDir>\n", argv[0]); Pstream::finalize(); return 2; }
+    if (argc < 2)
+    {
+        if (Pstream::master()) std::printf("usage: %s <caseDir>\n", argv[0]);
+        Pstream::finalize();
+        return 2;
+    }
     if (!Pstream::nvshmemActive())
     {
         if (Pstream::master()) std::printf("test_gpu_parallel_spmv: NVSHMEM inactive -- SKIP\n");

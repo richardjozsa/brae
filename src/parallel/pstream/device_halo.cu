@@ -37,9 +37,10 @@ void scatterKernel(
 }
 } // namespace
 
-DeviceHalo::DeviceHalo(int myPart,
-                       const std::vector<int>& nbrParts,
-                       const std::vector<std::vector<label>>& faceCells)
+DeviceHalo::DeviceHalo(
+    int myPart,
+    const std::vector<int>& nbrParts,
+    const std::vector<std::vector<label>>& faceCells)
     : myPart_(myPart), nbr_(nbrParts)
 {
     const int nI = static_cast<int>(nbr_.size());
@@ -77,20 +78,27 @@ DeviceHalo::DeviceHalo(int myPart,
     for (int i = 0; i < nI; ++i) remoteOffset_[i] = static_cast<label>(recvOff[i]);
 }
 
-void DeviceHalo::postExchange(const scalar* psi_d, cudaStream_t stream)
+void DeviceHalo::postExchange(
+    const scalar* psi_d,
+    cudaStream_t stream)
 {
     const int nI = static_cast<int>(nbr_.size());
     for (int i = 0; i < nI; ++i)
         if (size_[i] > 0)
             packKernel<<<(size_[i] + TPB - 1) / TPB, TPB, 0, stream>>>(
-                psi_d, faceCellsD_[i].data(), sendBuf_.data() + recvOffset_[i], static_cast<int>(size_[i]));
+                psi_d,
+                faceCellsD_[i].data(),
+                sendBuf_.data() + recvOffset_[i],
+                static_cast<int>(size_[i]));
 #ifdef BRAE_WITH_NVSHMEM
     for (int i = 0; i < nI; ++i)
         if (size_[i] > 0)
-            nvshmemx_putmem_on_stream(recvBuf_.data() + remoteOffset_[i],   // symmetric addr -> neighbour's recv
-                                      sendBuf_.data() + recvOffset_[i],
-                                      static_cast<std::size_t>(size_[i]) * sizeof(scalar),
-                                      nbr_[i], stream);
+            nvshmemx_putmem_on_stream(
+                recvBuf_.data() + remoteOffset_[i],           // symmetric addr -> neighbour's recv
+                sendBuf_.data() + recvOffset_[i],
+                static_cast<std::size_t>(size_[i]) * sizeof(scalar),
+                nbr_[i],
+                stream);
 #endif
 }
 
@@ -103,20 +111,32 @@ void DeviceHalo::waitExchange(cudaStream_t stream)
 #endif
 }
 
-void DeviceHalo::exchange(const scalar* psi_d, cudaStream_t stream)
+void DeviceHalo::exchange(
+    const scalar* psi_d,
+    cudaStream_t stream)
 {
     postExchange(psi_d, stream);
     waitExchange(stream);
 }
 
-void DeviceHalo::updateInterfaceMatrix(int i, scalar* result_d, const scalar* coeff_d, cudaStream_t stream)
+void DeviceHalo::updateInterfaceMatrix(
+    int i,
+    scalar* result_d,
+    const scalar* coeff_d,
+    cudaStream_t stream)
 {
     if (size_[i] > 0)
         scatterKernel<<<(size_[i] + TPB - 1) / TPB, TPB, 0, stream>>>(
-            result_d, faceCellsD_[i].data(), coeff_d, recvBuf_.data() + recvOffset_[i], static_cast<int>(size_[i]));
+            result_d,
+            faceCellsD_[i].data(),
+            coeff_d,
+            recvBuf_.data() + recvOffset_[i],
+            static_cast<int>(size_[i]));
 }
 
-std::vector<scalar> DeviceHalo::neighbourField(int i, cudaStream_t stream) const
+std::vector<scalar> DeviceHalo::neighbourField(
+    int i,
+    cudaStream_t stream) const
 {
     cudaStreamSynchronize(stream);
     std::vector<scalar> out(size_[i]);
