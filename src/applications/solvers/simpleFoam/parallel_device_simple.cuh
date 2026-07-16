@@ -58,6 +58,25 @@ void matrixHInterfaceKernel(
     atomicAdd(&Hk[c], ifCoeff[f] * psiNbr[f] / V[c]);
 }
 
+// L7: the pressure flux across a processor face, pEqn.flux() -- mirrors host parallelMatrixFlux:
+//   flux[f] = -ifCoeff[f] * (p_neighbour[f] - p_local[faceCells[f]])
+// It is conservative because the laplacian interface coeff has the same magnitude on both sides, so the two
+// sides differ only by the swap of (p_nbr, p_local) -> equal and opposite. fluxOut points at the interface's
+// slice of the flattened boundary-flux array.
+__global__
+void matrixFluxInterfaceKernel(
+    const label*  __restrict__ faceCells,
+    const scalar* __restrict__ ifCoeff,
+    const scalar* __restrict__ pNbr,
+    const scalar* __restrict__ p,
+    scalar*       __restrict__ fluxOut,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    fluxOut[f] = -ifCoeff[f] * (pNbr[f] - p[faceCells[f]]);
+}
+
 } // namespace detail
 
 // Assemble the momentum matrix's processor coupling on `halo`'s interfaces: fold the convection+diffusion
@@ -88,6 +107,35 @@ inline void deviceMomentumInterface(
             ifCoeff[i].data(),
             n);
     }
+}
+
+// Write the processor-face pressure flux into `fluxB` (the flattened boundary-flux array) at each interface's
+// procStart offset. Exchanges p itself. The result cancels across a cut face (both sides equal and opposite),
+// which is what keeps the corrected phi globally conservative.
+inline void deviceParallelMatrixFluxInterface(
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<label>>& faceCells,
+    const std::vector<DeviceBuffer<scalar>>& ifCoeff,
+    const std::vector<label>& procStart,
+    const DeviceBuffer<scalar>& p,
+    DeviceBuffer<scalar>& fluxB,
+    cudaStream_t stream = cudaStreamPerThread)
+{
+    constexpr int TPB = 128;
+    halo.exchange(p.data(), stream);
+    for (int i = 0; i < halo.nInterfaces(); ++i)
+    {
+        const int n = static_cast<int>(halo.size(i));
+        if (n <= 0) continue;
+        detail::matrixFluxInterfaceKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
+            faceCells[i].data(),
+            ifCoeff[i].data(),
+            halo.recvData(i),
+            p.data(),
+            fluxB.data() + procStart[i],
+            n);
+    }
+    halo.waitExchange(stream);   // protect the recv buffer from the next exchange (see device_halo.cuh hazard)
 }
 
 // Distributed H() per component: the local deviceMatrixH plus the processor-interface term, i.e. the device

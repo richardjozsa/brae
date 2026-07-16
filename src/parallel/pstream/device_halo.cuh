@@ -47,6 +47,13 @@ public:
     // Complete the exchange (barrier). After the stream completes, recv region i holds the neighbour values.
     void waitExchange(cudaStream_t stream = cudaStreamPerThread);
     // postExchange + waitExchange as one call (standalone use, e.g. the halo unit test).
+    //
+    // HAZARD -- the recv buffer is REUSED by every exchange. After waitExchange the ranks run on independently,
+    // so a neighbour can post its NEXT exchange (writing our recv buffer) while we are still READING the
+    // previous one. Back-to-back exchanges therefore need an intervening global sync: either a collective the
+    // caller already performs (e.g. the Krylov allReduce between two products) or an explicit waitExchange()
+    // AFTER the read. Exchanging several fields (e.g. the 3 components of a vector) without that sync silently
+    // corrupts the earlier field.
     void exchange(
         const scalar* psi_d,
         cudaStream_t stream = cudaStreamPerThread);
