@@ -35,6 +35,23 @@ void scatterKernel(
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f < n) atomicAdd(&result[faceCells[f]], -coeff[f] * recvRegion[f]);
 }
+
+// bvalOut[f] = w[f]*psi[faceCells[f]] + (1 - w[f])*recvRegion[f]  (the coupled processor-face boundary value).
+// bvalOut points at bval + procStart[i], so each interface writes its slice of the flattened boundary array.
+__global__
+void bvalKernel(
+    const scalar* __restrict__ psi,
+    const label*  __restrict__ faceCells,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ recvRegion,
+    scalar*       __restrict__ bvalOut,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    const scalar wf = w[f];
+    bvalOut[f] = wf * psi[faceCells[f]] + (1.0 - wf) * recvRegion[f];
+}
 } // namespace
 
 DeviceHalo::DeviceHalo(
@@ -132,6 +149,27 @@ void DeviceHalo::updateInterfaceMatrix(
             coeff_d,
             recvBuf_.data() + recvOffset_[i],
             static_cast<int>(size_[i]));
+}
+
+void DeviceHalo::scatterBoundaryValues(
+    const scalar* psi_d,
+    const std::vector<DeviceBuffer<scalar>>& weights,
+    const std::vector<label>& procStart,
+    scalar* bval_d,
+    cudaStream_t stream)
+{
+    const int nI = static_cast<int>(nbr_.size());
+    for (int i = 0; i < nI; ++i)
+    {
+        if (size_[i] <= 0) continue;
+        bvalKernel<<<(size_[i] + TPB - 1) / TPB, TPB, 0, stream>>>(
+            psi_d,
+            faceCellsD_[i].data(),
+            weights[i].data(),
+            recvBuf_.data() + recvOffset_[i],
+            bval_d + procStart[i],
+            static_cast<int>(size_[i]));
+    }
 }
 
 std::vector<scalar> DeviceHalo::neighbourField(

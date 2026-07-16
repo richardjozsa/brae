@@ -304,6 +304,15 @@ already anticipates.
 
 ### Phase 4a -- Laminar distributed device SIMPLE (TRUE multi-GPU, the OOM milestone)
 
+- **Status: foundation DONE, loop IN PROGRESS.** The coupled-processor-boundary mechanism that EVERY explicit
+  operator needs is built and tested: `DeviceHalo::scatterBoundaryValues` exchanges a field and writes the
+  interpolated processor-face value `w*local + (1-w)*nbr` into the flattened `bval` array, so the UNCHANGED
+  device operators (grad/div/interpolate) treat a processor face as a coupled boundary. Proven by
+  `test_gpu_parallel_grad` (device `gaussGrad` on a decomposed mesh vs serial, np=1/2/4/8, rel 1.4e-15).
+  Interpolation weights via host `computeProcWeights` (uploaded once); interface->bval mapping via `procStart`.
+  **Remaining:** apply the same pattern to the other explicit operators (`deviceDiv`, interpolate, the `H()`
+  assembly), wire the Phase-2/3 parallel SpMV/PCG into the momentum + pressure solves, and compose the
+  distributed device SIMPLE loop with reconstruction.
 - **Goal:** the **laminar** steady SIMPLE step (momentum + pressure, no turbulence) running across two
   *physical* GPUs. This is the phase that answers the original OOM question, and it is the natural cut point:
   the laminar loop closes the multi-GPU story end to end; turbulence (4b) then adds fields, not new machinery.
