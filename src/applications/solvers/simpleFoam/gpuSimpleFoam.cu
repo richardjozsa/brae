@@ -20,6 +20,7 @@
 #include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
+#include "parallel_device_foam.cuh"   // brae ... -parallel: the distributed DEVICE path (one rank per GPU)
 
 #include <algorithm>
 #include <cctype>
@@ -44,6 +45,9 @@ static void printUsage()
 "The whole SIMPLE loop runs on one GPU; reads a standard OpenFOAM case and writes standard time dirs.\n\n"
 "Usage:\n"
 "  brae [-case <dir>]             solve an OpenFOAM case (default: the current directory)\n"
+"  mpirun -np N brae -case <dir> -parallel\n"
+"                                 solve across N GPUs, one rank per GPU (laminar only; needs P2P/NVLink).\n"
+"                                 Decomposes in core and reconstructs on write -- no decomposePar step.\n"
 "  brae -partition [-case <dir>]  build + cache the mesh and AMG hierarchy, then exit (no solve)\n"
 "  brae -cases <d1> <d2> ...      run several cases at once, one per GPU (mesh/parameter study)\n"
 "  brae --help                    show this message\n\n"
@@ -80,6 +84,12 @@ int main(int argc, char** argv)
                     sweep.push_back(argv[j]);
                 if (!sweep.empty()) return braesweep::runSweepCases(sweep);
             }
+        // -parallel (the OpenFOAM convention): the distributed DEVICE path, one rank per GPU.
+        //   mpirun -np N brae -case <dir> -parallel
+        // Gated on the flag rather than on Pstream::nProcs() so a plain `brae -case ...` never initialises
+        // MPI -- which also keeps the -cases fork orchestrator above clear of it.
+        for (int i = 1; i < argc; ++i)
+            if (std::string(argv[i]) == "-parallel") return runParallelDeviceFoam(argc, argv);
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
         for (int i = 1; i < argc; ++i)
