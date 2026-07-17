@@ -18,6 +18,7 @@
 #include "device_halo.cuh"
 #include "parallel_simple.cuh"     // Partition, distributeFromCells
 #include "reconstruct.cuh"
+#include "local_assembly.cuh"   // computeProcUpwindD
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -101,6 +102,51 @@ void laplacianInterfaceKernel(
     atomicAdd(&diag[faceCells[f]], -coeff[f]);
 }
 
+// linearUpwind deferred correction at a PROCESSOR face -- the distributed analogue of
+// linearUpwindCorrKernel (device_simple.cu) and of deviceCyclicAddLinUpwindCorr (no rotation here: a
+// processor cut is a plain interior face, the two sides share an orientation).
+//
+// The matrix stays plain UPWIND; linearUpwind is this explicit source. Per cut face, the local cell is the
+// face's owner and phi is the OUTWARD flux, so it is the owner branch of the internal kernel:
+//   corr[localCell] += phi * (grad(U_comp)[upwind] . d_upwind)
+// with the upwind side chosen by sign(phi):
+//   phi >= 0 -> LOCAL is upwind:  grad at the local cell,  d = dOwn = Cf - C[local]
+//   phi <  0 -> REMOTE is upwind: grad at the remote cell (gxN/gyN/gzN, from the halo), d = dNei = Cf - C[remote]
+// dOwn/dNei are static geometry, precomputed once by host computeProcUpwindD (the remote centre needs an
+// exchange). The caller does relaxSrc -= corr, exactly as for the internal correction.
+__global__
+void linUpwindInterfaceKernel(
+    const label*  __restrict__ faceCells,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    const scalar* __restrict__ gxN,
+    const scalar* __restrict__ gyN,
+    const scalar* __restrict__ gzN,
+    const scalar* __restrict__ dOwn,
+    const scalar* __restrict__ dNei,
+    scalar*       __restrict__ corr,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    const scalar pf = phi[f];
+    const label  c  = faceCells[f];
+    scalar g[3], d[3];
+    if (pf >= 0.0)   // local upwind: local gradient, local offset
+    {
+        g[0] = gx[c];  g[1] = gy[c];  g[2] = gz[c];
+        d[0] = dOwn[3*f]; d[1] = dOwn[3*f+1]; d[2] = dOwn[3*f+2];
+    }
+    else             // remote upwind: the halo gradient at the remote cell, remote offset
+    {
+        g[0] = gxN[f]; g[1] = gyN[f]; g[2] = gzN[f];
+        d[0] = dNei[3*f]; d[1] = dNei[3*f+1]; d[2] = dNei[3*f+2];
+    }
+    atomicAdd(&corr[c], pf * (g[0]*d[0] + g[1]*d[1] + g[2]*d[2]));   // a cell may own several cut faces
+}
+
 // Per-cell sum of |processor off-diagonal|, for fvMatrix::relax's diagonal-dominance term. Host
 // parallelRelaxMatrix adds |interfaceCoeffs| into sumOff; on device this feeds deviceRelaxDiag's cycSumOff
 // hook (the same role the cyclic interface's off-diagonal sum plays).
@@ -167,6 +213,65 @@ inline void deviceInterfaceOffDiagSum(
             faceCells[i].data(),
             ifCoeff[i].data(),
             sumOff.data(),
+            n);
+    }
+}
+
+// Add the processor faces' linearUpwind deferred correction into `corr` (which already holds the internal
+// deviceLinearUpwindCorr result). `gx/gy/gz` are grad(U_comp) as CELL fields -- already processor-consistent
+// (the halo injected the coupled face value before the gaussGrad). The three exchanges below fetch that same
+// gradient at the REMOTE cell, needed only where the remote side is upwind.
+// `phiF[i]` is the processor-face flux, `dOwnD/dNeiD[i]` the precomputed offsets (3 per face).
+inline void deviceLinUpwindInterface(
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<label>>& faceCells,
+    const std::vector<DeviceBuffer<scalar>>& phiF,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    const std::vector<DeviceBuffer<scalar>>& dOwnD,
+    const std::vector<DeviceBuffer<scalar>>& dNeiD,
+    DeviceBuffer<scalar>& corr,
+    cudaStream_t stream = cudaStreamPerThread)
+{
+    constexpr int TPB = 128;
+    // The recv buffer is shared and reused, so each component's remote gradient must be COPIED out before the
+    // next exchange overwrites it (see the hazard note in device_halo.cuh).
+    const int nI = halo.nInterfaces();
+    std::vector<DeviceBuffer<scalar>> gN[3];
+    const DeviceBuffer<scalar>* gsrc[3] = { &gx, &gy, &gz };
+    for (int k = 0; k < 3; ++k)
+    {
+        halo.exchange(gsrc[k]->data(), stream);
+        gN[k].resize(nI);
+        for (int i = 0; i < nI; ++i)
+        {
+            const int n = static_cast<int>(halo.size(i));
+            if (n <= 0) continue;
+            gN[k][i].resize(n);
+            cudaCheck(
+                cudaMemcpyAsync(gN[k][i].data(), halo.recvData(i), n * sizeof(scalar),
+                                cudaMemcpyDeviceToDevice, stream),
+                "linUpwind halo grad copy");
+        }
+        halo.waitExchange(stream);
+    }
+    for (int i = 0; i < nI; ++i)
+    {
+        const int n = static_cast<int>(halo.size(i));
+        if (n <= 0) continue;
+        detail::linUpwindInterfaceKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
+            faceCells[i].data(),
+            phiF[i].data(),
+            gx.data(),
+            gy.data(),
+            gz.data(),
+            gN[0][i].data(),
+            gN[1][i].data(),
+            gN[2][i].data(),
+            dOwnD[i].data(),
+            dNeiD[i].data(),
+            corr.data(),
             n);
     }
 }
@@ -251,7 +356,8 @@ public:
         scalar tolU,
         scalar tolP,
         int maxIter,
-        bool bounded = false)
+        bool bounded = false,
+        bool linearUpwind = false)
         : P_(part),
           nu_(nu),
           relaxU_(relaxU),
@@ -260,6 +366,7 @@ public:
           tolP_(tolP),
           maxIter_(maxIter),
           bounded_(bounded),
+          linearUpwind_(linearUpwind),
           lnC_(part.Lm.mesh.nCells()),
           nIf_(part.Lm.mesh.nInternalFaces()),
           dm_(buildDeviceMesh(part.Lm.mesh, part.lg, part.lp)),
@@ -316,6 +423,18 @@ public:
         for (std::size_t i = 0; i < P_.Lm.procFaceCells.size(); ++i) faceCellsD_[i].copyFrom(P_.Lm.procFaceCells[i]);
         for (std::size_t i = 0; i < P_.procW.size(); ++i) weightsD_[i].copyFrom(P_.procW[i]);
 
+        // linearUpwind needs Cf-C on BOTH sides of a cut; the remote centre needs an exchange, but the
+        // geometry is static, so do it once here rather than per iteration.
+        if (linearUpwind_)
+        {
+            std::vector<std::vector<scalar>> dO, dN;
+            computeProcUpwindD(P_.Lm, P_.lg, P_.lp, dO, dN);
+            dOwnD_.resize(dO.size());
+            dNeiD_.resize(dN.size());
+            for (std::size_t i = 0; i < dO.size(); ++i) dOwnD_[i].copyFrom(dO[i]);
+            for (std::size_t i = 0; i < dN.size(); ++i) dNeiD_[i].copyFrom(dN[i]);
+        }
+
         // initial conservative flux phi = flux(U0), internal + boundary (processor faces carry the coupled flux)
         const SurfaceScalarField phi0 = fvc::flux(U0, P_.Lm.mesh, P_.lg, P_.lp);
         phiInt_.copyFrom(std::vector<scalar>(phi0.internal.begin(), phi0.internal.begin() + nIf_));
@@ -359,6 +478,7 @@ private:
     scalar nu_, relaxU_, relaxP_, tolU_, tolP_;
     int    maxIter_;
     bool   bounded_ = false;
+    bool   linearUpwind_ = false;
     label  lnC_, nIf_, nBnd_ = 0;
     bool   validC_[3] = { true, true, true };
     DeviceMesh           dm_;
@@ -369,6 +489,7 @@ private:
     std::vector<label>   procStart_;
     std::vector<DeviceBuffer<label>>  faceCellsD_;
     std::vector<DeviceBuffer<scalar>> weightsD_;
+    std::vector<DeviceBuffer<scalar>> dOwnD_, dNeiD_;   // linearUpwind: static per-cut-face offsets
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_;
     DeviceBuffer<scalar> ones_, zeroSrc_, zeroBnd_, nuEffBnd_, nuCell_;
 };
@@ -496,6 +617,29 @@ inline ParStepResidual ParallelDeviceSimple::step()
     {
         deviceHadamard(relaxSrc[k], delta, Uk_[k]);      // delta*U_old
         deviceAxpy(1.0, *sS[k], relaxSrc[k]);            // + V*divSig  -> == host Ml.source
+    }
+
+    // linearUpwind: the matrix stays upwind and this deferred correction is an explicit source. It must land
+    // in relaxSrc -- the SAME source H() reads later -- not only in the predictor's rhs, or HbyA would be
+    // built from an upwind-only source and the corrector would disagree with the predictor.
+    if (linearUpwind_)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> ub;
+            deviceBCValue(dbU_.comp[k], Uk_[k], ub);
+            halo_.exchange(Uk_[k].data());
+            halo_.scatterBoundaryValues(Uk_[k].data(), weightsD_, procStart_, ub.data());
+            halo_.waitExchange();
+            DeviceBuffer<scalar> ggx, ggy, ggz;
+            deviceGaussGrad(dm_, Uk_[k], ub, ggx, ggy, ggz);   // processor-consistent grad(U_k)
+
+            DeviceBuffer<scalar> corr;
+            deviceLinearUpwindCorr(dm_, phiInt_, ggx, ggy, ggz, corr);          // internal faces
+            deviceLinUpwindInterface(halo_, faceCellsD_, phiF, ggx, ggy, ggz,
+                                     dOwnD_, dNeiD_, corr);                     // + cut faces
+            deviceAxpy(-1.0, corr, relaxSrc[k]);                                // source -= corr
+        }
     }
 
     // ---- grad(p): coupled processor boundary value from the halo ----
