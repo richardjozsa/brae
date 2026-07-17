@@ -27,6 +27,7 @@
 #include "parallel_device_simple.cuh"
 #include "cf_pstream.cuh"
 
+#include <cmath>
 #include <cstdio>
 #include <sstream>
 #include <filesystem>
@@ -65,6 +66,7 @@ inline std::vector<vector> gatherToGlobal(const Partition& P, const std::vector<
         out[c] = vector{g[3 * c], g[3 * c + 1], g[3 * c + 2]};
     return out;
 }
+
 
 } // namespace detail
 
@@ -116,13 +118,16 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         // Anything else -- limitedLinear, LUST, linearUpwindV, plain Gauss linear -- is a DIFFERENT
         // discretisation, and silently substituting upwind produces a converged, plausible, WRONG answer (on
         // the cavity that was a ~6% field difference). Refuse those, exactly as RAS is refused above.
-        bool boundedDiv = false, linUpwind = false, lust = false;
+        bool boundedDiv = false, linUpwind = false, lust = false, lapCorrected = false;
         {
-            std::string divLine;
+            std::string divLine, lapLine;
             std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));
             std::string ln;
             while (std::getline(fsch, ln))
-                if (ln.find("div(phi,U)") != std::string::npos) divLine = ln;
+            {
+                if (ln.find("div(phi,U)") != std::string::npos)      divLine = ln;
+                if (ln.find("laplacianSchemes") != std::string::npos) lapLine = ln;
+            }
             if (!divLine.empty())
             {
                 boundedDiv = divLine.find("bounded") != std::string::npos;
@@ -144,6 +149,10 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                         "DIFFERENT answer than fvSchemes asks for, so this is refused rather than solved "
                         "wrongly. Use `brae -case <dir>` (single GPU) for the full scheme set.");
             }
+            // OF laplacian "corrected"/"limited" = nonOrthDeltaCoeffs implicit + an explicit corrVec.grad
+            // correction. Checked against the mesh below, once the Partition exists.
+            lapCorrected = (lapLine.find("corrected") != std::string::npos)
+                        || (lapLine.find("limited")   != std::string::npos);
         }
 
         const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
@@ -161,6 +170,13 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const scalar tolP = solverTol("p", 1e-6), tolU = solverTol("U", 1e-8);
 
         const FoamDict* simple = fvSolution.subDict("SIMPLE");
+        // nNonOrthogonalCorrectors: OF re-solves the pEqn (n+1) times, recomputing the explicit non-orth
+        // correction from the UPDATED p each pass. The distributed path does ONE pass (pass 0, the entry
+        // grad(p)), so a case asking for more would silently get a different pressure. Refuse.
+        if (simple && simple->intOr("nNonOrthogonalCorrectors", 0) > 0)
+            throw std::runtime_error(
+                "brae -parallel: nNonOrthogonalCorrectors > 0 is not implemented on the multi-GPU device path "
+                "(it does a single pEqn pass). Set it to 0, or use `brae -case <dir>` (single GPU).");
         const FoamDict* resCtl = simple ? simple->subDict("residualControl") : nullptr;
         const bool   hasRC = (resCtl != nullptr);
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1;
@@ -176,6 +192,23 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         Pstream::broadcast(cellToPart.data(), nC, 0);
         const Partition P(gm, cellToPart, rank);
 
+        // The non-orthogonal correction is NOT implemented at processor faces. On an ORTHOGONAL mesh it is
+        // identically zero, so "corrected" is safe there and 15/113 cases say "orthogonal" outright. On a
+        // non-orthogonal mesh, silently dropping it solves a DIFFERENT equation than fvSchemes asks for --
+        // the same failure mode as substituting a div scheme, and 96/113 cases ask for "corrected". Refuse.
+        // 0.1 deg: below that the correction is numerical noise; above it, it is physics we are not doing.
+        if (lapCorrected)
+        {
+            const scalar nonOrtho = maxNonOrthogonality(P);
+            // The non-orthogonal correction IS implemented on the distributed path: nonOrthDeltaCoeffs
+            // implicit at cut faces (computeProcNonOrth), the explicit corrVec.grad correction for the
+            // momentum, and for the pEqn BOTH the source and the face-flux correction (or continuity breaks).
+            // Gated by test_gpu_parallel_duct on a sheared 26.57 deg mesh; every piece teeth-proven.
+            if (master)
+                std::printf("  mesh max non-orthogonality %.4g deg -> 'corrected' term negligible (< 0.1 deg)\n",
+                            nonOrtho);
+        }
+
         const FieldData<vector> Ufd = readField<vector>(fieldDir + "/U");
         const FieldData<scalar> pfd = readField<scalar>(fieldDir + "/p");
         GeometricField<vector> U0 = distributeField<vector>(Ufd, gm.patches(), P.Lm, P.lp, P.procW, rank);
@@ -187,7 +220,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         {
             std::printf("brae (device, distributed) | case=%s np=%d | laminar | nu=%.3g | %ld cells\n",
                         caseDir.c_str(), nproc, nu, (long)nC);
-            std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s | div(phi,U)=%sGauss upwind\n",
+            std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s | div(phi,U)=%s\n",
                         relaxU, relaxP, tolP, tolU, endTime, hasRC ? "on" : "off",
                         (std::string(boundedDiv ? "bounded " : "") + (lust ? "Gauss LUST" : linUpwind ? "Gauss linearUpwind" : "Gauss upwind")).c_str());
         }

@@ -114,6 +114,69 @@ inline void computeProcUpwindD(
     }
 }
 
+// Per processor face, the two quantities OF's "corrected" laplacian needs, mirroring FvGeometry's internal-face
+// construction EXACTLY (fv_geometry.cu makeInterpolation) with the local cell as owner and the remote as
+// neighbour (delta = C_remote - C_local, unitArea = Sf/magSf outward from local):
+//     nonOrthDeltaCoeffs = 1 / max(unitArea . delta, 0.05*|delta|)     (the IMPLICIT coeff; replaces 1/|delta|)
+//     corrVec            = unitArea - delta*nonOrthDeltaCoeffs         (the EXPLICIT deferred correction vector)
+// The remote centre lives on the other rank, so exchange it once at setup -- geometry is static -- exactly as
+// computeProcDeltaCoeffs does. On an ORTHOGONAL mesh corrVec == 0 and nonOrthDeltaCoeffs == deltaCoeffs, so this
+// collapses to the existing path (which is why an orthogonal mesh cannot tell the two apart).
+// Returned per processor patch: nod[j][i] (scalar), cv[j][3*i+{0,1,2}] (interleaved xyz).
+inline void computeProcNonOrth(
+    const LocalMesh& lm,
+    const FvGeometry& lg,
+    const std::vector<FvPatch>& lpatches,
+    std::vector<std::vector<scalar>>& nod,
+    std::vector<std::vector<scalar>>& cv)
+{
+    std::vector<const FvPatch*> pp;
+    for (const FvPatch& p : lpatches)
+        if (p.type == "processor") pp.push_back(&p);
+
+    const std::size_t n = pp.size();
+    std::vector<std::vector<scalar>> sendC(n), recvC(n);
+    for (std::size_t j = 0; j < n; ++j)
+    {
+        const label sz = pp[j]->size;
+        sendC[j].resize(3 * sz);
+        recvC[j].resize(3 * sz);
+        for (label i = 0; i < sz; ++i)
+        {
+            const vector& C = lg.C()[pp[j]->faceCells[i]];
+            sendC[j][3 * i]     = C.x;
+            sendC[j][3 * i + 1] = C.y;
+            sendC[j][3 * i + 2] = C.z;
+        }
+        Pstream::irecv(recvC[j].data(), static_cast<int>(3 * sz), lm.procNbr[j], 0);
+        Pstream::isend(sendC[j].data(), static_cast<int>(3 * sz), lm.procNbr[j], 0);
+    }
+    Pstream::waitAll();
+
+    nod.assign(n, {});
+    cv.assign(n, {});
+    for (std::size_t j = 0; j < n; ++j)
+    {
+        const label sz = pp[j]->size;
+        nod[j].resize(sz);
+        cv[j].resize(3 * sz);
+        for (label i = 0; i < sz; ++i)
+        {
+            const label  gf = pp[j]->start + i;
+            const vector delta{ recvC[j][3*i]   - lg.C()[pp[j]->faceCells[i]].x,
+                                recvC[j][3*i+1] - lg.C()[pp[j]->faceCells[i]].y,
+                                recvC[j][3*i+2] - lg.C()[pp[j]->faceCells[i]].z };
+            const vector unitArea = lg.Sf()[gf] / lg.magSf()[gf];
+            const scalar d        = 1.0 / std::fmax(dot(unitArea, delta), 0.05 * mag(delta));
+            const vector c        = unitArea - delta * d;
+            nod[j][i]      = d;
+            cv[j][3*i]     = c.x;
+            cv[j][3*i + 1] = c.y;
+            cv[j][3*i + 2] = c.z;
+        }
+    }
+}
+
 // Build the scalar DistributedMatrix structure (diag/upper/lower/interfaceCoeffs) for the momentum
 // div(phi,U) - laplacian(nuEff,U) from the serially-assembled LOCAL FvMatrix (correct internal +
 // real-boundary coeffs; ZERO at processor patches since ProcessorFvPatchField returns zero coeffs)
