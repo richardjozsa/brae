@@ -103,7 +103,7 @@ int main(int argc, char** argv)
         // linearUpwind ON: this test exists to exercise its interface term.
         ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, maxIter,
                                     /*bounded*/ true, /*linearUpwind*/ !lust, /*lust*/ lust);
-        if (!dump.empty()) solver.setStageDump(dump, 1);   // dump iteration 1: before anything diverges
+        if (!dump.empty()) solver.setStageDump(dump, (argc > 8) ? std::atoi(argv[8]) : 1);
         for (int it = 0; it < N; ++it) solver.step();
         cudaDeviceSynchronize();
 

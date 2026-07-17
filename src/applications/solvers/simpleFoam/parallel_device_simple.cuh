@@ -172,7 +172,7 @@ void linearCorrInterfaceKernel(
     const scalar pf   = phi[f];
     const scalar pos0 = (pf >= 0.0) ? 1.0 : 0.0;
     const label  c    = faceCells[f];
-    atomicAdd(&corr[c], 1000.0 * pf * (w[f] - pos0) * (psi[c] - psiNbr[f]));   // DIAGNOSTIC x1000
+    atomicAdd(&corr[c], pf * (w[f] - pos0) * (psi[c] - psiNbr[f]));   // a cell may own several cut faces
 }
 
 // Per-cell sum of |processor off-diagonal|, for fvMatrix::relax's diagonal-dominance term. Host
@@ -331,24 +331,6 @@ inline void deviceLinearCorrInterface(
             n);
     }
     halo.waitExchange(stream);   // the kernels above READ the shared recv buffer -- see device_halo.cuh
-    {   // DIAG: magnitude probe
-        static int nprobe = 0;
-        ++nprobe;
-        if (nprobe > 300 && nprobe < 304)
-        {
-            cudaStreamSynchronize(stream);
-            const std::vector<scalar> h = corr.host();
-            scalar mx = 0, sm = 0;
-            for (scalar v : h) { mx = std::fmax(mx, std::fabs(v)); sm += std::fabs(v); }
-            const std::vector<scalar> pf0 = phiF[0].host();
-            const std::vector<scalar> w0 = weights[0].host();
-            scalar mphi = 0, mw = 0, mnw = 0;
-            for (scalar v : pf0) mphi = std::fmax(mphi, std::fabs(v));
-            for (scalar v : w0) { mw = std::fmax(mw, v); mnw = std::fmin(mnw == 0 ? v : mnw, v); }
-            std::fprintf(stderr, "[PROBE] |corr|max=%.3e sum=%.3e | max|phiF|=%.3e | procW in [%.3f, %.3f]\n",
-                         mx, sm, mphi, mnw, mw);
-        }
-    }
 }
 
 // Assemble a laplacian(gamma, .) matrix's processor coupling (the pressure equation): fold -coeff into `diag`
@@ -527,10 +509,21 @@ public:
         dbRAU_  = buildDeviceBoundary(rAUfld_, part.lp, part.lg);
     }
 
-    // STAGE DUMP (debug): write every intermediate of iteration `it` gathered to the GLOBAL cell ordering,
-    // so an np=1 run (no processor faces -> interface terms inactive -> the reference discretisation) and an
-    // np=N run can be diffed stage by stage. The FIRST stage that differs localises an interface bug, instead
-    // of only seeing the blown-up field N iterations later.
+    // STAGE DUMP: write every intermediate of iteration `iter`, gathered to the GLOBAL cell ordering,
+    // so an np=1 run (no processor faces -> interface terms inactive -> THE reference discretisation) and an
+    // np=N run can be diffed stage by stage. The FIRST stage that differs localises the bug, instead of only
+    // seeing a blown-up field N iterations later.
+    //
+    // This is how the LUST interface bug was found: at iteration 2 (the first iteration where the corrections
+    // are non-zero at all -- U starts uniform, so grad(U)=0 and every correction is identically 0 at iteration
+    // 1) `luCorr_int` was 3.7e-02 off and `luCorr_tot` 1.2e-09 (the linearUpwind interface term restoring it
+    // exactly), while `linCorr_tot` was 6.2e+01 off -- one kernel, isolated. Free when unused (early return).
+    //
+    // Two traps it also exposed, both worth knowing before adding any interface term:
+    //   - dump at an iteration where the term is ACTUALLY NON-ZERO (iteration 1 proves nothing here);
+    //   - `sumOff` legitimately DIFFERS between np=1 and np>1: at np=1 those cut faces are internal and
+    //     deviceRelaxDiag already counts them from the LDU; at np>1 they arrive via the cycSumOff hook. It is
+    //     the complement, not a bug -- check `mDiagR` (which must match) instead.
     void setStageDump(const std::string& path, int iter) { dumpPath_ = path; dumpAt_ = iter; }
 
     // One distributed SIMPLE iteration. U/p/phi are updated in place on the device. Returns the momentum and
@@ -685,24 +678,6 @@ inline ParStepResidual ParallelDeviceSimple::step()
     }
 
     const std::vector<scalar> phiBndH = phiBnd_.host();
-    {   // DIAG: where does the boundary flux actually live?
-        static int np2 = 0;
-        if (np2++ == 120)
-        {
-            label b2 = 0;
-            for (std::size_t pi = 0; pi < lp.size(); ++pi)
-            {
-                if (lp[pi].type == "cyclic" || lp[pi].type == "cyclicAMI") continue;
-                scalar mx = 0;
-                for (label i = 0; i < lp[pi].size; ++i) mx = std::fmax(mx, std::fabs(phiBndH[b2 + i]));
-                std::fprintf(stderr, "[PATCH] %-14s type=%-10s off=%5ld n=%4ld max|phi|=%.3e\n",
-                             lp[pi].name.c_str(), lp[pi].type.c_str(), (long)b2, (long)lp[pi].size, mx);
-                b2 += lp[pi].size;
-            }
-            std::fprintf(stderr, "[PATCH] total flattened = %ld, phiBndH.size = %zu, dbU_.n = %ld\n",
-                         (long)b2, phiBndH.size(), (long)dbU_.n);
-        }
-    }
     std::vector<DeviceBuffer<scalar>> phiF, coeffGeo;
     {
         std::size_t pj = 0;

@@ -116,7 +116,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         // Anything else -- limitedLinear, LUST, linearUpwindV, plain Gauss linear -- is a DIFFERENT
         // discretisation, and silently substituting upwind produces a converged, plausible, WRONG answer (on
         // the cavity that was a ~6% field difference). Refuse those, exactly as RAS is refused above.
-        bool boundedDiv = false, linUpwind = false;
+        bool boundedDiv = false, linUpwind = false, lust = false;
         {
             std::string divLine;
             std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));
@@ -127,18 +127,14 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             {
                 boundedDiv = divLine.find("bounded") != std::string::npos;
                 linUpwind  = divLine.find("linearUpwind") != std::string::npos;
+                lust       = divLine.find("LUST") != std::string::npos;   // 0.75*linear + 0.25*linearUpwind (OF LUST.H)
                 // NB "linearUpwind" has a capital U, so it does NOT contain the substring "upwind" -- the two
                 // must be tested separately or a linearUpwind case reads as "no upwind scheme at all".
-                const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind;
+                const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind || lust;
                 // linearUpwindV adds OF's vector direction limiter on top of linearUpwind -- NOT implemented,
                 // and it contains the substring "linearUpwind", so it must be excluded explicitly.
-                // LUST (0.75 linear + 0.25 linearUpwind) is REFUSED: the distributed linear part at a cut
-                // face is not implemented correctly -- with it the duct test diverges (1e42), without it the
-                // cut-face linear correction is simply missing (~6e-3 error). Both are wrong, so refuse.
-                // It costs nothing today: every LUST case in validation/ is RAS, refused above anyway.
                 const bool unsupported = divLine.find("linearUpwindV") != std::string::npos
-                                      || divLine.find("limitedLinear") != std::string::npos
-                                      || divLine.find("LUST") != std::string::npos;
+                                      || divLine.find("limitedLinear") != std::string::npos;
                 if (!upwindFamily || unsupported)
                     throw std::runtime_error(
                         "brae -parallel: div(phi,U) scheme '" + divLine + "' is not implemented on the "
@@ -193,14 +189,14 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                         caseDir.c_str(), nproc, nu, (long)nC);
             std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s | div(phi,U)=%sGauss upwind\n",
                         relaxU, relaxP, tolP, tolU, endTime, hasRC ? "on" : "off",
-                        (std::string(boundedDiv ? "bounded " : "") + (linUpwind ? "Gauss linearUpwind" : "Gauss upwind")).c_str());
+                        (std::string(boundedDiv ? "bounded " : "") + (lust ? "Gauss LUST" : linUpwind ? "Gauss linearUpwind" : "Gauss upwind")).c_str());
         }
 
         std::vector<vector> Ug;
         std::vector<scalar> pg;
         int nIter = 0;
         {   // scope: the solver's symmetric-heap buffers must be freed BEFORE Pstream::finalize
-            ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind);
+            ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust);
 
             auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };
             bool converged = false;
