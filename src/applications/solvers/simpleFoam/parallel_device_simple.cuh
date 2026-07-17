@@ -20,6 +20,8 @@
 #include "reconstruct.cuh"
 #include "local_assembly.cuh"   // computeProcUpwindD
 #include "device_kepsilon.cuh"   // DeviceWallData / KEpsilonCoeffs / buildDeviceWallData (Phase 4b turbulence)
+#include "komega_sst_coeffs.cuh"
+#include "cell_wall_dist.cuh"
 #include "parallel_device_interface.cuh"   // deviceMomentumInterface / deviceInterfaceOffDiagSum (shared)
 #include <cuda_runtime.h>
 #include <fstream>
@@ -744,7 +746,7 @@ public:
                           const GeometricField<scalar>& eps0, const GeometricField<scalar>& nut0,
                           const KEpsilonCoeffs& co, scalar relaxK = 0.7, scalar relaxEps = 0.7)
     {
-        turbulent_ = true;
+        turbulent_ = true;  turbModel_ = 0;
         relaxK_ = relaxK; relaxEps_ = relaxEps;
         keCoeffs_ = co;
         k_.copyFrom(k0.internal); eps_.copyFrom(eps0.internal); nut_.copyFrom(nut0.internal);
@@ -771,6 +773,52 @@ public:
             bndY_.copyFrom(byy);
         }
         // geomD = magSf*procDelta per interface (static)
+        std::size_t pj = 0;
+        for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
+        {
+            if (P_.lp[pi].type != "processor") continue;
+            std::vector<scalar> gd(P_.lp[pi].size);
+            for (label i = 0; i < P_.lp[pi].size; ++i)
+                gd[i] = P_.lg.magSf()[P_.lp[pi].start + i] * P_.procDelta[pj][i];
+            geomD_.emplace_back();
+            geomD_.back().copyFrom(gd);
+            ++pj;
+        }
+    }
+
+    // Turn on distributed k-omega SST. Second field is OMEGA (stored in eps_/dbEps_), plus the cell wall
+    // distance y (F1/F2). Reuses the k-eps setup; keCoeffs_ is derived for the momentum wall nut
+    // (nutkWallFunction uses Cmu=betaStar, kappa, E). step() then calls parallelDeviceKOmegaSSTCorrect.
+    void enableTurbulenceSST(const GeometricField<vector>& U0, const GeometricField<scalar>& k0,
+                             const GeometricField<scalar>& omega0, const GeometricField<scalar>& nut0,
+                             const KOmegaSSTCoeffs& co, scalar relaxK = 0.7, scalar relaxOmega = 0.7)
+    {
+        turbulent_ = true;  turbModel_ = 1;
+        relaxK_ = relaxK; relaxEps_ = relaxOmega;
+        sstCoeffs_ = co;
+        keCoeffs_.Cmu = co.betaStar; keCoeffs_.kappa = co.kappa; keCoeffs_.E = co.E;   // momentum wall nut
+        k_.copyFrom(k0.internal); eps_.copyFrom(omega0.internal); nut_.copyFrom(nut0.internal);
+        dbK_   = buildDeviceBoundary(k0,     P_.lp, P_.lg);
+        dbEps_ = buildDeviceBoundary(omega0, P_.lp, P_.lg);
+        wall_ = buildDeviceWallData(P_.Lm.mesh, P_.lg, P_.lp, U0);
+        yCell_.copyFrom(cellWallDist(P_.Lm.mesh, P_.lg, P_.lp));
+        std::vector<label> isW(lnC_, 0);
+        for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
+            if (P_.lp[pi].type == "wall")
+                for (label i = 0; i < P_.lp[pi].size; ++i) isW[P_.lp[pi].faceCells[i]] = 1;
+        isWallCell_.copyFrom(isW);
+        {
+            const std::vector<std::vector<scalar>> yW = nearWallDist(P_.Lm.mesh, P_.lg, P_.lp);
+            std::vector<label> biw; std::vector<scalar> byy;
+            for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
+            {
+                if (P_.lp[pi].type == "cyclic" || P_.lp[pi].type == "cyclicAMI") continue;
+                const bool wall = (P_.lp[pi].type == "wall");
+                for (label i = 0; i < P_.lp[pi].size; ++i) { biw.push_back(wall ? 1 : 0); byy.push_back(wall ? yW[pi][i] : 0.0); }
+            }
+            bndIsWall_.copyFrom(biw);
+            bndY_.copyFrom(byy);
+        }
         std::size_t pj = 0;
         for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
         {
@@ -854,6 +902,9 @@ private:
     DeviceBuffer<scalar> bndY_;       // per-boundary-face near-wall distance
     std::vector<DeviceBuffer<scalar>> geomD_;   // magSf*procDelta per interface (for the k/eps interface gamma)
     KEpsilonCoeffs keCoeffs_;
+    int  turbModel_ = 0;             // 0 = k-epsilon, 1 = k-omega SST
+    KOmegaSSTCoeffs sstCoeffs_;
+    DeviceBuffer<scalar> yCell_;    // cell wall distance (SST F1/F2)
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_;
     DeviceBuffer<scalar> ones_, zeroSrc_, zeroBnd_, nuEffBnd_, nuCell_;
 };
@@ -1300,10 +1351,19 @@ inline ParStepResidual ParallelDeviceSimple::step()
                 bi += lp[pi].size;
             }
         }
-        scalar rEps = 0, rK = 0;
-        parallelDeviceKEpsilonCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, Uk_[0], Uk_[1], Uk_[2],
-            k_, eps_, nut_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_, isWallCell_,
-            nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, keCoeffs_, &rEps, &rK);
+        if (turbModel_ == 1)   // k-omega SST (eps_ holds omega)
+        {
+            parallelDeviceKOmegaSSTCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, Uk_[0], Uk_[1], Uk_[2],
+                k_, eps_, nut_, yCell_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_,
+                isWallCell_, nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, sstCoeffs_);
+        }
+        else                   // k-epsilon
+        {
+            scalar rEps = 0, rK = 0;
+            parallelDeviceKEpsilonCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, Uk_[0], Uk_[1], Uk_[2],
+                k_, eps_, nut_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_, isWallCell_,
+                nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, keCoeffs_, &rEps, &rK);
+        }
     }
     return res;
 }

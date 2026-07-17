@@ -8,8 +8,8 @@
 // decomposePar step), iterate, gather on write -- but the SIMPLE loop itself runs entirely on the GPU via
 // ParallelDeviceSimple: U/p/phi stay device-resident across iterations and only cross PCIe at write time.
 //
-// LAMINAR ONLY (Phase 4a). Turbulence is 4b: ParallelDeviceSimple has no k/epsilon transport, so a RAS case
-// must be REFUSED here rather than silently solved as laminar -- that would look like it worked and be wrong.
+// Laminar OR RAS (kEpsilon, kOmegaSST): the SIMPLE loop runs on the GPU via ParallelDeviceSimple, with
+// turbulence enabled per the case's turbulenceProperties. Unsupported models/schemes are refused, not approximated.
 //
 // The single-GPU `brae` path is untouched: this is reached only when -parallel is passed, so a plain
 // `brae -case <dir>` never initialises MPI (which also keeps the -cases fork orchestrator clear of MPI).
@@ -104,14 +104,56 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const int   precision = controlDict.intOr("writePrecision", 16);
         const scalar nu       = transport.scalarOr("nu", 1e-5);
 
-        // Phase 4a is laminar. Refuse RAS rather than solve it as laminar behind the user's back.
+        // Turbulence: laminar, or RAS kEpsilon (the loop-integrated + validated model). kOmegaSST correct() is
+        // validated standalone (test_gpu_parallel_komegasst) but not yet wired into the distributed loop, so it
+        // is refused here -- honestly, not silently solved as something else.
         const std::string simType = turbProps.wordOr("simulationType", "laminar");
-        if (simType != "laminar")
+        const bool turbulent = (simType == "RAS");
+        KEpsilonCoeffs keCoeffs;
+        KOmegaSSTCoeffs sstCoeffs;
+        bool sst = false;
+        if (turbulent)
+        {
+            const FoamDict* ras = turbProps.subDict("RAS");
+            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            if (model != "kEpsilon" && model != "kOmegaSST")
+                throw std::runtime_error(
+                    "brae -parallel: RASModel '" + model + "' is not implemented on the multi-GPU device path "
+                    "(kEpsilon and kOmegaSST are). Use `mpirun -np N brae_simpleFoam -case <dir>` (host) or "
+                    "`brae -case <dir>` (single GPU) for other models.");
+            sst = (model == "kOmegaSST");
+            const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr;
+            if (kec)
+            {
+                keCoeffs.Cmu = kec->scalarOr("Cmu", keCoeffs.Cmu);
+                keCoeffs.C1 = kec->scalarOr("C1", keCoeffs.C1);
+                keCoeffs.C2 = kec->scalarOr("C2", keCoeffs.C2);
+                keCoeffs.C3 = kec->scalarOr("C3", keCoeffs.C3);
+                keCoeffs.sigmaK = kec->scalarOr("sigmak", keCoeffs.sigmaK);
+                keCoeffs.sigmaEps = kec->scalarOr("sigmaEps", keCoeffs.sigmaEps);
+                keCoeffs.kappa = kec->scalarOr("kappa", keCoeffs.kappa);
+                keCoeffs.E = kec->scalarOr("E", keCoeffs.E);
+            }
+            const FoamDict* ssc = ras ? ras->subDict("kOmegaSSTCoeffs") : nullptr;
+            if (ssc)
+            {
+                sstCoeffs.alphaK1 = ssc->scalarOr("alphaK1", sstCoeffs.alphaK1);
+                sstCoeffs.alphaK2 = ssc->scalarOr("alphaK2", sstCoeffs.alphaK2);
+                sstCoeffs.alphaOmega1 = ssc->scalarOr("alphaOmega1", sstCoeffs.alphaOmega1);
+                sstCoeffs.alphaOmega2 = ssc->scalarOr("alphaOmega2", sstCoeffs.alphaOmega2);
+                sstCoeffs.gamma1 = ssc->scalarOr("gamma1", sstCoeffs.gamma1);
+                sstCoeffs.gamma2 = ssc->scalarOr("gamma2", sstCoeffs.gamma2);
+                sstCoeffs.beta1 = ssc->scalarOr("beta1", sstCoeffs.beta1);
+                sstCoeffs.beta2 = ssc->scalarOr("beta2", sstCoeffs.beta2);
+                sstCoeffs.betaStar = ssc->scalarOr("betaStar", sstCoeffs.betaStar);
+                sstCoeffs.a1 = ssc->scalarOr("a1", sstCoeffs.a1);
+                sstCoeffs.b1 = ssc->scalarOr("b1", sstCoeffs.b1);
+                sstCoeffs.c1 = ssc->scalarOr("c1", sstCoeffs.c1);
+            }
+        }
+        else if (simType != "laminar")
             throw std::runtime_error(
-                "brae -parallel: simulationType '" + simType + "' is not supported on the multi-GPU device "
-                "path yet (Phase 4a is laminar; turbulence is 4b). Use the host solver "
-                "`mpirun -np N brae_simpleFoam -case <dir>` for RAS in parallel, or `brae -case <dir>` for "
-                "RAS on a single GPU.");
+                "brae -parallel: simulationType '" + simType + "' is not supported (laminar or RAS).");
 
         // fvSchemes div(phi,U). The distributed path implements Gauss upwind, bounded, and linearUpwind (the
         // matrix is upwind either way; linearUpwind adds the deferred gradient correction, cut faces included).
@@ -160,6 +202,8 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const FoamDict* fld = rf ? rf->subDict("fields") : nullptr;
         const scalar relaxU = eqs ? eqs->scalarOr("U", 1.0) : 1.0;
         const scalar relaxP = fld ? fld->scalarOr("p", 1.0) : 1.0;
+        const scalar relaxK   = eqs ? eqs->scalarOr("k", 1.0) : 1.0;
+        const scalar relaxEps = eqs ? eqs->scalarOr("epsilon", 1.0) : 1.0;
 
         const FoamDict* solvers = fvSolution.subDict("solvers");
         auto solverTol = [&](const std::string& f, scalar def)
@@ -216,20 +260,36 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         GeometricField<scalar> p0 = distributeField<scalar>(pfd, gm.patches(), P.Lm, P.lp, P.procW, rank);
         p0.evaluateBoundary();
 
+        // turbulence start fields (RAS kEpsilon)
+        FieldData<scalar> kfd, efd, nfd;
+        GeometricField<scalar> k0, eps0, nut0;
+        if (turbulent)
+        {
+            kfd = readField<scalar>(fieldDir + "/k");
+            efd = readField<scalar>(fieldDir + "/" + (sst ? "omega" : "epsilon"));
+            nfd = readField<scalar>(fieldDir + "/nut");
+            k0   = distributeField<scalar>(kfd, gm.patches(), P.Lm, P.lp, P.procW, rank); k0.evaluateBoundary();
+            eps0 = distributeField<scalar>(efd, gm.patches(), P.Lm, P.lp, P.procW, rank); eps0.evaluateBoundary();
+            nut0 = distributeField<scalar>(nfd, gm.patches(), P.Lm, P.lp, P.procW, rank); nut0.evaluateBoundary();
+        }
+
         if (master)
         {
-            std::printf("brae (device, distributed) | case=%s np=%d | laminar | nu=%.3g | %ld cells\n",
-                        caseDir.c_str(), nproc, nu, (long)nC);
-            std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s | div(phi,U)=%s\n",
-                        relaxU, relaxP, tolP, tolU, endTime, hasRC ? "on" : "off",
+            std::printf("brae (device, distributed) | case=%s np=%d | %s%s | nu=%.3g | %ld cells\n",
+                        caseDir.c_str(), nproc, simType.c_str(), turbulent ? (sst ? " (kOmegaSST)" : " (kEpsilon)") : "", nu, (long)nC);
+            std::printf("  relax U=%.2g p=%.2g%s | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s | div(phi,U)=%s\n",
+                        relaxU, relaxP, turbulent ? (" k=" + std::to_string(relaxK)).c_str() : "",
+                        tolP, tolU, endTime, hasRC ? "on" : "off",
                         (std::string(boundedDiv ? "bounded " : "") + (lust ? "Gauss LUST" : linUpwind ? "Gauss linearUpwind" : "Gauss upwind")).c_str());
         }
 
         std::vector<vector> Ug;
-        std::vector<scalar> pg;
+        std::vector<scalar> pg, kg, eg, ng;
         int nIter = 0;
         {   // scope: the solver's symmetric-heap buffers must be freed BEFORE Pstream::finalize
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust);
+            if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
+            else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
 
             auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };
             bool converged = false;
@@ -239,6 +299,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                 const ParStepResidual r = solver.step();
                 if (master && (iter == 1 || iter % 50 == 0))
                     std::printf("  iter %4d:  Ux %.3e  p %.3e\n", iter, r.Ux, r.p);
+                // residualControl on U/p (the turbulence fields co-converge; step() returns only U/p residuals).
                 converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU);
             }
             nIter = converged ? iter - 1 : endTime;
@@ -248,6 +309,12 @@ inline int runParallelDeviceFoam(int argc, char** argv)
 
             Ug = detail::gatherToGlobal(P, solver.U());   // D2H once, at write time
             pg = detail::gatherToGlobal(P, solver.p());
+            if (turbulent)
+            {
+                kg = detail::gatherToGlobal(P, solver.kLocal());
+                eg = detail::gatherToGlobal(P, solver.epsLocal());
+                ng = detail::gatherToGlobal(P, solver.nutLocal());
+            }
         }
 
         // pRefCell/pRefValue. A CLOSED domain (no fixedValue p patch) has an all-Neumann pressure equation,
@@ -283,6 +350,12 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             const std::string src = fieldDir + "/";
             writeVolField(src + "U", outDir + "/U", Ug, gm.patches(), precision);
             writeVolField(src + "p", outDir + "/p", pg, gm.patches(), precision);
+            if (turbulent)
+            {
+                writeVolField(src + "k",       outDir + "/k",       kg, gm.patches(), precision);
+                writeVolField(src + (sst ? "omega" : "epsilon"), outDir + "/" + (sst ? "omega" : "epsilon"), eg, gm.patches(), precision);
+                writeVolField(src + "nut",     outDir + "/nut",     ng, gm.patches(), precision);
+            }
             std::printf("wrote %s\n", outDir.c_str());
         }
     }
