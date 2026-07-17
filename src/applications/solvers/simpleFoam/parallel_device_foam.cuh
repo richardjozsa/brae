@@ -111,11 +111,12 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                 "`mpirun -np N brae_simpleFoam -case <dir>` for RAS in parallel, or `brae -case <dir>` for "
                 "RAS on a single GPU.");
 
-        // fvSchemes div(phi,U). ParallelDeviceSimple implements Gauss upwind (+ the `bounded` -Sp(div(phi),U)
-        // term). Anything else -- linearUpwind, limitedLinear, LUST, ... -- is a DIFFERENT discretisation, and
-        // silently substituting upwind produces a converged, plausible, WRONG answer (on the cavity that is a
-        // ~6% field difference vs the single-GPU solver). Refuse instead, exactly as RAS is refused above.
-        bool boundedDiv = false;
+        // fvSchemes div(phi,U). The distributed path implements Gauss upwind, bounded, and linearUpwind (the
+        // matrix is upwind either way; linearUpwind adds the deferred gradient correction, cut faces included).
+        // Anything else -- limitedLinear, LUST, linearUpwindV, plain Gauss linear -- is a DIFFERENT
+        // discretisation, and silently substituting upwind produces a converged, plausible, WRONG answer (on
+        // the cavity that was a ~6% field difference). Refuse those, exactly as RAS is refused above.
+        bool boundedDiv = false, linUpwind = false;
         {
             std::string divLine;
             std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));
@@ -125,15 +126,22 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             if (!divLine.empty())
             {
                 boundedDiv = divLine.find("bounded") != std::string::npos;
-                const bool upwind = divLine.find("upwind") != std::string::npos;
-                const bool linearUpwind = divLine.find("linearUpwind") != std::string::npos;
-                if (!upwind || linearUpwind)
+                linUpwind  = divLine.find("linearUpwind") != std::string::npos;
+                // NB "linearUpwind" has a capital U, so it does NOT contain the substring "upwind" -- the two
+                // must be tested separately or a linearUpwind case reads as "no upwind scheme at all".
+                const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind;
+                // linearUpwindV adds OF's vector direction limiter on top of linearUpwind -- NOT implemented,
+                // and it contains the substring "linearUpwind", so it must be excluded explicitly.
+                const bool unsupported = divLine.find("linearUpwindV") != std::string::npos
+                                      || divLine.find("limitedLinear") != std::string::npos
+                                      || divLine.find("LUST") != std::string::npos;
+                if (!upwindFamily || unsupported)
                     throw std::runtime_error(
                         "brae -parallel: div(phi,U) scheme '" + divLine + "' is not implemented on the "
-                        "multi-GPU device path (it supports 'Gauss upwind' and 'bounded Gauss upwind'). "
-                        "Substituting upwind would converge to a DIFFERENT answer than the scheme asks for, "
-                        "so this is refused rather than solved wrongly. Use `brae -case <dir>` (single GPU) "
-                        "for the full scheme set.");
+                        "multi-GPU device path (it supports 'Gauss upwind', 'bounded Gauss upwind' and "
+                        "'[bounded] Gauss linearUpwind grad(U)'). Substituting a scheme would converge to a "
+                        "DIFFERENT answer than fvSchemes asks for, so this is refused rather than solved "
+                        "wrongly. Use `brae -case <dir>` (single GPU) for the full scheme set.");
             }
         }
 
@@ -179,14 +187,15 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             std::printf("brae (device, distributed) | case=%s np=%d | laminar | nu=%.3g | %ld cells\n",
                         caseDir.c_str(), nproc, nu, (long)nC);
             std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s | div(phi,U)=%sGauss upwind\n",
-                        relaxU, relaxP, tolP, tolU, endTime, hasRC ? "on" : "off", boundedDiv ? "bounded " : "");
+                        relaxU, relaxP, tolP, tolU, endTime, hasRC ? "on" : "off",
+                        (std::string(boundedDiv ? "bounded " : "") + (linUpwind ? "Gauss linearUpwind" : "Gauss upwind")).c_str());
         }
 
         std::vector<vector> Ug;
         std::vector<scalar> pg;
         int nIter = 0;
         {   // scope: the solver's symmetric-heap buffers must be freed BEFORE Pstream::finalize
-            ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv);
+            ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind);
 
             auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };
             bool converged = false;
