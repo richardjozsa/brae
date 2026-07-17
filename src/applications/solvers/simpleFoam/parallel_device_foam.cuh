@@ -132,14 +132,19 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                 const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind;
                 // linearUpwindV adds OF's vector direction limiter on top of linearUpwind -- NOT implemented,
                 // and it contains the substring "linearUpwind", so it must be excluded explicitly.
+                // LUST (0.75 linear + 0.25 linearUpwind) is REFUSED: the distributed linear part at a cut
+                // face is not implemented correctly -- with it the duct test diverges (1e42), without it the
+                // cut-face linear correction is simply missing (~6e-3 error). Both are wrong, so refuse.
+                // It costs nothing today: every LUST case in validation/ is RAS, refused above anyway.
                 const bool unsupported = divLine.find("linearUpwindV") != std::string::npos
                                       || divLine.find("limitedLinear") != std::string::npos
                                       || divLine.find("LUST") != std::string::npos;
                 if (!upwindFamily || unsupported)
                     throw std::runtime_error(
                         "brae -parallel: div(phi,U) scheme '" + divLine + "' is not implemented on the "
-                        "multi-GPU device path (it supports 'Gauss upwind', 'bounded Gauss upwind' and "
-                        "'[bounded] Gauss linearUpwind grad(U)'). Substituting a scheme would converge to a "
+                        "multi-GPU device path (it supports 'Gauss upwind', 'bounded Gauss upwind', "
+                        "'[bounded] Gauss linearUpwind grad(U)' and '[bounded] Gauss LUST grad(U)'). "
+                        "Substituting a scheme would converge to a "
                         "DIFFERENT answer than fvSchemes asks for, so this is refused rather than solved "
                         "wrongly. Use `brae -case <dir>` (single GPU) for the full scheme set.");
             }
