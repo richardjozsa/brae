@@ -263,6 +263,41 @@ if(BRAE_WITH_NVSHMEM)
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
 
+    # Phase 4b: the distributed kOmegaSST::correct() (2nd RAS model) reproduces np=1
+    add_executable(test_gpu_parallel_komegasst tests/test_gpu_parallel_komegasst.cu)
+    target_include_directories(test_gpu_parallel_komegasst PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_komegasst PRIVATE brae_core)
+    add_test(NAME gpu_parallel_komegasst_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_komegasst>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/sst_ref.txt)
+    set_tests_properties(gpu_parallel_komegasst_ref PROPERTIES FIXTURES_SETUP SSTREF)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_komegasst_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_komegasst>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/sst_ref.txt)
+        set_tests_properties(gpu_parallel_komegasst_np${_np} PROPERTIES FIXTURES_REQUIRED SSTREF)
+    endforeach()
+
+    # Phase 4b: the CLOSED distributed turbulent SIMPLE loop (momentum+pressure with nuEff=nu+nut, then
+    # kEpsilon correct(), maintained across iterations) reproduces np=1.
+    add_executable(test_gpu_parallel_turbloop tests/test_gpu_parallel_turbloop.cu)
+    target_include_directories(test_gpu_parallel_turbloop PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_turbloop PRIVATE brae_core)
+    add_test(NAME gpu_parallel_turbloop_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_turbloop>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_ref.txt)
+    set_tests_properties(gpu_parallel_turbloop_ref PROPERTIES FIXTURES_SETUP TURBLOOP)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_turbloop_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_turbloop>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_ref.txt)
+        set_tests_properties(gpu_parallel_turbloop_np${_np} PROPERTIES FIXTURES_REQUIRED TURBLOOP)
+    endforeach()
+
     # Phase 4b: the full distributed kEpsilon::correct() (production + wall functions + eps/k transport + nut)
     # reproduces np=1. Duct walls are y/z, cut is x -> near-wall cells sit adjacent to the cut.
     add_executable(test_gpu_parallel_kepsilon tests/test_gpu_parallel_kepsilon.cu)

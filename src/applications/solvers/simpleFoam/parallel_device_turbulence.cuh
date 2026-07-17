@@ -13,9 +13,15 @@
 // separate them -- confirmed by the host oracle's "WALL FUNCTIONS are unchanged and entirely local"), so they
 // reuse the single-GPU kernels unchanged. The one genuinely new device piece is the near-wall setValues
 // constraint (fixed epsilon at wall-adjacent cells), which also zeroes those cells' interface coeffs.
-#include "parallel_device_simple.cuh"
+#include "parallel_device_interface.cuh"   // deviceMomentumInterface / deviceInterfaceOffDiagSum
+#include "device_simple.cuh"
+#include "device_pcg.cuh"
+#include "device_mesh.cuh"
+#include "device_ldu.cuh"
+#include "device_blas.cuh"
 #include "device_boundary.cuh"
 #include "device_kepsilon.cuh"
+#include "device_komega_sst.cuh"
 #include <vector>
 
 namespace brae {
@@ -342,6 +348,129 @@ inline void parallelDeviceKEpsilonCorrect(
 
     // ---- correctNut (LOCAL: nut = Cmu*k^2/eps) ----
     deviceNut(k, eps, nut, co);
+}
+
+
+// Distributed device kOmegaSST::correct() -- mirrors the single-GPU deviceKOmegaSSTCorrect (device_kepsilon.cu)
+// exactly, reusing its exposed LOCAL kernels (S2, F1, F2, CDkOmega, blends, reactions, nutSST, wall omega) and
+// the distributed scalar-transport core for the two solves. Processor-coupled inputs: gradU, grad(k), grad(omega)
+// (each field's cut value from the halo before gaussGrad), and the F1-blended diffusivities DkEff/DomegaEff at
+// cut faces (halo-interpolated). k/omega/nut updated in place. Same wall/setValues/geomD scaffolding as k-eps.
+inline void parallelDeviceKOmegaSSTCorrect(
+    const DeviceMesh& dm, DeviceHalo& halo, const DeviceWallData& wall,
+    const DeviceVectorBoundary& dbU, const DeviceBoundary& dbK, const DeviceBoundary& dbOmega,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& omega, DeviceBuffer<scalar>& nut,
+    const DeviceBuffer<scalar>& y,                       // cell wall distance
+    const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
+    const std::vector<DeviceBuffer<scalar>>& phiF,
+    const std::vector<DeviceBuffer<label>>& faceCellsD, const std::vector<label>& procStart,
+    const std::vector<DeviceBuffer<scalar>>& weightsD, const std::vector<DeviceBuffer<scalar>>& geomD,
+    const DeviceBuffer<label>& isWallCell,
+    scalar nu, scalar relaxOmega, scalar relaxK, scalar tol, int maxIter, label globalNCells,
+    const DeviceBuffer<scalar>& ones, bool bounded, const KOmegaSSTCoeffs& co)
+{
+    constexpr int TPB = 128;
+    const int nC = dm.nCells;
+    auto nb = [&](int n){ return (n + TPB - 1) / TPB; };
+
+    // halo-consistent scalar gradient: inject the field's cut value from the halo before gaussGrad
+    auto haloGrad = [&](const DeviceBoundary& db, const DeviceBuffer<scalar>& fld,
+                        DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz)
+    {
+        DeviceBuffer<scalar> bv;
+        deviceBCValue(db, fld, bv);
+        halo.exchange(fld.data());
+        halo.scatterBoundaryValues(fld.data(), weightsD, procStart, bv.data());
+        halo.waitExchange();
+        deviceGaussGrad(dm, fld, bv, gx, gy, gz);
+    };
+    // F1-blended diffusivity DEff at internal/boundary/cut faces (like k-eps faceGammaGeo)
+    auto faceGammaGeo = [&](const DeviceBuffer<scalar>& gammaCell, const DeviceBoundary& db,
+                            DeviceBuffer<scalar>& gInt, DeviceBuffer<scalar>& gBnd,
+                            std::vector<DeviceBuffer<scalar>>& gCoeffGeo)
+    {
+        deviceInterpolate(dm, gammaCell, gInt);
+        deviceBCValue(db, gammaCell, gBnd);
+        DeviceBuffer<scalar> gBndProc;
+        deviceBCValue(db, gammaCell, gBndProc);
+        halo.exchange(gammaCell.data());
+        halo.scatterBoundaryValues(gammaCell.data(), weightsD, procStart, gBndProc.data());
+        halo.waitExchange();
+        const std::vector<scalar> gh = gBndProc.host();
+        gCoeffGeo.clear(); gCoeffGeo.resize(procStart.size());
+        for (std::size_t i = 0; i < procStart.size(); ++i)
+        {
+            const int n = static_cast<int>(halo.size(static_cast<int>(i)));
+            if (n <= 0) continue;
+            const std::vector<scalar> gd = geomD[i].host();
+            std::vector<scalar> cg(n);
+            for (int f = 0; f < n; ++f) cg[f] = gh[procStart[i] + f] * gd[f];
+            gCoeffGeo[i].copyFrom(cg);
+        }
+    };
+
+    // gradU (halo) -> GbyNu0, S2 ; production G = nut*GbyNu0 ; divU
+    const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
+    DeviceBuffer<scalar> gradU(static_cast<std::size_t>(9) * nC);
+    for (int i = 0; i < 3; ++i)
+    {
+        DeviceBuffer<scalar> gx, gy, gz;
+        haloGrad(dbU.comp[i], *Uc[i], gx, gy, gz);
+        cudaCheck(cudaMemcpyAsync(gradU.data()+(0*3+i)*(std::size_t)nC, gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "sstGU");
+        cudaCheck(cudaMemcpyAsync(gradU.data()+(1*3+i)*(std::size_t)nC, gy.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "sstGU");
+        cudaCheck(cudaMemcpyAsync(gradU.data()+(2*3+i)*(std::size_t)nC, gz.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "sstGU");
+    }
+    DeviceBuffer<scalar> GbyNu0; deviceGByNuFromGradU(gradU, nC, GbyNu0);
+    DeviceBuffer<scalar> G;      deviceHadamard(G, nut, GbyNu0);
+    DeviceBuffer<scalar> divU;   deviceDiv(dm, phiInt, phiBnd, divU);
+    DeviceBuffer<scalar> S2;     deviceS2(gradU, nC, S2);
+
+    // omega wall FIRST: omega0/G0, override omega & G at wall cells
+    DeviceBuffer<scalar> omega0, G0;
+    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co);
+    detail::prodAndWallKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(
+        nut.data(), GbyNu0.data(), isWallCell.data(), omega0.data(), G0.data(), G.data(), omega.data(), nC);
+    // NB prodAndWallKernel sets G=nut*GbyNu0 for non-wall; SST needs G=nut*GbyNu0 too (GbyNu0 passed as gByNu). OK.
+
+    // CDkOmega from grad(k), grad(omega) (halo-consistent); F1, F2
+    DeviceBuffer<scalar> kgx, kgy, kgz, ogx, ogy, ogz;
+    haloGrad(dbK, k, kgx, kgy, kgz);
+    haloGrad(dbOmega, omega, ogx, ogy, ogz);
+    DeviceBuffer<scalar> CD; deviceCDkOmega(kgx, kgy, kgz, ogx, ogy, ogz, omega, co.alphaOmega2, CD);
+    DeviceBuffer<scalar> F1; deviceF1(k, omega, y, CD, nu, co, F1, false);
+    DeviceBuffer<scalar> F2; deviceF2(k, omega, y, nu, co, F2);
+
+    // blends, limited production, diffusivities
+    DeviceBuffer<scalar> gamma; deviceBlend(F1, co.gamma1, co.gamma2, gamma);
+    DeviceBuffer<scalar> beta;  deviceBlend(F1, co.beta1,  co.beta2,  beta);
+    DeviceBuffer<scalar> GbyNu0lim; deviceGbyNuLimit(GbyNu0, omega, F2, S2, co, GbyNu0lim);
+    DeviceBuffer<scalar> DomegaEff; deviceDEff(F1, nut, co.alphaOmega1, co.alphaOmega2, nu, DomegaEff);
+    DeviceBuffer<scalar> DkEff;     deviceDEff(F1, nut, co.alphaK1,     co.alphaK2,     nu, DkEff);
+
+    // ---- omega equation (with the omega near-wall setValues constraint) ----
+    {
+        DeviceBuffer<scalar> gInt, gBnd; std::vector<DeviceBuffer<scalar>> gGeo;
+        faceGammaGeo(DomegaEff, dbOmega, gInt, gBnd, gGeo);
+        DeviceBuffer<scalar> Sp(std::vector<scalar>(nC,0.0)), Su(std::vector<scalar>(nC,0.0));
+        deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, Sp, Su);
+        deviceParallelScalarTransport(dm, halo, dbOmega, faceCellsD, procStart, weightsD, phiInt, phiBnd, phiF,
+            gInt, gBnd, gGeo, Sp, Su, omega, relaxOmega, tol, maxIter, globalNCells, ones, isWallCell, omega0);
+        detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(omega.data(), 1e-15, nC);
+    }
+    // ---- k equation ----
+    {
+        DeviceBuffer<scalar> gInt, gBnd; std::vector<DeviceBuffer<scalar>> gGeo;
+        faceGammaGeo(DkEff, dbK, gInt, gBnd, gGeo);
+        DeviceBuffer<scalar> Sp(std::vector<scalar>(nC,0.0)), Su(std::vector<scalar>(nC,0.0));
+        deviceKReactionSST(dm.V, k, omega, G, divU, co, Sp, Su, nullptr);
+        DeviceBuffer<label> noWall; DeviceBuffer<scalar> noVal;
+        deviceParallelScalarTransport(dm, halo, dbK, faceCellsD, procStart, weightsD, phiInt, phiBnd, phiF,
+            gInt, gBnd, gGeo, Sp, Su, k, relaxK, tol, maxIter, globalNCells, ones, noWall, noVal);
+        detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(k.data(), 1e-15, nC);
+    }
+    // ---- correctNut (Bradshaw limiter) ----
+    deviceNutSST(k, omega, F2, S2, co, nut);
 }
 
 } // namespace brae
