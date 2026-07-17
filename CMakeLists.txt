@@ -282,6 +282,19 @@ if(BRAE_WITH_NVSHMEM)
         set_tests_properties(gpu_parallel_duct_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTREF)
     endforeach()
 
+    # LUST (0.75 linear + 0.25 linearUpwind) over the same flux-carrying cut: it exercises BOTH interface
+    # deferred corrections (linearUpwind's gradient term AND the linear term), so it is the stronger gate.
+    add_test(NAME gpu_parallel_duct_lust_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
+                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_lust_ref.txt lust)
+    set_tests_properties(gpu_parallel_duct_lust_ref PROPERTIES FIXTURES_SETUP DUCTLUST)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_duct_lust_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
+                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_lust_ref.txt lust)
+        set_tests_properties(gpu_parallel_duct_lust_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTLUST)
+    endforeach()
+
     # Phase 4a EXIT GATE: the OOM proof -- a mesh too big for one GPU runs split across two. No ctest entry:
     # the mesh size is hardware-specific (it must exceed ONE GPU's VRAM), so it is driven by hand.
     add_executable(test_gpu_parallel_oom tests/test_gpu_parallel_oom.cu)
