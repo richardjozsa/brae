@@ -303,19 +303,40 @@ DeviceSolverPerf deviceParallelJacobiPCG(
     deviceAxpy(-1.0, Ax, rA);
 
     DeviceSolverPerf perf;
-    perf.initialResidual = Pstream::allReduce(deviceSumMag(rA), ReduceOp::Sum) / normFactor;
+
+    // FUSED REDUCTIONS. Every reduction here is a HOST Pstream::allReduce, and deviceDot/deviceSumMag copy
+    // their scalar to the host first -- so each one is a full GPU sync + blocking collective. At ~100 Krylov
+    // iterations per SIMPLE step that latency, NOT the NVLink halo, is what caps the multi-GPU speedup (it is
+    // a fixed cost that does not shrink as ranks are added, and at np=1 a 1-rank allReduce is nearly free, so
+    // it shows up only when you parallelise). The textbook loop does THREE per iteration:
+    //     wArA = allReduce(dot(wA,rA))     -> beta
+    //     wApA = allReduce(dot(wA,pA))     -> alpha
+    //     resid = allReduce(sumMag(rA))    -> convergence test only
+    // but the residual test and the NEXT iteration's wArA both reduce over the freshly updated rA, so they
+    // fuse into ONE collective of two values: 3 -> 2 per iteration, ~33% fewer round-trips. The arithmetic is
+    // UNCHANGED -- same wArA/wApA/alpha/beta/residual sequence, same iteration count -- it is purely the
+    // packing of the collectives. (`wA` can no longer be reused for A*pA, hence the separate ApA buffer.)
+    DeviceBuffer<scalar> ApA;
+    scalar red[2];
+    auto fusedReduce = [&]()   // wA = M^-1 rA ; red = [ dot(wA,rA), sumMag(rA) ] in ONE collective
+    {
+        deviceJacobi(wA, rA, A.diag);
+        red[0] = deviceDot(wA, rA);
+        red[1] = deviceSumMag(rA);
+        Pstream::allReduce(red, 2, ReduceOp::Sum);
+    };
+
+    fusedReduce();
+    perf.initialResidual = red[1] / normFactor;
     perf.finalResidual   = perf.initialResidual;
     auto converged = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf.initialResidual); };
 
-    scalar wArA = 1e300, wArAold;
+    scalar wArA = red[0], wArAold = 1e300;
     int nIter = 0;
     if (!converged(perf.finalResidual))
     {
         do
         {
-            wArAold = wArA;
-            deviceJacobi(wA, rA, A.diag);                        // wA = M^-1 rA (local Jacobi)
-            wArA = Pstream::allReduce(deviceDot(wA, rA), ReduceOp::Sum);
             if (nIter == 0) deviceCopy(pA, wA);
             else
             {
@@ -323,12 +344,15 @@ DeviceSolverPerf deviceParallelJacobiPCG(
                 deviceScale(pA, beta);
                 deviceAxpy(1.0, wA, pA);
             }
-            deviceParallelAmul(A, halo, ifaceCoeffs, pA, wA);    // wA = A*pA
-            const scalar wApA  = Pstream::allReduce(deviceDot(wA, pA), ReduceOp::Sum);
+            deviceParallelAmul(A, halo, ifaceCoeffs, pA, ApA);   // ApA = A*pA
+            const scalar wApA  = Pstream::allReduce(deviceDot(ApA, pA), ReduceOp::Sum);
             const scalar alpha = wArA / wApA;
             deviceAxpy(alpha, pA, psi);
-            deviceAxpy(-alpha, wA, rA);
-            perf.finalResidual = Pstream::allReduce(deviceSumMag(rA), ReduceOp::Sum) / normFactor;
+            deviceAxpy(-alpha, ApA, rA);
+            wArAold = wArA;
+            fusedReduce();                                       // next wArA AND the residual, one collective
+            wArA = red[0];
+            perf.finalResidual = red[1] / normFactor;
             ++nIter;
         } while (nIter < maxIter && !converged(perf.finalResidual));
     }

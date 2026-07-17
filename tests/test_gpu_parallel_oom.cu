@@ -26,6 +26,7 @@
 #include "cf_pstream.cuh"
 #include "box_mesh.cuh"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -101,8 +102,21 @@ int main(int argc, char** argv)
         p0.evaluateBoundary();
 
         ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, maxIter);
+        // SPEEDUP: time the SOLVE only -- mesh generation, decomposition and field distribution are setup, and
+        // at these sizes they dwarf a handful of iterations. One warm-up step first (first-touch allocation,
+        // the halo's symmetric-heap registration and the initial exchanges are one-off costs), then a barrier
+        // so every rank starts the timed region together, and the MAX across ranks (the slowest rank sets the
+        // wall clock; an average would flatter an imbalanced decomposition).
+        solver.step();
+        cudaDeviceSynchronize();
+        Pstream::barrier();
+        const long k0 = solver.krylovIters();
+        const auto t0 = std::chrono::steady_clock::now();
         for (int it = 0; it < N; ++it) solver.step();
         cudaDeviceSynchronize();
+        const scalar secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const scalar wall = Pstream::allReduce(secs, ReduceOp::Max);
+        const long  kIt = solver.krylovIters() - k0;
 
         const std::vector<scalar> pl = solver.p();
         scalar s = 0;
@@ -117,6 +131,8 @@ int main(int argc, char** argv)
         if (Pstream::master())
         {
             std::printf("  per-rank cells (max): %ld\n", (long)maxCells);
+            std::printf("  SOLVE: %.3f s for %d iters -> %.4f s/iter  (%.3f Mcell-iter/s)  krylov=%ld (%.1f/step)\n",
+                        wall, N, wall / N, (nC / 1e6) * N / wall, kIt, double(kIt) / N);
             std::printf("  per-rank device mem (max): %.2f GiB\n", maxGiB);
             std::printf("  sum(p) = %.6e %s\n", tot, std::isfinite(tot) ? "(finite)" : "(NON-FINITE!)");
             std::printf("%s\n", std::isfinite(tot) ? "PASS" : "FAIL");

@@ -263,6 +263,42 @@ if(BRAE_WITH_NVSHMEM)
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
 
+    # Phase 4b: the full distributed kEpsilon::correct() (production + wall functions + eps/k transport + nut)
+    # reproduces np=1. Duct walls are y/z, cut is x -> near-wall cells sit adjacent to the cut.
+    add_executable(test_gpu_parallel_kepsilon tests/test_gpu_parallel_kepsilon.cu)
+    target_include_directories(test_gpu_parallel_kepsilon PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_kepsilon PRIVATE brae_core)
+    add_test(NAME gpu_parallel_kepsilon_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_kepsilon>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/keps_ref.txt)
+    set_tests_properties(gpu_parallel_kepsilon_ref PROPERTIES FIXTURES_SETUP KEPSREF)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_kepsilon_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_kepsilon>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/keps_ref.txt)
+        set_tests_properties(gpu_parallel_kepsilon_np${_np} PROPERTIES FIXTURES_REQUIRED KEPSREF)
+    endforeach()
+
+    # Phase 4b foundation: the distributed scalar transport solve (deviceParallelScalarTransport) -- the
+    # reusable core of the turbulence step (k/eps/omega/nuTilda) -- reproduces np=1 on a flux-carrying cut.
+    add_executable(test_gpu_parallel_scalar tests/test_gpu_parallel_scalar.cu)
+    target_include_directories(test_gpu_parallel_scalar PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_scalar PRIVATE brae_core)
+    add_test(NAME gpu_parallel_scalar_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_scalar>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/scalar_ref.txt)
+    set_tests_properties(gpu_parallel_scalar_ref PROPERTIES FIXTURES_SETUP SCALARREF)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_scalar_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_scalar>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/scalar_ref.txt)
+        set_tests_properties(gpu_parallel_scalar_np${_np} PROPERTIES FIXTURES_REQUIRED SCALARREF)
+    endforeach()
+
     # Phase 4a: the linearUpwind/LUST interface correction on a cut that CARRIES FLUX (the cavity's cut is a
     # symmetry plane -> phi~0 -> those terms are multiplied by zero and any bug in them is invisible).
     add_executable(test_gpu_parallel_duct tests/test_gpu_parallel_duct.cu)
