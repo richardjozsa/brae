@@ -21,6 +21,7 @@
 #include "parallel_device_simple.cuh"
 #include "cf_pstream.cuh"
 #include "box_mesh.cuh"
+#include "cell_wall_dist.cuh"
 
 #include <cmath>
 #include <cstdio>
@@ -40,10 +41,11 @@ int main(int argc, char** argv)
     const label Nx = std::atol(argv[1]), Ny = std::atol(argv[2]), Nz = std::atol(argv[3]);
     const std::string ref = (argc > 4) ? argv[4] : "turbloop_ref.txt";
     const std::string dump = (argc > 5) ? argv[5] : "";
+    const bool sst = (argc > 6) && (std::string(argv[6]) == "sst");
     const scalar nu = 1e-3, relaxU = 0.7, relaxP = 0.3, relaxK = 0.7, tolU = 1e-9, tolP = 1e-9;
     const scalar kIn = 0.375, epsIn = 0.09 * std::pow(kIn, 1.5) / 0.1;
     const int maxIter = 2000, N = 4;
-    KEpsilonCoeffs co;
+    KEpsilonCoeffs co; KOmegaSSTCoeffs sco;
     const label nC = Nx * Ny * Nz;
     bool ok = true;
     scalar relU = 0, relP = 0, relK = 0, relN = 0;
@@ -74,11 +76,13 @@ int main(int argc, char** argv)
         GeometricField<vector> U0 = distributeField<vector>(Ufd, gm.patches(), P.Lm, P.lp, P.procW, rank); U0.evaluateBoundary();
         GeometricField<scalar> p0 = distributeField<scalar>(pfdta, gm.patches(), P.Lm, P.lp, P.procW, rank); p0.evaluateBoundary();
         GeometricField<scalar> k0   = distributeField<scalar>(scalfd(kIn),   gm.patches(), P.Lm, P.lp, P.procW, rank); k0.evaluateBoundary();
-        GeometricField<scalar> eps0 = distributeField<scalar>(scalfd(epsIn), gm.patches(), P.Lm, P.lp, P.procW, rank); eps0.evaluateBoundary();
-        GeometricField<scalar> nut0 = distributeField<scalar>(scalfd(co.Cmu*kIn*kIn/epsIn), gm.patches(), P.Lm, P.lp, P.procW, rank); nut0.evaluateBoundary();
+        const scalar omIn = std::sqrt(kIn) / (0.09 * 0.1);   // SST second field is omega
+        GeometricField<scalar> eps0 = distributeField<scalar>(scalfd(sst ? omIn : epsIn), gm.patches(), P.Lm, P.lp, P.procW, rank); eps0.evaluateBoundary();
+        GeometricField<scalar> nut0 = distributeField<scalar>(scalfd(sst ? kIn/omIn : co.Cmu*kIn*kIn/epsIn), gm.patches(), P.Lm, P.lp, P.procW, rank); nut0.evaluateBoundary();
 
         ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, maxIter);
-        solver.enableTurbulence(U0, k0, eps0, nut0, co, relaxK, relaxK);
+        if (sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sco, relaxK, relaxK);
+        else     solver.enableTurbulence(U0, k0, eps0, nut0, co, relaxK, relaxK);
         if (!dump.empty()) solver.setStageDump(dump, (argc>6)?std::atoi(argv[6]):2);
         for (int it = 0; it < N; ++it) solver.step();
         cudaDeviceSynchronize();

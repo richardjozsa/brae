@@ -298,6 +298,18 @@ if(BRAE_WITH_NVSHMEM)
         set_tests_properties(gpu_parallel_turbloop_np${_np} PROPERTIES FIXTURES_REQUIRED TURBLOOP)
     endforeach()
 
+    # SST in the closed loop (second field = omega): same gate, sst mode
+    add_test(NAME gpu_parallel_turbloop_sst_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_turbloop>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_sst_ref.txt "" sst)
+    set_tests_properties(gpu_parallel_turbloop_sst_ref PROPERTIES FIXTURES_SETUP TURBLOOPSST)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_turbloop_sst_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_turbloop>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_sst_ref.txt "" sst)
+        set_tests_properties(gpu_parallel_turbloop_sst_np${_np} PROPERTIES FIXTURES_REQUIRED TURBLOOPSST)
+    endforeach()
+
     # Phase 4b: the full distributed kEpsilon::correct() (production + wall functions + eps/k transport + nut)
     # reproduces np=1. Duct walls are y/z, cut is x -> near-wall cells sit adjacent to the cut.
     add_executable(test_gpu_parallel_kepsilon tests/test_gpu_parallel_kepsilon.cu)
