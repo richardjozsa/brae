@@ -802,6 +802,11 @@ public:
     // max |phi| over this rank's processor faces. The interface deferred corrections (linearUpwind, LUST) are
     // all multiplied by the cut-face flux, so a test on a mesh where this is ~0 cannot see them at all -- the
     // 3D cavity cuts on a symmetry midplane and measures ~3e-14 here. Tests assert on this to prove teeth.
+    // Total Krylov iterations (3 momentum BiCGStab + 1 pressure PCG) since construction. A speedup number is
+    // uninterpretable without this: if np=1 and np=2 run different iteration counts (the reduction order
+    // changes convergence slightly), wall-clock per SIMPLE step measures SOLVER WORK, not parallel efficiency.
+    long krylovIters() const { return kIters_; }
+
     scalar maxProcFlux() const
     {
         const std::vector<scalar> b = phiBnd_.host();
@@ -855,6 +860,7 @@ private:
     std::string dumpPath_;
     int    dumpAt_ = -1;
     mutable int iter_ = 0;
+    mutable long kIters_ = 0;
     label  lnC_, nIf_, nBnd_ = 0;
     bool   validC_[3] = { true, true, true };
     DeviceMesh           dm_;
@@ -1095,6 +1101,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         const scalar nf = deviceParallelNormFactor(mv, halo_, ifCoeff, Uk_[k], b, ones_, P_.globalNCells);
         const DeviceSolverPerf up =
             deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_);
+        kIters_ += up.nIterations;
         if (validC_[k] && up.initialResidual > res.Ux) res.Ux = up.initialResidual;
         dumpStage("Upred", Uk_[k], k);
     }
@@ -1212,6 +1219,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     const DeviceLduView pv = deviceLduView(dm_, pDiagC, pU_, pL_);
     const scalar nfp = deviceParallelNormFactor(pv, halo_, pIfCoeff, pSol, pb, ones_, P_.globalNCells);
     const DeviceSolverPerf pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_);
+    kIters_ += pp.nIterations;
     res.p = pp.initialResidual;
     dumpStage("pSol", pSol);
 
