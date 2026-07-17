@@ -18,7 +18,15 @@ namespace boxtest {
 // upper-triangular order (owner ascending, neighbour ascending within an owner -- the lduAddressing contract),
 // then one contiguous block per boundary patch. Face vertex winding is chosen so Sf points owner->neighbour
 // for internal faces and outward for boundary faces (right-hand rule).
-PrimitiveMesh boxMesh(label Nx, label Ny, label Nz)
+// `shear` skews the mesh: point x is displaced by shear*y, so cell-centre offsets are no longer aligned with
+// the face normals -- i.e. the mesh becomes NON-ORTHOGONAL, and OF's "corrected" laplacian correction stops
+// being a no-op. shear = 0 gives the plain orthogonal box.
+//
+// This exists because EVERY other brae test mesh is orthogonal (cav3d is a cube, the duct a unit box), which
+// makes the non-orthogonal correction invisible: on an orthogonal mesh "corrected" == "orthogonal" exactly.
+// Testing that correction on an orthogonal mesh is the same class of blindness as testing a cut-face term on
+// a zero-flux cut.
+PrimitiveMesh boxMesh(label Nx, label Ny, label Nz, scalar shear = 0.0)
 {
     const label nC = Nx * Ny * Nz;
     auto cell  = [&](label i, label j, label k) { return i + Nx * (j + Ny * k); };
@@ -28,7 +36,7 @@ PrimitiveMesh boxMesh(label Nx, label Ny, label Nz)
     for (label k = 0; k <= Nz; ++k)
         for (label j = 0; j <= Ny; ++j)
             for (label i = 0; i <= Nx; ++i)
-                pts[point(i, j, k)] = vector{scalar(i), scalar(j), scalar(k)};
+                pts[point(i, j, k)] = vector{scalar(i) + shear * scalar(j), scalar(j), scalar(k)};
 
     // reserve: at ~1e8 cells these reach ~1e9 entries, and push_back's doubling would otherwise transiently
     // double an already multi-GB allocation. nFaces = 3*nC + the 6 boundary planes; nInternal = nFaces - nBnd.

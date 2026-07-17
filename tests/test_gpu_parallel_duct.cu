@@ -58,6 +58,8 @@ int main(int argc, char** argv)
     const int   N  = (argc > 4) ? std::atoi(argv[4]) : 20;
     const std::string ref = (argc > 5) ? argv[5] : "duct_ref.txt";
     const bool  lust = (argc > 6) && (std::string(argv[6]) == "lust");
+    const scalar shear = (argc > 9) ? std::atof(argv[9]) : 0.0;   // >0 -> NON-ORTHOGONAL cut faces
+    const bool nonOrth = (argc > 10) && (std::string(argv[10]) == "nonorth");
     const std::string dump = (argc > 7) ? argv[7] : "";   // stage-by-stage dump (see setStageDump)
     const scalar nu = 1e-2, relaxU = 0.7, relaxP = 0.3, tolU = 1e-9, tolP = 1e-9;
     const int maxIter = 500;
@@ -66,7 +68,7 @@ int main(int argc, char** argv)
     bool ok = true;
     scalar cutPhi = 0, relU = 0, relP = 0;
     {
-        const PrimitiveMesh gm = boxtest::boxMesh(Nx, Ny, Nz);
+        const PrimitiveMesh gm = boxtest::boxMesh(Nx, Ny, Nz, shear);
         // SLABS IN X: cut planes normal to the flow, so every cut face carries the through-flux.
         std::vector<label> cellToPart(nC);
         for (label k = 0; k < Nz; ++k)
@@ -102,7 +104,8 @@ int main(int argc, char** argv)
 
         // linearUpwind ON: this test exists to exercise its interface term.
         ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, maxIter,
-                                    /*bounded*/ true, /*linearUpwind*/ !lust, /*lust*/ lust);
+                                    /*bounded*/ true, /*linearUpwind*/ !lust, /*lust*/ lust,
+                                    /*nonOrth*/ nonOrth);
         if (!dump.empty()) solver.setStageDump(dump, (argc > 8) ? std::atoi(argv[8]) : 1);
         for (int it = 0; it < N; ++it) solver.step();
         cudaDeviceSynchronize();
@@ -110,6 +113,10 @@ int main(int argc, char** argv)
         // TEETH CHECK: the cut must actually carry flux, else the interface terms are multiplied by zero and
         // this test proves nothing (which is precisely how the cavity fooled us).
         cutPhi = Pstream::allReduce(solver.maxProcFlux(), ReduceOp::Max);
+        // Report the mesh's non-orthogonality: with shear>0 the cut faces are genuinely non-orthogonal, which
+        // is what the app's `corrected` guard keys on. shear=0 must measure ~0; shear>0 must measure >0.1 deg,
+        // else that guard could never fire and would be decoration.
+        const scalar nonOrtho = maxNonOrthogonality(P);
 
         // gather to the global mesh
         std::vector<scalar> pg(nC, 0.0), ug(3 * nC, 0.0);
@@ -133,7 +140,8 @@ int main(int argc, char** argv)
                 for (label c = 0; c < nC; ++c)
                     os << pg[c] << ' ' << ug[3*c] << ' ' << ug[3*c+1] << ' ' << ug[3*c+2] << '\n';
                 std::printf("test_gpu_parallel_duct np=1: wrote reference %s (%ld cells)\n", ref.c_str(), (long)nC);
-                std::printf("  max|phi| at cut = %.3e (no cut at np=1, as expected)\n", cutPhi);
+                std::printf("  max|phi| at cut = %.3e (no cut at np=1, as expected)  mesh nonOrtho = %.4g deg\n",
+                            cutPhi, nonOrtho);
                 std::printf("PASS\n");
             }
             else
@@ -162,8 +170,8 @@ int main(int argc, char** argv)
                     relP = dP > 0 ? nP / dP : nP;
                     // The cut must carry flux, or the interface terms were never exercised.
                     const bool teeth = cutPhi > 1e-6;
-                    std::printf("test_gpu_parallel_duct np=%d (%d iters): U rel=%.3e  p rel=%.3e  max|phi| at cut=%.3e\n",
-                                nproc, N, relU, relP, cutPhi);
+                    std::printf("test_gpu_parallel_duct np=%d (%d iters): U rel=%.3e  p rel=%.3e  max|phi| at cut=%.3e  nonOrtho=%.4g deg\n",
+                                nproc, N, relU, relP, cutPhi, nonOrtho);
                     if (!teeth)
                         std::printf("  NO TEETH: cut flux ~0, the interface terms were multiplied by zero\n");
                     ok = teeth && (relU < 1e-4) && (relP < 1e-4);

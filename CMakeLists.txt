@@ -282,6 +282,35 @@ if(BRAE_WITH_NVSHMEM)
         set_tests_properties(gpu_parallel_duct_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTREF)
     endforeach()
 
+    # SHEARED duct: the same flux-carrying cut, but on a NON-ORTHOGONAL mesh (shear 0.5 -> 26.57 deg, =
+    # atan(0.5)). Every other brae test mesh is orthogonal, where the cut-face geometry conventions
+    # (dNei = Cf - C_remote) coincide with their normal-projected variants and cannot be told apart. This is
+    # the only gate that exercises the interface terms on a non-orthogonal cut.
+    add_test(NAME gpu_parallel_duct_skew_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
+                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_skew_ref.txt nolust "" 1 0.5)
+    set_tests_properties(gpu_parallel_duct_skew_ref PROPERTIES FIXTURES_SETUP DUCTSKEW)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_duct_skew_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
+                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_skew_ref.txt nolust "" 1 0.5)
+        set_tests_properties(gpu_parallel_duct_skew_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTSKEW)
+    endforeach()
+
+    # NON-ORTHOGONAL correction on the sheared cut: nonOrthDeltaCoeffs implicit + the explicit corrVec.grad
+    # correction (momentum) + the pEqn source AND face-flux correction. Invisible on an orthogonal mesh
+    # (corrVec == 0), so this gate is the only thing standing between it and silent wrongness on real meshes.
+    add_test(NAME gpu_parallel_duct_nonorth_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
+                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_nonorth_ref.txt nolust "" 1 0.5 nonorth)
+    set_tests_properties(gpu_parallel_duct_nonorth_ref PROPERTIES FIXTURES_SETUP DUCTNO)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_duct_nonorth_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
+                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_nonorth_ref.txt nolust "" 1 0.5 nonorth)
+        set_tests_properties(gpu_parallel_duct_nonorth_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTNO)
+    endforeach()
+
     # LUST (0.75 linear + 0.25 linearUpwind) over the same flux-carrying cut: it exercises BOTH interface
     # deferred corrections (linearUpwind's gradient term AND the linear term), so it is the stronger gate.
     add_test(NAME gpu_parallel_duct_lust_ref

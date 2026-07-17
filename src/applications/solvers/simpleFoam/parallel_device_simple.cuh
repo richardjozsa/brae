@@ -175,6 +175,89 @@ void linearCorrInterfaceKernel(
     atomicAdd(&corr[c], pf * (w[f] - pos0) * (psi[c] - psiNbr[f]));   // a cell may own several cut faces
 }
 
+// Non-orthogonal ("corrected") laplacian correction at a PROCESSOR face -- the distributed analogue of
+// lapCorrFaceKernel + lapCorrGatherKernel (device_fvm.cu) and of deviceCyclicAddLapCorr (no rotation here).
+// Mirrors the internal formula exactly, with the local cell as owner and the remote as neighbour:
+//     grad_face = w*grad[local] + (1-w)*grad[remote]          (w = procW, the LOCAL/owner weight)
+//     ffc       = gamma_f * magSf * (corrVec . grad_face)
+//     corr[local] -= ffc                                      (the gather kernel's OWNER branch: s -= ffc)
+// gamma_f is the face value of the diffusivity (nuEff for momentum, rAU for the pEqn) -- already the
+// halo-interpolated boundary value. corrVec/magSf are static geometry from host computeProcNonOrth.
+// On an ORTHOGONAL mesh corrVec == 0, so this contributes exactly nothing -- which is why it is invisible
+// there, and why it must be validated on the SHEARED duct (see test_gpu_parallel_duct).
+__global__
+void lapCorrInterfaceKernel(
+    const label*  __restrict__ faceCells,
+    const scalar* __restrict__ gammaF,
+    const scalar* __restrict__ magSfF,
+    const scalar* __restrict__ corrVec,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    const scalar* __restrict__ gxN,
+    const scalar* __restrict__ gyN,
+    const scalar* __restrict__ gzN,
+    scalar*       __restrict__ corr,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    const label  c  = faceCells[f];
+    const scalar wf = w[f], wn = 1.0 - wf;
+    const scalar gfx = wf * gx[c] + wn * gxN[f];
+    const scalar gfy = wf * gy[c] + wn * gyN[f];
+    const scalar gfz = wf * gz[c] + wn * gzN[f];
+    const scalar ffc = gammaF[f] * magSfF[f]
+                     * (corrVec[3*f] * gfx + corrVec[3*f+1] * gfy + corrVec[3*f+2] * gfz);
+    atomicAdd(&corr[c], -ffc);   // owner branch; a cell may own several cut faces
+}
+
+// PRESSURE non-orthogonal correction at a PROCESSOR face -- the distributed analogue of deviceCyclicLapCorrP.
+// Does BOTH jobs, exactly as the internal path does with deviceLaplacianCorrFlux + deviceFaceDivSource:
+//   ffc         = rAU_f * magSf * (corrVec . grad(p)_face)      (grad_face = w*grad[local] + (1-w)*grad[remote])
+//   pb[local]  -= ffc      (the faceDivSource OWNER branch: b += -V*div(ffc))
+//   ffcOut[f]   = ffc      (the caller then does phi -= ffc, or continuity breaks on non-orthogonal cut faces)
+// Both are required: the source alone leaves the reconstructed flux non-conservative.
+__global__
+void lapCorrPInterfaceKernel(
+    const label*  __restrict__ faceCells,
+    const scalar* __restrict__ gammaF,
+    const scalar* __restrict__ magSfF,
+    const scalar* __restrict__ corrVec,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    const scalar* __restrict__ gxN,
+    const scalar* __restrict__ gyN,
+    const scalar* __restrict__ gzN,
+    scalar*       __restrict__ pb,
+    scalar*       __restrict__ ffcOut,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    const label  c  = faceCells[f];
+    const scalar wf = w[f], wn = 1.0 - wf;
+    const scalar gfx = wf * gx[c] + wn * gxN[f];
+    const scalar gfy = wf * gy[c] + wn * gyN[f];
+    const scalar gfz = wf * gz[c] + wn * gzN[f];
+    const scalar ffc = gammaF[f] * magSfF[f]
+                     * (corrVec[3*f] * gfx + corrVec[3*f+1] * gfy + corrVec[3*f+2] * gfz);
+    ffcOut[f] = ffc;
+    atomicAdd(&pb[c], -ffc);
+}
+
+// dst[offset + f] -= src[f]  (subtract an interface's flux correction out of the flattened boundary-flux array)
+__global__
+void subtractSliceKernel(scalar* __restrict__ dst, int offset, const scalar* __restrict__ src, int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    dst[offset + f] -= src[f];
+}
+
 // Per-cell sum of |processor off-diagonal|, for fvMatrix::relax's diagonal-dominance term. Host
 // parallelRelaxMatrix adds |interfaceCoeffs| into sumOff; on device this feeds deviceRelaxDiag's cycSumOff
 // hook (the same role the cyclic interface's off-diagonal sum plays).
@@ -333,6 +416,116 @@ inline void deviceLinearCorrInterface(
     halo.waitExchange(stream);   // the kernels above READ the shared recv buffer -- see device_halo.cuh
 }
 
+// Add the processor faces' non-orthogonal laplacian correction into `corr` (which already holds the internal
+// deviceLaplacianCorr result). Needs grad(psi) at the REMOTE cell, so it exchanges the 3 gradient components --
+// the same pattern as deviceLinUpwindInterface, copying each out of the shared recv buffer before the next
+// exchange overwrites it (see the hazard note in device_halo.cuh).
+inline void deviceLapCorrInterface(
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<label>>& faceCells,
+    const std::vector<DeviceBuffer<scalar>>& gammaF,
+    const std::vector<DeviceBuffer<scalar>>& magSfF,
+    const std::vector<DeviceBuffer<scalar>>& corrVec,
+    const std::vector<DeviceBuffer<scalar>>& weights,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>& corr,
+    cudaStream_t stream = cudaStreamPerThread)
+{
+    constexpr int TPB = 128;
+    const int nI = halo.nInterfaces();
+    std::vector<DeviceBuffer<scalar>> gN[3];
+    const DeviceBuffer<scalar>* gsrc[3] = { &gx, &gy, &gz };
+    for (int k = 0; k < 3; ++k)
+    {
+        halo.exchange(gsrc[k]->data(), stream);
+        gN[k].resize(nI);
+        for (int i = 0; i < nI; ++i)
+        {
+            const int n = static_cast<int>(halo.size(i));
+            if (n <= 0) continue;
+            gN[k][i].resize(n);
+            cudaCheck(
+                cudaMemcpyAsync(gN[k][i].data(), halo.recvData(i), n * sizeof(scalar),
+                                cudaMemcpyDeviceToDevice, stream),
+                "lapCorr halo grad copy");
+        }
+        halo.waitExchange(stream);
+    }
+    for (int i = 0; i < nI; ++i)
+    {
+        const int n = static_cast<int>(halo.size(i));
+        if (n <= 0) continue;
+        detail::lapCorrInterfaceKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
+            faceCells[i].data(),
+            gammaF[i].data(),
+            magSfF[i].data(),
+            corrVec[i].data(),
+            weights[i].data(),
+            gx.data(), gy.data(), gz.data(),
+            gN[0][i].data(), gN[1][i].data(), gN[2][i].data(),
+            corr.data(),
+            n);
+    }
+}
+
+// The processor faces' PRESSURE non-orth correction: folds -ffc into `pb` and returns ffc per interface so the
+// caller can keep the reconstructed flux conservative. `gammaF[i]` is rAU at interface i's faces.
+inline void deviceLapCorrPInterface(
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<label>>& faceCells,
+    const std::vector<DeviceBuffer<scalar>>& gammaF,
+    const std::vector<DeviceBuffer<scalar>>& magSfF,
+    const std::vector<DeviceBuffer<scalar>>& corrVec,
+    const std::vector<DeviceBuffer<scalar>>& weights,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>& pb,
+    std::vector<DeviceBuffer<scalar>>& ffcOut,
+    cudaStream_t stream = cudaStreamPerThread)
+{
+    constexpr int TPB = 128;
+    const int nI = halo.nInterfaces();
+    std::vector<DeviceBuffer<scalar>> gN[3];
+    const DeviceBuffer<scalar>* gsrc[3] = { &gx, &gy, &gz };
+    for (int k = 0; k < 3; ++k)
+    {
+        halo.exchange(gsrc[k]->data(), stream);
+        gN[k].resize(nI);
+        for (int i = 0; i < nI; ++i)
+        {
+            const int n = static_cast<int>(halo.size(i));
+            if (n <= 0) continue;
+            gN[k][i].resize(n);
+            cudaCheck(
+                cudaMemcpyAsync(gN[k][i].data(), halo.recvData(i), n * sizeof(scalar),
+                                cudaMemcpyDeviceToDevice, stream),
+                "lapCorrP halo grad copy");
+        }
+        halo.waitExchange(stream);
+    }
+    ffcOut.resize(nI);
+    for (int i = 0; i < nI; ++i)
+    {
+        const int n = static_cast<int>(halo.size(i));
+        if (n <= 0) continue;
+        ffcOut[i].resize(n);
+        detail::lapCorrPInterfaceKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
+            faceCells[i].data(),
+            gammaF[i].data(),
+            magSfF[i].data(),
+            corrVec[i].data(),
+            weights[i].data(),
+            gx.data(), gy.data(), gz.data(),
+            gN[0][i].data(), gN[1][i].data(), gN[2][i].data(),
+            pb.data(),
+            ffcOut[i].data(),
+            n);
+    }
+}
+
 // Assemble a laplacian(gamma, .) matrix's processor coupling (the pressure equation): fold -coeff into `diag`
 // and produce `ifCoeff[i]` per interface. `coeffGeo[i] = gammaF*magSf*procDelta` of interface i.
 inline void deviceLaplacianInterface(
@@ -389,6 +582,46 @@ inline void deviceParallelMatrixFluxInterface(
     halo.waitExchange(stream);   // protect the recv buffer from the next exchange (see device_halo.cuh hazard)
 }
 
+// Max mesh non-orthogonality in DEGREES: the angle between a face's Sf and its owner->neighbour centre vector,
+// over internal AND processor faces (the remote centre comes from the same exchange computeProcUpwindD uses).
+// OF's "corrected"/"limited" laplacian adds an explicit correction that scales with this angle; the distributed
+// device path does NOT implement that correction at processor faces, so on a non-orthogonal mesh it would
+// silently solve the "orthogonal" scheme instead -- converged, plausible and WRONG. On an orthogonal mesh the
+// correction is identically zero, so the scheme is safe to accept there. This measures which case we are in.
+inline scalar maxNonOrthogonality(const Partition& P)
+{
+    const PrimitiveMesh& m = P.Lm.mesh;
+    const FvGeometry& g = P.lg;
+    const scalar rad2deg = 180.0 / 3.14159265358979323846;
+    auto angle = [&](const vector& S, const vector& d) -> scalar
+    {
+        const scalar den = mag(S) * mag(d);
+        if (den <= 0) return 0.0;
+        const scalar c = std::fmin(1.0, std::fmax(-1.0, dot(S, d) / den));
+        return std::acos(c) * rad2deg;
+    };
+    scalar mx = 0;
+    for (label f = 0; f < m.nInternalFaces(); ++f)
+        mx = std::fmax(mx, angle(g.Sf()[f], g.C()[m.neighbour()[f]] - g.C()[m.owner()[f]]));
+
+    std::vector<std::vector<scalar>> dO, dN;   // dOwn = Cf-C_local, dNei = Cf-C_remote
+    computeProcUpwindD(P.Lm, P.lg, P.lp, dO, dN);
+    std::size_t j = 0;
+    for (std::size_t pi = 0; pi < P.lp.size(); ++pi)
+    {
+        if (P.lp[pi].type != "processor") continue;
+        for (label i = 0; i < P.lp[pi].size; ++i)
+        {
+            const vector d{ dO[j][3*i]   - dN[j][3*i],        // = C_remote - C_local
+                            dO[j][3*i+1] - dN[j][3*i+1],
+                            dO[j][3*i+2] - dN[j][3*i+2] };
+            mx = std::fmax(mx, angle(g.Sf()[P.lp[pi].start + i], d));
+        }
+        ++j;
+    }
+    return Pstream::allReduce(mx, ReduceOp::Max);
+}
+
 // ----------------------------------------------------------------------------------------------------------
 // ParallelDeviceSimple: the closed distributed laminar SIMPLE loop. One rank == one partition == one GPU.
 //
@@ -415,7 +648,8 @@ public:
         int maxIter,
         bool bounded = false,
         bool linearUpwind = false,
-        bool lust = false)
+        bool lust = false,
+        bool nonOrth = false)
         : P_(part),
           nu_(nu),
           relaxU_(relaxU),
@@ -426,6 +660,7 @@ public:
           bounded_(bounded),
           linearUpwind_(linearUpwind),
           lust_(lust),
+          nonOrth_(nonOrth),
           lnC_(part.Lm.mesh.nCells()),
           nIf_(part.Lm.mesh.nInternalFaces()),
           dm_(buildDeviceMesh(part.Lm.mesh, part.lg, part.lp)),
@@ -492,6 +727,31 @@ public:
             dNeiD_.resize(dN.size());
             for (std::size_t i = 0; i < dO.size(); ++i) dOwnD_[i].copyFrom(dO[i]);
             for (std::size_t i = 0; i < dN.size(); ++i) dNeiD_[i].copyFrom(dN[i]);
+        }
+
+        // non-orth geometry: static, so build it once. procNonOrth_ REPLACES procDelta in the interface
+        // coeff (implicit); corrVecD_ drives the explicit correction. Also cache per-interface magSf and the
+        // (constant, laminar) face nuEff, both needed by the correction kernel.
+        if (nonOrth_)
+        {
+            std::vector<std::vector<scalar>> cvH;
+            computeProcNonOrth(P_.Lm, P_.lg, P_.lp, procNonOrth_, cvH);
+            corrVecD_.resize(cvH.size());
+            for (std::size_t i = 0; i < cvH.size(); ++i) corrVecD_[i].copyFrom(cvH[i]);
+        }
+        {
+            std::size_t pj = 0;
+            for (std::size_t pi = 0; pi < lp.size(); ++pi)
+            {
+                if (lp[pi].type != "processor") continue;
+                std::vector<scalar> ms(lp[pi].size), nf(lp[pi].size, nu_);
+                for (label i = 0; i < lp[pi].size; ++i) ms[i] = P_.lg.magSf()[lp[pi].start + i];
+                magSfD_.emplace_back();
+                magSfD_.back().copyFrom(ms);
+                nuFaceD_.emplace_back();
+                nuFaceD_.back().copyFrom(nf);
+                ++pj;
+            }
         }
 
         // initial conservative flux phi = flux(U0), internal + boundary (processor faces carry the coupled flux)
@@ -591,6 +851,7 @@ private:
     bool   bounded_ = false;
     bool   linearUpwind_ = false;
     bool   lust_ = false;
+    bool   nonOrth_ = false;
     std::string dumpPath_;
     int    dumpAt_ = -1;
     mutable int iter_ = 0;
@@ -605,6 +866,9 @@ private:
     std::vector<DeviceBuffer<label>>  faceCellsD_;
     std::vector<DeviceBuffer<scalar>> weightsD_;
     std::vector<DeviceBuffer<scalar>> dOwnD_, dNeiD_;   // linearUpwind: static per-cut-face offsets
+    // non-orth ("corrected") laplacian: static per-cut-face geometry + the per-interface face areas
+    std::vector<std::vector<scalar>> procNonOrth_;      // host: the IMPLICIT coeff (replaces procDelta)
+    std::vector<DeviceBuffer<scalar>> corrVecD_, magSfD_, nuFaceD_;
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_;
     DeviceBuffer<scalar> ones_, zeroSrc_, zeroBnd_, nuEffBnd_, nuCell_;
 };
@@ -661,7 +925,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     DeviceBuffer<scalar> nuEff_f(std::vector<scalar>(nIf_, nu_));
     DeviceBuffer<scalar> mDiag, mUp, mLo, lD, lU, lL;
     deviceDivUpwindCoeffs(dm_, phiInt_, mDiag, mUp, mLo);
-    deviceLaplacianCoeffs(dm_, nuEff_f, lD, lU, lL, false);
+    deviceLaplacianCoeffs(dm_, nuEff_f, lD, lU, lL, nonOrth_);
     deviceAxpy(-1.0, lD, mDiag);
     deviceAxpy(-1.0, lU, mUp);
     deviceAxpy(-1.0, lL, mLo);
@@ -692,7 +956,8 @@ inline ParStepResidual ParallelDeviceSimple::step()
                 phiF.push_back(std::move(pf));
                 std::vector<scalar> cg(lp[pi].size);
                 for (label i = 0; i < lp[pi].size; ++i)
-                    cg[i] = nu_ * lg.magSf()[lp[pi].start + i] * P_.procDelta[pj][i];
+                    cg[i] = nu_ * lg.magSf()[lp[pi].start + i]
+                          * (nonOrth_ ? procNonOrth_[pj][i] : P_.procDelta[pj][i]);
                 DeviceBuffer<scalar> cgd;
                 cgd.copyFrom(cg);
                 coeffGeo.push_back(std::move(cgd));
@@ -783,6 +1048,30 @@ inline ParStepResidual ParallelDeviceSimple::step()
         }
     }
 
+    // Non-orthogonal ("corrected") laplacian: the matrix above used nonOrthDeltaCoeffs (implicit); this is
+    // the matching EXPLICIT deferred correction, internal faces + cut faces. It must land in relaxSrc -- the
+    // same source H() reads -- like every other explicit momentum term. Mirrors the single-GPU
+    // `if (ctl_.nonOrth) { deviceLaplacianCorr; +cyclic; relaxSrc -= corr; }`.
+    if (nonOrth_)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> ub;
+            deviceBCValue(dbU_.comp[k], Uk_[k], ub);
+            halo_.exchange(Uk_[k].data());
+            halo_.scatterBoundaryValues(Uk_[k].data(), weightsD_, procStart_, ub.data());
+            halo_.waitExchange();
+            DeviceBuffer<scalar> ggx, ggy, ggz;
+            deviceGaussGrad(dm_, Uk_[k], ub, ggx, ggy, ggz);
+
+            DeviceBuffer<scalar> lc;
+            deviceLaplacianCorr(dm_, nuEff_f, ggx, ggy, ggz, lc);                       // internal faces
+            deviceLapCorrInterface(halo_, faceCellsD_, nuFaceD_, magSfD_, corrVecD_,
+                                   weightsD_, ggx, ggy, ggz, lc);                       // + cut faces
+            deviceAxpy(-1.0, lc, relaxSrc[k]);   // momentum is div - laplacian: source -= lapCorr
+        }
+    }
+
     // ---- grad(p): coupled processor boundary value from the halo ----
     DeviceBuffer<scalar> pbv;
     deviceBCValue(dbP_, dp_, pbv);
@@ -857,7 +1146,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     halo_.waitExchange();
 
     DeviceBuffer<scalar> pD, pU_, pL_;
-    deviceLaplacianCoeffs(dm_, rAUf_int, pD, pU_, pL_, false);
+    deviceLaplacianCoeffs(dm_, rAUf_int, pD, pU_, pL_, nonOrth_);
     const std::vector<scalar> rAUbndH = rAUbnd.host();
     std::vector<DeviceBuffer<scalar>> pCoeffGeo;
     {
@@ -870,7 +1159,8 @@ inline ParStepResidual ParallelDeviceSimple::step()
             {
                 std::vector<scalar> cg(lp[pi].size);
                 for (label i = 0; i < lp[pi].size; ++i)
-                    cg[i] = rAUbndH[bi + i] * lg.magSf()[lp[pi].start + i] * P_.procDelta[pj][i];
+                    cg[i] = rAUbndH[bi + i] * lg.magSf()[lp[pi].start + i]
+                          * (nonOrth_ ? procNonOrth_[pj][i] : P_.procDelta[pj][i]);
                 DeviceBuffer<scalar> cgd;
                 cgd.copyFrom(cg);
                 pCoeffGeo.push_back(std::move(cgd));
@@ -890,6 +1180,33 @@ inline ParStepResidual ParallelDeviceSimple::step()
     DeviceBuffer<scalar> pDiagC, pb;
     deviceFold(dm_, pD, psrc, piC, pbC, pDiagC, pb);
 
+    // Explicit non-orth correction of laplacian(rAU,p), from the ENTRY grad(p) (gx/gy/gz), matching the
+    // single-GPU pass-0 convention. It needs BOTH halves: b += -V*div(ffc) here, and phi -= ffc at the
+    // corrector below -- the source alone leaves the reconstructed flux non-conservative on cut faces.
+    DeviceBuffer<scalar> ffcP;
+    std::vector<DeviceBuffer<scalar>> ffcPif;
+    if (nonOrth_)
+    {
+        deviceLaplacianCorrFlux(dm_, rAUf_int, gx, gy, gz, ffcP);      // internal faces
+        DeviceBuffer<scalar> sc;
+        deviceFaceDivSource(dm_, ffcP, sc);
+        deviceAxpy(1.0, sc, pb);
+        // rAU at the cut faces = the halo-interpolated boundary value, sliced per interface
+        std::vector<DeviceBuffer<scalar>> rAUfaceD(procStart_.size());
+        for (std::size_t i = 0; i < procStart_.size(); ++i)
+        {
+            const int n = static_cast<int>(halo_.size(static_cast<int>(i)));
+            if (n <= 0) continue;
+            rAUfaceD[i].resize(n);
+            cudaCheck(
+                cudaMemcpyAsync(rAUfaceD[i].data(), rAUbnd.data() + procStart_[i], n * sizeof(scalar),
+                                cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                "rAU face slice");
+        }
+        deviceLapCorrPInterface(halo_, faceCellsD_, rAUfaceD, magSfD_, corrVecD_, weightsD_,
+                                gx, gy, gz, pb, ffcPif);               // + cut faces
+    }
+
     DeviceBuffer<scalar> pSol;
     deviceCopy(pSol, dp_);
     const DeviceLduView pv = deviceLduView(dm_, pDiagC, pU_, pL_);
@@ -905,6 +1222,18 @@ inline ParStepResidual ParallelDeviceSimple::step()
     deviceParallelMatrixFluxInterface(halo_, faceCellsD_, pIfCoeff, procStart_, pSol, pfluxBnd);
     deviceAxpy(-1.0, pfluxInt, phiHbyAint);          // phi = phiHbyA - pflux
     deviceAxpy(-1.0, pfluxBnd, phiHbyAbnd);
+    if (nonOrth_)   // ... and the non-orth face-flux correction, so div(phi)=0 holds on non-orthogonal faces
+    {
+        deviceAxpy(-1.0, ffcP, phiHbyAint);
+        constexpr int TPB = 128;
+        for (std::size_t i = 0; i < ffcPif.size(); ++i)
+        {
+            const int n = static_cast<int>(halo_.size(static_cast<int>(i)));
+            if (n <= 0) continue;
+            detail::subtractSliceKernel<<<(n + TPB - 1) / TPB, TPB, 0, cudaStreamPerThread>>>(
+                phiHbyAbnd.data(), static_cast<int>(procStart_[i]), ffcPif[i].data(), n);
+        }
+    }
     deviceCopy(phiInt_, phiHbyAint);                 // maintained across iterations
     deviceCopy(phiBnd_, phiHbyAbnd);
 
