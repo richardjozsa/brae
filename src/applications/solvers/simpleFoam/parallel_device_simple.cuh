@@ -19,6 +19,8 @@
 #include "parallel_simple.cuh"     // Partition, distributeFromCells
 #include "reconstruct.cuh"
 #include "local_assembly.cuh"   // computeProcUpwindD
+#include "device_kepsilon.cuh"   // DeviceWallData / KEpsilonCoeffs / buildDeviceWallData (Phase 4b turbulence)
+#include "parallel_device_interface.cuh"   // deviceMomentumInterface / deviceInterfaceOffDiagSum (shared)
 #include <cuda_runtime.h>
 #include <fstream>
 #include <string>
@@ -27,27 +29,6 @@
 namespace brae {
 
 namespace detail {
-
-// L1: the processor-interface coeffs of the momentum matrix M = div(phi,U) - laplacian(nuEff,U). Mirrors host
-// momentumDistributed, per cut face f (upwind weight w = phi>=0 ? 1 : 0, coeff = nuEffF*magSf*procDelta):
-//   diag[faceCell[f]] += w*phi[f] + coeff[f]              (outflow convection + diffusion, atomic)
-//   ifCoeff[f]         = -(1 - w)*phi[f] + coeff[f]        (inflow convection + diffusion off-diagonal)
-__global__
-void momentumInterfaceKernel(
-    const label*  __restrict__ faceCells,
-    const scalar* __restrict__ phi,
-    const scalar* __restrict__ coeff,
-    scalar*       __restrict__ diag,
-    scalar*       __restrict__ ifCoeff,
-    int n)
-{
-    const int f = blockIdx.x * blockDim.x + threadIdx.x;
-    if (f >= n) return;
-    const scalar ph = phi[f];
-    const scalar w = (ph >= 0.0) ? 1.0 : 0.0;
-    ifCoeff[f] = -(1.0 - w) * ph + coeff[f];
-    atomicAdd(&diag[faceCells[f]], w * ph + coeff[f]);
-}
 
 // L4: the processor contribution to H(). lduMatrix::H(psi) = -offdiag.psi, and the PARALLEL A.psi carries
 // -ifCoeff*psiNbr at each interface face, so H picks up +ifCoeff*psiNbr there. deviceMatrixH already divided
@@ -258,75 +239,7 @@ void subtractSliceKernel(scalar* __restrict__ dst, int offset, const scalar* __r
     dst[offset + f] -= src[f];
 }
 
-// Per-cell sum of |processor off-diagonal|, for fvMatrix::relax's diagonal-dominance term. Host
-// parallelRelaxMatrix adds |interfaceCoeffs| into sumOff; on device this feeds deviceRelaxDiag's cycSumOff
-// hook (the same role the cyclic interface's off-diagonal sum plays).
-__global__
-void offDiagSumKernel(
-    const label*  __restrict__ faceCells,
-    const scalar* __restrict__ ifCoeff,
-    scalar*       __restrict__ sumOff,
-    int n)
-{
-    const int f = blockIdx.x * blockDim.x + threadIdx.x;
-    if (f >= n) return;
-    atomicAdd(&sumOff[faceCells[f]], fabs(ifCoeff[f]));
-}
-
 } // namespace detail
-
-// Assemble the momentum matrix's processor coupling on `halo`'s interfaces: fold the convection+diffusion
-// contribution into `diag` and produce `ifCoeff[i]` (per interface, for deviceParallelAmul). `phiF[i]` is the
-// processor-face flux and `coeffGeo[i] = nuEffF*magSf*procDelta` of interface i (same order as the halo).
-inline void deviceMomentumInterface(
-    const DeviceHalo& halo,
-    const std::vector<DeviceBuffer<label>>& faceCells,
-    const std::vector<DeviceBuffer<scalar>>& phiF,
-    const std::vector<DeviceBuffer<scalar>>& coeffGeo,
-    DeviceBuffer<scalar>& diag,
-    std::vector<DeviceBuffer<scalar>>& ifCoeff,
-    cudaStream_t stream = cudaStreamPerThread)
-{
-    constexpr int TPB = 128;
-    const int nI = halo.nInterfaces();
-    ifCoeff.resize(nI);
-    for (int i = 0; i < nI; ++i)
-    {
-        const int n = static_cast<int>(halo.size(i));
-        if (n <= 0) continue;
-        ifCoeff[i].resize(n);
-        detail::momentumInterfaceKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
-            faceCells[i].data(),
-            phiF[i].data(),
-            coeffGeo[i].data(),
-            diag.data(),
-            ifCoeff[i].data(),
-            n);
-    }
-}
-
-// sumOff[c] += sum over this rank's interface faces owned by c of |ifCoeff|. Pass the result to
-// deviceRelaxDiag's cycSumOff so the processor interface counts toward diagonal dominance, matching host
-// parallelRelaxMatrix. `sumOff` must be zeroed by the caller (size nCells).
-inline void deviceInterfaceOffDiagSum(
-    const DeviceHalo& halo,
-    const std::vector<DeviceBuffer<label>>& faceCells,
-    const std::vector<DeviceBuffer<scalar>>& ifCoeff,
-    DeviceBuffer<scalar>& sumOff,
-    cudaStream_t stream = cudaStreamPerThread)
-{
-    constexpr int TPB = 128;
-    for (int i = 0; i < halo.nInterfaces(); ++i)
-    {
-        const int n = static_cast<int>(halo.size(i));
-        if (n <= 0) continue;
-        detail::offDiagSumKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
-            faceCells[i].data(),
-            ifCoeff[i].data(),
-            sumOff.data(),
-            n);
-    }
-}
 
 // Add the processor faces' linearUpwind deferred correction into `corr` (which already holds the internal
 // deviceLinearUpwindCorr result). `gx/gy/gz` are grad(U_comp) as CELL fields -- already processor-consistent
@@ -525,6 +438,7 @@ inline void deviceLapCorrPInterface(
             n);
     }
 }
+
 
 // Assemble a laplacian(gamma, .) matrix's processor coupling (the pressure equation): fold -coeff into `diag`
 // and produce `ifCoeff[i]` per interface. `coeffGeo[i] = gammaF*magSf*procDelta` of interface i.
@@ -823,6 +737,59 @@ public:
     // The global field, gathered from every partition (decomposePar's inverse) -- for output/validation.
     std::vector<scalar> reconstructP() const { return reconstructField(P_.Lm.cellProcAddr, dp_.host(), P_.globalNCells); }
 
+    // Turn on the distributed k-epsilon model: k/eps/nut become device-resident, step() then uses
+    // nuEff = nu + nut for the momentum and runs parallelDeviceKEpsilonCorrect after the corrector. The three
+    // fields carry their OpenFOAM boundary shapes (wall functions etc.). Idempotent per constructed solver.
+    void enableTurbulence(const GeometricField<vector>& U0, const GeometricField<scalar>& k0,
+                          const GeometricField<scalar>& eps0, const GeometricField<scalar>& nut0,
+                          const KEpsilonCoeffs& co, scalar relaxK = 0.7, scalar relaxEps = 0.7)
+    {
+        turbulent_ = true;
+        relaxK_ = relaxK; relaxEps_ = relaxEps;
+        keCoeffs_ = co;
+        k_.copyFrom(k0.internal); eps_.copyFrom(eps0.internal); nut_.copyFrom(nut0.internal);
+        dbK_   = buildDeviceBoundary(k0,   P_.lp, P_.lg);
+        dbEps_ = buildDeviceBoundary(eps0, P_.lp, P_.lg);
+        wall_ = buildDeviceWallData(P_.Lm.mesh, P_.lg, P_.lp, U0);   // proper no-slip wall BCs
+        std::vector<label> isW(lnC_, 0);
+        for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
+            if (P_.lp[pi].type == "wall")
+                for (label i = 0; i < P_.lp[pi].size; ++i) isW[P_.lp[pi].faceCells[i]] = 1;
+        isWallCell_.copyFrom(isW);
+        // per-boundary-FACE wall mask + near-wall distance (deviceBoundaryNut indexes by boundary face, NOT by
+        // cell): iterate patches skipping cyclic, exactly as the single-GPU bndIsWall_/bndY_ (device_simple_foam).
+        {
+            const std::vector<std::vector<scalar>> yW = nearWallDist(P_.Lm.mesh, P_.lg, P_.lp);
+            std::vector<label> biw; std::vector<scalar> byy;
+            for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
+            {
+                if (P_.lp[pi].type == "cyclic" || P_.lp[pi].type == "cyclicAMI") continue;
+                const bool wall = (P_.lp[pi].type == "wall");
+                for (label i = 0; i < P_.lp[pi].size; ++i) { biw.push_back(wall ? 1 : 0); byy.push_back(wall ? yW[pi][i] : 0.0); }
+            }
+            bndIsWall_.copyFrom(biw);
+            bndY_.copyFrom(byy);
+        }
+        // geomD = magSf*procDelta per interface (static)
+        std::size_t pj = 0;
+        for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
+        {
+            if (P_.lp[pi].type != "processor") continue;
+            std::vector<scalar> gd(P_.lp[pi].size);
+            for (label i = 0; i < P_.lp[pi].size; ++i)
+                gd[i] = P_.lg.magSf()[P_.lp[pi].start + i] * P_.procDelta[pj][i];
+            geomD_.emplace_back();
+            geomD_.back().copyFrom(gd);
+            ++pj;
+        }
+    }
+    std::vector<scalar> reconstructK()   const { return reconstructField(P_.Lm.cellProcAddr, k_.host(),   P_.globalNCells); }
+    std::vector<scalar> reconstructEps() const { return reconstructField(P_.Lm.cellProcAddr, eps_.host(), P_.globalNCells); }
+    std::vector<scalar> reconstructNut() const { return reconstructField(P_.Lm.cellProcAddr, nut_.host(), P_.globalNCells); }
+    std::vector<scalar> kLocal()   const { return k_.host(); }
+    std::vector<scalar> epsLocal() const { return eps_.host(); }
+    std::vector<scalar> nutLocal() const { return nut_.host(); }
+
     // gather `d` to the global ordering and append "<name> v0 v1 ..." to the dump file (master only)
     void dumpStage(const char* name, const DeviceBuffer<scalar>& d, int k = -1) const
     {
@@ -875,6 +842,18 @@ private:
     // non-orth ("corrected") laplacian: static per-cut-face geometry + the per-interface face areas
     std::vector<std::vector<scalar>> procNonOrth_;      // host: the IMPLICIT coeff (replaces procDelta)
     std::vector<DeviceBuffer<scalar>> corrVecD_, magSfD_, nuFaceD_;
+    // Phase 4b turbulence (k-epsilon): held device-resident like U/p/phi; nut feeds nuEff each step, and
+    // correct() runs after the corrector. Laminar path is untouched (turbulent_ = false).
+    bool turbulent_ = false;
+    scalar relaxK_ = 0.7, relaxEps_ = 0.7;
+    DeviceBuffer<scalar> k_, eps_, nut_;
+    DeviceWallData wall_;
+    DeviceBoundary dbK_, dbEps_;
+    DeviceBuffer<label> isWallCell_;
+    DeviceBuffer<label> bndIsWall_;   // per-boundary-face wall mask (for deviceBoundaryNut)
+    DeviceBuffer<scalar> bndY_;       // per-boundary-face near-wall distance
+    std::vector<DeviceBuffer<scalar>> geomD_;   // magSf*procDelta per interface (for the k/eps interface gamma)
+    KEpsilonCoeffs keCoeffs_;
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_;
     DeviceBuffer<scalar> ones_, zeroSrc_, zeroBnd_, nuEffBnd_, nuCell_;
 };
@@ -920,6 +899,11 @@ inline void deviceParallelMatrixH(
 
 // One distributed SIMPLE iteration -- the sequence validated stage-by-stage against host
 // parallelSimpleStepLaminar in test_gpu_parallel_predictor.
+// parallelDeviceKEpsilonCorrect needs the interface helpers (deviceMomentumInterface, ...) defined
+// above; include it here, AFTER them, to break the simple<->turbulence include cycle.
+} // (reopened below)
+#include "parallel_device_turbulence.cuh"
+namespace brae {
 inline ParStepResidual ParallelDeviceSimple::step()
 {
     ParStepResidual res;
@@ -927,8 +911,32 @@ inline ParStepResidual ParallelDeviceSimple::step()
     const std::vector<FvPatch>& lp = P_.lp;
     const FvGeometry& lg = P_.lg;
 
+    // ---- effective viscosity for this step: nu (laminar) or nu + nut (turbulent, refreshed from the model) ----
+    // Laminar: nuEffCell = nuCell_ (=nu), nuEffBndEff = nuEffBnd_ (=nu), nuEff_f = nu, nuEffScatBnd = nu-at-cut.
+    DeviceBuffer<scalar> nuEffCell, nuEffBndEff, nuEff_f, nuEffScatBnd;
+    if (turbulent_)
+    {
+        deviceCopy(nuEffCell, nut_);   deviceAxpy(1.0, nuCell_, nuEffCell);     // nu + nut (cell)
+        deviceInterpolate(dm_, nuEffCell, nuEff_f);                            // internal faces
+        // boundary faces: nu + the TRUE wall nut (nutkWallFunction), matching OpenFOAM wall shear
+        DeviceBuffer<scalar> nutBnd;
+        deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, k_, nut_, nu_, nutBnd, keCoeffs_);
+        deviceCopy(nuEffBndEff, nutBnd);   deviceAxpy(1.0, nuEffBnd_, nuEffBndEff);   // + nu everywhere
+    }
+    else
+    {
+        nuEff_f.copyFrom(std::vector<scalar>(nIf_, nu_));
+        deviceCopy(nuEffCell, nuCell_);
+        deviceCopy(nuEffBndEff, nuEffBnd_);
+    }
+    // nuEff at the cut faces: the halo-interpolated cell value (nu on both sides for laminar -> unchanged)
+    nuEffScatBnd.copyFrom(std::vector<scalar>(nBnd_, 0.0));
+    halo_.exchange(nuEffCell.data());
+    halo_.scatterBoundaryValues(nuEffCell.data(), weightsD_, procStart_, nuEffScatBnd.data());
+    halo_.waitExchange();
+    const std::vector<scalar> nuEffScatH = nuEffScatBnd.host();
+
     // ---- momentum matrix: div(phi,U) - laplacian(nuEff,U), + processor interface ----
-    DeviceBuffer<scalar> nuEff_f(std::vector<scalar>(nIf_, nu_));
     DeviceBuffer<scalar> mDiag, mUp, mLo, lD, lU, lL;
     deviceDivUpwindCoeffs(dm_, phiInt_, mDiag, mUp, mLo);
     deviceLaplacianCoeffs(dm_, nuEff_f, lD, lU, lL, nonOrth_);
@@ -962,7 +970,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
                 phiF.push_back(std::move(pf));
                 std::vector<scalar> cg(lp[pi].size);
                 for (label i = 0; i < lp[pi].size; ++i)
-                    cg[i] = nu_ * lg.magSf()[lp[pi].start + i]
+                    cg[i] = nuEffScatH[bi + i] * lg.magSf()[lp[pi].start + i]
                           * (nonOrth_ ? procNonOrth_[pj][i] : P_.procDelta[pj][i]);
                 DeviceBuffer<scalar> cgd;
                 cgd.copyFrom(cg);
@@ -982,7 +990,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     {
         DeviceBuffer<scalar> lIC, lBC;
         deviceBCDivCoeffs(dbU_.comp[k], phiBnd_, iC[k], bC[k]);
-        deviceBCLaplacianCoeffsFace(dbU_.comp[k], nuEffBnd_, lIC, lBC);
+        deviceBCLaplacianCoeffsFace(dbU_.comp[k], nuEffBndEff, lIC, lBC);
         deviceAxpy(-1.0, lIC, iC[k]);
         deviceAxpy(-1.0, lBC, bC[k]);
     }
@@ -1002,7 +1010,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     proc.weights   = &weightsD_;
     proc.procStart = &procStart_;
     DeviceBuffer<scalar> sX, sY, sZ;
-    deviceDivDevReff(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], nuCell_, nuEffBnd_, sX, sY, sZ, nullptr, nullptr, &proc);
+    deviceDivDevReff(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEffCell, nuEffBndEff, sX, sY, sZ, nullptr, nullptr, &proc);
     DeviceBuffer<scalar>* sS[3] = { &sX, &sY, &sZ };
     dumpStage("stress", sX, 0);
     dumpStage("stress", sY, 1);
@@ -1266,6 +1274,36 @@ inline ParStepResidual ParallelDeviceSimple::step()
         deviceCorrector(HbyA[k], rAU, *gn[k], Un);
         deviceCopy(Uk_[k], Un);
         dumpStage("Ucorr", Uk_[k], k);
+    }
+
+    // ---- turbulence: update k/eps/nut on the corrected U/phi (OF runs turbulence->correct() at the end of
+    // the SIMPLE iteration, so nut for the NEXT momentum comes from THIS step's fields) ----
+    if (turbulent_)
+    {
+        // rebuild phiF from the CORRECTED flux: the phiF above was built from the pre-corrector phi (for the
+        // momentum interface), but OF runs turbulence->correct() with the NEW phi. At np=1 this is moot (no
+        // interface), but at np>1 the cut would otherwise convect k/eps with a STALE flux while the interior
+        // used the fresh phiInt_ -- inconsistent across the cut. Rebuild it from the maintained phiBnd_.
+        std::vector<DeviceBuffer<scalar>> phiFc;
+        {
+            const std::vector<scalar> pbH = phiBnd_.host();
+            label bi = 0;
+            for (std::size_t pi = 0; pi < lp.size(); ++pi)
+            {
+                if (lp[pi].type == "cyclic" || lp[pi].type == "cyclicAMI") continue;
+                if (lp[pi].type == "processor")
+                {
+                    DeviceBuffer<scalar> pf;
+                    pf.copyFrom(std::vector<scalar>(pbH.begin() + bi, pbH.begin() + bi + lp[pi].size));
+                    phiFc.push_back(std::move(pf));
+                }
+                bi += lp[pi].size;
+            }
+        }
+        scalar rEps = 0, rK = 0;
+        parallelDeviceKEpsilonCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, Uk_[0], Uk_[1], Uk_[2],
+            k_, eps_, nut_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_, isWallCell_,
+            nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, keCoeffs_, &rEps, &rK);
     }
     return res;
 }
