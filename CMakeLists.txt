@@ -263,10 +263,30 @@ if(BRAE_WITH_NVSHMEM)
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
 
+    # Phase 4a: the linearUpwind/LUST interface correction on a cut that CARRIES FLUX (the cavity's cut is a
+    # symmetry plane -> phi~0 -> those terms are multiplied by zero and any bug in them is invisible).
+    add_executable(test_gpu_parallel_duct tests/test_gpu_parallel_duct.cu)
+    target_include_directories(test_gpu_parallel_duct PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_duct PRIVATE brae_core)
+    # np=1 writes the reference (no cuts), then np=2/4 must reproduce it. Sequential: np>1 needs the file.
+    add_test(NAME gpu_parallel_duct_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
+                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_ref.txt)
+    set_tests_properties(gpu_parallel_duct_ref PROPERTIES FIXTURES_SETUP DUCTREF)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_duct_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
+                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_ref.txt)
+        set_tests_properties(gpu_parallel_duct_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTREF)
+    endforeach()
+
     # Phase 4a EXIT GATE: the OOM proof -- a mesh too big for one GPU runs split across two. No ctest entry:
     # the mesh size is hardware-specific (it must exceed ONE GPU's VRAM), so it is driven by hand.
     add_executable(test_gpu_parallel_oom tests/test_gpu_parallel_oom.cu)
     target_include_directories(test_gpu_parallel_oom PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
                                ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
     target_link_libraries(test_gpu_parallel_oom PRIVATE brae_core)
 

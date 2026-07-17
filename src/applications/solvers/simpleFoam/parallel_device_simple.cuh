@@ -20,6 +20,8 @@
 #include "reconstruct.cuh"
 #include "local_assembly.cuh"   // computeProcUpwindD
 #include <cuda_runtime.h>
+#include <fstream>
+#include <string>
 #include <vector>
 
 namespace brae {
@@ -145,6 +147,32 @@ void linUpwindInterfaceKernel(
         d[0] = dNei[3*f]; d[1] = dNei[3*f+1]; d[2] = dNei[3*f+2];
     }
     atomicAdd(&corr[c], pf * (g[0]*d[0] + g[1]*d[1] + g[2]*d[2]));   // a cell may own several cut faces
+}
+
+// LUST linear part at a PROCESSOR face -- the distributed analogue of linearCorrKernel (device_simple.cu).
+// The face correction is (linear - upwind) weighted by phi; with linear = w*own + (1-w)*nbr and
+// upwind = pos0*own + (1-pos0)*nbr (pos0 = phi>=0), that difference collapses to (w - pos0)*(own - nbr):
+//   corr[localCell] += phi * (w - pos0) * (psi[local] - psi[remote])
+// The local cell is the cut face's owner and phi is the OUTWARD flux, so this is the internal kernel's owner
+// branch. `w` is procW -- the LOCAL side's interpolation weight, matching linearCorrKernel's w[f] = w of own.
+// NB the single-GPU path OMITS the cyclic linear part ("LUST cases are non-cyclic"); that shortcut is NOT
+// available here, since a decomposed mesh has processor faces everywhere.
+__global__
+void linearCorrInterfaceKernel(
+    const label*  __restrict__ faceCells,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ psi,
+    const scalar* __restrict__ psiNbr,
+    scalar*       __restrict__ corr,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    const scalar pf   = phi[f];
+    const scalar pos0 = (pf >= 0.0) ? 1.0 : 0.0;
+    const label  c    = faceCells[f];
+    atomicAdd(&corr[c], 1000.0 * pf * (w[f] - pos0) * (psi[c] - psiNbr[f]));   // DIAGNOSTIC x1000
 }
 
 // Per-cell sum of |processor off-diagonal|, for fvMatrix::relax's diagonal-dominance term. Host
@@ -276,6 +304,53 @@ inline void deviceLinUpwindInterface(
     }
 }
 
+// Add the processor faces' LUST linear-part correction into `corr` (which already holds the internal
+// deviceLinearCorr result). Only the remote psi is needed, so this is a single exchange per component.
+inline void deviceLinearCorrInterface(
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<label>>& faceCells,
+    const std::vector<DeviceBuffer<scalar>>& phiF,
+    const std::vector<DeviceBuffer<scalar>>& weights,
+    const DeviceBuffer<scalar>& psi,
+    DeviceBuffer<scalar>& corr,
+    cudaStream_t stream = cudaStreamPerThread)
+{
+    constexpr int TPB = 128;
+    halo.exchange(psi.data(), stream);
+    for (int i = 0; i < halo.nInterfaces(); ++i)
+    {
+        const int n = static_cast<int>(halo.size(i));
+        if (n <= 0) continue;
+        detail::linearCorrInterfaceKernel<<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
+            faceCells[i].data(),
+            phiF[i].data(),
+            weights[i].data(),
+            psi.data(),
+            halo.recvData(i),
+            corr.data(),
+            n);
+    }
+    halo.waitExchange(stream);   // the kernels above READ the shared recv buffer -- see device_halo.cuh
+    {   // DIAG: magnitude probe
+        static int nprobe = 0;
+        ++nprobe;
+        if (nprobe > 300 && nprobe < 304)
+        {
+            cudaStreamSynchronize(stream);
+            const std::vector<scalar> h = corr.host();
+            scalar mx = 0, sm = 0;
+            for (scalar v : h) { mx = std::fmax(mx, std::fabs(v)); sm += std::fabs(v); }
+            const std::vector<scalar> pf0 = phiF[0].host();
+            const std::vector<scalar> w0 = weights[0].host();
+            scalar mphi = 0, mw = 0, mnw = 0;
+            for (scalar v : pf0) mphi = std::fmax(mphi, std::fabs(v));
+            for (scalar v : w0) { mw = std::fmax(mw, v); mnw = std::fmin(mnw == 0 ? v : mnw, v); }
+            std::fprintf(stderr, "[PROBE] |corr|max=%.3e sum=%.3e | max|phiF|=%.3e | procW in [%.3f, %.3f]\n",
+                         mx, sm, mphi, mnw, mw);
+        }
+    }
+}
+
 // Assemble a laplacian(gamma, .) matrix's processor coupling (the pressure equation): fold -coeff into `diag`
 // and produce `ifCoeff[i]` per interface. `coeffGeo[i] = gammaF*magSf*procDelta` of interface i.
 inline void deviceLaplacianInterface(
@@ -357,7 +432,8 @@ public:
         scalar tolP,
         int maxIter,
         bool bounded = false,
-        bool linearUpwind = false)
+        bool linearUpwind = false,
+        bool lust = false)
         : P_(part),
           nu_(nu),
           relaxU_(relaxU),
@@ -367,6 +443,7 @@ public:
           maxIter_(maxIter),
           bounded_(bounded),
           linearUpwind_(linearUpwind),
+          lust_(lust),
           lnC_(part.Lm.mesh.nCells()),
           nIf_(part.Lm.mesh.nInternalFaces()),
           dm_(buildDeviceMesh(part.Lm.mesh, part.lg, part.lp)),
@@ -425,7 +502,7 @@ public:
 
         // linearUpwind needs Cf-C on BOTH sides of a cut; the remote centre needs an exchange, but the
         // geometry is static, so do it once here rather than per iteration.
-        if (linearUpwind_)
+        if (linearUpwind_ || lust_)
         {
             std::vector<std::vector<scalar>> dO, dN;
             computeProcUpwindD(P_.Lm, P_.lg, P_.lp, dO, dN);
@@ -450,6 +527,12 @@ public:
         dbRAU_  = buildDeviceBoundary(rAUfld_, part.lp, part.lg);
     }
 
+    // STAGE DUMP (debug): write every intermediate of iteration `it` gathered to the GLOBAL cell ordering,
+    // so an np=1 run (no processor faces -> interface terms inactive -> the reference discretisation) and an
+    // np=N run can be diffed stage by stage. The FIRST stage that differs localises an interface bug, instead
+    // of only seeing the blown-up field N iterations later.
+    void setStageDump(const std::string& path, int iter) { dumpPath_ = path; dumpAt_ = iter; }
+
     // One distributed SIMPLE iteration. U/p/phi are updated in place on the device. Returns the momentum and
     // pressure INITIAL residuals -- OpenFOAM's SIMPLE convergence measure (fvSolution residualControl).
     ParStepResidual step();
@@ -463,8 +546,43 @@ public:
     }
     std::vector<scalar> p() const { return dp_.host(); }
 
+    // max |phi| over this rank's processor faces. The interface deferred corrections (linearUpwind, LUST) are
+    // all multiplied by the cut-face flux, so a test on a mesh where this is ~0 cannot see them at all -- the
+    // 3D cavity cuts on a symmetry midplane and measures ~3e-14 here. Tests assert on this to prove teeth.
+    scalar maxProcFlux() const
+    {
+        const std::vector<scalar> b = phiBnd_.host();
+        scalar mx = 0;
+        for (std::size_t i = 0; i < procStart_.size(); ++i)
+        {
+            const label n = static_cast<label>(halo_.size(static_cast<int>(i)));
+            for (label f = 0; f < n; ++f)
+                mx = std::fmax(mx, std::fabs(b[procStart_[i] + f]));
+        }
+        return mx;
+    }
+
     // The global field, gathered from every partition (decomposePar's inverse) -- for output/validation.
     std::vector<scalar> reconstructP() const { return reconstructField(P_.Lm.cellProcAddr, dp_.host(), P_.globalNCells); }
+
+    // gather `d` to the global ordering and append "<name> v0 v1 ..." to the dump file (master only)
+    void dumpStage(const char* name, const DeviceBuffer<scalar>& d, int k = -1) const
+    {
+        if (dumpPath_.empty() || iter_ != dumpAt_) return;
+        cudaStreamSynchronize(cudaStreamPerThread);
+        std::vector<scalar> g(P_.globalNCells, 0.0);
+        const std::vector<scalar> h = d.host();
+        for (label c = 0; c < lnC_ && c < static_cast<label>(h.size()); ++c)
+            g[P_.Lm.cellProcAddr[c]] = h[c];
+        Pstream::allReduce(g.data(), static_cast<int>(g.size()), ReduceOp::Sum);
+        if (!Pstream::master()) return;
+        std::ofstream os(dumpPath_, std::ios::app);
+        os.precision(17);
+        os << name;
+        if (k >= 0) os << '_' << k;
+        for (scalar v : g) os << ' ' << v;
+        os << '\n';
+    }
 
 private:
     static std::vector<int> intNbrs(const Partition& part)
@@ -479,6 +597,10 @@ private:
     int    maxIter_;
     bool   bounded_ = false;
     bool   linearUpwind_ = false;
+    bool   lust_ = false;
+    std::string dumpPath_;
+    int    dumpAt_ = -1;
+    mutable int iter_ = 0;
     label  lnC_, nIf_, nBnd_ = 0;
     bool   validC_[3] = { true, true, true };
     DeviceMesh           dm_;
@@ -538,6 +660,7 @@ inline void deviceParallelMatrixH(
 inline ParStepResidual ParallelDeviceSimple::step()
 {
     ParStepResidual res;
+    ++iter_;
     const std::vector<FvPatch>& lp = P_.lp;
     const FvGeometry& lg = P_.lg;
 
@@ -562,6 +685,24 @@ inline ParStepResidual ParallelDeviceSimple::step()
     }
 
     const std::vector<scalar> phiBndH = phiBnd_.host();
+    {   // DIAG: where does the boundary flux actually live?
+        static int np2 = 0;
+        if (np2++ == 120)
+        {
+            label b2 = 0;
+            for (std::size_t pi = 0; pi < lp.size(); ++pi)
+            {
+                if (lp[pi].type == "cyclic" || lp[pi].type == "cyclicAMI") continue;
+                scalar mx = 0;
+                for (label i = 0; i < lp[pi].size; ++i) mx = std::fmax(mx, std::fabs(phiBndH[b2 + i]));
+                std::fprintf(stderr, "[PATCH] %-14s type=%-10s off=%5ld n=%4ld max|phi|=%.3e\n",
+                             lp[pi].name.c_str(), lp[pi].type.c_str(), (long)b2, (long)lp[pi].size, mx);
+                b2 += lp[pi].size;
+            }
+            std::fprintf(stderr, "[PATCH] total flattened = %ld, phiBndH.size = %zu, dbU_.n = %ld\n",
+                         (long)b2, phiBndH.size(), (long)dbU_.n);
+        }
+    }
     std::vector<DeviceBuffer<scalar>> phiF, coeffGeo;
     {
         std::size_t pj = 0;
@@ -587,6 +728,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     }
     std::vector<DeviceBuffer<scalar>> ifCoeff;
     deviceMomentumInterface(halo_, faceCellsD_, phiF, coeffGeo, mDiag, ifCoeff);
+    dumpStage("mDiag", mDiag);
 
     // ---- relax (the processor interface counts toward diagonal dominance) ----
     DeviceBuffer<scalar> iC[3], bC[3], relaxSrc[3];
@@ -602,6 +744,9 @@ inline ParStepResidual ParallelDeviceSimple::step()
     deviceInterfaceOffDiagSum(halo_, faceCellsD_, ifCoeff, sumOff);
     DeviceBuffer<scalar> mDiagR, delta;
     deviceRelaxDiag(deviceLduView(dm_, mDiag, mUp, mLo), dm_, iC[0], relaxU_, mDiagR, delta, sumOff.data());
+    dumpStage("sumOff", sumOff);
+    dumpStage("mDiagR", mDiagR);
+    dumpStage("delta", delta);
 
     // The explicit stress source, V*fvc::div(nuEff*dev2(T(grad U))), from the PRE-predictor U -- processor
     // faces coupled via the halo. Host parallelSimpleStepLaminar folds this into Ml.source BEFORE relax, so
@@ -613,6 +758,9 @@ inline ParStepResidual ParallelDeviceSimple::step()
     DeviceBuffer<scalar> sX, sY, sZ;
     deviceDivDevReff(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], nuCell_, nuEffBnd_, sX, sY, sZ, nullptr, nullptr, &proc);
     DeviceBuffer<scalar>* sS[3] = { &sX, &sY, &sZ };
+    dumpStage("stress", sX, 0);
+    dumpStage("stress", sY, 1);
+    dumpStage("stress", sZ, 2);
     for (int k = 0; k < 3; ++k)
     {
         deviceHadamard(relaxSrc[k], delta, Uk_[k]);      // delta*U_old
@@ -622,7 +770,9 @@ inline ParStepResidual ParallelDeviceSimple::step()
     // linearUpwind: the matrix stays upwind and this deferred correction is an explicit source. It must land
     // in relaxSrc -- the SAME source H() reads later -- not only in the predictor's rhs, or HbyA would be
     // built from an upwind-only source and the corrector would disagree with the predictor.
-    if (linearUpwind_)
+    // LUST also runs the linearUpwind correction (OF LUST.H = 0.75*linear + 0.25*linearUpwind), mirroring the
+    // single-GPU `if (ctl_.linearUpwind || ctl_.lust)`.
+    if (linearUpwind_ || lust_)
     {
         for (int k = 0; k < 3; ++k)
         {
@@ -633,12 +783,28 @@ inline ParStepResidual ParallelDeviceSimple::step()
             halo_.waitExchange();
             DeviceBuffer<scalar> ggx, ggy, ggz;
             deviceGaussGrad(dm_, Uk_[k], ub, ggx, ggy, ggz);   // processor-consistent grad(U_k)
+            dumpStage("gradx", ggx, k);
+            dumpStage("grady", ggy, k);
 
             DeviceBuffer<scalar> corr;
             deviceLinearUpwindCorr(dm_, phiInt_, ggx, ggy, ggz, corr);          // internal faces
+            dumpStage("luCorr_int", corr, k);
             deviceLinUpwindInterface(halo_, faceCellsD_, phiF, ggx, ggy, ggz,
                                      dOwnD_, dNeiD_, corr);                     // + cut faces
+            dumpStage("luCorr_tot", corr, k);
+            if (lust_)   // 0.25*linearUpwind + 0.75*linear, cut faces included on BOTH parts
+            {
+                deviceScale(corr, 0.25);
+                DeviceBuffer<scalar> lc;
+                deviceLinearCorr(dm_, phiInt_, Uk_[k], lc);                     // internal faces
+                dumpStage("linCorr_int", lc, k);
+                deviceLinearCorrInterface(halo_, faceCellsD_, phiF, weightsD_, Uk_[k], lc);   // + cut faces
+                dumpStage("linCorr_tot", lc, k);
+                deviceAxpy(0.75, lc, corr);
+            }
+            dumpStage("corr_final", corr, k);
             deviceAxpy(-1.0, corr, relaxSrc[k]);                                // source -= corr
+            dumpStage("relaxSrc", relaxSrc[k], k);
         }
     }
 
@@ -666,6 +832,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         const DeviceSolverPerf up =
             deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_);
         if (validC_[k] && up.initialResidual > res.Ux) res.Ux = up.initialResidual;
+        dumpStage("Upred", Uk_[k], k);
     }
 
     // ---- rAU, HbyA ----
@@ -677,6 +844,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     DeviceBuffer<scalar> diagA, dumb, rAU;
     deviceFold(dm_, mDiagR, zeroSrc_, cmptAvIC, zeroBnd_, diagA, dumb);
     deviceReciprocalV(dm_, diagA, rAU);
+    dumpStage("rAU", rAU);
 
     DeviceBuffer<scalar> HbyA[3];
     const DeviceLduView av = deviceLduView(dm_, diagA, mUp, mLo);
@@ -688,6 +856,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         DeviceBuffer<scalar> Hk;
         deviceParallelMatrixH(av, dm_, halo_, faceCellsD_, ifCoeff, Uk_[k], relaxSrc[k], bdDiag, bC[k], Hk);
         deviceHadamard(HbyA[k], rAU, Hk);
+        dumpStage("HbyA", HbyA[k], k);
     }
 
     // ---- phiHbyA ----
@@ -752,6 +921,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     const scalar nfp = deviceParallelNormFactor(pv, halo_, pIfCoeff, pSol, pb, ones_, P_.globalNCells);
     const DeviceSolverPerf pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_);
     res.p = pp.initialResidual;
+    dumpStage("pSol", pSol);
 
     // ---- corrector: conservative phi, relax p, U = HbyA - rAU*grad(p) ----
     DeviceBuffer<scalar> pfluxInt, pfluxBnd;
@@ -783,6 +953,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         DeviceBuffer<scalar> Un;
         deviceCorrector(HbyA[k], rAU, *gn[k], Un);
         deviceCopy(Uk_[k], Un);
+        dumpStage("Ucorr", Uk_[k], k);
     }
     return res;
 }
