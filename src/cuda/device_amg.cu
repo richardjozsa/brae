@@ -2881,17 +2881,38 @@ DeviceSolverPerf deviceAMGPCG(
     return perf;
 }
 
+// Cast the fine + coarse matrices to their FP32 mirrors for this solve's V-cycles. Call ONCE per solve, AFTER
+// amgGalerkin has updated the FP64 operators (the coarse matrices change every SIMPLE step). No-op unless FP32
+// mixed precision applies (BRAE_AMG_FP32 default on; the SA/GS/Chebyshev paths stay FP64). After this,
+// amgVCycleApply runs the FP32 V-cycle automatically -- the same mixed-precision path the single-GPU deviceAMGPCG
+// uses, now available to the distributed Krylov (the pressure V-cycle's SpMV+smoother are bandwidth-bound, so
+// FP32 halves their bytes ~= 2x, while the r->FP32/FP32->z casts and the FP64 coarsest solve keep it accurate).
+void amgPrepareFP32(AMGData& amg, const DeviceLduView& A)
+{
+    if (useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev())
+        amgCastFP32(amg, A);
+}
+
 // z = M^-1 r : ONE symmetric AMG V-cycle applied as a PRECONDITIONER, factored out of deviceAMGPCG so the
 // DISTRIBUTED Krylov (device_pcg.cu) can precondition each rank's LOCAL block with AMG. The V-cycle is built on
 // internal faces only, so it omits the processor-interface coupling -- exactly the block-Jacobi / additive-Schwarz
 // design: the outer distributed matvec (deviceParallelAmul) supplies the interface, the local V-cycle need only
 // approximate the local block. amg must be built (buildAMG) and current (amgGalerkin gives it this step's coarse
-// operators). FP64 (the outer distributed Krylov is FP64; the mixed-precision cast path stays inside deviceAMGPCG).
+// operators). Runs the FP32 V-cycle when amgPrepareFP32 cast the matrices this solve, else the FP64 one.
 void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
                     const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z)
 {
     ensureSpectrum(amg, A);                // one-time Chebyshev spectrum estimate (no-op unless the Chebyshev smoother is on)
-    vcycleAt(0, amg, A, r, z);             // z = M^-1 r, one symmetric V-cycle down the local hierarchy and back
+    const bool fp32 = amg.fp32Alloc && useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    if (fp32)
+    {
+        const int nC = A.nCells;
+        const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);   // grid-0 FP32 matrix view
+        cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, r.data(), amg.vBF[0].data());   // r -> FP32
+        vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());              // FP32 V-cycle
+        cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), z.data());   // FP32 -> z (FP64)
+    }
+    else vcycleAt(0, amg, A, r, z);        // z = M^-1 r, one symmetric FP64 V-cycle down the local hierarchy and back
 }
 
 } // namespace brae
