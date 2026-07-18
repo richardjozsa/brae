@@ -34,6 +34,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <cstdlib>
 
 namespace brae {
 
@@ -226,15 +228,32 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1;
         const scalar rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
 
+        // Startup phase timing (BRAE_TIME_STARTUP=1): the ~17-20s fixed cost dominates the 2-GPU wall on a short
+        // run, so break it down before optimising. cudaDeviceSynchronize before each lap captures GPU work; timed
+        // on master (a rough per-phase breakdown, enough to find the dominant contributor).
+        const bool timeStartup = std::getenv("BRAE_TIME_STARTUP") != nullptr;
+        auto tclk = std::chrono::high_resolution_clock::now();
+        auto lap = [&](const char* name)
+        {
+            if (!timeStartup) return;
+            cudaDeviceSynchronize();
+            auto now = std::chrono::high_resolution_clock::now();
+            if (master) std::printf("[startup] %-14s %8.1f ms\n", name,
+                                    std::chrono::duration<double, std::milli>(now - tclk).count());
+            tclk = now;
+        };
+
         PrimitiveMesh gm;
         gm.read(caseDir + "/constant/polyMesh");
         const label nC = gm.nCells();
+        lap("meshRead");
 
         // decompose in core: SCOTCH on master, broadcast so every rank agrees on the same partitioning
         std::vector<label> cellToPart(nC, 0);
-        if (master) cellToPart = scotchDecompose(gm, nproc);
+        if (master) cellToPart = scotchDecomposeCached(gm, nproc, caseDir + "/constant/polyMesh");   // ~1s -> cached
         Pstream::broadcast(cellToPart.data(), nC, 0);
         const Partition P(gm, cellToPart, rank);
+        lap("decompose");
 
         // The non-orthogonal correction is NOT implemented at processor faces. On an ORTHOGONAL mesh it is
         // identically zero, so "corrected" is safe there and 15/113 cases say "orthogonal" outright. On a
@@ -259,6 +278,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         U0.evaluateBoundary();
         GeometricField<scalar> p0 = distributeField<scalar>(pfd, gm.patches(), P.Lm, P.lp, P.procW, rank);
         p0.evaluateBoundary();
+        lap("distribute");
 
         // turbulence start fields (RAS kEpsilon)
         FieldData<scalar> kfd, efd, nfd;
@@ -290,6 +310,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust);
             if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
+            lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc
 
             auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };
             bool converged = false;
@@ -297,6 +318,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             for (iter = 1; iter <= endTime && !converged; ++iter)
             {
                 const ParStepResidual r = solver.step();
+                if (iter == 1) lap("firstStep");   // first step pays graph capture + first-touch allocation
                 if (master && (iter == 1 || iter % 20 == 0))
                     std::printf("  iter %4d:  Ux %.3e  p %.3e  | avg krylov/iter %ld\n",
                                 iter, r.Ux, r.p, solver.krylovIters() / iter);

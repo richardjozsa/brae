@@ -384,6 +384,8 @@ DeviceSolverPerf deviceParallelAMGPCG(
     const int nC = A.nCells;
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC), ApA;
 
+    amgPrepareFP32(amg, A);   // cast the local hierarchy to FP32 once (matrices are current post-amgGalerkin) -> FP32 V-cycles
+
     deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);          // rA = b - A*psi  (interface-coupled)
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
