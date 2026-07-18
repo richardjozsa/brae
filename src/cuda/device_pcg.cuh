@@ -69,6 +69,26 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
     scalar normFactor,
     scalar tol,
     scalar relTol,
+    int maxIter,
+    int checkEvery = 1);   // convergence-read cadence: read |r| to the host every K iters (1 = exact per-iter)
+
+struct AMGData;   // fwd (device_amg.cuh); passed by ref so this header need not include the AMG hierarchy
+
+// AMG-preconditioned distributed CG: identical recurrence to deviceParallelJacobiPCG (halo-coupled matvec +
+// GLOBAL fused reductions), but the preconditioner z=M^-1 r is a per-rank LOCAL AMG V-cycle (amgVCycleApply)
+// instead of point-Jacobi. This is the block-Jacobi/additive-Schwarz AMG preconditioner: it converges the
+// pressure on stiff/graded meshes where point-Jacobi caps its iteration count and the SIMPLE loop diverges.
+// `amg` must be built on A's LOCAL internal addressing (buildAMG) and current for this step (amgGalerkin).
+DeviceSolverPerf deviceParallelAMGPCG(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    AMGData& amg,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
     int maxIter);
 
 } // namespace brae
