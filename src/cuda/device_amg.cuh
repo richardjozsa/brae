@@ -130,6 +130,13 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
                               DeviceBuffer<scalar>& psi, scalar normFactor, scalar tol, scalar relTol, int maxIter,
                               bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false);
 
+// z = M^-1 r : one symmetric AMG V-cycle applied as a PRECONDITIONER (the V-cycle factored out of deviceAMGPCG).
+// Used by the distributed Krylov (deviceParallelAMGPCG) to precondition each rank's LOCAL block with AMG -- the
+// V-cycle is internal-face only, so it omits the processor interface (block-Jacobi/additive-Schwarz: the outer
+// distributed matvec supplies the interface coupling). amg must be built (buildAMG) and current (amgGalerkin).
+void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
+                    const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z);
+
 // #7 (clusters+DSM): the coarse-level weighted-Jacobi solve (nSweeps of x += omega*(b-Ax)/diag), fused into a
 // SINGLE thread-block-cluster kernel, the whole coarse vector lives in the cluster's distributed shared memory
 // and all sweeps run with cluster.sync() between them (1 launch instead of 2*nSweeps). xc is the in/out guess.

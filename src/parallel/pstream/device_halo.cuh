@@ -14,6 +14,7 @@
 #include "cf_types.cuh"
 #include "cf_pstream.cuh"
 #include "sym_buffer.cuh"
+#include "device_reduce.cuh"   // DeviceReducer owned here so its symmetric heap is freed with the halo (pre-finalize)
 #include "device_buffer.cuh"
 #include <cuda_runtime.h>
 #include <vector>
@@ -85,12 +86,18 @@ public:
         int i,
         cudaStream_t stream = cudaStreamPerThread) const;
 
+    // On-stream NVSHMEM global reducer for the distributed Krylov solvers, owned here so its symmetric heap is
+    // allocated (collectively) with the halo and freed BEFORE Pstream::finalize -- a process-static reducer's
+    // nvshmem_free runs after finalize and crashes ("API called before init completed").
+    DeviceReducer& reducer() { return red_; }
+
 private:
     int                              myPart_ = 0;
     std::vector<int>                 nbr_;
     std::vector<label>               size_, recvOffset_, remoteOffset_;
     std::vector<DeviceBuffer<label>> faceCellsD_;
     SymBuffer<scalar>                sendBuf_, recvBuf_;
+    DeviceReducer                    red_{8};   // sized for the largest fused reduction group (BiCGStab: 2 dots)
     label                            total_ = 0;
 };
 

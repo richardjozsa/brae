@@ -14,6 +14,7 @@
 #include "device_blas.cuh"
 #include "device_boundary.cuh"
 #include "device_pcg.cuh"
+#include "device_amg.cuh"          // local per-rank AMG preconditioner for the distributed pressure solve
 #include "device_divdevreff.cuh"
 #include "device_halo.cuh"
 #include "parallel_simple.cuh"     // Partition, distributeFromCells
@@ -683,6 +684,27 @@ public:
         // rAU's boundary shape: zeroGradient on real patches, coupled on processor (mirrors distributeFromCells)
         rAUfld_ = distributeFromCells<scalar>(std::vector<scalar>(lnC_, 1.0), P_);
         dbRAU_  = buildDeviceBoundary(rAUfld_, part.lp, part.lg);
+
+        // LOCAL AMG preconditioner for the distributed pressure solve (the #1 lever over point-Jacobi, which
+        // caps its iteration count and diverges on graded meshes). Built ONCE per rank from this partition's
+        // internal-face addressing + face areas (static geometry), exactly like the single-GPU pressure AMG.
+        // It intentionally omits the PROCESSOR interface -- as a preconditioner inside the interface-coupled
+        // outer CG that is the block-Jacobi/additive-Schwarz design (the outer matvec carries the coupling). A
+        // CYCLIC patch, however, is a long-range edge the Galerkin coarse operator cannot represent, so AMG is
+        // skipped (fall back to Jacobi-PCG) when the local mesh has one, matching the single-GPU guard.
+        {
+            const bool amgOff = (std::getenv("BRAE_PARALLEL_AMG") && std::atoi(std::getenv("BRAE_PARALLEL_AMG")) == 0);
+            bool hasCyclic = false;
+            for (const FvPatch& p : lp) if (p.type == "cyclic" || p.type == "cyclicAMI") hasCyclic = true;
+            if (!amgOff && !hasCyclic && lnC_ > 64)
+            {
+                const std::vector<label> ownerInt(P_.Lm.mesh.owner().begin(), P_.Lm.mesh.owner().begin() + nIf_);
+                const std::vector<label> neiInt(P_.Lm.mesh.neighbour());
+                std::vector<scalar> fwAMG(P_.lg.magSf().begin(), P_.lg.magSf().begin() + nIf_);   // geometric face area
+                pAMG_ = buildAMG(ownerInt, neiInt, fwAMG, static_cast<int>(lnC_));
+                useAMG_ = true;
+            }
+        }
     }
 
     // STAGE DUMP: write every intermediate of iteration `iter`, gathered to the GLOBAL cell ordering,
@@ -883,6 +905,8 @@ private:
     DeviceBoundary       dbP_, dbRAU_;
     GeometricField<scalar> rAUfld_;
     DeviceHalo           halo_;
+    bool     useAMG_ = false;   // pressure preconditioned by the local per-rank AMG V-cycle (else point-Jacobi)
+    AMGData  pAMG_;             // the local pressure-Laplacian hierarchy (built once, Galerkin-recoarsened per step)
     std::vector<label>   procStart_;
     std::vector<DeviceBuffer<label>>  faceCellsD_;
     std::vector<DeviceBuffer<scalar>> weightsD_;
@@ -1277,7 +1301,17 @@ inline ParStepResidual ParallelDeviceSimple::step()
     deviceCopy(pSol, dp_);
     const DeviceLduView pv = deviceLduView(dm_, pDiagC, pU_, pL_);
     const scalar nfp = deviceParallelNormFactor(pv, halo_, pIfCoeff, pSol, pb, ones_, P_.globalNCells);
-    const DeviceSolverPerf pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_);
+    // pressure solve: local-AMG-preconditioned distributed CG (the strong preconditioner that converges on graded
+    // meshes), else point-Jacobi CG. amgGalerkin re-coarsens the hierarchy from THIS step's pressure matrix
+    // (pDiagC includes the interface + boundary diagonal terms; pU_/pL_ are the internal Laplacian off-diagonals).
+    DeviceSolverPerf pp;
+    if (useAMG_)
+    {
+        amgGalerkin(pAMG_, pDiagC, pU_, pL_);
+        pp = deviceParallelAMGPCG(pv, halo_, pIfCoeff, pb, pSol, pAMG_, nfp, tolP_, 0.0, maxIter_);
+    }
+    else
+        pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_);
     kIters_ += pp.nIterations;
     res.p = pp.initialResidual;
     dumpStage("pSol", pSol);

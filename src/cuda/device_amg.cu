@@ -2881,4 +2881,17 @@ DeviceSolverPerf deviceAMGPCG(
     return perf;
 }
 
+// z = M^-1 r : ONE symmetric AMG V-cycle applied as a PRECONDITIONER, factored out of deviceAMGPCG so the
+// DISTRIBUTED Krylov (device_pcg.cu) can precondition each rank's LOCAL block with AMG. The V-cycle is built on
+// internal faces only, so it omits the processor-interface coupling -- exactly the block-Jacobi / additive-Schwarz
+// design: the outer distributed matvec (deviceParallelAmul) supplies the interface, the local V-cycle need only
+// approximate the local block. amg must be built (buildAMG) and current (amgGalerkin gives it this step's coarse
+// operators). FP64 (the outer distributed Krylov is FP64; the mixed-precision cast path stays inside deviceAMGPCG).
+void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
+                    const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z)
+{
+    ensureSpectrum(amg, A);                // one-time Chebyshev spectrum estimate (no-op unless the Chebyshev smoother is on)
+    vcycleAt(0, amg, A, r, z);             // z = M^-1 r, one symmetric V-cycle down the local hierarchy and back
+}
+
 } // namespace brae

@@ -297,8 +297,9 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             for (iter = 1; iter <= endTime && !converged; ++iter)
             {
                 const ParStepResidual r = solver.step();
-                if (master && (iter == 1 || iter % 50 == 0))
-                    std::printf("  iter %4d:  Ux %.3e  p %.3e\n", iter, r.Ux, r.p);
+                if (master && (iter == 1 || iter % 20 == 0))
+                    std::printf("  iter %4d:  Ux %.3e  p %.3e  | avg krylov/iter %ld\n",
+                                iter, r.Ux, r.p, solver.krylovIters() / iter);
                 // residualControl on U/p (the turbulence fields co-converge; step() returns only U/p residuals).
                 converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU);
             }
