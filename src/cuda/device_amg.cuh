@@ -130,6 +130,32 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
                               DeviceBuffer<scalar>& psi, scalar normFactor, scalar tol, scalar relTol, int maxIter,
                               bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false);
 
+// z = M^-1 r : one symmetric AMG V-cycle applied as a PRECONDITIONER (the V-cycle factored out of deviceAMGPCG).
+// Used by the distributed Krylov (deviceParallelAMGPCG) to precondition each rank's LOCAL block with AMG -- the
+// V-cycle is internal-face only, so it omits the processor interface (block-Jacobi/additive-Schwarz: the outer
+// distributed matvec supplies the interface coupling). amg must be built (buildAMG) and current (amgGalerkin).
+// captureVcycle: replay the V-cycle from a cached CUDA graph (keyed on A.diag) instead of launching every kernel,
+// removing the launch overhead of the V-cycle's many small kernels. Default false (direct launch).
+void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
+                    const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle = false);
+
+// Prepare the FP32 mixed-precision V-cycle for this solve: cast the (Galerkin-updated) matrices to FP32 mirrors.
+// Call ONCE per solve before the amgVCycleApply loop; after it, amgVCycleApply runs FP32 automatically. No-op
+// unless BRAE_AMG_FP32 (default on) and the default smoother/aggregation (SA/GS/Chebyshev stay FP64).
+void amgPrepareFP32(AMGData& amg, const DeviceLduView& A);
+
+class DeviceHalo;   // fwd (parallel/pstream/device_halo.cuh)
+
+// DISTRIBUTED whole-loop graph PCG: the entire steady-state PCG WHILE body captured once into a conditional CUDA
+// graph and replayed on-device (no per-iteration host launches), with deviceParallelAmul (halo) + on-stream
+// NVSHMEM reduces INSIDE the captured body. Real-multi-GPU only (1 PE/GPU; the MPG host-MPI reduce fallback is
+// not graph-capturable). Captures once per run only if the caller holds psi/matrix buffers persistent.
+DeviceSolverPerf deviceParallelAMGPCGGraph(
+    const DeviceLduView& A, AMGData& amg, DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
+    scalar normFactor, scalar tol, scalar relTol, int maxIter);
+
 // #7 (clusters+DSM): the coarse-level weighted-Jacobi solve (nSweeps of x += omega*(b-Ax)/diag), fused into a
 // SINGLE thread-block-cluster kernel, the whole coarse vector lives in the cluster's distributed shared memory
 // and all sweeps run with cluster.sync() between them (1 launch instead of 2*nSweeps). xc is the in/out guess.

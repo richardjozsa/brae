@@ -60,6 +60,123 @@ inline std::vector<std::vector<scalar>> computeProcDeltaCoeffs(
     return pdc;
 }
 
+// Per processor face, the two cell-centre->face-centre offset vectors that a linearUpwind deferred correction
+// needs: dOwn = Cf - C[localCell] and dNei = Cf - C[remoteCell]. On an internal face these are dm.dOwn/dNei;
+// across a cut the remote centre lives on the other rank, so exchange it once at setup (geometry is static)
+// exactly as computeProcDeltaCoeffs does. Returned interleaved xyz per face, one vector per processor patch:
+//   dOwn[j][3*i+{0,1,2}], dNei[j][3*i+{0,1,2}]
+inline void computeProcUpwindD(
+    const LocalMesh& lm,
+    const FvGeometry& lg,
+    const std::vector<FvPatch>& lpatches,
+    std::vector<std::vector<scalar>>& dOwn,
+    std::vector<std::vector<scalar>>& dNei)
+{
+    std::vector<const FvPatch*> pp;
+    for (const FvPatch& p : lpatches)
+        if (p.type == "processor") pp.push_back(&p);
+
+    const std::size_t n = pp.size();
+    std::vector<std::vector<scalar>> sendC(n), recvC(n);   // 3 scalars (cell centre) per face
+    for (std::size_t j = 0; j < n; ++j)
+    {
+        const label sz = pp[j]->size;
+        sendC[j].resize(3 * sz);
+        recvC[j].resize(3 * sz);
+        for (label i = 0; i < sz; ++i)
+        {
+            const vector& C = lg.C()[pp[j]->faceCells[i]];
+            sendC[j][3 * i]     = C.x;
+            sendC[j][3 * i + 1] = C.y;
+            sendC[j][3 * i + 2] = C.z;
+        }
+        Pstream::irecv(recvC[j].data(), static_cast<int>(3 * sz), lm.procNbr[j], 0);
+        Pstream::isend(sendC[j].data(), static_cast<int>(3 * sz), lm.procNbr[j], 0);
+    }
+    Pstream::waitAll();
+
+    dOwn.assign(n, {});
+    dNei.assign(n, {});
+    for (std::size_t j = 0; j < n; ++j)
+    {
+        const label sz = pp[j]->size;
+        dOwn[j].resize(3 * sz);
+        dNei[j].resize(3 * sz);
+        for (label i = 0; i < sz; ++i)
+        {
+            const vector& Cf = lg.Cf()[pp[j]->start + i];
+            const vector& Cl = lg.C()[pp[j]->faceCells[i]];
+            const vector  Cr{recvC[j][3 * i], recvC[j][3 * i + 1], recvC[j][3 * i + 2]};
+            const vector dO = Cf - Cl, dN = Cf - Cr;
+            dOwn[j][3 * i] = dO.x; dOwn[j][3 * i + 1] = dO.y; dOwn[j][3 * i + 2] = dO.z;
+            dNei[j][3 * i] = dN.x; dNei[j][3 * i + 1] = dN.y; dNei[j][3 * i + 2] = dN.z;
+        }
+    }
+}
+
+// Per processor face, the two quantities OF's "corrected" laplacian needs, mirroring FvGeometry's internal-face
+// construction EXACTLY (fv_geometry.cu makeInterpolation) with the local cell as owner and the remote as
+// neighbour (delta = C_remote - C_local, unitArea = Sf/magSf outward from local):
+//     nonOrthDeltaCoeffs = 1 / max(unitArea . delta, 0.05*|delta|)     (the IMPLICIT coeff; replaces 1/|delta|)
+//     corrVec            = unitArea - delta*nonOrthDeltaCoeffs         (the EXPLICIT deferred correction vector)
+// The remote centre lives on the other rank, so exchange it once at setup -- geometry is static -- exactly as
+// computeProcDeltaCoeffs does. On an ORTHOGONAL mesh corrVec == 0 and nonOrthDeltaCoeffs == deltaCoeffs, so this
+// collapses to the existing path (which is why an orthogonal mesh cannot tell the two apart).
+// Returned per processor patch: nod[j][i] (scalar), cv[j][3*i+{0,1,2}] (interleaved xyz).
+inline void computeProcNonOrth(
+    const LocalMesh& lm,
+    const FvGeometry& lg,
+    const std::vector<FvPatch>& lpatches,
+    std::vector<std::vector<scalar>>& nod,
+    std::vector<std::vector<scalar>>& cv)
+{
+    std::vector<const FvPatch*> pp;
+    for (const FvPatch& p : lpatches)
+        if (p.type == "processor") pp.push_back(&p);
+
+    const std::size_t n = pp.size();
+    std::vector<std::vector<scalar>> sendC(n), recvC(n);
+    for (std::size_t j = 0; j < n; ++j)
+    {
+        const label sz = pp[j]->size;
+        sendC[j].resize(3 * sz);
+        recvC[j].resize(3 * sz);
+        for (label i = 0; i < sz; ++i)
+        {
+            const vector& C = lg.C()[pp[j]->faceCells[i]];
+            sendC[j][3 * i]     = C.x;
+            sendC[j][3 * i + 1] = C.y;
+            sendC[j][3 * i + 2] = C.z;
+        }
+        Pstream::irecv(recvC[j].data(), static_cast<int>(3 * sz), lm.procNbr[j], 0);
+        Pstream::isend(sendC[j].data(), static_cast<int>(3 * sz), lm.procNbr[j], 0);
+    }
+    Pstream::waitAll();
+
+    nod.assign(n, {});
+    cv.assign(n, {});
+    for (std::size_t j = 0; j < n; ++j)
+    {
+        const label sz = pp[j]->size;
+        nod[j].resize(sz);
+        cv[j].resize(3 * sz);
+        for (label i = 0; i < sz; ++i)
+        {
+            const label  gf = pp[j]->start + i;
+            const vector delta{ recvC[j][3*i]   - lg.C()[pp[j]->faceCells[i]].x,
+                                recvC[j][3*i+1] - lg.C()[pp[j]->faceCells[i]].y,
+                                recvC[j][3*i+2] - lg.C()[pp[j]->faceCells[i]].z };
+            const vector unitArea = lg.Sf()[gf] / lg.magSf()[gf];
+            const scalar d        = 1.0 / std::fmax(dot(unitArea, delta), 0.05 * mag(delta));
+            const vector c        = unitArea - delta * d;
+            nod[j][i]      = d;
+            cv[j][3*i]     = c.x;
+            cv[j][3*i + 1] = c.y;
+            cv[j][3*i + 2] = c.z;
+        }
+    }
+}
+
 // Build the scalar DistributedMatrix structure (diag/upper/lower/interfaceCoeffs) for the momentum
 // div(phi,U) - laplacian(nuEff,U) from the serially-assembled LOCAL FvMatrix (correct internal +
 // real-boundary coeffs; ZERO at processor patches since ProcessorFvPatchField returns zero coeffs)

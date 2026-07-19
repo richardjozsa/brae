@@ -25,7 +25,7 @@
 #  Env:  SPUMA_SRC (clone target, default $HOME/spuma)   NVARCH (default: autodetect, e.g. 121)
 #        NVHPC_DIR (HPC SDK compilers/bin, default: autodetect)   JOBS (default 16)
 # ============================================================================
-set -u
+set +u   # OpenFOAM etc/bashrc is not nounset-safe; sourcing it under set -u fails
 SPUMA_SRC="${SPUMA_SRC:-$HOME/spuma}"
 NVARCH="${NVARCH:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d .)}"
 JOBS="${JOBS:-16}"

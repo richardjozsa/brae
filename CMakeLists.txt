@@ -61,6 +61,7 @@ list(REMOVE_DUPLICATES BRAE_HEADER_DIRS)
 add_library(brae_core STATIC
     src/parallel/pstream/cf_pstream.cu
     src/parallel/pstream/device_halo.cu
+    src/parallel/pstream/device_reduce.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
     src/OpenFOAM/meshes/primitive_mesh.cu
@@ -263,10 +264,155 @@ if(BRAE_WITH_NVSHMEM)
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
 
+    # Phase 4b: the distributed kOmegaSST::correct() (2nd RAS model) reproduces np=1
+    add_executable(test_gpu_parallel_komegasst tests/test_gpu_parallel_komegasst.cu)
+    target_include_directories(test_gpu_parallel_komegasst PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_komegasst PRIVATE brae_core)
+    add_test(NAME gpu_parallel_komegasst_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_komegasst>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/sst_ref.txt)
+    set_tests_properties(gpu_parallel_komegasst_ref PROPERTIES FIXTURES_SETUP SSTREF)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_komegasst_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_komegasst>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/sst_ref.txt)
+        set_tests_properties(gpu_parallel_komegasst_np${_np} PROPERTIES FIXTURES_REQUIRED SSTREF)
+    endforeach()
+
+    # Phase 4b: the CLOSED distributed turbulent SIMPLE loop (momentum+pressure with nuEff=nu+nut, then
+    # kEpsilon correct(), maintained across iterations) reproduces np=1.
+    add_executable(test_gpu_parallel_turbloop tests/test_gpu_parallel_turbloop.cu)
+    target_include_directories(test_gpu_parallel_turbloop PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_turbloop PRIVATE brae_core)
+    add_test(NAME gpu_parallel_turbloop_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_turbloop>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_ref.txt)
+    set_tests_properties(gpu_parallel_turbloop_ref PROPERTIES FIXTURES_SETUP TURBLOOP)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_turbloop_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_turbloop>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_ref.txt)
+        set_tests_properties(gpu_parallel_turbloop_np${_np} PROPERTIES FIXTURES_REQUIRED TURBLOOP)
+    endforeach()
+
+    # SST in the closed loop (second field = omega): same gate, sst mode
+    add_test(NAME gpu_parallel_turbloop_sst_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_turbloop>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_sst_ref.txt "" sst)
+    set_tests_properties(gpu_parallel_turbloop_sst_ref PROPERTIES FIXTURES_SETUP TURBLOOPSST)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_turbloop_sst_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_turbloop>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_sst_ref.txt "" sst)
+        set_tests_properties(gpu_parallel_turbloop_sst_np${_np} PROPERTIES FIXTURES_REQUIRED TURBLOOPSST)
+    endforeach()
+
+    # Phase 4b: the full distributed kEpsilon::correct() (production + wall functions + eps/k transport + nut)
+    # reproduces np=1. Duct walls are y/z, cut is x -> near-wall cells sit adjacent to the cut.
+    add_executable(test_gpu_parallel_kepsilon tests/test_gpu_parallel_kepsilon.cu)
+    target_include_directories(test_gpu_parallel_kepsilon PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_kepsilon PRIVATE brae_core)
+    add_test(NAME gpu_parallel_kepsilon_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_kepsilon>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/keps_ref.txt)
+    set_tests_properties(gpu_parallel_kepsilon_ref PROPERTIES FIXTURES_SETUP KEPSREF)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_kepsilon_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_kepsilon>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/keps_ref.txt)
+        set_tests_properties(gpu_parallel_kepsilon_np${_np} PROPERTIES FIXTURES_REQUIRED KEPSREF)
+    endforeach()
+
+    # Phase 4b foundation: the distributed scalar transport solve (deviceParallelScalarTransport) -- the
+    # reusable core of the turbulence step (k/eps/omega/nuTilda) -- reproduces np=1 on a flux-carrying cut.
+    add_executable(test_gpu_parallel_scalar tests/test_gpu_parallel_scalar.cu)
+    target_include_directories(test_gpu_parallel_scalar PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_scalar PRIVATE brae_core)
+    add_test(NAME gpu_parallel_scalar_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_scalar>
+                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/scalar_ref.txt)
+    set_tests_properties(gpu_parallel_scalar_ref PROPERTIES FIXTURES_SETUP SCALARREF)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_scalar_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_scalar>
+                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/scalar_ref.txt)
+        set_tests_properties(gpu_parallel_scalar_np${_np} PROPERTIES FIXTURES_REQUIRED SCALARREF)
+    endforeach()
+
+    # Phase 4a: the linearUpwind/LUST interface correction on a cut that CARRIES FLUX (the cavity's cut is a
+    # symmetry plane -> phi~0 -> those terms are multiplied by zero and any bug in them is invisible).
+    add_executable(test_gpu_parallel_duct tests/test_gpu_parallel_duct.cu)
+    target_include_directories(test_gpu_parallel_duct PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_gpu_parallel_duct PRIVATE brae_core)
+    # np=1 writes the reference (no cuts), then np=2/4 must reproduce it. Sequential: np>1 needs the file.
+    add_test(NAME gpu_parallel_duct_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
+                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_ref.txt)
+    set_tests_properties(gpu_parallel_duct_ref PROPERTIES FIXTURES_SETUP DUCTREF)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_duct_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
+                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_ref.txt)
+        set_tests_properties(gpu_parallel_duct_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTREF)
+    endforeach()
+
+    # SHEARED duct: the same flux-carrying cut, but on a NON-ORTHOGONAL mesh (shear 0.5 -> 26.57 deg, =
+    # atan(0.5)). Every other brae test mesh is orthogonal, where the cut-face geometry conventions
+    # (dNei = Cf - C_remote) coincide with their normal-projected variants and cannot be told apart. This is
+    # the only gate that exercises the interface terms on a non-orthogonal cut.
+    add_test(NAME gpu_parallel_duct_skew_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
+                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_skew_ref.txt nolust "" 1 0.5)
+    set_tests_properties(gpu_parallel_duct_skew_ref PROPERTIES FIXTURES_SETUP DUCTSKEW)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_duct_skew_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
+                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_skew_ref.txt nolust "" 1 0.5)
+        set_tests_properties(gpu_parallel_duct_skew_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTSKEW)
+    endforeach()
+
+    # NON-ORTHOGONAL correction on the sheared cut: nonOrthDeltaCoeffs implicit + the explicit corrVec.grad
+    # correction (momentum) + the pEqn source AND face-flux correction. Invisible on an orthogonal mesh
+    # (corrVec == 0), so this gate is the only thing standing between it and silent wrongness on real meshes.
+    add_test(NAME gpu_parallel_duct_nonorth_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
+                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_nonorth_ref.txt nolust "" 1 0.5 nonorth)
+    set_tests_properties(gpu_parallel_duct_nonorth_ref PROPERTIES FIXTURES_SETUP DUCTNO)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_duct_nonorth_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
+                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_nonorth_ref.txt nolust "" 1 0.5 nonorth)
+        set_tests_properties(gpu_parallel_duct_nonorth_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTNO)
+    endforeach()
+
+    # LUST (0.75 linear + 0.25 linearUpwind) over the same flux-carrying cut: it exercises BOTH interface
+    # deferred corrections (linearUpwind's gradient term AND the linear term), so it is the stronger gate.
+    add_test(NAME gpu_parallel_duct_lust_ref
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
+                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_lust_ref.txt lust)
+    set_tests_properties(gpu_parallel_duct_lust_ref PROPERTIES FIXTURES_SETUP DUCTLUST)
+    foreach(_np 2 4)
+        add_test(NAME gpu_parallel_duct_lust_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
+                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_lust_ref.txt lust)
+        set_tests_properties(gpu_parallel_duct_lust_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTLUST)
+    endforeach()
+
     # Phase 4a EXIT GATE: the OOM proof -- a mesh too big for one GPU runs split across two. No ctest entry:
     # the mesh size is hardware-specific (it must exceed ONE GPU's VRAM), so it is driven by hand.
     add_executable(test_gpu_parallel_oom tests/test_gpu_parallel_oom.cu)
     target_include_directories(test_gpu_parallel_oom PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
                                ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
     target_link_libraries(test_gpu_parallel_oom PRIVATE brae_core)
 
