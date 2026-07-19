@@ -1116,3 +1116,14 @@ add_executable(test_gpu_crossover tests/test_gpu_crossover.cu)
 target_include_directories(test_gpu_crossover PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
 target_link_libraries(test_gpu_crossover PRIVATE brae_core)
 add_test(NAME gpu_crossover COMMAND test_gpu_crossover ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurbBig)
+
+# CI robustness: every MPI test is `mpirun -np N ..._npN`. Without PROCESSORS, `ctest -jK` treats each as a single
+# slot and launches many concurrently -> on the self-hosted SINGLE-GPU runner that oversubscribes the GPU/CPU with
+# dozens of ranks at once, the cause of the flaky failures (parallel_spmv_np2, parallel_pcg_np8 under load; each
+# passes in isolation). Setting PROCESSORS=N makes the scheduler reserve N slots per test, so it never overcommits.
+get_property(_brae_all_tests DIRECTORY PROPERTY TESTS)
+foreach(_t ${_brae_all_tests})
+    if(_t MATCHES "_np([0-9]+)$")
+        set_tests_properties(${_t} PROPERTIES PROCESSORS ${CMAKE_MATCH_1})
+    endif()
+endforeach()
