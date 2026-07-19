@@ -949,6 +949,9 @@ private:
     // step (matrix, rhs, interface coeffs, and the psi seed) -- the graph references the buffers, read at replay.
     DeviceBuffer<scalar> pUp_, pLp_, pDiagp_, pbp_, pSolp_;
     std::vector<DeviceBuffer<scalar>> pIfCoeffp_;
+    // Per-U-component momentum-BiCGStab whole-loop graph caches (BRAE_PARALLEL_GRAPH=3), keyed on Uk_[k]'s address.
+    // unique_ptr so the cache (which owns a CUDA graph + persistent Krylov/matrix buffers) stays non-copyable/stable.
+    std::unique_ptr<BiCGGraphCache> bicgGCache_[3];
     std::vector<label>   procStart_;
     std::vector<DeviceBuffer<label>>  faceCellsD_;
     std::vector<DeviceBuffer<scalar>> weightsD_;
@@ -1224,8 +1227,9 @@ inline ParStepResidual ParallelDeviceSimple::step()
         deviceFold(dm_, mDiagR, s, iC[k], bC[k], diagC, b);
         const DeviceLduView mv = deviceLduView(dm_, diagC, mUp, mLo);
         const scalar nf = deviceParallelNormFactor(mv, halo_, ifCoeff, Uk_[k], b, ones_, P_.globalNCells);
+        if (!bicgGCache_[k]) bicgGCache_[k] = std::make_unique<BiCGGraphCache>();   // lazy: whole-loop graph (BRAE_PARALLEL_GRAPH=3)
         const DeviceSolverPerf up =
-            deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_);
+            deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_, 1, bicgGCache_[k].get());
         kIters_ += up.nIterations;
         if (validC_[k] && up.initialResidual > res.Ux) res.Ux = up.initialResidual;
         dumpStage("Upred", Uk_[k], k);
