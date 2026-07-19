@@ -3,6 +3,9 @@
 #include <cstdio>   // scotch.h uses FILE
 #include <scotch.h>
 #include <stdexcept>
+#include <fstream>
+#include <filesystem>
+#include <string>
 
 namespace brae {
 
@@ -65,6 +68,50 @@ std::vector<label> scotchDecompose(const PrimitiveMesh& m, label nParts)
     std::vector<label> cellToPart(nC);
     for (label c = 0; c < nC; ++c) cellToPart[c] = static_cast<label>(part[c]);
     return cellToPart;
+}
+
+// Cached SCOTCH decomposition: the cell->partition map is STATIC per (mesh, nParts), but scotchDecompose costs
+// ~1s on a 1M-cell mesh and ran on every launch (a top-3 startup cost). Persist it to
+// cacheDir/.brae_decomp_np<N> and reload when the file is at least as new as cacheDir/owner (mesh unchanged) and
+// the header (magic, nParts, nCells) matches; otherwise recompute and write. Falls back to a plain decompose on
+// any I/O problem, so it can never be wrong -- at worst it recomputes.
+std::vector<label> scotchDecomposeCached(const PrimitiveMesh& m, label nParts, const std::string& cacheDir)
+{
+    namespace fs = std::filesystem;
+    constexpr unsigned kMagic = 0x44454331u;                 // "DEC1"
+    const label nC = m.nCells();
+    const std::string cachePath = cacheDir + "/.brae_decomp_np" + std::to_string(nParts);
+    const std::string ownerPath = cacheDir + "/owner";
+
+    std::error_code ec;
+    const bool fresh = fs::exists(cachePath, ec) && fs::exists(ownerPath, ec)
+                    && fs::last_write_time(cachePath, ec) >= fs::last_write_time(ownerPath, ec);
+    if (fresh)
+    {
+        std::ifstream is(cachePath, std::ios::binary);
+        unsigned magic = 0; label np = 0, n = 0;
+        is.read(reinterpret_cast<char*>(&magic), sizeof magic);
+        is.read(reinterpret_cast<char*>(&np),    sizeof np);
+        is.read(reinterpret_cast<char*>(&n),     sizeof n);
+        if (is && magic == kMagic && np == nParts && n == nC)
+        {
+            std::vector<label> v(nC);
+            is.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(nC) * sizeof(label));
+            if (is) return v;                                // cache hit
+        }
+    }
+
+    std::vector<label> v = scotchDecompose(m, nParts);       // miss -> compute + persist
+    std::ofstream os(cachePath, std::ios::binary);
+    if (os)
+    {
+        const unsigned magic = kMagic; const label np = nParts, n = nC;
+        os.write(reinterpret_cast<const char*>(&magic), sizeof magic);
+        os.write(reinterpret_cast<const char*>(&np),    sizeof np);
+        os.write(reinterpret_cast<const char*>(&n),     sizeof n);
+        os.write(reinterpret_cast<const char*>(v.data()), static_cast<std::streamsize>(nC) * sizeof(label));
+    }
+    return v;
 }
 
 } // namespace brae

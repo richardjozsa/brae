@@ -7,10 +7,27 @@
 #include "cf_types.cuh"
 #include "device_ldu.cuh"
 #include "device_buffer.cuh"
+#include <cuda_runtime.h>
+#include <vector>
 
 namespace brae {
 
 struct DeviceSolverPerf { scalar initialResidual = 0, finalResidual = 0; int nIterations = 0; };
+
+// Cached conditional-graph of the distributed momentum BiCGStab WHILE-body (BRAE_PARALLEL_GRAPH>=3). One cache
+// per U-component, owned by the solver (Uk_[k]'s address is the stable key). The momentum matrix is REBUILT with
+// fresh buffers every SIMPLE step (unlike the stable pressure matrix), so the graph body references PERSISTENT
+// copies here (diagP/upperP/lowerP/ifaceP) that the caller memcpy-refreshes each step -> the graph is captured
+// ONCE and replayed, no per-step re-instantiation. Holds the graph-referenced Krylov vectors + control scalars.
+struct BiCGGraphCache {
+    cudaGraphExec_t exec = nullptr; cudaGraph_t graph = nullptr;
+    cudaGraphConditionalHandle handle{}; const void* key = nullptr;
+    DeviceBuffer<scalar> rA, rA0, pA, yA, AyA, sA, zA, tA, Ax;      // persistent Krylov vectors
+    DeviceBuffer<scalar> diagP, upperP, lowerP;                     // persistent matrix copies (refreshed per step)
+    std::vector<DeviceBuffer<scalar>> ifaceP;                       // persistent interface-coeff copies
+    DeviceBuffer<scalar> sNormF, sInit, sRes; DeviceBuffer<int> sIter;   // control scalars
+    ~BiCGGraphCache();
+};
 
 // OpenFOAM's lduMatrix::solver::normFactor: sum(|A*psi - sumA*avg(psi)| + |b - sumA*avg(psi)|) + small,
 // where sumA = rowSum(A) = A*ones. Pass this as the solver's normFactor so the reported initial residual
@@ -66,6 +83,44 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
     const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
     const DeviceBuffer<scalar>& b,
     DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int checkEvery = 1,          // convergence-read cadence: read |r| to the host every K iters (1 = exact per-iter)
+    BiCGGraphCache* gcache = nullptr);   // if BRAE_PARALLEL_GRAPH>=3 and non-null, use the whole-loop graph path
+
+// Whole-loop conditional-graph momentum BiCGStab (BRAE_PARALLEL_GRAPH=3): the entire steady-state BiCGStab WHILE
+// body -- interface-coupled matvec + on-stream NVSHMEM reductions + the recurrence -- captured once into a
+// cudaGraphCondTypeWhile graph and replayed on-device, removing the ~15 host kernel launches/Krylov-iter that the
+// direct device-resident path still pays. Mirrors deviceParallelAMGPCGGraph. Requires CUDA >= 13 (WHILE nodes) and
+// 1 PE/GPU (the on-stream reduce must be capturable); returns nIterations = -1 otherwise so the caller falls back.
+DeviceSolverPerf deviceParallelJacobiBiCGStabGraph(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    BiCGGraphCache& c,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter);
+
+struct AMGData;   // fwd (device_amg.cuh); passed by ref so this header need not include the AMG hierarchy
+
+// AMG-preconditioned distributed CG: identical recurrence to deviceParallelJacobiPCG (halo-coupled matvec +
+// GLOBAL fused reductions), but the preconditioner z=M^-1 r is a per-rank LOCAL AMG V-cycle (amgVCycleApply)
+// instead of point-Jacobi. This is the block-Jacobi/additive-Schwarz AMG preconditioner: it converges the
+// pressure on stiff/graded meshes where point-Jacobi caps its iteration count and the SIMPLE loop diverges.
+// `amg` must be built on A's LOCAL internal addressing (buildAMG) and current for this step (amgGalerkin).
+DeviceSolverPerf deviceParallelAMGPCG(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    AMGData& amg,
     scalar normFactor,
     scalar tol,
     scalar relTol,

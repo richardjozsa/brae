@@ -2,6 +2,8 @@
 // Used by deviceAMGPCG. Feature flags live in one BRAE_AMG_* block at the top of the anonymous namespace.
 #include "device_amg.cuh"
 #include "device_blas.cuh"
+#include "device_ldu.cuh"       // deviceParallelAmul (halo-coupled matvec) for the distributed whole-loop graph PCG
+#include "device_halo.cuh"      // DeviceHalo + its DeviceReducer (on-stream NVSHMEM reduce)
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <algorithm>
@@ -2710,7 +2712,150 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     if (dbgCyc) std::fprintf(stderr, "[AMG] p cycles=%d finalRes=%.3e (device)\n", perf.nIterations, perf.finalResidual);
     return perf;
 }
+
+// DISTRIBUTED whole-loop graph PCG: the exact structure of deviceAMGPCGGraph (the entire steady-state PCG WHILE
+// body captured once into a conditional graph and replayed on-device -- no per-iteration host launches or syncs),
+// but the matvec is deviceParallelAmul (halo-coupled) and every dot is globalised by an ON-STREAM NVSHMEM reduce
+// through the halo's DeviceReducer, so the halo put/barrier and the collective are captured INSIDE the graph body.
+// This is the 2x lever: the ~13ms/iter of GPU work stops being spread across ~hundreds of separate launches. It
+// requires the on-stream NVSHMEM ops to be graph-capturable (NVSHMEM 3.6 has cuda_graph paths) and 1 PE/GPU (the
+// MPG host-MPI reduce fallback is NOT capturable) -- so it is real-multi-GPU only. Persistent buffers (psi/matrix
+// held across steps by the caller) make it capture ONCE per run; otherwise it re-instantiates per step (still
+// correct). Falls back to the direct deviceParallelAMGPCG if the caller keeps buffers non-persistent.
+DeviceSolverPerf deviceParallelAMGPCGGraph(
+    const DeviceLduView& A,
+    AMGData& amg,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter)
+{
+    const cudaStream_t strm = cudaStreamPerThread;
+    const int nC = A.nCells;
+    amg.corrScaling = false;
+    DeviceBuffer<scalar>& wA = amg.wA;
+    DeviceBuffer<scalar>& rA = amg.rA;
+    if (!amg.pcgCache) amg.pcgCache = std::make_unique<PCGGraphCache>();
+    PCGGraphCache& c = *amg.pcgCache;
+    c.pA.resize(nC); c.Ax.resize(nC); c.sNormF.resize(1); c.sInit.resize(1); c.sRes.resize(1); c.sIter.resize(1);
+    cudaMemcpyAsync(c.sNormF.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, strm);
+    scalar* dWArA = amg.sWArA.data();  scalar* dWArAold = amg.sWArAold.data();
+    scalar* dPap  = amg.sPap.data();   scalar* dAlpha = amg.sAlpha.data();
+    scalar* dNegAlpha = amg.sNegAlpha.data(); scalar* dBeta = amg.sBeta.data();
+    ensureSpectrum(amg, A);
+    const bool fp32 = useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    if (fp32) amgCastFP32(amg, A);
+    const LduF A0 = fp32 ? lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]) : LduF{};
+    auto applyPrec = [&]()
+    {
+        if (fp32)
+        {
+            cast_<scalar,float><<<nBlocks(nC),TPB,0,strm>>>(nC, rA.data(), amg.vBF[0].data());
+            vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
+            cast_<float,scalar><<<nBlocks(nC),TPB,0,strm>>>(nC, amg.vXF[0].data(), wA.data());
+        }
+        else vcycleAt(0, amg, A, rA, wA);
+    };
+    DeviceReducer& R = halo.reducer();
+    auto gdot = [&](const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar* dOut)
+    {   // *dOut = global sum of x.y (local dot -> on-stream NVSHMEM reduce -> copy)
+        deviceDotInto(x, y, R.src()); R.sumReduce(1, strm); deviceScalarCopy(R.dst(), dOut);
+    };
+    auto gsum = [&](const DeviceBuffer<scalar>& x, scalar* dOut)   // *dOut = global |x|_1
+    {
+        deviceSumMagInto(x, R.src()); R.sumReduce(1, strm); deviceScalarCopy(R.dst(), dOut);
+    };
+
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, c.Ax);          // r = b - A psi
+    deviceCopy(rA, b);
+    deviceAxpy(-1.0, c.Ax, rA);
+    DeviceSolverPerf perf;
+    gsum(rA, c.sInit.data());
+    gsScaleInvK<<<1,1,0,strm>>>(c.sInit.data(), c.sNormF.data());
+    scalar initRes;
+    cudaCheck(cudaMemcpyAsync(&initRes, c.sInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "pgraph init D2H");
+    cudaStreamSynchronize(strm);
+    perf.initialResidual = initRes; perf.finalResidual = initRes;
+    auto convergedHost = [&](scalar fr){ return (fr < tol) || (relTol > 0.0 && fr < relTol*initRes); };
+    if (convergedHost(initRes)) { perf.nIterations = 0; return perf; }
+
+    applyPrec();                                                  // iteration 0 (explicit)
+    gdot(wA, rA, dWArA);
+    deviceCopy(c.pA, wA);
+    deviceParallelAmul(A, halo, ifaceCoeffs, c.pA, wA);
+    gdot(wA, c.pA, dPap);
+    deviceScalarDivNeg(dWArA, dPap, dAlpha, dNegAlpha);
+    deviceAxpyDev(dAlpha, c.pA, psi);
+    deviceAxpyDev(dNegAlpha, wA, rA);
+    gsum(rA, c.sRes.data());
+    gsScaleInvK<<<1,1,0,strm>>>(c.sRes.data(), c.sNormF.data());
+    scalar res1;
+    cudaCheck(cudaMemcpyAsync(&res1, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "pgraph it0 D2H");
+    cudaStreamSynchronize(strm);
+    if (convergedHost(res1) || maxIter <= 1) { perf.finalResidual = res1; perf.nIterations = 1; return perf; }
+    cudaMemsetAsync(c.sIter.data(), 0, sizeof(int), strm);
+
+    if (!c.exec || c.key != psi.data())
+    {
+        if (c.exec)  { cudaGraphExecDestroy(c.exec);  c.exec  = nullptr; }
+        if (c.graph) { cudaGraphDestroy(c.graph);     c.graph = nullptr; }
+        cudaCheck(cudaGraphCreate(&c.graph, 0), "pgraph create");
+        cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 1, cudaGraphCondAssignDefault), "pgraph cond handle");
+        cudaGraphNodeParams cp = {};
+        cp.type = cudaGraphNodeTypeConditional;
+        cp.conditional.handle = c.handle;
+        cp.conditional.type = cudaGraphCondTypeWhile;
+        cp.conditional.size = 1;
+        cudaGraphNode_t cnode;
+        cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "pgraph cond node");
+        cudaGraph_t body = cp.conditional.phGraph_out[0];
+        cudaCheck(cudaStreamBeginCaptureToGraph(strm, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "pgraph capture begin");
+        deviceScalarCopy(dWArA, dWArAold);
+        applyPrec();
+        gdot(wA, rA, dWArA);
+        deviceScalarDiv(dWArA, dWArAold, dBeta);
+        deviceFusedScaleAxpy(c.pA, dBeta, wA);
+        deviceParallelAmul(A, halo, ifaceCoeffs, c.pA, wA);
+        gdot(wA, c.pA, dPap);
+        deviceScalarDivNeg(dWArA, dPap, dAlpha, dNegAlpha);
+        deviceAxpyDev(dAlpha, c.pA, psi);
+        deviceAxpyDev(dNegAlpha, wA, rA);
+        gsum(rA, c.sRes.data());
+        gsScaleInvK<<<1,1,0,strm>>>(c.sRes.data(), c.sNormF.data());
+        pcgSetCondK<<<1,1,0,strm>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1);
+        cudaGraph_t tmp;
+        cudaCheck(cudaStreamEndCapture(strm, &tmp), "pgraph capture end");
+        cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pgraph instantiate");
+        c.key = psi.data();
+    }
+    cudaCheck(cudaGraphLaunch(c.exec, strm), "pgraph launch");
+    scalar finalRes; int whileIters;
+    cudaCheck(cudaMemcpyAsync(&finalRes, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "pgraph final D2H");
+    cudaCheck(cudaMemcpyAsync(&whileIters, c.sIter.data(), sizeof(int), cudaMemcpyDeviceToHost, strm), "pgraph iters D2H");
+    cudaStreamSynchronize(strm);
+    perf.finalResidual = finalRes;
+    perf.nIterations = 1 + whileIters;
+    return perf;
+}
 #endif // BRAE_HAS_GS_DEVICE
+
+#ifndef BRAE_HAS_GS_DEVICE
+// CUDA < 13: WHILE-node conditional graphs are unavailable, so the whole-loop graph cannot be built. Return a
+// sentinel (nIterations < 0); the caller falls back to the direct (non-graph) distributed AMG-PCG.
+DeviceSolverPerf deviceParallelAMGPCGGraph(
+    const DeviceLduView& A, AMGData&, DeviceHalo&,
+    const std::vector<DeviceBuffer<scalar>>&,
+    const DeviceBuffer<scalar>&, DeviceBuffer<scalar>&,
+    scalar, scalar, scalar, int)
+{
+    (void)A;
+    DeviceSolverPerf p; p.nIterations = -1; return p;
+}
+#endif
 
 DeviceSolverPerf deviceAMGPCG(
     const DeviceLduView& A,
@@ -2879,6 +3024,87 @@ DeviceSolverPerf deviceAMGPCG(
     static const bool dbgCyc = std::getenv("BRAE_AMG_CYCLES") != nullptr;   // benchmark: AMG V-cycles per pressure solve
     if (dbgCyc) std::fprintf(stderr, "[AMG] p cycles=%d finalRes=%.3e\n", nIter, perf.finalResidual);
     return perf;
+}
+
+// Cast the fine + coarse matrices to their FP32 mirrors for this solve's V-cycles. Call ONCE per solve, AFTER
+// amgGalerkin has updated the FP64 operators (the coarse matrices change every SIMPLE step). No-op unless FP32
+// mixed precision applies (BRAE_AMG_FP32 default on; the SA/GS/Chebyshev paths stay FP64). After this,
+// amgVCycleApply runs the FP32 V-cycle automatically -- the same mixed-precision path the single-GPU deviceAMGPCG
+// uses, now available to the distributed Krylov (the pressure V-cycle's SpMV+smoother are bandwidth-bound, so
+// FP32 halves their bytes ~= 2x, while the r->FP32/FP32->z casts and the FP64 coarsest solve keep it accurate).
+void amgPrepareFP32(AMGData& amg, const DeviceLduView& A)
+{
+    if (useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev())
+        amgCastFP32(amg, A);
+}
+
+// z = M^-1 r : ONE symmetric AMG V-cycle applied as a PRECONDITIONER, factored out of deviceAMGPCG so the
+// DISTRIBUTED Krylov (device_pcg.cu) can precondition each rank's LOCAL block with AMG. The V-cycle is built on
+// internal faces only, so it omits the processor-interface coupling -- exactly the block-Jacobi / additive-Schwarz
+// design: the outer distributed matvec (deviceParallelAmul) supplies the interface, the local V-cycle need only
+// approximate the local block. amg must be built (buildAMG) and current (amgGalerkin gives it this step's coarse
+// operators). Runs the FP32 V-cycle when amgPrepareFP32 cast the matrices this solve, else the FP64 one.
+void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
+                    const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle)
+{
+    ensureSpectrum(amg, A);                // one-time Chebyshev spectrum estimate (no-op unless the Chebyshev smoother is on)
+    const bool fp32 = amg.fp32Alloc && useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    const int nC = A.nCells;
+
+    if (!captureVcycle)
+    {
+        // DIRECT launch (default): every V-cycle kernel is a fresh launch.
+        if (fp32)
+        {
+            const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);         // grid-0 FP32 matrix view
+            cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, r.data(), amg.vBF[0].data());   // r -> FP32
+            vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());              // FP32 V-cycle
+            cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), z.data());   // FP32 -> z (FP64)
+        }
+        else vcycleAt(0, amg, A, r, z);    // FP64 V-cycle
+        return;
+    }
+
+    // GRAPH REPLAY: the V-cycle is host-scalar-free and runs on FIXED buffers (amg.rA/wA), so capture it once
+    // (keyed on A.diag; the coarse VALUES change each step but the graph references the buffers, read at replay) and
+    // replay -- removing the launch overhead of the V-cycle's many small kernels (13 levels x SpMV+smoother per PCG
+    // iter, the dominant per-iteration launch cost). Copy r -> persistent amg.rA, replay, amg.wA -> z. Same
+    // capture/replay the single-GPU deviceAMGPCG uses; now available to the distributed pressure solve.
+    deviceCopy(amg.rA, r);
+    if (fp32)
+    {
+        const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);
+        AMGGraphCache& gcf = *amg.gcacheF;
+        if (!gcf.exec || gcf.key != A.diag)
+        {
+            if (gcf.exec)  { cudaGraphExecDestroy(gcf.exec);  gcf.exec  = nullptr; }
+            if (gcf.graph) { cudaGraphDestroy(gcf.graph);     gcf.graph = nullptr; }
+            cudaCheck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal), "amgF capture begin");
+            cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, amg.rA.data(), amg.vBF[0].data());
+            vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
+            cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), amg.wA.data());
+            cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gcf.graph), "amgF capture end");
+            cudaCheck(cudaGraphInstantiate(&gcf.exec, gcf.graph, 0), "amgF graph instantiate");
+            gcf.key = A.diag;
+        }
+        cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
+    }
+    else
+    {
+        AMGGraphCache& gc = *amg.gcache;
+        if (!gc.exec || gc.key != A.diag)
+        {
+            if (gc.exec)  { cudaGraphExecDestroy(gc.exec);  gc.exec  = nullptr; }
+            if (gc.graph) { cudaGraphDestroy(gc.graph);     gc.graph = nullptr; }
+            cudaCheck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal), "amg capture begin");
+            vcycleAt(0, amg, A, amg.rA, amg.wA);
+            cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gc.graph), "amg capture end");
+            cudaCheck(cudaGraphInstantiate(&gc.exec, gc.graph, 0), "amg graph instantiate");
+            gc.key = A.diag;
+        }
+        cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
+    }
+    deviceCopy(z, amg.wA);
 }
 
 } // namespace brae
