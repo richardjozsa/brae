@@ -24,6 +24,7 @@
 #include "komega_sst_coeffs.cuh"
 #include "cell_wall_dist.cuh"
 #include "parallel_device_interface.cuh"   // deviceMomentumInterface / deviceInterfaceOffDiagSum (shared)
+#include "device_mrf.cuh"          // DeviceMRF: Coriolis source + makeRelative frame flux (rotating cell zone)
 #include <cuda_runtime.h>
 #include <fstream>
 #include <string>
@@ -794,6 +795,40 @@ public:
     //     the complement, not a bug -- check `mDiagR` (which must match) instead.
     void setStageDump(const std::string& path, int iter) { dumpPath_ = path; dumpAt_ = iter; }
 
+    // Enable an MRF rotating cell zone (distributed mirror of the single-GPU device setMRF). Builds the per-rank
+    // frame data from this rank's LOCAL mesh/geometry/patches (z is the LOCAL zone) and makes the resident flux
+    // RELATIVE. Call once after construction, before stepping. deviceMrfCoriolis adds -V*(Omega x U) to the
+    // momentum source (step()), deviceMrfApplyFrameFlux makes phi/phiHbyA relative.
+    //   Cut-face gating: buildDeviceMRF marks a processor (cut) face relative whenever the LOCAL cell is in the
+    // zone, but a cut face is "internal to the zone" only if BOTH cells are -- and the two ranks must agree.
+    // Exchange the per-cell zone mask across the cut and zero the frame flux where the REMOTE cell is outside the
+    // zone. At np=1 there are no processor faces, so this is a no-op and the result is bit-identical to single-GPU.
+    void setMRF(
+        const MRFZone& z,
+        const std::vector<std::string>& nonRotating = {})
+    {
+        mrf_ = buildDeviceMRF(z, P_.Lm.mesh, P_.lg, P_.lp, nonRotating);
+        if (halo_.nInterfaces() > 0)
+        {
+            std::vector<scalar> zc(lnC_, 0.0);   // per-cell zone mask (scalar) for the halo exchange
+            for (label c : z.cells) zc[c] = 1.0;
+            DeviceBuffer<scalar> zoneF;
+            zoneF.copyFrom(zc);
+            DeviceBuffer<scalar> remoteMask;     // 1 everywhere; processor faces overwritten with the RAW remote mask
+            remoteMask.copyFrom(std::vector<scalar>(nBnd_, 1.0));
+            // zero interpolation weights -> bvalKernel returns wf*local + (1-wf)*remote = remote (raw 0/1 remote mask
+            // at the cut faces; physical boundary faces are not written, so they keep the initial 1.0).
+            std::vector<DeviceBuffer<scalar>> zeroW(halo_.nInterfaces());
+            for (int i = 0; i < halo_.nInterfaces(); ++i)
+                zeroW[i].copyFrom(std::vector<scalar>(static_cast<std::size_t>(halo_.size(i)), 0.0));
+            halo_.exchange(zoneF.data());
+            halo_.scatterBoundaryValues(zoneF.data(), zeroW, procStart_, remoteMask.data());
+            halo_.waitExchange();
+            deviceHadamard(mrf_.frameFluxBnd, mrf_.frameFluxBnd, remoteMask);   // cut faces relative only if remote in zone
+        }
+        deviceMrfApplyFrameFlux(mrf_, +1.0, phiInt_, phiBnd_);   // initial resident phi -> relative (OF createFields)
+    }
+
     // One distributed SIMPLE iteration. U/p/phi are updated in place on the device. Returns the momentum and
     // pressure INITIAL residuals -- OpenFOAM's SIMPLE convergence measure (fvSolution residualControl).
     ParStepResidual step();
@@ -1023,6 +1058,7 @@ private:
     bool   limitedU_ = false;     // div(phi,U) limitedLinear (magSqr): IMPLICIT limited convection, ONE limiter/face on |U|^2
     scalar twoByk_ = 2.0;         // limitedLinear coefficient: 2/max(k_,SMALL) (k_=1 -> 2); limiter = clamp(twoByk*r,0,1)
     bool   limitedV_ = false;     // div(phi,U) limitedLinearV (NVDVTVDV): IMPLICIT limited convection, vector limiter/face
+    DeviceMRF mrf_;               // optional rotating cell zone (MRF): Coriolis source + relative flux (inactive by default)
     std::string dumpPath_;
     int    dumpAt_ = -1;
     mutable int iter_ = 0;
@@ -1276,6 +1312,8 @@ inline ParStepResidual ParallelDeviceSimple::step()
     {
         deviceHadamard(relaxSrc[k], delta, Uk_[k]);      // delta*U_old
         deviceAxpy(1.0, *sS[k], relaxSrc[k]);            // + V*divSig  -> == host Ml.source
+        if (mrf_.active)                                 // MRF Coriolis: source -= V*(Omega x U)_k on zone cells
+            deviceMrfCoriolis(mrf_, dm_.V, Uk_[0], Uk_[1], Uk_[2], k, relaxSrc[k]);
     }
 
     // linearUpwind: the matrix stays upwind and this deferred correction is an explicit source. It must land
@@ -1456,6 +1494,11 @@ inline ParStepResidual ParallelDeviceSimple::step()
             deviceAxpy(1.0, t, HbyA[k]);
         }
     }
+
+    // MRF.makeRelative(phiHbyA): subtract the static frame flux on the zone faces so the pressure equation is
+    // solved for the RELATIVE flux inside the rotating zone (the corrector below reconstructs the relative phi,
+    // and setMRF already made the resident phi relative). No-op outside the zone.
+    if (mrf_.active) deviceMrfApplyFrameFlux(mrf_, +1.0, phiHbyAint, phiHbyAbnd);
 
     // ---- pEqn: laplacian(rAtU,p) == div(phiHbyA)  (rAtU == rAU for plain SIMPLE) ----
     DeviceBuffer<scalar> rAUf_int;
