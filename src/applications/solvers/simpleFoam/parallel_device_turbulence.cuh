@@ -276,6 +276,10 @@ inline void parallelDeviceKEpsilonCorrect(
     }
     DeviceBuffer<scalar> gByNu;
     deviceGByNuFromGradU(gradU, nC, gByNu);
+    // realizableKE: variable Cmu (rCmu) + strain magnitude (magS) from the SAME halo-consistent gradU tensor
+    // (cell-local, no extra halo). Feeds the strain-based eps reaction + nut = rCmu*k^2/eps below.
+    DeviceBuffer<scalar> rCmu, magS;
+    if (co.realizable) deviceRealizableStrain(gradU, k, eps, co.A0, nC, rCmu, magS);
 
     // ---- divU (processor-consistent via the maintained phi) ----
     DeviceBuffer<scalar> divU;
@@ -322,9 +326,25 @@ inline void parallelDeviceKEpsilonCorrect(
     std::vector<DeviceBuffer<scalar>> DepsGeo;
     faceGammaGeo(DepsCell, Deps_i, Deps_b, DepsGeo);
     DeviceBuffer<scalar> SpE(nC), SuE(nC);
-    detail::epsSourceKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(
-        k.data(), eps.data(), gByNu.data(), divU.data(), dm.V.data(),
-        co.C1, co.C2, co.C3, co.Cmu, bounded ? 1 : 0, SpE.data(), SuE.data(), nC);
+    if (co.realizable)
+    {
+        // realizableKE eps reaction: production C1(eta)*magS*eps + destruction C2*eps^2/(k+sqrt(nu*eps)). The kernel
+        // ACCUMULATES (+=) so zero first; then fold in the bounded -div(phi) term (Sp += -divU*V) that the standard
+        // epsSourceKernel applies -- distributed transport does not handle `bounded`, the source does.
+        cudaCheck(cudaMemsetAsync(SpE.data(), 0, static_cast<std::size_t>(nC)*sizeof(scalar), cudaStreamPerThread), "rke SpE 0");
+        cudaCheck(cudaMemsetAsync(SuE.data(), 0, static_cast<std::size_t>(nC)*sizeof(scalar), cudaStreamPerThread), "rke SuE 0");
+        deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, SpE, SuE);
+        if (bounded)
+        {
+            DeviceBuffer<scalar> vDiv;
+            deviceHadamard(vDiv, divU, dm.V);
+            deviceAxpy(-1.0, vDiv, SpE);
+        }
+    }
+    else
+        detail::epsSourceKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(
+            k.data(), eps.data(), gByNu.data(), divU.data(), dm.V.data(),
+            co.C1, co.C2, co.C3, co.Cmu, bounded ? 1 : 0, SpE.data(), SuE.data(), nC);
     const scalar rE = deviceParallelScalarTransport(dm, halo, dbEps, faceCellsD, procStart, weightsD,
         phiInt, phiBnd, phiF, Deps_i, Deps_b, DepsGeo, SpE, SuE, eps, relaxEps, tol, maxIter, globalNCells, ones,
         isWallCell, eps0);
@@ -346,8 +366,9 @@ inline void parallelDeviceKEpsilonCorrect(
     detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(k.data(), 1e-15, nC);
     if (resK) *resK = rK;
 
-    // ---- correctNut (LOCAL: nut = Cmu*k^2/eps) ----
-    deviceNut(k, eps, nut, co);
+    // ---- correctNut (LOCAL: nut = Cmu*k^2/eps; realizableKE: rCmu*k^2/eps with the variable Cmu) ----
+    if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);
+    else               deviceNut(k, eps, nut, co);
 }
 
 

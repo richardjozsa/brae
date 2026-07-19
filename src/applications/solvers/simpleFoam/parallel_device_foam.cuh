@@ -118,12 +118,30 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            if (model != "kEpsilon" && model != "kOmegaSST")
+            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE")
                 throw std::runtime_error(
                     "brae -parallel: RASModel '" + model + "' is not implemented on the multi-GPU device path "
-                    "(kEpsilon and kOmegaSST are). Use `mpirun -np N brae_simpleFoam -case <dir>` (host) or "
-                    "`brae -case <dir>` (single GPU) for other models.");
+                    "(kEpsilon, realizableKE and kOmegaSST are). Use `mpirun -np N brae_simpleFoam -case <dir>` "
+                    "(host) or `brae -case <dir>` (single GPU) for other models.");
             sst = (model == "kOmegaSST");
+            if (model == "realizableKE")
+            {
+                // realizableKE (OF RAS/realizableKE): variable-Cmu strain model, shares the k-eps loop but with
+                // rCmu/magS + a strain-based eps reaction. Defaults differ from standard k-eps: A0=4, C2=1.9, sigmaEps=1.2.
+                keCoeffs.realizable = true;
+                keCoeffs.C2 = 1.9;
+                keCoeffs.sigmaEps = 1.2;
+                const FoamDict* rke = ras ? ras->subDict("realizableKECoeffs") : nullptr;
+                if (rke)
+                {
+                    keCoeffs.A0 = rke->scalarOr("A0", keCoeffs.A0);
+                    keCoeffs.C2 = rke->scalarOr("C2", keCoeffs.C2);
+                    keCoeffs.sigmaK = rke->scalarOr("sigmak", keCoeffs.sigmaK);
+                    keCoeffs.sigmaEps = rke->scalarOr("sigmaEps", keCoeffs.sigmaEps);
+                    keCoeffs.kappa = rke->scalarOr("kappa", keCoeffs.kappa);
+                    keCoeffs.E = rke->scalarOr("E", keCoeffs.E);
+                }
+            }
             const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr;
             if (kec)
             {
