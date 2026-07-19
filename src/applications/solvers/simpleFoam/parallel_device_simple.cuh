@@ -929,6 +929,44 @@ public:
         dbReThetat_ = buildDeviceBoundary(ReThetat0, P_.lp, P_.lg);
         dbGammaInt_ = buildDeviceBoundary(gammaInt0, P_.lp, P_.lg);
     }
+    // SpalartAllmaras (one-equation nuTilda): single transport field + nut = nuTilda*fv1. The momentum wall nut
+    // uses Spalding (deviceBoundaryNutSpalding) in step(), so build the per-boundary wall flag + distance too.
+    void enableTurbulenceSA(const GeometricField<vector>& U0, const GeometricField<scalar>& nuTilda0,
+                            const GeometricField<scalar>& nut0, const SpalartAllmarasCoeffs& co, scalar relaxNuTilda = 0.7)
+    {
+        turbulent_ = true;  turbModel_ = 3;
+        relaxK_ = relaxNuTilda; relaxEps_ = relaxNuTilda;
+        saCoeffs_ = co;
+        nuTilda_.copyFrom(nuTilda0.internal);
+        nut_.copyFrom(nut0.internal);
+        dbNuTilda_ = buildDeviceBoundary(nuTilda0, P_.lp, P_.lg);
+        wall_ = buildDeviceWallData(P_.Lm.mesh, P_.lg, P_.lp, U0);
+        yCell_.copyFrom(cellWallDist(P_.Lm.mesh, P_.lg, P_.lp));
+        {
+            const std::vector<std::vector<scalar>> yW = nearWallDist(P_.Lm.mesh, P_.lg, P_.lp);
+            std::vector<label> biw; std::vector<scalar> byy;
+            for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
+            {
+                if (P_.lp[pi].type == "cyclic" || P_.lp[pi].type == "cyclicAMI") continue;
+                const bool wall = (P_.lp[pi].type == "wall");
+                for (label i = 0; i < P_.lp[pi].size; ++i) { biw.push_back(wall ? 1 : 0); byy.push_back(wall ? yW[pi][i] : 0.0); }
+            }
+            bndIsWall_.copyFrom(biw);
+            bndY_.copyFrom(byy);
+        }
+        std::size_t pj = 0;   // geomD_ (magSf*procDelta per interface) for the nuTilda faceGammaGeo
+        for (std::size_t pi = 0; pi < P_.lp.size(); ++pi)
+        {
+            if (P_.lp[pi].type != "processor") continue;
+            std::vector<scalar> gd(P_.lp[pi].size);
+            for (label i = 0; i < P_.lp[pi].size; ++i)
+                gd[i] = P_.lg.magSf()[P_.lp[pi].start + i] * P_.procDelta[pj][i];
+            geomD_.emplace_back();
+            geomD_.back().copyFrom(gd);
+            ++pj;
+        }
+    }
+    std::vector<scalar> reconstructNuTilda() const { return reconstructField(P_.Lm.cellProcAddr, nuTilda_.host(), P_.globalNCells); }
     std::vector<scalar> reconstructReThetat() const { return reconstructField(P_.Lm.cellProcAddr, ReThetat_.host(), P_.globalNCells); }
     std::vector<scalar> reconstructGammaInt() const { return reconstructField(P_.Lm.cellProcAddr, gammaInt_.host(), P_.globalNCells); }
     std::vector<scalar> reconstructK()   const { return reconstructField(P_.Lm.cellProcAddr, k_.host(),   P_.globalNCells); }
@@ -1008,9 +1046,12 @@ private:
     scalar relaxK_ = 0.7, relaxEps_ = 0.7;
     DeviceBuffer<scalar> k_, eps_, nut_;
     DeviceBuffer<scalar> ReThetat_, gammaInt_;   // kOmegaSSTLM (turbModel_==2) transition transport fields
+    DeviceBuffer<scalar> nuTilda_;               // SpalartAllmaras (turbModel_==3) single transport field
     DeviceWallData wall_;
     DeviceBoundary dbK_, dbEps_;
     DeviceBoundary dbReThetat_, dbGammaInt_;     // kOmegaSSTLM transition-field boundaries
+    DeviceBoundary dbNuTilda_;                   // SpalartAllmaras nuTilda boundary
+    SpalartAllmarasCoeffs saCoeffs_;             // SpalartAllmaras coefficients
     DeviceBuffer<label> isWallCell_;
     DeviceBuffer<label> bndIsWall_;   // per-boundary-face wall mask (for deviceBoundaryNut)
     DeviceBuffer<scalar> bndY_;       // per-boundary-face near-wall distance
@@ -1085,9 +1126,12 @@ inline ParStepResidual ParallelDeviceSimple::step()
     {
         deviceCopy(nuEffCell, nut_);   deviceAxpy(1.0, nuCell_, nuEffCell);     // nu + nut (cell)
         deviceInterpolate(dm_, nuEffCell, nuEff_f);                            // internal faces
-        // boundary faces: nu + the TRUE wall nut (nutkWallFunction), matching OpenFOAM wall shear
+        // boundary faces: nu + the TRUE wall nut. kEps/SST use nutkWallFunction; SpalartAllmaras uses Spalding.
         DeviceBuffer<scalar> nutBnd;
-        deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, k_, nut_, nu_, nutBnd, keCoeffs_);
+        if (turbModel_ == 3)
+            deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], nut_, nu_, saCoeffs_, nutBnd);
+        else
+            deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, k_, nut_, nu_, nutBnd, keCoeffs_);
         deviceCopy(nuEffBndEff, nutBnd);   deviceAxpy(1.0, nuEffBnd_, nuEffBndEff);   // + nu everywhere
     }
     else
@@ -1508,7 +1552,13 @@ inline ParStepResidual ParallelDeviceSimple::step()
                                 cudaMemcpyDeviceToDevice, cudaStreamPerThread),
                 "phiFc cut slice");
         }
-        if (turbModel_ == 2)   // k-omega SST + Langtry-Menter transition (eps_ holds omega)
+        if (turbModel_ == 3)   // Spalart-Allmaras (single nuTilda field; no k/eps)
+        {
+            parallelDeviceSpalartAllmarasCorrect(dm_, halo_, dbU_, dbNuTilda_, Uk_[0], Uk_[1], Uk_[2],
+                nuTilda_, nut_, yCell_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_,
+                nu_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, saCoeffs_);
+        }
+        else if (turbModel_ == 2)   // k-omega SST + Langtry-Menter transition (eps_ holds omega)
         {
             parallelDeviceKOmegaSSTLMCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, dbReThetat_, dbGammaInt_,
                 Uk_[0], Uk_[1], Uk_[2], k_, eps_, nut_, ReThetat_, gammaInt_, yCell_,

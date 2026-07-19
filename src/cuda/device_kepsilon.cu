@@ -1521,4 +1521,43 @@ void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, Dev
     cudaCheck(cudaGetLastError(), "SA correctNut (validate)");
 }
 
+// ---- Exported SA (Spalart-Allmaras) source-prep wrappers for the DISTRIBUTED SA correct -----------------------
+// Cell-local (gradU + grad(nuTilda) are the only halo-coupled inputs, supplied by the caller). Reuse the exact
+// anon kernels + coeffs so the distributed nuTilda equation is byte-identical to the single-GPU physics.
+void deviceSAStilda(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda,
+    const DeviceBuffer<scalar>& y, scalar nu, const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& Stilda)
+{
+    const int nC = dm.nCells; Stilda.resize(nC);
+    saStildaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuTilda.data(), y.data(), nu, co, Stilda.data());
+    cudaCheck(cudaGetLastError(), "deviceSAStilda");
+}
+void deviceSAFw(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, const DeviceBuffer<scalar>& Stilda,
+    const DeviceBuffer<scalar>& y, const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& fw)
+{
+    const int nC = dm.nCells; fw.resize(nC);
+    saFwKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), Stilda.data(), y.data(), co, fw.data());
+    cudaCheck(cudaGetLastError(), "deviceSAFw");
+}
+void deviceSAMagSqr(const DeviceMesh& dm, const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& out)
+{
+    const int nC = dm.nCells; out.resize(nC);
+    saMagSqrKernel<<<nBlocks(nC), TPB>>>(nC, gx.data(), gy.data(), gz.data(), out.data());
+    cudaCheck(cudaGetLastError(), "deviceSAMagSqr");
+}
+void deviceSADEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar sigmaNut, DeviceBuffer<scalar>& D)
+{
+    const int nC = dm.nCells; D.resize(nC);
+    saDEffKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, sigmaNut, D.data());
+    cudaCheck(cudaGetLastError(), "deviceSADEff");
+}
+void deviceSAReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, const DeviceBuffer<scalar>& Stilda,
+    const DeviceBuffer<scalar>& fw, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& gradNt2,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src)
+{
+    saReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), nuTilda.data(), Stilda.data(),
+        fw.data(), y.data(), gradNt2.data(), co, diag.data(), src.data());
+    cudaCheck(cudaGetLastError(), "deviceSAReaction");
+}
+
 } // namespace brae
