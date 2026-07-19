@@ -198,7 +198,8 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         // Anything else -- limitedLinear, LUST, linearUpwindV, plain Gauss linear -- is a DIFFERENT
         // discretisation, and silently substituting upwind produces a converged, plausible, WRONG answer (on
         // the cavity that was a ~6% field difference). Refuse those, exactly as RAS is refused above.
-        bool boundedDiv = false, linUpwind = false, lust = false, linUpwindV = false, lapCorrected = false;
+        bool boundedDiv = false, linUpwind = false, lust = false, linUpwindV = false, limitedU = false, limitedVsch = false, lapCorrected = false;
+        scalar limitedTwoByk = 2.0;   // limitedLinear[V] coefficient 2/max(k_,SMALL); default k_=1 -> 2
         {
             std::string divLine, lapLine;
             std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));
@@ -221,17 +222,30 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                 lust       = divLine.find("LUST") != std::string::npos;   // 0.75*linear + 0.25*linearUpwind (OF LUST.H)
                 // NB "linearUpwind" has a capital U, so it does NOT contain the substring "upwind" -- the two
                 // must be tested separately or a linearUpwind case reads as "no upwind scheme at all".
-                const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind || lust;
-                // linearUpwindV = linearUpwind + OF's vector direction limiter (internal faces; cut faces use the
-                // plain grad -- exact at np=1). limitedLinear[V] is a TVD flux limiter, a different scheme -> refused.
                 linUpwindV = divLine.find("linearUpwindV") != std::string::npos;
-                const bool unsupported = divLine.find("limitedLinear") != std::string::npos;
-                if (!upwindFamily || unsupported)
+                // limitedLinear (vector) = OF NVDTVD + magSqr: reduce U to s=|U|^2, ONE limiter/face from grad(s).
+                // limitedLinearV = NVDVTVDV + null: ONE limiter/face from the VECTOR U directly. Both build the
+                // limited convection IMPLICITLY into the momentum matrix (a deferred source under-converges). NB
+                // "limitedLinear" is a prefix of "limitedLinearV", so test V FIRST.
+                limitedVsch        = divLine.find("limitedLinearV") != std::string::npos;
+                const bool limited = !limitedVsch && (divLine.find("limitedLinear") != std::string::npos);
+                const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind || lust || limited || limitedVsch;
+                if (limited || limitedVsch)   // parse the coefficient k_ in "limitedLinear[V] k_" -> twoByk = 2/max(k_,SMALL)
+                {
+                    linUpwind = false; lust = false;   // limitedLinear[V] is its own family
+                    limitedU = limited;                // magSqr path
+                    size_t q = divLine.find("limitedLinear") + std::string("limitedLinear").size();
+                    if (q < divLine.size() && divLine[q] == 'V') ++q;   // skip the trailing 'V' of limitedLinearV
+                    std::istringstream cs(divLine.substr(q));
+                    scalar kv = 1.0;
+                    limitedTwoByk = (cs >> kv) ? (2.0 / std::max(kv, static_cast<scalar>(1e-30))) : 2.0;
+                }
+                if (!upwindFamily)
                     throw std::runtime_error(
                         "brae -parallel: div(phi,U) scheme '" + divLine + "' is not implemented on the "
                         "multi-GPU device path (it supports 'Gauss upwind', 'bounded Gauss upwind', "
-                        "'[bounded] Gauss linearUpwind grad(U)' and '[bounded] Gauss LUST grad(U)'). "
-                        "Substituting a scheme would converge to a "
+                        "'[bounded] Gauss linearUpwind[V] grad(U)', '[bounded] Gauss LUST grad(U)' and "
+                        "'[bounded] Gauss limitedLinear[V] k'). Substituting a scheme would converge to a "
                         "DIFFERENT answer than fvSchemes asks for, so this is refused rather than solved "
                         "wrongly. Use `brae -case <dir>` (single GPU) for the full scheme set.");
             }
@@ -369,7 +383,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             std::printf("  relax U=%.2g p=%.2g%s | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s | div(phi,U)=%s\n",
                         relaxU, relaxP, turbulent ? (" k=" + std::to_string(relaxK)).c_str() : "",
                         tolP, tolU, endTime, hasRC ? "on" : "off",
-                        (std::string(boundedDiv ? "bounded " : "") + (lust ? "Gauss LUST" : linUpwind ? "Gauss linearUpwind" : "Gauss upwind")).c_str());
+                        (std::string(boundedDiv ? "bounded " : "") + (lust ? "Gauss LUST" : limitedVsch ? "Gauss limitedLinearV" : limitedU ? "Gauss limitedLinear" : linUpwind ? (linUpwindV ? "Gauss linearUpwindV" : "Gauss linearUpwind") : "Gauss upwind")).c_str());
         }
 
         std::vector<vector> Ug;
@@ -378,6 +392,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         {   // scope: the solver's symmetric-heap buffers must be freed BEFORE Pstream::finalize
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust,
                                         /*linUpwindV*/ linUpwindV, /*nonOrth*/ useNonOrth, /*consistent*/ consistent,
+                                        /*limitedU*/ limitedU, /*limitedTwoByk*/ limitedTwoByk, /*limitedV*/ limitedVsch,
                                         /*amgCacheDir*/ caseDir + "/constant/polyMesh");
             if (turbulent && sa)  solver.enableTurbulenceSA(U0, nuTilda0, nut0, saCoeffs, relaxNuTilda);
             else if (turbulent && lm)  solver.enableTurbulenceSSTLM(U0, k0, eps0, nut0, ReThetat0, gammaInt0, sstCoeffs, relaxK, relaxEps);

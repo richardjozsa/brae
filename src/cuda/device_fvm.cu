@@ -96,6 +96,68 @@ void divLimitedFaceKernel(
 }
 
 
+// limitedLinearV convection: the OF "V" scheme (NVDVTVDV::r + null LimitFunc) -- a SINGLE limiter per face computed
+// from the VECTOR field (not per component, not magSqr): gradfV = U[N]-U[P], gradf = gradfV.gradfV,
+// gradcf = gradfV.(d & gradU[upwind]), r = 2*gradcf/gradf - 1. One limiter -> W applied to all 3 components (the
+// convection matrix is shared, so this feeds mDiag/mUp/mLo implicitly, exactly as the magSqr path does). gU{n}{x,y,z}
+// = grad(U_n) cell fields; d = (Cf-C_own)-(Cf-C_nei) = C[N]-C[P].
+__global__
+void divLimitedVFaceKernel(
+    int nIf,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ cdw,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ U0,
+    const scalar* __restrict__ U1,
+    const scalar* __restrict__ U2,
+    const scalar* __restrict__ gU0x,
+    const scalar* __restrict__ gU0y,
+    const scalar* __restrict__ gU0z,
+    const scalar* __restrict__ gU1x,
+    const scalar* __restrict__ gU1y,
+    const scalar* __restrict__ gU1z,
+    const scalar* __restrict__ gU2x,
+    const scalar* __restrict__ gU2y,
+    const scalar* __restrict__ gU2z,
+    const scalar* __restrict__ dOwnX,
+    const scalar* __restrict__ dOwnY,
+    const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX,
+    const scalar* __restrict__ dNeiY,
+    const scalar* __restrict__ dNeiZ,
+    scalar twoByk,
+    scalar* __restrict__ upper,
+    scalar* __restrict__ lower)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+
+    const int P = own[f], N = nei[f];
+    const scalar p = phi[f];
+    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
+    const scalar g0 = U0[N] - U0[P], g1 = U1[N] - U1[P], g2 = U2[N] - U2[P];   // gradfV = U[N]-U[P]
+    const scalar gradf = g0*g0 + g1*g1 + g2*g2;                                // gradfV . gradfV
+    const int U = (p > 0.0) ? P : N;                                          // strict upwind cell
+    const scalar dgU0 = dx*gU0x[U] + dy*gU0y[U] + dz*gU0z[U];                  // (d & gradU)[k] at the upwind cell
+    const scalar dgU1 = dx*gU1x[U] + dy*gU1y[U] + dz*gU1z[U];
+    const scalar dgU2 = dx*gU2x[U] + dy*gU2y[U] + dz*gU2z[U];
+    const scalar gradcf = g0*dgU0 + g1*dgU1 + g2*dgU2;                         // gradfV . (d & gradU)
+    scalar r;
+    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+    else
+        r = 2.0 * (gradcf / gradf) - 1.0;
+    scalar limiter = twoByk * r;
+    limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);        // clamp(.,0,1)
+    const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
+    const scalar W = limiter * cdw[f] + (1.0 - limiter) * pos0;
+    const scalar lo = -W * p;
+    lower[f] = lo;
+    upper[f] = lo + p;
+}
+
+
 __global__
 void diagGatherKernel(
     int nC,
@@ -371,6 +433,36 @@ void deviceDivLimitedCoeffs(
                                                 dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
                                                 twoByk, upper.data(), lower.data());
     cudaCheck(cudaGetLastError(), "divLimitedFace");
+    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    cudaCheck(cudaGetLastError(), "diagGather");
+}
+
+
+void deviceDivLimitedVCoeffs(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>* U,       // U[3]     component cell fields
+    const DeviceBuffer<scalar>* gUx,     // gUx[3]   d(U_n)/dx
+    const DeviceBuffer<scalar>* gUy,     // gUy[3]   d(U_n)/dy
+    const DeviceBuffer<scalar>* gUz,     // gUz[3]   d(U_n)/dz
+    scalar twoByk,
+    DeviceBuffer<scalar>& diag,
+    DeviceBuffer<scalar>& upper,
+    DeviceBuffer<scalar>& lower)
+{
+    const int nIf = dm.nInternalFaces, nC = dm.nCells;
+    upper.resize(nIf);
+    lower.resize(nIf);
+    diag.resize(nC);
+    divLimitedVFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(),
+                                                 U[0].data(), U[1].data(), U[2].data(),
+                                                 gUx[0].data(), gUy[0].data(), gUz[0].data(),
+                                                 gUx[1].data(), gUy[1].data(), gUz[1].data(),
+                                                 gUx[2].data(), gUy[2].data(), gUz[2].data(),
+                                                 dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
+                                                 dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                                 twoByk, upper.data(), lower.data());
+    cudaCheck(cudaGetLastError(), "divLimitedVFace");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
     cudaCheck(cudaGetLastError(), "diagGather");
 }
