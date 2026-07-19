@@ -128,6 +128,17 @@ void deviceEpsReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, co
 void deviceKReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps,
                      const DeviceBuffer<scalar>& G, const DeviceBuffer<scalar>& divU,
                      DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
+// realizableKE (OF RAS/realizableKE): variable Cmu (rCmu) + strain magnitude magS from the gradU tensor; nut =
+// rCmu*k^2/eps; eps reaction = strain production C1*magS*eps - destruction C2*eps^2/(k+sqrt(nu*eps)). Cell-local
+// (no halo), so the distributed kEps correct reuses them on its already-halo-consistent gradU tensor.
+void deviceRealizableStrain(const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& k,
+                            const DeviceBuffer<scalar>& eps, scalar A0, int nC,
+                            DeviceBuffer<scalar>& rCmu, DeviceBuffer<scalar>& magS);
+void deviceRealizableNut(const DeviceBuffer<scalar>& rCmu, const DeviceBuffer<scalar>& k,
+                         const DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut);
+void deviceEpsReactionRealizable(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,
+                                 const DeviceBuffer<scalar>& magS, scalar nu, scalar C2,
+                                 DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
 
 // Boundary nut per face: wall faces -> nutkWallFunction(k[cell], y, nu); other faces -> nut[cell]. Gives the
 // true wall eddy viscosity for the momentum boundary nuEff (vs the cell-value approximation).

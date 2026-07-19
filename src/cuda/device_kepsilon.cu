@@ -448,7 +448,7 @@ void deviceNut(
 
 
 // realizableKE: rCmu + magS from gradU, nut = rCmu*k^2/eps, eps reaction (strain production + k+sqrt(nu*eps) destruction).
-static void deviceRealizableStrain(
+void deviceRealizableStrain(
     const DeviceBuffer<scalar>& gradU,
     const DeviceBuffer<scalar>& k,
     const DeviceBuffer<scalar>& eps,
@@ -464,7 +464,7 @@ static void deviceRealizableStrain(
 }
 
 
-static void deviceRealizableNut(
+void deviceRealizableNut(
     const DeviceBuffer<scalar>& rCmu,
     const DeviceBuffer<scalar>& k,
     const DeviceBuffer<scalar>& eps,
@@ -477,7 +477,7 @@ static void deviceRealizableNut(
 }
 
 
-static void deviceEpsReactionRealizable(
+void deviceEpsReactionRealizable(
     const DeviceMesh& dm,
     const DeviceBuffer<scalar>& eps,
     const DeviceBuffer<scalar>& k,
