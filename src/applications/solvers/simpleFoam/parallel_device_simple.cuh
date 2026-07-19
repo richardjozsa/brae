@@ -28,6 +28,9 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
 
 namespace brae {
 
@@ -566,7 +569,8 @@ public:
         bool bounded = false,
         bool linearUpwind = false,
         bool lust = false,
-        bool nonOrth = false)
+        bool nonOrth = false,
+        const std::string& amgCacheDir = "")   // polyMesh dir for the per-rank AMG-hierarchy disk cache ("" = off)
         : P_(part),
           nu_(nu),
           relaxU_(relaxU),
@@ -701,8 +705,40 @@ public:
                 const std::vector<label> ownerInt(P_.Lm.mesh.owner().begin(), P_.Lm.mesh.owner().begin() + nIf_);
                 const std::vector<label> neiInt(P_.Lm.mesh.neighbour());
                 std::vector<scalar> fwAMG(P_.lg.magSf().begin(), P_.lg.magSf().begin() + nIf_);   // geometric face area
-                pAMG_ = buildAMG(ownerInt, neiInt, fwAMG, static_cast<int>(lnC_));
+                const bool tS = std::getenv("BRAE_TIME_STARTUP") != nullptr;
+                const auto t0 = std::chrono::high_resolution_clock::now();
+
+                // AMG hierarchy: the agglomeration STRUCTURE is static per (mesh, nProcs), so DISK-CACHE it like the
+                // single-GPU buildOrLoadAMG -- a warm launch reloads instead of re-agglomerating. Per-rank cache file
+                // (each rank's local partition differs); freshness vs the GLOBAL owner (the local mesh is a
+                // deterministic function of it + nProcs). Only the structure is cached; amgGalerkin rebuilds the
+                // coarse VALUES each step. Default ON when a cacheDir is given; BRAE_AMG_CACHE=0 forces a rebuild.
+                bool loaded = false;
+                const bool cacheOn = !amgCacheDir.empty()
+                    && !(std::getenv("BRAE_AMG_CACHE") && std::atoi(std::getenv("BRAE_AMG_CACHE")) == 0);
+                std::string cacheFile;
+                if (cacheOn)
+                {
+                    cacheFile = amgCacheDir + "/.brae_amg_p" + std::to_string(P_.rank)
+                              + "_np" + std::to_string(Pstream::nProcs());
+                    namespace fs = std::filesystem;
+                    std::error_code ec;
+                    const std::string ownerF = amgCacheDir + "/owner";
+                    if (fs::exists(cacheFile, ec) && fs::exists(ownerF, ec)
+                        && fs::last_write_time(cacheFile, ec) >= fs::last_write_time(ownerF, ec))
+                        loaded = loadAMGCache(cacheFile, pAMG_);
+                }
+                if (!loaded)
+                {
+                    pAMG_ = buildAMG(ownerInt, neiInt, fwAMG, static_cast<int>(lnC_));
+                    if (cacheOn) writeAMGCache(pAMG_, cacheFile);
+                }
                 useAMG_ = true;
+                if (tS && P_.rank == 0)
+                    std::printf("[startup] buildAMG      %8.1f ms  (%s, %d levels)\n",
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::high_resolution_clock::now() - t0).count(),
+                                loaded ? "cache HIT" : "built", pAMG_.nLevels());
             }
         }
     }
