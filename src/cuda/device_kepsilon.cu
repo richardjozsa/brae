@@ -1199,6 +1199,57 @@ void deviceKOmegaSSTLMCorrect(
     cudaCheck(cudaGetLastError(), "lmGammaEff");
 }
 
+// ---- Exported LM (kOmegaSSTLM transition) source-prep wrappers ----------------------------------------------
+// The transition kernels + LMCoeffs are cell-local (only gradU needs the halo, which the DISTRIBUTED SST correct
+// already builds). These thin wrappers expose them so parallelDeviceKOmegaSSTLMCorrect can reuse the exact same
+// physics + coefficients, feeding the distributed scalar-transport core -- the realizableKE pattern, two equations.
+void deviceLMReDiff(const DeviceBuffer<scalar>& nut, scalar nu, DeviceBuffer<scalar>& D)
+{
+    const int nC = static_cast<int>(nut.size()); const LMCoeffs lm; D.resize(nC);
+    lmReDiffKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), lm.sigmaThetat, nu, D.data());   // sigmaThetat*(nut+nu)
+    cudaCheck(cudaGetLastError(), "deviceLMReDiff");
+}
+void deviceLMReThetatPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, scalar nu,
+    DeviceBuffer<scalar>& Fth, DeviceBuffer<scalar>& spR, DeviceBuffer<scalar>& suR)
+{
+    const int nC = dm.nCells; const LMCoeffs lm; Fth.resize(nC); spR.resize(nC); suR.resize(nC);
+    lmReThetatPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.cThetat, lm.ce2, 1e-37, lm.lambdaErr, lm.maxIter,
+        Fth.data(), spR.data(), suR.data());
+    cudaCheck(cudaGetLastError(), "deviceLMReThetatPrep");
+}
+void deviceLMGammaPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, scalar nu,
+    DeviceBuffer<scalar>& spG, DeviceBuffer<scalar>& suG)
+{
+    const int nC = dm.nCells; const LMCoeffs lm; spG.resize(nC); suG.resize(nC);
+    lmGammaPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, 1e-37, spG.data(), suG.data());
+    cudaCheck(cudaGetLastError(), "deviceLMGammaPrep");
+}
+void deviceLMGammaEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, const DeviceBuffer<scalar>& Fth,
+    scalar nu, DeviceBuffer<scalar>& gammaIntEff)
+{
+    const int nC = dm.nCells; gammaIntEff.resize(nC);
+    lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, 1e-37, gammaIntEff.data());
+    cudaCheck(cudaGetLastError(), "deviceLMGammaEff");
+}
+void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, const DeviceBuffer<scalar>& su,
+    DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source)
+{
+    lmAddReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), sp.data(), su.data(), diag.data(), source.data());
+    cudaCheck(cudaGetLastError(), "deviceLMAddReaction");
+}
+
 
 // Spalart-Allmaras (one-equation)
 // nuTilda transport, transcribed from SpalartAllmarasBase::correct() (incompressible, steady, ft2=off):

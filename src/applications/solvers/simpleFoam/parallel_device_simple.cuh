@@ -915,6 +915,22 @@ public:
             ++pj;
         }
     }
+    // kOmegaSSTLM (Langtry-Menter transition): the shared SST scaffolding + the two extra transition transport
+    // fields ReThetat/gammaInt (device-resident, with boundaries). step() then runs parallelDeviceKOmegaSSTLMCorrect.
+    void enableTurbulenceSSTLM(const GeometricField<vector>& U0, const GeometricField<scalar>& k0,
+                               const GeometricField<scalar>& omega0, const GeometricField<scalar>& nut0,
+                               const GeometricField<scalar>& ReThetat0, const GeometricField<scalar>& gammaInt0,
+                               const KOmegaSSTCoeffs& co, scalar relaxK = 0.7, scalar relaxOmega = 0.7)
+    {
+        enableTurbulenceSST(U0, k0, omega0, nut0, co, relaxK, relaxOmega);
+        turbModel_ = 2;
+        ReThetat_.copyFrom(ReThetat0.internal);
+        gammaInt_.copyFrom(gammaInt0.internal);
+        dbReThetat_ = buildDeviceBoundary(ReThetat0, P_.lp, P_.lg);
+        dbGammaInt_ = buildDeviceBoundary(gammaInt0, P_.lp, P_.lg);
+    }
+    std::vector<scalar> reconstructReThetat() const { return reconstructField(P_.Lm.cellProcAddr, ReThetat_.host(), P_.globalNCells); }
+    std::vector<scalar> reconstructGammaInt() const { return reconstructField(P_.Lm.cellProcAddr, gammaInt_.host(), P_.globalNCells); }
     std::vector<scalar> reconstructK()   const { return reconstructField(P_.Lm.cellProcAddr, k_.host(),   P_.globalNCells); }
     std::vector<scalar> reconstructEps() const { return reconstructField(P_.Lm.cellProcAddr, eps_.host(), P_.globalNCells); }
     std::vector<scalar> reconstructNut() const { return reconstructField(P_.Lm.cellProcAddr, nut_.host(), P_.globalNCells); }
@@ -991,8 +1007,10 @@ private:
     bool turbulent_ = false;
     scalar relaxK_ = 0.7, relaxEps_ = 0.7;
     DeviceBuffer<scalar> k_, eps_, nut_;
+    DeviceBuffer<scalar> ReThetat_, gammaInt_;   // kOmegaSSTLM (turbModel_==2) transition transport fields
     DeviceWallData wall_;
     DeviceBoundary dbK_, dbEps_;
+    DeviceBoundary dbReThetat_, dbGammaInt_;     // kOmegaSSTLM transition-field boundaries
     DeviceBuffer<label> isWallCell_;
     DeviceBuffer<label> bndIsWall_;   // per-boundary-face wall mask (for deviceBoundaryNut)
     DeviceBuffer<scalar> bndY_;       // per-boundary-face near-wall distance
@@ -1490,7 +1508,14 @@ inline ParStepResidual ParallelDeviceSimple::step()
                                 cudaMemcpyDeviceToDevice, cudaStreamPerThread),
                 "phiFc cut slice");
         }
-        if (turbModel_ == 1)   // k-omega SST (eps_ holds omega)
+        if (turbModel_ == 2)   // k-omega SST + Langtry-Menter transition (eps_ holds omega)
+        {
+            parallelDeviceKOmegaSSTLMCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, dbReThetat_, dbGammaInt_,
+                Uk_[0], Uk_[1], Uk_[2], k_, eps_, nut_, ReThetat_, gammaInt_, yCell_,
+                phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_,
+                isWallCell_, nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, sstCoeffs_);
+        }
+        else if (turbModel_ == 1)   // k-omega SST (eps_ holds omega)
         {
             parallelDeviceKOmegaSSTCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, Uk_[0], Uk_[1], Uk_[2],
                 k_, eps_, nut_, yCell_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_,
