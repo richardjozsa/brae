@@ -113,18 +113,35 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const bool turbulent = (simType == "RAS");
         KEpsilonCoeffs keCoeffs;
         KOmegaSSTCoeffs sstCoeffs;
-        bool sst = false, lm = false;
+        SpalartAllmarasCoeffs saCoeffs;
+        bool sst = false, lm = false, sa = false;
         if (turbulent)
         {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE" && model != "kOmegaSSTLM")
+            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE"
+                && model != "kOmegaSSTLM" && model != "SpalartAllmaras")
                 throw std::runtime_error(
                     "brae -parallel: RASModel '" + model + "' is not implemented on the multi-GPU device path "
-                    "(kEpsilon, realizableKE, kOmegaSST and kOmegaSSTLM are). Use `mpirun -np N brae_simpleFoam "
-                    "-case <dir>` (host) or `brae -case <dir>` (single GPU) for other models.");
+                    "(kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM and SpalartAllmaras are). Use `mpirun -np N "
+                    "brae_simpleFoam -case <dir>` (host) or `brae -case <dir>` (single GPU) for other models.");
             sst = (model == "kOmegaSST" || model == "kOmegaSSTLM");   // LM reuses the SST scaffolding (omega field)
             lm  = (model == "kOmegaSSTLM");
+            sa  = (model == "SpalartAllmaras");
+            if (sa)   // OF defaults are in the struct; read the SpalartAllmarasCoeffs overrides if present
+            {
+                const FoamDict* sac = ras ? ras->subDict("SpalartAllmarasCoeffs") : nullptr;
+                if (sac)
+                {
+                    saCoeffs.sigmaNut = sac->scalarOr("sigmaNut", saCoeffs.sigmaNut);
+                    saCoeffs.Cb1 = sac->scalarOr("Cb1", saCoeffs.Cb1);
+                    saCoeffs.Cb2 = sac->scalarOr("Cb2", saCoeffs.Cb2);
+                    saCoeffs.Cw2 = sac->scalarOr("Cw2", saCoeffs.Cw2);
+                    saCoeffs.Cw3 = sac->scalarOr("Cw3", saCoeffs.Cw3);
+                    saCoeffs.Cv1 = sac->scalarOr("Cv1", saCoeffs.Cv1);
+                    saCoeffs.kappa = sac->scalarOr("kappa", saCoeffs.kappa);
+                }
+            }
             if (model == "realizableKE")
             {
                 // realizableKE (OF RAS/realizableKE): variable-Cmu strain model, shares the k-eps loop but with
@@ -231,6 +248,9 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const scalar relaxP = fld ? fld->scalarOr("p", 1.0) : 1.0;
         const scalar relaxK   = eqs ? eqs->scalarOr("k", 1.0) : 1.0;
         const scalar relaxEps = eqs ? eqs->scalarOr("epsilon", 1.0) : 1.0;
+        // SpalartAllmaras relaxes ONE field (nuTilda) -- read it explicitly (there is no "k"); default 0.7 (a safe SA
+        // under-relaxation) rather than 1.0, else the unrelaxed nuTilda destabilises after ~200 iters.
+        const scalar relaxNuTilda = eqs ? eqs->scalarOr("nuTilda", 0.7) : 0.7;
 
         const FoamDict* solvers = fvSolution.subDict("solvers");
         auto solverTol = [&](const std::string& f, scalar def)
@@ -313,23 +333,32 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         p0.evaluateBoundary();
         lap("distribute");
 
-        // turbulence start fields (RAS kEpsilon; + ReThetat/gammaInt for the kOmegaSSTLM transition model)
-        FieldData<scalar> kfd, efd, nfd, rfd, gfd;
-        GeometricField<scalar> k0, eps0, nut0, ReThetat0, gammaInt0;
+        // turbulence start fields: kEps/SST read k + eps|omega + nut (+ ReThetat/gammaInt for LM); SpalartAllmaras
+        // is one-equation -> nuTilda + nut only (no k/eps).
+        FieldData<scalar> kfd, efd, nfd, rfd, gfd, ntfd;
+        GeometricField<scalar> k0, eps0, nut0, ReThetat0, gammaInt0, nuTilda0;
         if (turbulent)
         {
-            kfd = readField<scalar>(fieldDir + "/k");
-            efd = readField<scalar>(fieldDir + "/" + (sst ? "omega" : "epsilon"));
             nfd = readField<scalar>(fieldDir + "/nut");
-            k0   = distributeField<scalar>(kfd, gm.patches(), P.Lm, P.lp, P.procW, rank); k0.evaluateBoundary();
-            eps0 = distributeField<scalar>(efd, gm.patches(), P.Lm, P.lp, P.procW, rank); eps0.evaluateBoundary();
             nut0 = distributeField<scalar>(nfd, gm.patches(), P.Lm, P.lp, P.procW, rank); nut0.evaluateBoundary();
-            if (lm)
+            if (sa)
             {
-                rfd = readField<scalar>(fieldDir + "/ReThetat");
-                gfd = readField<scalar>(fieldDir + "/gammaInt");
-                ReThetat0 = distributeField<scalar>(rfd, gm.patches(), P.Lm, P.lp, P.procW, rank); ReThetat0.evaluateBoundary();
-                gammaInt0 = distributeField<scalar>(gfd, gm.patches(), P.Lm, P.lp, P.procW, rank); gammaInt0.evaluateBoundary();
+                ntfd = readField<scalar>(fieldDir + "/nuTilda");
+                nuTilda0 = distributeField<scalar>(ntfd, gm.patches(), P.Lm, P.lp, P.procW, rank); nuTilda0.evaluateBoundary();
+            }
+            else
+            {
+                kfd = readField<scalar>(fieldDir + "/k");
+                efd = readField<scalar>(fieldDir + "/" + (sst ? "omega" : "epsilon"));
+                k0   = distributeField<scalar>(kfd, gm.patches(), P.Lm, P.lp, P.procW, rank); k0.evaluateBoundary();
+                eps0 = distributeField<scalar>(efd, gm.patches(), P.Lm, P.lp, P.procW, rank); eps0.evaluateBoundary();
+                if (lm)
+                {
+                    rfd = readField<scalar>(fieldDir + "/ReThetat");
+                    gfd = readField<scalar>(fieldDir + "/gammaInt");
+                    ReThetat0 = distributeField<scalar>(rfd, gm.patches(), P.Lm, P.lp, P.procW, rank); ReThetat0.evaluateBoundary();
+                    gammaInt0 = distributeField<scalar>(gfd, gm.patches(), P.Lm, P.lp, P.procW, rank); gammaInt0.evaluateBoundary();
+                }
             }
         }
 
@@ -350,7 +379,8 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust,
                                         /*nonOrth*/ useNonOrth, /*consistent*/ consistent,
                                         /*amgCacheDir*/ caseDir + "/constant/polyMesh");
-            if (turbulent && lm)  solver.enableTurbulenceSSTLM(U0, k0, eps0, nut0, ReThetat0, gammaInt0, sstCoeffs, relaxK, relaxEps);
+            if (turbulent && sa)  solver.enableTurbulenceSA(U0, nuTilda0, nut0, saCoeffs, relaxNuTilda);
+            else if (turbulent && lm)  solver.enableTurbulenceSSTLM(U0, k0, eps0, nut0, ReThetat0, gammaInt0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
             lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc

@@ -225,6 +225,18 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
+// Spalart-Allmaras source-prep, exported for the distributed SA correct. Cell-local (gradU + grad(nuTilda) supplied
+// by the caller). Stilda/Fw/DEff/Reaction reuse the anon kernels; deviceSAReaction ACCUMULATES (+=) -> zero first.
+void deviceSAStilda(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda,
+    const DeviceBuffer<scalar>& y, scalar nu, const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& Stilda);
+void deviceSAFw(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, const DeviceBuffer<scalar>& Stilda,
+    const DeviceBuffer<scalar>& y, const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& fw);
+void deviceSAMagSqr(const DeviceMesh& dm, const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& out);
+void deviceSADEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar sigmaNut, DeviceBuffer<scalar>& D);
+void deviceSAReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, const DeviceBuffer<scalar>& Stilda,
+    const DeviceBuffer<scalar>& fw, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& gradNt2,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src);
 
 // nutUSpaldingWallFunction boundary nut: wall faces -> Newton uTau from Spalding; other faces -> adjacent cell nut.
 // y / isWall are per boundary face (nearWallDist y, wall mask); nutBnd is in/out (warm-started seed). nu+nutBnd at
