@@ -1323,6 +1323,12 @@ inline ParStepResidual ParallelDeviceSimple::step()
         deviceLaplacianCoeffs(dm_, drAtUf, ld, lu, ll, nonOrth_);
         deviceMatrixFluxInternal(deviceLduView(dm_, ld, lu, ll), dp_, fInt);
         deviceAxpy(1.0, fInt, phiHbyAint);
+        if (nonOrth_)   // explicit non-orth part of the SIMPLEC flux correction: interp(drAtU)*(corrVec.grad(p))*magSf
+        {
+            DeviceBuffer<scalar> ffcS;
+            deviceLaplacianCorrFlux(dm_, drAtUf, gx, gy, gz, ffcS);
+            deviceAxpy(1.0, ffcS, phiHbyAint);
+        }
         DeviceBuffer<scalar> dIC, dBC, fBnd;
         deviceBCLaplacianCoeffs(dbP_, drAtU, dIC, dBC);
         deviceMatrixFluxBoundary(dbP_, dIC, dBC, dp_, fBnd);
