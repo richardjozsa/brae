@@ -144,6 +144,18 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
 // unless BRAE_AMG_FP32 (default on) and the default smoother/aggregation (SA/GS/Chebyshev stay FP64).
 void amgPrepareFP32(AMGData& amg, const DeviceLduView& A);
 
+class DeviceHalo;   // fwd (parallel/pstream/device_halo.cuh)
+
+// DISTRIBUTED whole-loop graph PCG: the entire steady-state PCG WHILE body captured once into a conditional CUDA
+// graph and replayed on-device (no per-iteration host launches), with deviceParallelAmul (halo) + on-stream
+// NVSHMEM reduces INSIDE the captured body. Real-multi-GPU only (1 PE/GPU; the MPG host-MPI reduce fallback is
+// not graph-capturable). Captures once per run only if the caller holds psi/matrix buffers persistent.
+DeviceSolverPerf deviceParallelAMGPCGGraph(
+    const DeviceLduView& A, AMGData& amg, DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
+    scalar normFactor, scalar tol, scalar relTol, int maxIter);
+
 // #7 (clusters+DSM): the coarse-level weighted-Jacobi solve (nSweeps of x += omega*(b-Ax)/diag), fused into a
 // SINGLE thread-block-cluster kernel, the whole coarse vector lives in the cluster's distributed shared memory
 // and all sweeps run with cluster.sync() between them (1 launch instead of 2*nSweeps). xc is the in/out guess.
