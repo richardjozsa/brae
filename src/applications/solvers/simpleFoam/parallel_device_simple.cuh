@@ -245,6 +245,23 @@ void subtractSliceKernel(scalar* __restrict__ dst, int offset, const scalar* __r
     dst[offset + f] -= src[f];
 }
 
+// out[f] = bndField[offset + f] * geom[f]  (the processor-interface coupling coefficient, on-device). Replaces the
+// per-interface host loop `coeff = fieldAtCut * magSf * procDelta` that forced a full .host() D2D sync of the cut
+// field every SIMPLE step: fieldAtCut is already a DEVICE boundary array (halo-scattered) and geom = magSf*delta is
+// static (built once in the ctor), so the whole coefficient is a fused device multiply -- no round-trip.
+__global__
+void interfaceCoeffKernel(
+    scalar*       __restrict__ out,
+    const scalar* __restrict__ bndField,
+    int offset,
+    const scalar* __restrict__ geom,
+    int n)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    out[f] = bndField[offset + f] * geom[f];
+}
+
 } // namespace detail
 
 // Add the processor faces' linearUpwind deferred correction into `corr` (which already holds the internal
@@ -671,6 +688,13 @@ public:
                 magSfD_.back().copyFrom(ms);
                 nuFaceD_.emplace_back();
                 nuFaceD_.back().copyFrom(nf);
+                // geomIf = magSf * (nonOrth ? procNonOrth : procDelta): the static device geometry factor of the
+                // momentum + pEqn interface coefficients (Phase A -- lets those coeffs build on-device, no .host()).
+                std::vector<scalar> gi(lp[pi].size);
+                for (label i = 0; i < lp[pi].size; ++i)
+                    gi[i] = ms[i] * (nonOrth_ ? procNonOrth_[pj][i] : P_.procDelta[pj][i]);
+                geomIf_.emplace_back();
+                geomIf_.back().copyFrom(gi);
                 ++pj;
             }
         }
@@ -970,6 +994,10 @@ private:
     DeviceBuffer<label> bndIsWall_;   // per-boundary-face wall mask (for deviceBoundaryNut)
     DeviceBuffer<scalar> bndY_;       // per-boundary-face near-wall distance
     std::vector<DeviceBuffer<scalar>> geomD_;   // magSf*procDelta per interface (for the k/eps interface gamma)
+    // magSf * (nonOrth ? procNonOrth : procDelta) per processor interface, static (nonOrth_ is fixed at ctor). The
+    // device geometry factor of the momentum + pEqn interface coefficients, so those coeffs build on-device from the
+    // halo-scattered cut field instead of a per-step .host() round-trip (Phase A: device-resident assembly).
+    std::vector<DeviceBuffer<scalar>> geomIf_;
     KEpsilonCoeffs keCoeffs_;
     int  turbModel_ = 0;             // 0 = k-epsilon, 1 = k-omega SST
     KOmegaSSTCoeffs sstCoeffs_;
@@ -1028,8 +1056,6 @@ inline ParStepResidual ParallelDeviceSimple::step()
 {
     ParStepResidual res;
     ++iter_;
-    const std::vector<FvPatch>& lp = P_.lp;
-    const FvGeometry& lg = P_.lg;
 
     // ---- effective viscosity for this step: nu (laminar) or nu + nut (turbulent, refreshed from the model) ----
     // Laminar: nuEffCell = nuCell_ (=nu), nuEffBndEff = nuEffBnd_ (=nu), nuEff_f = nu, nuEffScatBnd = nu-at-cut.
@@ -1054,7 +1080,6 @@ inline ParStepResidual ParallelDeviceSimple::step()
     halo_.exchange(nuEffCell.data());
     halo_.scatterBoundaryValues(nuEffCell.data(), weightsD_, procStart_, nuEffScatBnd.data());
     halo_.waitExchange();
-    const std::vector<scalar> nuEffScatH = nuEffScatBnd.host();
 
     // ---- momentum matrix: div(phi,U) - laplacian(nuEff,U), + processor interface ----
     DeviceBuffer<scalar> mDiag, mUp, mLo, lD, lU, lL;
@@ -1075,29 +1100,25 @@ inline ParStepResidual ParallelDeviceSimple::step()
         deviceAxpy(-1.0, sp, mDiag);
     }
 
-    const std::vector<scalar> phiBndH = phiBnd_.host();
-    std::vector<DeviceBuffer<scalar>> phiF, coeffGeo;
+    // Processor-interface coupling, ON-DEVICE (Phase A): phiF[i] = the cut-face flux (a device slice of phiBnd_),
+    // coeffGeo[i] = nuEff-at-cut * geomIf_[i] via interfaceCoeffKernel. Both were a per-step .host() round-trip of
+    // phiBnd_ and nuEffScatBnd + a host multiply; now the whole coefficient stays on the device.
+    const int nIface = halo_.nInterfaces();
+    std::vector<DeviceBuffer<scalar>> phiF(nIface), coeffGeo(nIface);
     {
-        std::size_t pj = 0;
-        label bi = 0;
-        for (std::size_t pi = 0; pi < lp.size(); ++pi)
+        constexpr int TPB = 128;
+        for (int i = 0; i < nIface; ++i)
         {
-            if (lp[pi].type == "cyclic" || lp[pi].type == "cyclicAMI") continue;
-            if (lp[pi].type == "processor")
-            {
-                DeviceBuffer<scalar> pf;
-                pf.copyFrom(std::vector<scalar>(phiBndH.begin() + bi, phiBndH.begin() + bi + lp[pi].size));
-                phiF.push_back(std::move(pf));
-                std::vector<scalar> cg(lp[pi].size);
-                for (label i = 0; i < lp[pi].size; ++i)
-                    cg[i] = nuEffScatH[bi + i] * lg.magSf()[lp[pi].start + i]
-                          * (nonOrth_ ? procNonOrth_[pj][i] : P_.procDelta[pj][i]);
-                DeviceBuffer<scalar> cgd;
-                cgd.copyFrom(cg);
-                coeffGeo.push_back(std::move(cgd));
-                ++pj;
-            }
-            bi += lp[pi].size;
+            const int n = static_cast<int>(halo_.size(i));
+            if (n <= 0) continue;
+            phiF[i].resize(n);
+            cudaCheck(
+                cudaMemcpyAsync(phiF[i].data(), phiBnd_.data() + procStart_[i], n * sizeof(scalar),
+                                cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                "phiF cut slice");
+            coeffGeo[i].resize(n);
+            detail::interfaceCoeffKernel<<<(n + TPB - 1) / TPB, TPB, 0, cudaStreamPerThread>>>(
+                coeffGeo[i].data(), nuEffScatBnd.data(), static_cast<int>(procStart_[i]), geomIf_[i].data(), n);
         }
     }
     std::vector<DeviceBuffer<scalar>> ifCoeff;
@@ -1285,26 +1306,18 @@ inline ParStepResidual ParallelDeviceSimple::step()
     DeviceBuffer<scalar>& pU_ = pUp_;   // persistent (graph-referenced): stable address -> whole-loop graph captures once
     DeviceBuffer<scalar>& pL_ = pLp_;
     deviceLaplacianCoeffs(dm_, rAUf_int, pD, pU_, pL_, nonOrth_);
-    const std::vector<scalar> rAUbndH = rAUbnd.host();
-    std::vector<DeviceBuffer<scalar>> pCoeffGeo;
+    // pEqn interface coeff ON-DEVICE (Phase A): pCoeffGeo[i] = rAU-at-cut * geomIf_[i], the same fused device
+    // multiply as the momentum coeff above -- replaces the per-step rAUbnd.host() round-trip + host loop.
+    std::vector<DeviceBuffer<scalar>> pCoeffGeo(nIface);
     {
-        std::size_t pj = 0;
-        label bi = 0;
-        for (std::size_t pi = 0; pi < lp.size(); ++pi)
+        constexpr int TPB = 128;
+        for (int i = 0; i < nIface; ++i)
         {
-            if (lp[pi].type == "cyclic" || lp[pi].type == "cyclicAMI") continue;
-            if (lp[pi].type == "processor")
-            {
-                std::vector<scalar> cg(lp[pi].size);
-                for (label i = 0; i < lp[pi].size; ++i)
-                    cg[i] = rAUbndH[bi + i] * lg.magSf()[lp[pi].start + i]
-                          * (nonOrth_ ? procNonOrth_[pj][i] : P_.procDelta[pj][i]);
-                DeviceBuffer<scalar> cgd;
-                cgd.copyFrom(cg);
-                pCoeffGeo.push_back(std::move(cgd));
-                ++pj;
-            }
-            bi += lp[pi].size;
+            const int n = static_cast<int>(halo_.size(i));
+            if (n <= 0) continue;
+            pCoeffGeo[i].resize(n);
+            detail::interfaceCoeffKernel<<<(n + TPB - 1) / TPB, TPB, 0, cudaStreamPerThread>>>(
+                pCoeffGeo[i].data(), rAUbnd.data(), static_cast<int>(procStart_[i]), geomIf_[i].data(), n);
         }
     }
     std::vector<DeviceBuffer<scalar>>& pIfCoeff = pIfCoeffp_;   // persistent (graph-referenced)
@@ -1418,21 +1431,16 @@ inline ParStepResidual ParallelDeviceSimple::step()
         // momentum interface), but OF runs turbulence->correct() with the NEW phi. At np=1 this is moot (no
         // interface), but at np>1 the cut would otherwise convect k/eps with a STALE flux while the interior
         // used the fresh phiInt_ -- inconsistent across the cut. Rebuild it from the maintained phiBnd_.
-        std::vector<DeviceBuffer<scalar>> phiFc;
+        std::vector<DeviceBuffer<scalar>> phiFc(nIface);   // ON-DEVICE cut-flux slices (Phase A: no phiBnd_.host())
+        for (int i = 0; i < nIface; ++i)
         {
-            const std::vector<scalar> pbH = phiBnd_.host();
-            label bi = 0;
-            for (std::size_t pi = 0; pi < lp.size(); ++pi)
-            {
-                if (lp[pi].type == "cyclic" || lp[pi].type == "cyclicAMI") continue;
-                if (lp[pi].type == "processor")
-                {
-                    DeviceBuffer<scalar> pf;
-                    pf.copyFrom(std::vector<scalar>(pbH.begin() + bi, pbH.begin() + bi + lp[pi].size));
-                    phiFc.push_back(std::move(pf));
-                }
-                bi += lp[pi].size;
-            }
+            const int n = static_cast<int>(halo_.size(i));
+            if (n <= 0) continue;
+            phiFc[i].resize(n);
+            cudaCheck(
+                cudaMemcpyAsync(phiFc[i].data(), phiBnd_.data() + procStart_[i], n * sizeof(scalar),
+                                cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                "phiFc cut slice");
         }
         if (turbModel_ == 1)   // k-omega SST (eps_ holds omega)
         {
