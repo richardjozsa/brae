@@ -8,6 +8,7 @@
 #include "cf_pstream.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cstdlib>
 
 
 namespace brae {
@@ -385,6 +386,7 @@ DeviceSolverPerf deviceParallelAMGPCG(
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC), ApA;
 
     amgPrepareFP32(amg, A);   // cast the local hierarchy to FP32 once (matrices are current post-amgGalerkin) -> FP32 V-cycles
+    static const bool g_parGraph = std::getenv("BRAE_PARALLEL_GRAPH") && std::atoi(std::getenv("BRAE_PARALLEL_GRAPH")) != 0;
 
     deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);          // rA = b - A*psi  (interface-coupled)
     deviceCopy(rA, b);
@@ -394,7 +396,7 @@ DeviceSolverPerf deviceParallelAMGPCG(
     scalar red[2];
     auto fusedReduce = [&]()   // wA = M^-1 rA (LOCAL AMG V-cycle) ; red = [ dot(wA,rA), sumMag(rA) ] in ONE collective
     {
-        amgVCycleApply(amg, A, rA, wA);                         // <-- the only change vs deviceParallelJacobiPCG
+        amgVCycleApply(amg, A, rA, wA, g_parGraph);             // <-- the only change vs deviceParallelJacobiPCG (opt: graph replay)
         red[0] = deviceDot(wA, rA);
         red[1] = deviceSumMag(rA);
         Pstream::allReduce(red, 2, ReduceOp::Sum);

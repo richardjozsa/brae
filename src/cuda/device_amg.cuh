@@ -134,8 +134,10 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
 // Used by the distributed Krylov (deviceParallelAMGPCG) to precondition each rank's LOCAL block with AMG -- the
 // V-cycle is internal-face only, so it omits the processor interface (block-Jacobi/additive-Schwarz: the outer
 // distributed matvec supplies the interface coupling). amg must be built (buildAMG) and current (amgGalerkin).
+// captureVcycle: replay the V-cycle from a cached CUDA graph (keyed on A.diag) instead of launching every kernel,
+// removing the launch overhead of the V-cycle's many small kernels. Default false (direct launch).
 void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
-                    const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z);
+                    const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle = false);
 
 // Prepare the FP32 mixed-precision V-cycle for this solve: cast the (Galerkin-updated) matrices to FP32 mirrors.
 // Call ONCE per solve before the amgVCycleApply loop; after it, amgVCycleApply runs FP32 automatically. No-op

@@ -2900,19 +2900,66 @@ void amgPrepareFP32(AMGData& amg, const DeviceLduView& A)
 // approximate the local block. amg must be built (buildAMG) and current (amgGalerkin gives it this step's coarse
 // operators). Runs the FP32 V-cycle when amgPrepareFP32 cast the matrices this solve, else the FP64 one.
 void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
-                    const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z)
+                    const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle)
 {
     ensureSpectrum(amg, A);                // one-time Chebyshev spectrum estimate (no-op unless the Chebyshev smoother is on)
     const bool fp32 = amg.fp32Alloc && useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    const int nC = A.nCells;
+
+    if (!captureVcycle)
+    {
+        // DIRECT launch (default): every V-cycle kernel is a fresh launch.
+        if (fp32)
+        {
+            const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);         // grid-0 FP32 matrix view
+            cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, r.data(), amg.vBF[0].data());   // r -> FP32
+            vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());              // FP32 V-cycle
+            cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), z.data());   // FP32 -> z (FP64)
+        }
+        else vcycleAt(0, amg, A, r, z);    // FP64 V-cycle
+        return;
+    }
+
+    // GRAPH REPLAY: the V-cycle is host-scalar-free and runs on FIXED buffers (amg.rA/wA), so capture it once
+    // (keyed on A.diag; the coarse VALUES change each step but the graph references the buffers, read at replay) and
+    // replay -- removing the launch overhead of the V-cycle's many small kernels (13 levels x SpMV+smoother per PCG
+    // iter, the dominant per-iteration launch cost). Copy r -> persistent amg.rA, replay, amg.wA -> z. Same
+    // capture/replay the single-GPU deviceAMGPCG uses; now available to the distributed pressure solve.
+    deviceCopy(amg.rA, r);
     if (fp32)
     {
-        const int nC = A.nCells;
-        const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);   // grid-0 FP32 matrix view
-        cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, r.data(), amg.vBF[0].data());   // r -> FP32
-        vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());              // FP32 V-cycle
-        cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), z.data());   // FP32 -> z (FP64)
+        const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);
+        AMGGraphCache& gcf = *amg.gcacheF;
+        if (!gcf.exec || gcf.key != A.diag)
+        {
+            if (gcf.exec)  { cudaGraphExecDestroy(gcf.exec);  gcf.exec  = nullptr; }
+            if (gcf.graph) { cudaGraphDestroy(gcf.graph);     gcf.graph = nullptr; }
+            cudaCheck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal), "amgF capture begin");
+            cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, amg.rA.data(), amg.vBF[0].data());
+            vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
+            cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), amg.wA.data());
+            cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gcf.graph), "amgF capture end");
+            cudaCheck(cudaGraphInstantiate(&gcf.exec, gcf.graph, 0), "amgF graph instantiate");
+            gcf.key = A.diag;
+        }
+        cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
     }
-    else vcycleAt(0, amg, A, r, z);        // z = M^-1 r, one symmetric FP64 V-cycle down the local hierarchy and back
+    else
+    {
+        AMGGraphCache& gc = *amg.gcache;
+        if (!gc.exec || gc.key != A.diag)
+        {
+            if (gc.exec)  { cudaGraphExecDestroy(gc.exec);  gc.exec  = nullptr; }
+            if (gc.graph) { cudaGraphDestroy(gc.graph);     gc.graph = nullptr; }
+            cudaCheck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal), "amg capture begin");
+            vcycleAt(0, amg, A, amg.rA, amg.wA);
+            cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gc.graph), "amg capture end");
+            cudaCheck(cudaGraphInstantiate(&gc.exec, gc.graph, 0), "amg graph instantiate");
+            gc.key = A.diag;
+        }
+        cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
+    }
+    deviceCopy(z, amg.wA);
 }
 
 } // namespace brae
