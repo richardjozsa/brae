@@ -113,17 +113,18 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const bool turbulent = (simType == "RAS");
         KEpsilonCoeffs keCoeffs;
         KOmegaSSTCoeffs sstCoeffs;
-        bool sst = false;
+        bool sst = false, lm = false;
         if (turbulent)
         {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE")
+            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE" && model != "kOmegaSSTLM")
                 throw std::runtime_error(
                     "brae -parallel: RASModel '" + model + "' is not implemented on the multi-GPU device path "
-                    "(kEpsilon, realizableKE and kOmegaSST are). Use `mpirun -np N brae_simpleFoam -case <dir>` "
-                    "(host) or `brae -case <dir>` (single GPU) for other models.");
-            sst = (model == "kOmegaSST");
+                    "(kEpsilon, realizableKE, kOmegaSST and kOmegaSSTLM are). Use `mpirun -np N brae_simpleFoam "
+                    "-case <dir>` (host) or `brae -case <dir>` (single GPU) for other models.");
+            sst = (model == "kOmegaSST" || model == "kOmegaSSTLM");   // LM reuses the SST scaffolding (omega field)
+            lm  = (model == "kOmegaSSTLM");
             if (model == "realizableKE")
             {
                 // realizableKE (OF RAS/realizableKE): variable-Cmu strain model, shares the k-eps loop but with
@@ -312,9 +313,9 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         p0.evaluateBoundary();
         lap("distribute");
 
-        // turbulence start fields (RAS kEpsilon)
-        FieldData<scalar> kfd, efd, nfd;
-        GeometricField<scalar> k0, eps0, nut0;
+        // turbulence start fields (RAS kEpsilon; + ReThetat/gammaInt for the kOmegaSSTLM transition model)
+        FieldData<scalar> kfd, efd, nfd, rfd, gfd;
+        GeometricField<scalar> k0, eps0, nut0, ReThetat0, gammaInt0;
         if (turbulent)
         {
             kfd = readField<scalar>(fieldDir + "/k");
@@ -323,6 +324,13 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             k0   = distributeField<scalar>(kfd, gm.patches(), P.Lm, P.lp, P.procW, rank); k0.evaluateBoundary();
             eps0 = distributeField<scalar>(efd, gm.patches(), P.Lm, P.lp, P.procW, rank); eps0.evaluateBoundary();
             nut0 = distributeField<scalar>(nfd, gm.patches(), P.Lm, P.lp, P.procW, rank); nut0.evaluateBoundary();
+            if (lm)
+            {
+                rfd = readField<scalar>(fieldDir + "/ReThetat");
+                gfd = readField<scalar>(fieldDir + "/gammaInt");
+                ReThetat0 = distributeField<scalar>(rfd, gm.patches(), P.Lm, P.lp, P.procW, rank); ReThetat0.evaluateBoundary();
+                gammaInt0 = distributeField<scalar>(gfd, gm.patches(), P.Lm, P.lp, P.procW, rank); gammaInt0.evaluateBoundary();
+            }
         }
 
         if (master)
@@ -342,7 +350,8 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust,
                                         /*nonOrth*/ useNonOrth, /*consistent*/ consistent,
                                         /*amgCacheDir*/ caseDir + "/constant/polyMesh");
-            if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
+            if (turbulent && lm)  solver.enableTurbulenceSSTLM(U0, k0, eps0, nut0, ReThetat0, gammaInt0, sstCoeffs, relaxK, relaxEps);
+            else if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
             lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc
 

@@ -139,6 +139,28 @@ void deviceRealizableNut(const DeviceBuffer<scalar>& rCmu, const DeviceBuffer<sc
 void deviceEpsReactionRealizable(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,
                                  const DeviceBuffer<scalar>& magS, scalar nu, scalar C2,
                                  DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
+// kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition) source-prep, exported for the distributed LM correct.
+// Cell-local (gradU is the only halo-coupled input, provided by the caller). ReThetat/gammaInt are the two extra
+// transport fields; deviceLMReDiff = sigmaThetat*(nut+nu); Prep fills the semi-implicit sp/su + Fth; GammaEff the
+// effective intermittency (feeds the SST k-production modulation); AddReaction folds sp/su into a transport diag/src.
+void deviceLMReDiff(const DeviceBuffer<scalar>& nut, scalar nu, DeviceBuffer<scalar>& D);
+void deviceLMReThetatPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, scalar nu,
+    DeviceBuffer<scalar>& Fth, DeviceBuffer<scalar>& spR, DeviceBuffer<scalar>& suR);
+void deviceLMGammaPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, scalar nu,
+    DeviceBuffer<scalar>& spG, DeviceBuffer<scalar>& suG);
+void deviceLMGammaEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, const DeviceBuffer<scalar>& Fth,
+    scalar nu, DeviceBuffer<scalar>& gammaIntEff);
+void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, const DeviceBuffer<scalar>& su,
+    DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
 
 // Boundary nut per face: wall faces -> nutkWallFunction(k[cell], y, nu); other faces -> nut[cell]. Gives the
 // true wall eddy viscosity for the momentum boundary nuEff (vs the cell-value approximation).
