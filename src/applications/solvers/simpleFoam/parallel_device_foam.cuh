@@ -25,6 +25,8 @@
 #include "parallel_simple.cuh"
 #include "field_distribute.cuh"
 #include "parallel_device_simple.cuh"
+#include "mrf_read.cuh"   // readMRFProperties / readCellZones / mrfCorrectBoundaryVelocity
+#include "mrf_zone.cuh"   // MRFZone / buildMRFZone
 #include "cf_pstream.cuh"
 
 #include <cmath>
@@ -36,6 +38,7 @@
 #include <vector>
 #include <chrono>
 #include <cstdlib>
+#include <unordered_set>
 
 namespace brae {
 
@@ -347,6 +350,34 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         p0.evaluateBoundary();
         lap("distribute");
 
+        // MRF rotating cell zone (constant/MRFProperties + polyMesh/cellZones), if present. Read the GLOBAL zone
+        // and map it to THIS rank's local cells (cellProcAddr is local->global); build a per-rank MRFZone. The
+        // in-zone velocity-fixing walls take U = Omega x (Cf-origin), then setMRF (after the solver is built) makes
+        // the resident flux relative and wires the Coriolis source. Done before the solver ctor so phi0 = flux(U0)
+        // already includes the rotating walls, exactly as single-GPU gpuSimpleFoam.
+        const MRFConfig mrfCfg = readMRFProperties(caseDir + "/constant");
+        MRFZone mrfZone;
+        if (mrfCfg.active)
+        {
+            const auto zones = readCellZones(caseDir + "/constant/polyMesh");
+            const auto it = zones.find(mrfCfg.cellZone);
+            if (it == zones.end())
+                throw std::runtime_error("brae -parallel: MRF cellZone '" + mrfCfg.cellZone +
+                                         "' not found in constant/polyMesh/cellZones");
+            std::unordered_set<label> gset(it->second.begin(), it->second.end());
+            std::vector<label> localZoneCells;
+            for (label c = 0; c < P.Lm.mesh.nCells(); ++c)
+                if (gset.count(P.Lm.cellProcAddr[c])) localZoneCells.push_back(c);
+            mrfZone = buildMRFZone(P.Lm.mesh, localZoneCells, mrfCfg.axis, mrfCfg.omega, mrfCfg.origin);
+            mrfCorrectBoundaryVelocity(U0, mrfZone, P.lg, P.lp, mrfCfg.nonRotatingPatches);   // in-zone walls -> Omega x r
+            const std::size_t nLoc = localZoneCells.size();
+            const std::size_t nGlob = Pstream::allReduce(static_cast<scalar>(nLoc), ReduceOp::Sum);
+            if (master)
+                std::printf("  MRF: cellZone=%s omega=%.4g axis=(%.2g %.2g %.2g) origin=(%.2g %.2g %.2g) zoneCells=%zu\n",
+                            mrfCfg.cellZone.c_str(), mrfCfg.omega, mrfCfg.axis.x, mrfCfg.axis.y, mrfCfg.axis.z,
+                            mrfCfg.origin.x, mrfCfg.origin.y, mrfCfg.origin.z, static_cast<std::size_t>(nGlob));
+        }
+
         // turbulence start fields: kEps/SST read k + eps|omega + nut (+ ReThetat/gammaInt for LM); SpalartAllmaras
         // is one-equation -> nuTilda + nut only (no k/eps).
         FieldData<scalar> kfd, efd, nfd, rfd, gfd, ntfd;
@@ -398,6 +429,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             else if (turbulent && lm)  solver.enableTurbulenceSSTLM(U0, k0, eps0, nut0, ReThetat0, gammaInt0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
+            if (mrfCfg.active) solver.setMRF(mrfZone, mrfCfg.nonRotatingPatches);   // Coriolis source + relative flux
             lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc
 
             auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };
