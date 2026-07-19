@@ -198,7 +198,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         // Anything else -- limitedLinear, LUST, linearUpwindV, plain Gauss linear -- is a DIFFERENT
         // discretisation, and silently substituting upwind produces a converged, plausible, WRONG answer (on
         // the cavity that was a ~6% field difference). Refuse those, exactly as RAS is refused above.
-        bool boundedDiv = false, linUpwind = false, lust = false, lapCorrected = false;
+        bool boundedDiv = false, linUpwind = false, lust = false, linUpwindV = false, lapCorrected = false;
         {
             std::string divLine, lapLine;
             std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));
@@ -222,10 +222,10 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                 // NB "linearUpwind" has a capital U, so it does NOT contain the substring "upwind" -- the two
                 // must be tested separately or a linearUpwind case reads as "no upwind scheme at all".
                 const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind || lust;
-                // linearUpwindV adds OF's vector direction limiter on top of linearUpwind -- NOT implemented,
-                // and it contains the substring "linearUpwind", so it must be excluded explicitly.
-                const bool unsupported = divLine.find("linearUpwindV") != std::string::npos
-                                      || divLine.find("limitedLinear") != std::string::npos;
+                // linearUpwindV = linearUpwind + OF's vector direction limiter (internal faces; cut faces use the
+                // plain grad -- exact at np=1). limitedLinear[V] is a TVD flux limiter, a different scheme -> refused.
+                linUpwindV = divLine.find("linearUpwindV") != std::string::npos;
+                const bool unsupported = divLine.find("limitedLinear") != std::string::npos;
                 if (!upwindFamily || unsupported)
                     throw std::runtime_error(
                         "brae -parallel: div(phi,U) scheme '" + divLine + "' is not implemented on the "
@@ -377,7 +377,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         int nIter = 0;
         {   // scope: the solver's symmetric-heap buffers must be freed BEFORE Pstream::finalize
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust,
-                                        /*nonOrth*/ useNonOrth, /*consistent*/ consistent,
+                                        /*linUpwindV*/ linUpwindV, /*nonOrth*/ useNonOrth, /*consistent*/ consistent,
                                         /*amgCacheDir*/ caseDir + "/constant/polyMesh");
             if (turbulent && sa)  solver.enableTurbulenceSA(U0, nuTilda0, nut0, saCoeffs, relaxNuTilda);
             else if (turbulent && lm)  solver.enableTurbulenceSSTLM(U0, k0, eps0, nut0, ReThetat0, gammaInt0, sstCoeffs, relaxK, relaxEps);

@@ -586,6 +586,7 @@ public:
         bool bounded = false,
         bool linearUpwind = false,
         bool lust = false,
+        bool linUpwindV = false,               // div(phi,U) "linearUpwindV": linearUpwind + OF's vector limiter
         bool nonOrth = false,
         bool consistent = false,               // SIMPLEC (fvSolution SIMPLE.consistent): rAtU consistency correction
         const std::string& amgCacheDir = "")   // polyMesh dir for the per-rank AMG-hierarchy disk cache ("" = off)
@@ -599,6 +600,7 @@ public:
           bounded_(bounded),
           linearUpwind_(linearUpwind),
           lust_(lust),
+          linUpwindV_(linUpwindV),
           nonOrth_(nonOrth),
           consistent_(consistent),
           lnC_(part.Lm.mesh.nCells()),
@@ -1009,6 +1011,7 @@ private:
     bool   bounded_ = false;
     bool   linearUpwind_ = false;
     bool   lust_ = false;
+    bool   linUpwindV_ = false;   // linearUpwindV: vector-limited internal linearUpwind correction (cut faces plain)
     bool   nonOrth_ = false;
     bool   consistent_ = false;   // SIMPLEC: use rAtU=1/(1/rAU - H1) in the pEqn + the flux/HbyA consistency corrections
     std::string dumpPath_;
@@ -1234,6 +1237,10 @@ inline ParStepResidual ParallelDeviceSimple::step()
     // single-GPU `if (ctl_.linearUpwind || ctl_.lust)`.
     if (linearUpwind_ || lust_)
     {
+        // grad(U_k) for all 3 components (halo-consistent), computed TOGETHER because linearUpwindV's vector limiter
+        // couples the components. gUx[k]=dU_k/dx etc. Then the internal deferred correction is either the plain
+        // per-component linearUpwind or (linearUpwindV) the vector-limited deviceLinearUpwindVCorr computed once.
+        DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
         for (int k = 0; k < 3; ++k)
         {
             DeviceBuffer<scalar> ub;
@@ -1241,30 +1248,28 @@ inline ParStepResidual ParallelDeviceSimple::step()
             halo_.exchange(Uk_[k].data());
             halo_.scatterBoundaryValues(Uk_[k].data(), weightsD_, procStart_, ub.data());
             halo_.waitExchange();
-            DeviceBuffer<scalar> ggx, ggy, ggz;
-            deviceGaussGrad(dm_, Uk_[k], ub, ggx, ggy, ggz);   // processor-consistent grad(U_k)
-            dumpStage("gradx", ggx, k);
-            dumpStage("grady", ggy, k);
-
+            deviceGaussGrad(dm_, Uk_[k], ub, gUx[k], gUy[k], gUz[k]);
+        }
+        DeviceBuffer<scalar> corrV[3];
+        if (linUpwindV_)   // vector-limited internal correction, all 3 at once (cut faces still use the plain grad)
+            deviceLinearUpwindVCorr(dm_, phiInt_, gUx, gUy, gUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
+        for (int k = 0; k < 3; ++k)
+        {
             DeviceBuffer<scalar> corr;
-            deviceLinearUpwindCorr(dm_, phiInt_, ggx, ggy, ggz, corr);          // internal faces
-            dumpStage("luCorr_int", corr, k);
-            deviceLinUpwindInterface(halo_, faceCellsD_, phiF, ggx, ggy, ggz,
+            if (linUpwindV_) corr = std::move(corrV[k]);
+            else             deviceLinearUpwindCorr(dm_, phiInt_, gUx[k], gUy[k], gUz[k], corr);   // internal faces
+            deviceLinUpwindInterface(halo_, faceCellsD_, phiF, gUx[k], gUy[k], gUz[k],
                                      dOwnD_, dNeiD_, corr);                     // + cut faces
-            dumpStage("luCorr_tot", corr, k);
             if (lust_)   // 0.25*linearUpwind + 0.75*linear, cut faces included on BOTH parts
             {
                 deviceScale(corr, 0.25);
                 DeviceBuffer<scalar> lc;
                 deviceLinearCorr(dm_, phiInt_, Uk_[k], lc);                     // internal faces
-                dumpStage("linCorr_int", lc, k);
                 deviceLinearCorrInterface(halo_, faceCellsD_, phiF, weightsD_, Uk_[k], lc);   // + cut faces
-                dumpStage("linCorr_tot", lc, k);
                 deviceAxpy(0.75, lc, corr);
             }
             dumpStage("corr_final", corr, k);
             deviceAxpy(-1.0, corr, relaxSrc[k]);                                // source -= corr
-            dumpStage("relaxSrc", relaxSrc[k], k);
         }
     }
 
