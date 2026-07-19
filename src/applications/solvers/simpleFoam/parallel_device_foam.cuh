@@ -167,10 +167,16 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             std::string divLine, lapLine;
             std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));
             std::string ln;
-            while (std::getline(fsch, ln))
+            bool inLap = false;   // the laplacian SCHEME ("... corrected;") is on the `default`/`laplacian(...)` line
+            while (std::getline(fsch, ln))  // INSIDE the laplacianSchemes{} block, NOT the block-header line itself.
             {
                 if (ln.find("div(phi,U)") != std::string::npos)      divLine = ln;
-                if (ln.find("laplacianSchemes") != std::string::npos) lapLine = ln;
+                if (ln.find("laplacianSchemes") != std::string::npos) { inLap = true; continue; }
+                if (inLap)
+                {
+                    if (ln.find('}') != std::string::npos) inLap = false;
+                    else lapLine += ln + " ";   // accumulate the block's scheme lines (default + any per-field)
+                }
             }
             if (!divLine.empty())
             {
@@ -265,16 +271,19 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         // non-orthogonal mesh, silently dropping it solves a DIFFERENT equation than fvSchemes asks for --
         // the same failure mode as substituting a div scheme, and 96/113 cases ask for "corrected". Refuse.
         // 0.1 deg: below that the correction is numerical noise; above it, it is physics we are not doing.
+        // The non-orthogonal correction IS implemented on the distributed path: nonOrthDeltaCoeffs implicit at cut
+        // faces (computeProcNonOrth), the explicit corrVec.grad correction for the momentum, and for the pEqn BOTH
+        // the source and the face-flux correction (or continuity breaks). Gated by test_gpu_parallel_duct on a
+        // sheared 26.57 deg mesh; every piece teeth-proven. APPLY it when the scheme is "corrected" AND the mesh is
+        // actually non-orthogonal (> 0.1 deg -- below that it is numerical noise and the extra work is a no-op).
+        bool useNonOrth = false;
         if (lapCorrected)
         {
             const scalar nonOrtho = maxNonOrthogonality(P);
-            // The non-orthogonal correction IS implemented on the distributed path: nonOrthDeltaCoeffs
-            // implicit at cut faces (computeProcNonOrth), the explicit corrVec.grad correction for the
-            // momentum, and for the pEqn BOTH the source and the face-flux correction (or continuity breaks).
-            // Gated by test_gpu_parallel_duct on a sheared 26.57 deg mesh; every piece teeth-proven.
+            useNonOrth = (nonOrtho > 0.1);
             if (master)
-                std::printf("  mesh max non-orthogonality %.4g deg -> 'corrected' term negligible (< 0.1 deg)\n",
-                            nonOrtho);
+                std::printf("  mesh max non-orthogonality %.4g deg -> non-orth 'corrected' term %s\n",
+                            nonOrtho, useNonOrth ? "ON" : "negligible (off)");
         }
 
         const FieldData<vector> Ufd = readField<vector>(fieldDir + "/U");
@@ -313,7 +322,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         int nIter = 0;
         {   // scope: the solver's symmetric-heap buffers must be freed BEFORE Pstream::finalize
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust,
-                                        /*nonOrth*/ false, /*consistent*/ consistent,
+                                        /*nonOrth*/ useNonOrth, /*consistent*/ consistent,
                                         /*amgCacheDir*/ caseDir + "/constant/polyMesh");
             if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
