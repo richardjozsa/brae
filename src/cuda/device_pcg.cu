@@ -386,7 +386,14 @@ DeviceSolverPerf deviceParallelAMGPCG(
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC), ApA;
 
     amgPrepareFP32(amg, A);   // cast the local hierarchy to FP32 once (matrices are current post-amgGalerkin) -> FP32 V-cycles
-    static const bool g_parGraph = std::getenv("BRAE_PARALLEL_GRAPH") && std::atoi(std::getenv("BRAE_PARALLEL_GRAPH")) != 0;
+    // BRAE_PARALLEL_GRAPH: 0 off, 1 = V-cycle-only graph replay (below), 2 = WHOLE-loop conditional graph (the 2x lever).
+    static const int g_parGraphLevel = std::getenv("BRAE_PARALLEL_GRAPH") ? std::atoi(std::getenv("BRAE_PARALLEL_GRAPH")) : 0;
+    if (g_parGraphLevel >= 2)
+    {
+        const DeviceSolverPerf gp = deviceParallelAMGPCGGraph(A, amg, halo, ifaceCoeffs, b, psi, normFactor, tol, relTol, maxIter);
+        if (gp.nIterations >= 0) return gp;   // whole-loop graph ran; else (CUDA<13) fall through to the direct path
+    }
+    const bool g_parGraph = (g_parGraphLevel == 1);
 
     deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);          // rA = b - A*psi  (interface-coupled)
     deviceCopy(rA, b);

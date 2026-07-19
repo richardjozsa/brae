@@ -943,6 +943,12 @@ private:
     DeviceHalo           halo_;
     bool     useAMG_ = false;   // pressure preconditioned by the local per-rank AMG V-cycle (else point-Jacobi)
     AMGData  pAMG_;             // the local pressure-Laplacian hierarchy (built once, Galerkin-recoarsened per step)
+    // Persistent pressure-solve buffers (graph-referenced): STABLE addresses across steps (resize is a no-op when
+    // the size is unchanged), so the whole-loop conditional graph (BRAE_PARALLEL_GRAPH=2) captures ONCE and
+    // replays across all steps instead of re-instantiating per step. Values are overwritten by the assembly each
+    // step (matrix, rhs, interface coeffs, and the psi seed) -- the graph references the buffers, read at replay.
+    DeviceBuffer<scalar> pUp_, pLp_, pDiagp_, pbp_, pSolp_;
+    std::vector<DeviceBuffer<scalar>> pIfCoeffp_;
     std::vector<label>   procStart_;
     std::vector<DeviceBuffer<label>>  faceCellsD_;
     std::vector<DeviceBuffer<scalar>> weightsD_;
@@ -1271,7 +1277,9 @@ inline ParStepResidual ParallelDeviceSimple::step()
     halo_.scatterBoundaryValues(rAU.data(), weightsD_, procStart_, rAUbnd.data());
     halo_.waitExchange();
 
-    DeviceBuffer<scalar> pD, pU_, pL_;
+    DeviceBuffer<scalar> pD;
+    DeviceBuffer<scalar>& pU_ = pUp_;   // persistent (graph-referenced): stable address -> whole-loop graph captures once
+    DeviceBuffer<scalar>& pL_ = pLp_;
     deviceLaplacianCoeffs(dm_, rAUf_int, pD, pU_, pL_, nonOrth_);
     const std::vector<scalar> rAUbndH = rAUbnd.host();
     std::vector<DeviceBuffer<scalar>> pCoeffGeo;
@@ -1295,7 +1303,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
             bi += lp[pi].size;
         }
     }
-    std::vector<DeviceBuffer<scalar>> pIfCoeff;
+    std::vector<DeviceBuffer<scalar>>& pIfCoeff = pIfCoeffp_;   // persistent (graph-referenced)
     deviceLaplacianInterface(halo_, faceCellsD_, pCoeffGeo, pD, pIfCoeff);
 
     DeviceBuffer<scalar> dphi, psrc;
@@ -1303,7 +1311,8 @@ inline ParStepResidual ParallelDeviceSimple::step()
     deviceHadamard(psrc, dm_.V, dphi);
     DeviceBuffer<scalar> piC, pbC;
     deviceBCLaplacianCoeffsFace(dbP_, rAUbnd, piC, pbC);
-    DeviceBuffer<scalar> pDiagC, pb;
+    DeviceBuffer<scalar>& pDiagC = pDiagp_;   // persistent (graph-referenced)
+    DeviceBuffer<scalar>& pb     = pbp_;
     deviceFold(dm_, pD, psrc, piC, pbC, pDiagC, pb);
 
     // Explicit non-orth correction of laplacian(rAU,p), from the ENTRY grad(p) (gx/gy/gz), matching the
@@ -1333,7 +1342,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
                                 gx, gy, gz, pb, ffcPif);               // + cut faces
     }
 
-    DeviceBuffer<scalar> pSol;
+    DeviceBuffer<scalar>& pSol = pSolp_;   // persistent: the whole-loop graph keys on pSol.data() -> capture once
     deviceCopy(pSol, dp_);
     const DeviceLduView pv = deviceLduView(dm_, pDiagC, pU_, pL_);
     const scalar nfp = deviceParallelNormFactor(pv, halo_, pIfCoeff, pSol, pb, ones_, P_.globalNCells);
