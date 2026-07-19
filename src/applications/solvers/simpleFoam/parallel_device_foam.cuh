@@ -223,6 +223,11 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             throw std::runtime_error(
                 "brae -parallel: nNonOrthogonalCorrectors > 0 is not implemented on the multi-GPU device path "
                 "(it does a single pEqn pass). Set it to 0, or use `brae -case <dir>` (single GPU).");
+        // SIMPLEC (SIMPLE.consistent): the rAtU consistency correction that lets a case run at high pressure
+        // relaxation (pitzDaily etc. use relaxP≈0.9, only stable WITH this). Without it the distributed path would
+        // run plain SIMPLE at that relaxation and diverge -- so it must honour the flag, not ignore it.
+        const std::string consWord = simple ? simple->wordOr("consistent", "no") : "no";
+        const bool consistent = (consWord == "yes" || consWord == "true" || consWord == "on" || consWord == "1");
         const FoamDict* resCtl = simple ? simple->subDict("residualControl") : nullptr;
         const bool   hasRC = (resCtl != nullptr);
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1;
@@ -308,7 +313,8 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         int nIter = 0;
         {   // scope: the solver's symmetric-heap buffers must be freed BEFORE Pstream::finalize
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust,
-                                        /*nonOrth*/ false, /*amgCacheDir*/ caseDir + "/constant/polyMesh");
+                                        /*nonOrth*/ false, /*consistent*/ consistent,
+                                        /*amgCacheDir*/ caseDir + "/constant/polyMesh");
             if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
             lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc
