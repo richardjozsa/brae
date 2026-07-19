@@ -589,6 +589,9 @@ public:
         bool linUpwindV = false,               // div(phi,U) "linearUpwindV": linearUpwind + OF's vector limiter
         bool nonOrth = false,
         bool consistent = false,               // SIMPLEC (fvSolution SIMPLE.consistent): rAtU consistency correction
+        bool limitedU = false,                 // div(phi,U) "limitedLinear" (magSqr): implicit TVD limited convection
+        scalar limitedTwoByk = 2.0,            // 2/max(k_,SMALL) from the scheme coefficient (limitedLinear 1 -> 2)
+        bool limitedV = false,                 // div(phi,U) "limitedLinearV" (NVDVTVDV vector limiter): implicit
         const std::string& amgCacheDir = "")   // polyMesh dir for the per-rank AMG-hierarchy disk cache ("" = off)
         : P_(part),
           nu_(nu),
@@ -603,6 +606,9 @@ public:
           linUpwindV_(linUpwindV),
           nonOrth_(nonOrth),
           consistent_(consistent),
+          limitedU_(limitedU),
+          twoByk_(limitedTwoByk),
+          limitedV_(limitedV),
           lnC_(part.Lm.mesh.nCells()),
           nIf_(part.Lm.mesh.nInternalFaces()),
           dm_(buildDeviceMesh(part.Lm.mesh, part.lg, part.lp)),
@@ -1014,6 +1020,9 @@ private:
     bool   linUpwindV_ = false;   // linearUpwindV: vector-limited internal linearUpwind correction (cut faces plain)
     bool   nonOrth_ = false;
     bool   consistent_ = false;   // SIMPLEC: use rAtU=1/(1/rAU - H1) in the pEqn + the flux/HbyA consistency corrections
+    bool   limitedU_ = false;     // div(phi,U) limitedLinear (magSqr): IMPLICIT limited convection, ONE limiter/face on |U|^2
+    scalar twoByk_ = 2.0;         // limitedLinear coefficient: 2/max(k_,SMALL) (k_=1 -> 2); limiter = clamp(twoByk*r,0,1)
+    bool   limitedV_ = false;     // div(phi,U) limitedLinearV (NVDVTVDV): IMPLICIT limited convection, vector limiter/face
     std::string dumpPath_;
     int    dumpAt_ = -1;
     mutable int iter_ = 0;
@@ -1149,9 +1158,48 @@ inline ParStepResidual ParallelDeviceSimple::step()
     halo_.scatterBoundaryValues(nuEffCell.data(), weightsD_, procStart_, nuEffScatBnd.data());
     halo_.waitExchange();
 
+    // limitedLinear (magSqr): build the limited convection IMPLICITLY (like OF -- the limited weights go INTO the
+    // matrix, not a deferred source). OF's NVDTVD::r takes a scalar, so reduce U to s=|U|^2, form grad(s) by Gauss,
+    // and deviceDivLimitedCoeffs computes ONE limiter per face applied to all 3 components (the convection matrix is
+    // shared, so it CAN be implicit). A deferred (divLim-divUp).U source instead UNDER-converges here: unlike
+    // linearUpwind's mild grad correction (which deferred handles to 0.6% of OF), limitedLinear blends toward
+    // central, and an upwind matrix + explicit central push settles near upwind (measured ~8% off OF). The limiter
+    // is lagged on U (Picard), exactly as OF does. INTERNAL faces only -> exact at np=1; the cut stays upwind (np>1).
+    // Both limitedLinear (magSqr) and limitedLinearV (NVDVTVDV) need grad(U_k); magSqr additionally needs
+    // s=|U|^2 and grad(s). limGU{x,y,z}[k] = grad(U_k); for magSqr, limS/limG{x,y,z} = s and grad(s).
+    DeviceBuffer<scalar> limS, limGx, limGy, limGz, limGUx[3], limGUy[3], limGUz[3];
+    if (limitedU_ || limitedV_)
+    {
+        DeviceBuffer<scalar> ub[3];
+        for (int k = 0; k < 3; ++k)
+        {
+            deviceBCValue(dbU_.comp[k], Uk_[k], ub[k]);
+            halo_.exchange(Uk_[k].data());
+            halo_.scatterBoundaryValues(Uk_[k].data(), weightsD_, procStart_, ub[k].data());
+            halo_.waitExchange();
+            deviceGaussGrad(dm_, Uk_[k], ub[k], limGUx[k], limGUy[k], limGUz[k]);
+        }
+        if (limitedU_)   // magSqr: s = |U|^2 (cell + boundary) and grad(s) by Gauss (== OF fvc::grad(magSqr(U)))
+        {
+            DeviceBuffer<scalar> sb, t;
+            deviceHadamard(limS, Uk_[0], Uk_[0]);
+            deviceHadamard(t, Uk_[1], Uk_[1]); deviceAxpy(1.0, t, limS);
+            deviceHadamard(t, Uk_[2], Uk_[2]); deviceAxpy(1.0, t, limS);
+            deviceHadamard(sb, ub[0], ub[0]);
+            deviceHadamard(t, ub[1], ub[1]); deviceAxpy(1.0, t, sb);
+            deviceHadamard(t, ub[2], ub[2]); deviceAxpy(1.0, t, sb);
+            deviceGaussGrad(dm_, limS, sb, limGx, limGy, limGz);
+        }
+    }
+
     // ---- momentum matrix: div(phi,U) - laplacian(nuEff,U), + processor interface ----
     DeviceBuffer<scalar> mDiag, mUp, mLo, lD, lU, lL;
-    deviceDivUpwindCoeffs(dm_, phiInt_, mDiag, mUp, mLo);
+    if (limitedV_)        // NVDVTVDV vector limiter -> implicit limited convection (one limiter/face, all 3 components)
+        deviceDivLimitedVCoeffs(dm_, phiInt_, Uk_, limGUx, limGUy, limGUz, twoByk_, mDiag, mUp, mLo);
+    else if (limitedU_)   // magSqr single limiter -> implicit limited convection (weights W shared across components)
+        deviceDivLimitedCoeffs(dm_, phiInt_, limS, limGx, limGy, limGz, twoByk_, mDiag, mUp, mLo);
+    else
+        deviceDivUpwindCoeffs(dm_, phiInt_, mDiag, mUp, mLo);
     deviceLaplacianCoeffs(dm_, nuEff_f, lD, lU, lL, nonOrth_);
     deviceAxpy(-1.0, lD, mDiag);
     deviceAxpy(-1.0, lU, mUp);
@@ -1240,6 +1288,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         // grad(U_k) for all 3 components (halo-consistent), computed TOGETHER because linearUpwindV's vector limiter
         // couples the components. gUx[k]=dU_k/dx etc. Then the internal deferred correction is either the plain
         // per-component linearUpwind or (linearUpwindV) the vector-limited deviceLinearUpwindVCorr computed once.
+        // (limitedLinear does NOT come here -- it is built implicitly into the matrix above.)
         DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
         for (int k = 0; k < 3; ++k)
         {
