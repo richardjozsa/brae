@@ -587,6 +587,7 @@ public:
         bool linearUpwind = false,
         bool lust = false,
         bool nonOrth = false,
+        bool consistent = false,               // SIMPLEC (fvSolution SIMPLE.consistent): rAtU consistency correction
         const std::string& amgCacheDir = "")   // polyMesh dir for the per-rank AMG-hierarchy disk cache ("" = off)
         : P_(part),
           nu_(nu),
@@ -599,6 +600,7 @@ public:
           linearUpwind_(linearUpwind),
           lust_(lust),
           nonOrth_(nonOrth),
+          consistent_(consistent),
           lnC_(part.Lm.mesh.nCells()),
           nIf_(part.Lm.mesh.nInternalFaces()),
           dm_(buildDeviceMesh(part.Lm.mesh, part.lg, part.lp)),
@@ -954,6 +956,7 @@ private:
     bool   linearUpwind_ = false;
     bool   lust_ = false;
     bool   nonOrth_ = false;
+    bool   consistent_ = false;   // SIMPLEC: use rAtU=1/(1/rAU - H1) in the pEqn + the flux/HbyA consistency corrections
     std::string dumpPath_;
     int    dumpAt_ = -1;
     mutable int iter_ = 0;
@@ -1269,6 +1272,21 @@ inline ParStepResidual ParallelDeviceSimple::step()
 
     DeviceBuffer<scalar> HbyA[3];
     const DeviceLduView av = deviceLduView(dm_, diagA, mUp, mLo);
+    // SIMPLEC (consistent_): rAtU = 1/(1/rAU - H1) = V/max(A*1, 0.1*diagA), where A*1 is the row sum INCLUDING the
+    // interface off-diagonals (deviceParallelAmul with ones). drAtU = rAtU - rAU drives the flux/HbyA corrections
+    // below, and rAtU replaces rAU in the pEqn -- so a `consistent yes` case (pitzDaily) is stable at its native
+    // relaxP instead of diverging as plain SIMPLE. For plain SIMPLE (consistent_ off), rAtU == rAU (a no-op copy).
+    DeviceBuffer<scalar> rAtU, drAtU;
+    if (consistent_)
+    {
+        DeviceBuffer<scalar> rowSum;
+        deviceParallelAmul(av, halo_, ifCoeff, ones_, rowSum);
+        deviceSimplecRAtU(dm_, rowSum, diagA, rAtU);
+        deviceCopy(drAtU, rAtU);
+        deviceAxpy(-1.0, rAU, drAtU);
+    }
+    else
+        deviceCopy(rAtU, rAU);
     for (int k = 0; k < 3; ++k)
     {
         DeviceBuffer<scalar> bdDiag;
@@ -1293,13 +1311,37 @@ inline ParStepResidual ParallelDeviceSimple::step()
     deviceVectorFlux(dm_, HbyA[0], HbyA[1], HbyA[2], phiHbyAint);
     deviceBoundaryFlux(dm_, hb[0], hb[1], hb[2], phiHbyAbnd);
 
-    // ---- pEqn: laplacian(rAU,p) == div(phiHbyA) ----
+    // SIMPLEC flux + HbyA consistency correction (OF simpleFoam `consistent` branch), from the ENTRY grad(p):
+    //   phiHbyA += interp(rAtU-rAU)*snGrad(p)*magSf  (= the drAtU-weighted Laplacian flux of dp_, internal + boundary)
+    //   HbyA    -= (rAU-rAtU)*grad(p)  ==  HbyA += drAtU*grad(p)   (feeds the velocity corrector only)
+    // phiHbyA above was built from the UNCORRECTED HbyA, so the corrections are added separately. No-op when off.
+    if (consistent_)
+    {
+        DeviceBuffer<scalar> drAtUf;
+        deviceInterpolate(dm_, drAtU, drAtUf);
+        DeviceBuffer<scalar> ld, lu, ll, fInt;
+        deviceLaplacianCoeffs(dm_, drAtUf, ld, lu, ll, nonOrth_);
+        deviceMatrixFluxInternal(deviceLduView(dm_, ld, lu, ll), dp_, fInt);
+        deviceAxpy(1.0, fInt, phiHbyAint);
+        DeviceBuffer<scalar> dIC, dBC, fBnd;
+        deviceBCLaplacianCoeffs(dbP_, drAtU, dIC, dBC);
+        deviceMatrixFluxBoundary(dbP_, dIC, dBC, dp_, fBnd);
+        deviceAxpy(1.0, fBnd, phiHbyAbnd);
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> t;
+            deviceHadamard(t, drAtU, *gg[k]);
+            deviceAxpy(1.0, t, HbyA[k]);
+        }
+    }
+
+    // ---- pEqn: laplacian(rAtU,p) == div(phiHbyA)  (rAtU == rAU for plain SIMPLE) ----
     DeviceBuffer<scalar> rAUf_int;
-    deviceInterpolate(dm_, rAU, rAUf_int);
+    deviceInterpolate(dm_, rAtU, rAUf_int);
     DeviceBuffer<scalar> rAUbnd;
-    deviceBCValue(dbRAU_, rAU, rAUbnd);
-    halo_.exchange(rAU.data());
-    halo_.scatterBoundaryValues(rAU.data(), weightsD_, procStart_, rAUbnd.data());
+    deviceBCValue(dbRAU_, rAtU, rAUbnd);
+    halo_.exchange(rAtU.data());
+    halo_.scatterBoundaryValues(rAtU.data(), weightsD_, procStart_, rAUbnd.data());
     halo_.waitExchange();
 
     DeviceBuffer<scalar> pD;
@@ -1418,7 +1460,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     for (int k = 0; k < 3; ++k)
     {
         DeviceBuffer<scalar> Un;
-        deviceCorrector(HbyA[k], rAU, *gn[k], Un);
+        deviceCorrector(HbyA[k], rAtU, *gn[k], Un);   // SIMPLEC: rAtU (== rAU for plain SIMPLE)
         deviceCopy(Uk_[k], Un);
         dumpStage("Ucorr", Uk_[k], k);
     }
