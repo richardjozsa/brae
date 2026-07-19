@@ -455,11 +455,21 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
     scalar tol,
     scalar relTol,
     int maxIter,
-    int checkEvery)
+    int checkEvery,
+    BiCGGraphCache* gcache)
 {
     const int nC = A.nCells;
     const int K  = (checkEvery > 1) ? checkEvery : 1;            // convergence-read cadence (1 = exact per-iter)
     const cudaStream_t strm = cudaStreamPerThread;               // the halo/reduce stream: everything is stream-ordered
+    // BRAE_PARALLEL_GRAPH>=3: whole-loop conditional-graph momentum solve (the momentum twin of the pressure
+    // deviceParallelAMGPCGGraph). Falls through to the direct device-resident path below on CUDA<13 (sentinel -1).
+    static const int g_parGraphLevel = std::getenv("BRAE_PARALLEL_GRAPH") ? std::atoi(std::getenv("BRAE_PARALLEL_GRAPH")) : 0;
+    if (g_parGraphLevel >= 3 && gcache)
+    {
+        const DeviceSolverPerf gp =
+            deviceParallelJacobiBiCGStabGraph(A, halo, ifaceCoeffs, b, psi, *gcache, normFactor, tol, relTol, maxIter);
+        if (gp.nIterations >= 0) return gp;
+    }
     DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC), AyA(nC), sA(nC), zA(nC), tA(nC), Ax(nC);
 
     deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);           // rA = b - A*psi
@@ -546,5 +556,199 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
     perf.nIterations = nIter;
     return perf;
 }
+
+// ---- whole-loop conditional-graph momentum BiCGStab (BRAE_PARALLEL_GRAPH=3) --------------------------------
+BiCGGraphCache::~BiCGGraphCache()
+{
+    if (exec)  cudaGraphExecDestroy(exec);
+    if (graph) cudaGraphDestroy(graph);
+}
+
+#if CUDART_VERSION >= 13000
+namespace {
+__global__
+void bicgScaleInvK(scalar* v, const scalar* nf)   // v = v / normFactor (device-resident residual normalize)
+{
+    if (threadIdx.x==0 && blockIdx.x==0) *v = *v / *nf;
+}
+__global__
+void bicgSetCondK(                                 // drive the WHILE conditional from the on-device stop predicate
+    cudaGraphConditionalHandle h,
+    const scalar* res,
+    scalar tol,
+    const scalar* init,
+    scalar relTol,
+    int* iter,
+    int maxIter,
+    const scalar* bd)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    const int it = ++(*iter);
+    const scalar fr = *res;                        // already normalized by normFactor
+    const bool conv = (fr < tol) || (relTol > 0.0 && fr < relTol * (*init));
+    cudaGraphSetConditional(h, (conv || (*bd != 0.0) || it >= maxIter) ? 0u : 1u);   // stop on converge/breakdown/maxIter
+}
+} // namespace
+
+// The momentum twin of deviceParallelAMGPCGGraph: the entire steady-state BiCGStab iteration (interface-coupled
+// matvec + on-stream NVSHMEM reductions + the guarded recurrence) captured once into a cudaGraphCondTypeWhile graph
+// and replayed on-device, removing the ~15 host kernel launches/Krylov-iter the direct device-resident path still
+// pays. The momentum matrix is rebuilt with fresh buffers each SIMPLE step, so the graph body references PERSISTENT
+// copies (c.diagP/upperP/lowerP/ifaceP) that we memcpy-refresh here -> capture ONCE, replay every step. The direct
+// path's mid-iter |s| early exit is dropped (the body must be uniform: at most < 1 extra half-iteration, same psi);
+// convergence + OF breakdown are tested at the END of the body from the full-iteration residual r.
+DeviceSolverPerf deviceParallelJacobiBiCGStabGraph(
+    const DeviceLduView& A,
+    DeviceHalo& halo,
+    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    BiCGGraphCache& c,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter)
+{
+    const cudaStream_t strm = cudaStreamPerThread;
+    const int nC = A.nCells;
+    const int nF = A.nInternalFaces;
+
+    c.rA.resize(nC); c.rA0.resize(nC); c.pA.resize(nC); c.yA.resize(nC); c.AyA.resize(nC);
+    c.sA.resize(nC); c.zA.resize(nC); c.tA.resize(nC); c.Ax.resize(nC);
+    c.sNormF.resize(1); c.sInit.resize(1); c.sRes.resize(1); c.sIter.resize(1);
+    cudaMemcpyAsync(c.sNormF.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, strm);
+
+    // refresh the persistent matrix copies from THIS step's momentum matrix (stable addresses -> capture once)
+    c.diagP.resize(nC); c.upperP.resize(nF); c.lowerP.resize(nF);
+    cudaMemcpyAsync(c.diagP.data(),  A.diag,  nC*sizeof(scalar), cudaMemcpyDeviceToDevice, strm);
+    cudaMemcpyAsync(c.upperP.data(), A.upper, nF*sizeof(scalar), cudaMemcpyDeviceToDevice, strm);
+    cudaMemcpyAsync(c.lowerP.data(), A.lower, nF*sizeof(scalar), cudaMemcpyDeviceToDevice, strm);
+    DeviceLduView Ap = A;
+    Ap.diag = c.diagP.data(); Ap.upper = c.upperP.data(); Ap.lower = c.lowerP.data();
+    c.ifaceP.resize(ifaceCoeffs.size());
+    for (std::size_t i = 0; i < ifaceCoeffs.size(); ++i)
+    {
+        c.ifaceP[i].resize(ifaceCoeffs[i].size());
+        deviceCopy(c.ifaceP[i], ifaceCoeffs[i]);
+    }
+
+    DeviceReducer& R = halo.reducer();
+    auto gdot = [&](const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar* dOut)
+    { deviceDotInto(x, y, R.src()); R.sumReduce(1, strm); deviceScalarCopy(R.dst(), dOut); };
+    auto gsum = [&](const DeviceBuffer<scalar>& x, scalar* dOut)
+    { deviceSumMagInto(x, R.src()); R.sumReduce(1, strm); deviceScalarCopy(R.dst(), dOut); };
+
+    BiCGScalars& s = bicgScalars();
+    cudaMemsetAsync(s.bd.data(), 0, sizeof(scalar), strm);
+
+    // r = b - A psi ; r0 = r ; initial residual (one host read for the converge-in-0 early-out)
+    deviceParallelAmul(Ap, halo, c.ifaceP, psi, c.Ax);
+    deviceCopy(c.rA, b);
+    deviceAxpy(-1.0, c.Ax, c.rA);
+    deviceCopy(c.rA0, c.rA);
+    DeviceSolverPerf perf;
+    gsum(c.rA, c.sInit.data());
+    bicgScaleInvK<<<1,1,0,strm>>>(c.sInit.data(), c.sNormF.data());
+    scalar initRes;
+    cudaCheck(cudaMemcpyAsync(&initRes, c.sInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "mbicg init D2H");
+    cudaStreamSynchronize(strm);
+    perf.initialResidual = initRes; perf.finalResidual = initRes;
+    auto convergedHost = [&](scalar fr){ return (fr < tol) || (relTol > 0.0 && fr < relTol*initRes); };
+    if (convergedHost(initRes)) { perf.nIterations = 0; return perf; }
+
+    // iteration 0 (explicit: p = r, no beta) -- one full BiCGStab step
+    gdot(c.rA0, c.rA, s.rr.data());
+    bicgRhoSingK<<<1,1,0,strm>>>(s.rr.data(), s.bd.data());
+    deviceCopy(c.pA, c.rA);
+    deviceJacobi(c.yA, c.pA, Ap.diag);
+    deviceParallelAmul(Ap, halo, c.ifaceP, c.yA, c.AyA);
+    gdot(c.rA0, c.AyA, s.r0Ay.data());
+    bicgAlphaK<<<1,1,0,strm>>>(s.rr.data(), s.r0Ay.data(), s.alpha.data(), s.negAlpha.data(), s.bd.data());
+    deviceFusedSxpy(c.sA, c.rA, s.negAlpha.data(), c.AyA);
+    deviceJacobi(c.zA, c.sA, Ap.diag);
+    deviceParallelAmul(Ap, halo, c.ifaceP, c.zA, c.tA);
+    deviceDotInto(c.tA, c.tA, R.src() + 0);
+    deviceDotInto(c.tA, c.sA, R.src() + 1);
+    R.sumReduce(2, strm);
+    deviceScalarCopy(R.dst() + 0, s.tt.data());
+    deviceScalarCopy(R.dst() + 1, s.ts.data());
+    omegaK<<<1,1,0,strm>>>(s.ts.data(), s.tt.data(), s.omega.data(), s.negOmega.data(), s.bd.data());
+    deviceFusedAxpy2(psi, s.alpha.data(), c.yA, s.omega.data(), c.zA);
+    deviceFusedSxpy(c.rA, c.sA, s.negOmega.data(), c.tA);
+    gsum(c.rA, c.sRes.data());
+    bicgScaleInvK<<<1,1,0,strm>>>(c.sRes.data(), c.sNormF.data());
+    scalar res1;
+    cudaCheck(cudaMemcpyAsync(&res1, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "mbicg it0 D2H");
+    cudaStreamSynchronize(strm);
+    if (convergedHost(res1) || maxIter <= 1) { perf.finalResidual = res1; perf.nIterations = 1; return perf; }
+    cudaMemsetAsync(c.sIter.data(), 0, sizeof(int), strm);
+
+    // WHILE body = steady-state iteration 1+ (captured once, replayed on-device)
+    if (!c.exec || c.key != psi.data())
+    {
+        if (c.exec)  { cudaGraphExecDestroy(c.exec);  c.exec  = nullptr; }
+        if (c.graph) { cudaGraphDestroy(c.graph);     c.graph = nullptr; }
+        cudaCheck(cudaGraphCreate(&c.graph, 0), "mbicg graph create");
+        cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 1, cudaGraphCondAssignDefault), "mbicg cond handle");
+        cudaGraphNodeParams cp = {};
+        cp.type = cudaGraphNodeTypeConditional;
+        cp.conditional.handle = c.handle;
+        cp.conditional.type = cudaGraphCondTypeWhile;
+        cp.conditional.size = 1;
+        cudaGraphNode_t cnode;
+        cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "mbicg cond node");
+        cudaGraph_t body = cp.conditional.phGraph_out[0];
+        cudaCheck(cudaStreamBeginCaptureToGraph(strm, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "mbicg capture begin");
+        deviceScalarCopy(s.rr.data(), s.rrOld.data());              // rrOld = rr
+        gdot(c.rA0, c.rA, s.rr.data());
+        bicgRhoSingK<<<1,1,0,strm>>>(s.rr.data(), s.bd.data());
+        bicgBetaK<<<1,1,0,strm>>>(s.rr.data(), s.rrOld.data(), s.alpha.data(), s.omega.data(), s.beta.data(), s.bd.data());
+        deviceFusedBicgP(c.rA, c.pA, c.AyA, s.beta.data(), s.negOmega.data());   // p = r + beta*(p - omega*AyA)
+        deviceJacobi(c.yA, c.pA, Ap.diag);
+        deviceParallelAmul(Ap, halo, c.ifaceP, c.yA, c.AyA);
+        gdot(c.rA0, c.AyA, s.r0Ay.data());
+        bicgAlphaK<<<1,1,0,strm>>>(s.rr.data(), s.r0Ay.data(), s.alpha.data(), s.negAlpha.data(), s.bd.data());
+        deviceFusedSxpy(c.sA, c.rA, s.negAlpha.data(), c.AyA);     // s = r - alpha*AyA
+        deviceJacobi(c.zA, c.sA, Ap.diag);
+        deviceParallelAmul(Ap, halo, c.ifaceP, c.zA, c.tA);
+        deviceDotInto(c.tA, c.tA, R.src() + 0);
+        deviceDotInto(c.tA, c.sA, R.src() + 1);
+        R.sumReduce(2, strm);
+        deviceScalarCopy(R.dst() + 0, s.tt.data());
+        deviceScalarCopy(R.dst() + 1, s.ts.data());
+        omegaK<<<1,1,0,strm>>>(s.ts.data(), s.tt.data(), s.omega.data(), s.negOmega.data(), s.bd.data());
+        deviceFusedAxpy2(psi, s.alpha.data(), c.yA, s.omega.data(), c.zA);       // psi += alpha*y + omega*z
+        deviceFusedSxpy(c.rA, c.sA, s.negOmega.data(), c.tA);     // r = s - omega*tA
+        gsum(c.rA, c.sRes.data());
+        bicgScaleInvK<<<1,1,0,strm>>>(c.sRes.data(), c.sNormF.data());
+        bicgSetCondK<<<1,1,0,strm>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1, s.bd.data());
+        cudaGraph_t tmp;
+        cudaCheck(cudaStreamEndCapture(strm, &tmp), "mbicg capture end");
+        cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "mbicg graph instantiate");
+        c.key = psi.data();
+    }
+    cudaCheck(cudaGraphLaunch(c.exec, strm), "mbicg graph launch");
+    scalar finalRes; int whileIters;
+    cudaCheck(cudaMemcpyAsync(&finalRes, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "mbicg final D2H");
+    cudaCheck(cudaMemcpyAsync(&whileIters, c.sIter.data(), sizeof(int), cudaMemcpyDeviceToHost, strm), "mbicg iters D2H");
+    cudaStreamSynchronize(strm);
+    perf.finalResidual = finalRes;
+    perf.nIterations = 1 + whileIters;
+    return perf;
+}
+#endif // CUDART_VERSION >= 13000
+
+#if CUDART_VERSION < 13000
+// CUDA < 13: WHILE conditional-graph nodes are unavailable -> sentinel (nIterations < 0); caller uses the direct path.
+DeviceSolverPerf deviceParallelJacobiBiCGStabGraph(
+    const DeviceLduView& A, DeviceHalo&,
+    const std::vector<DeviceBuffer<scalar>>&,
+    const DeviceBuffer<scalar>&, DeviceBuffer<scalar>&,
+    BiCGGraphCache&, scalar, scalar, scalar, int)
+{
+    (void)A;
+    DeviceSolverPerf p; p.nIterations = -1; return p;
+}
+#endif
 
 } // namespace brae
