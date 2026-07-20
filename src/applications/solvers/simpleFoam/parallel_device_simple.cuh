@@ -1739,6 +1739,12 @@ inline ParStepResidual ParallelDeviceSimple::step()
                 phiHbyAbnd.data(), static_cast<int>(procStart_[i]), ffcPif[i].data(), n);
         }
     }
+    if (ami_.active)   // AMI conservative flux: ami_.phi -= ifCoeff*(interp(p) - p[own]) from the SOLVED pressure
+    {
+        DeviceBuffer<scalar> pe;
+        distributedAmiGather(ami_, pSol, pe);
+        deviceAmiCorrectFlux(ami_.local, pe);
+    }
     deviceCopy(phiInt_, phiHbyAint);                 // maintained across iterations
     deviceCopy(phiBnd_, phiHbyAbnd);
 
@@ -1756,6 +1762,12 @@ inline ParStepResidual ParallelDeviceSimple::step()
     halo_.waitExchange();
     DeviceBuffer<scalar> gxn, gyn, gzn;
     deviceGaussGrad(dm_, dp_, pbv2, gxn, gyn, gzn);
+    if (ami_.active)   // AMI-face contribution to the corrector grad(p) (velocity update U = HbyA - rAU*grad(p))
+    {
+        DeviceBuffer<scalar> pe;
+        distributedAmiGather(ami_, dp_, pe);
+        deviceAmiAddGrad(ami_.local, pe, dm_.V, gxn, gyn, gzn);
+    }
     DeviceBuffer<scalar>* gn[3] = { &gxn, &gyn, &gzn };
     for (int k = 0; k < 3; ++k)
     {
