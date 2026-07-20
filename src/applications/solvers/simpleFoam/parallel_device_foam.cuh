@@ -317,20 +317,19 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const label nC = gm.nCells();
         lap("meshRead");
 
-        // cyclicAMI: the distributed weaving (buildDistributedAMI -> solver.setAMI) is IMPLEMENTED but NOT YET
-        // VALIDATED -- np=1 vs single-GPU still diverges on the pressure side (WIP #16). So it is REFUSED by default
-        // (correctness-safe) and only built when BRAE_AMI_EXPERIMENTAL=1 is set, for debugging. Plain conformal
-        // `cyclic` is not implemented at all. Single-GPU `brae -case` handles both correctly.
-        const bool amiExperimental = std::getenv("BRAE_AMI_EXPERIMENTAL")
-                                   && std::atoi(std::getenv("BRAE_AMI_EXPERIMENTAL")) == 1;
+        // cyclicAMI: the distributed weaving (buildDistributedAMI -> solver.setAMI) is VALIDATED -- np=1 reproduces the
+        // single-GPU BIT-FOR-BIT (U to 1e-13, p to 1e-12 after removing the singular-pressure level; both converge in
+        // the same 148 iterations on tc_wedge_ami, rotational rotor-stator), and np=2 (cross-rank NVSHMEM gather)
+        // matches to the residualControl tolerance (~1e-5). So cyclicAMI is coupled on the multi-GPU path by default.
+        // Plain conformal `cyclic` (no interpolation) is still not implemented; single-GPU `brae -case` handles it.
         bool hasAMI = false;
         for (const auto& pinfo : gm.patches())
         {
-            if (pinfo.type == "cyclic" || (pinfo.type == "cyclicAMI" && !amiExperimental))
+            if (pinfo.type == "cyclic")
                 throw std::runtime_error(
-                    "brae -parallel: patch '" + pinfo.name + "' is type '" + pinfo.type + "', which is not coupled "
-                    "on the multi-GPU device path (the interface would be left open and the answer wrong). Use "
-                    "`brae -case <dir>` (single GPU) for cyclic/cyclicAMI cases.");
+                    "brae -parallel: patch '" + pinfo.name + "' is type 'cyclic', which is not coupled on the "
+                    "multi-GPU device path (the interface would be left open and the answer wrong). Use "
+                    "`brae -case <dir>` (single GPU) for plain cyclic cases.");
             if (pinfo.type == "cyclicAMI") hasAMI = true;
         }
 
@@ -495,6 +494,17 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
             if (mrfCfg.active) solver.setMRF(mrfZone, mrfCfg.nonRotatingPatches);   // Coriolis source + relative flux
             if (!localFvo.empty()) solver.setFvOptions(localFvo);                   // per-cell momentum Su/Sp + porosity
+            {   // no fixedValue-type p patch -> singular pressure (needs interface regularisation when hasAMI, level
+                // pinned post-hoc below). Same scan as the post-solve pin at the bottom of this function.
+                bool needRef = true;
+                for (const PatchFieldData<scalar>& b : pfd.boundary)
+                    if (b.type == "fixedValue" || b.type == "totalPressure" || b.type == "outletInlet"
+                        || b.type == "fixedMean" || b.type == "prghPressure")
+                        needRef = false;
+                solver.setPressureSingular(needRef);
+            }
+            if (const char* sd = std::getenv("BRAE_STAGE_DUMP"))
+                solver.setStageDump(sd, std::getenv("BRAE_STAGE_DUMP_ITER") ? std::atoi(std::getenv("BRAE_STAGE_DUMP_ITER")) : 1);
             if (hasAMI)   // cyclicAMI: build the GLOBAL AMI (same on every rank) + this rank's DistributedAMI
             {
                 FvGeometry gg;
