@@ -2,6 +2,7 @@
 // plus the owner-ordered upper faces and the neighbour-sorted lower faces, race-free, deterministic.
 #include "device_ldu.cuh"
 #include "device_halo.cuh"
+#include "distributed_ami.cuh"   // DistributedAMI + distributedAmiAmul: optional cyclicAMI coupling in the matvec
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -108,13 +109,15 @@ void deviceParallelAmul(
     DeviceHalo& halo,
     const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
     const DeviceBuffer<scalar>& psi,
-    DeviceBuffer<scalar>& Apsi)
+    DeviceBuffer<scalar>& Apsi,
+    const DistributedAMI* ami)
 {
     halo.postExchange(psi.data());          // pack + put (async)
     deviceAmul(A, psi, Apsi);               // local diag + upper/lower gather, overlaps the transfer
     halo.waitExchange();                    // barrier: neighbour values now in the recv buffers
     for (int i = 0; i < halo.nInterfaces(); ++i)
         halo.updateInterfaceMatrix(i, Apsi.data(), ifaceCoeffs[i].data());   // Apsi[fc] -= coeff * psiNbr
+    if (ami) distributedAmiAmul(*ami, psi, Apsi);   // + cyclicAMI: gather remote target cells (NVSHMEM) then amul
 }
 
 } // namespace brae
