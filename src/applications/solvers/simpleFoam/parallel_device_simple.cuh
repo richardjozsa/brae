@@ -862,6 +862,16 @@ public:
     void setAMI(const std::vector<AMIInterface>& globalAMIs, const std::vector<label>& cellToPart)
     {
         ami_ = buildDistributedAMI(globalAMIs, cellToPart, P_);
+        if (ami_.active)
+        {
+            // initial conservative AMI flux from U (deviceAmiFlux reads U[own] + interp(forwardT.U[nbr]) -> the
+            // interpolated neighbour needs the GATHERED extended field for each component). Sets ami_.local.phi.
+            DeviceBuffer<scalar> ux, uy, uz;
+            distributedAmiGather(ami_, Uk_[0], ux);
+            distributedAmiGather(ami_, Uk_[1], uy);
+            distributedAmiGather(ami_, Uk_[2], uz);
+            deviceAmiFlux(ami_.local, ux, uy, uz);
+        }
     }
 
     // One distributed SIMPLE iteration. U/p/phi are updated in place on the device. Returns the momentum and
@@ -1095,6 +1105,7 @@ private:
     bool   limitedV_ = false;     // div(phi,U) limitedLinearV (NVDVTVDV): IMPLICIT limited convection, vector limiter/face
     DeviceMRF mrf_;               // optional rotating cell zone (MRF): Coriolis source + relative flux (inactive by default)
     DistributedAMI ami_;          // optional cyclicAMI interface (implicit coupling in the matvec); inactive by default
+    DeviceBuffer<scalar> amiSumOff_, amiExt_;   // AMI diagonal-dominance term + a gather scratch (explicit ops)
     bool   hasFvoMom_ = false;    // fvOptions vectorSemiImplicitSource(U): per-cell explicit Su + implicit Sp
     DeviceBuffer<scalar> fvoMomSu_[3], fvoMomSp_;   // Su*V per component -> relaxSrc; Sp*V -> momentum diagonal
     DevicePorosity por_;          // fvOptions explicitPorositySource (DarcyForchheimer), evaluated each iter
@@ -1280,6 +1291,18 @@ inline ParStepResidual ParallelDeviceSimple::step()
     deviceAxpy(-1.0, lU, mUp);
     deviceAxpy(-1.0, lL, mLo);
 
+    // cyclicAMI momentum coupling: assemble the interface off-diagonal into mDiag (ifCoeff = -(nuFace*dc*magSf) +
+    // min(phi,0); diag[own] += (nuFace*dc*magSf) + max(phi,0)) from ami_.phi + the GATHERED nuEff, and the
+    // diagonal-dominance term amiSumOff_ (added to sumOff before deviceRelaxDiag). Rotation is inside the op (fT).
+    if (ami_.active)
+    {
+        distributedAmiGather(ami_, nuEffCell, amiExt_);
+        deviceAmiAssembleMomentum(ami_.local, amiExt_, mDiag);
+        amiSumOff_.copyFrom(std::vector<scalar>(static_cast<std::size_t>(lnC_), 0.0));
+        deviceAmiOffDiagSum(ami_.local, amiSumOff_);
+        if (ami_.local.rotational) deviceAmiScaleImplicit(ami_.local);   // per-comp ifCoeffC = ifCoeff*forwardT[kk][kk]
+    }
+
     // fvOptions vectorSemiImplicitSource(U) implicit Sp: diag -= Sp*V (== fvm::Sp(Sp,U)); the explicit Su feeds
     // relaxSrc below. explicitPorositySource: DarcyForchheimer isotropic resistance into the diagonal (from |U|).
     if (fvoMomSp_.size()) deviceAxpy(-1.0, fvoMomSp_, mDiag);
@@ -1333,6 +1356,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     }
     DeviceBuffer<scalar> sumOff(std::vector<scalar>(lnC_, 0.0));
     deviceInterfaceOffDiagSum(halo_, faceCellsD_, ifCoeff, sumOff);
+    if (ami_.active) deviceAxpy(1.0, amiSumOff_, sumOff);   // AMI off-diagonals count toward diagonal dominance too
     DeviceBuffer<scalar> mDiagR, delta;
     deviceRelaxDiag(deviceLduView(dm_, mDiag, mUp, mLo), dm_, iC[0], relaxU_, mDiagR, delta, sumOff.data());
     dumpStage("sumOff", sumOff);
@@ -1440,6 +1464,12 @@ inline ParStepResidual ParallelDeviceSimple::step()
     halo_.waitExchange();
     DeviceBuffer<scalar> gx, gy, gz;
     deviceGaussGrad(dm_, dp_, pbv, gx, gy, gz);
+    if (ami_.active)   // AMI-face contribution to grad(p): grad[own] += Sf*(w*p[own]+(1-w)*interp(p))/V
+    {
+        DeviceBuffer<scalar> pe;
+        distributedAmiGather(ami_, dp_, pe);
+        deviceAmiAddGrad(ami_.local, pe, dm_.V, gx, gy, gz);
+    }
     DeviceBuffer<scalar>* gg[3] = { &gx, &gy, &gz };
 
     // ---- momentum predictor ----
@@ -1513,6 +1543,14 @@ inline ParStepResidual ParallelDeviceSimple::step()
     DeviceBuffer<scalar> phiHbyAint, phiHbyAbnd;
     deviceVectorFlux(dm_, HbyA[0], HbyA[1], HbyA[2], phiHbyAint);
     deviceBoundaryFlux(dm_, hb[0], hb[1], hb[2], phiHbyAbnd);
+    if (ami_.active)   // AMI-face phiHbyA = (w*HbyA[own] + (1-w)*interp(forwardT.HbyA[nbr])).Sf -> ami_.phi
+    {
+        DeviceBuffer<scalar> hxe, hye, hze;
+        distributedAmiGather(ami_, HbyA[0], hxe);
+        distributedAmiGather(ami_, HbyA[1], hye);
+        distributedAmiGather(ami_, HbyA[2], hze);
+        deviceAmiFlux(ami_.local, hxe, hye, hze);
+    }
 
     // SIMPLEC flux + HbyA consistency correction (OF simpleFoam `consistent` branch), from the ENTRY grad(p):
     //   phiHbyA += interp(rAtU-rAU)*snGrad(p)*magSf  (= the drAtU-weighted Laplacian flux of dp_, internal + boundary)
@@ -1581,12 +1619,19 @@ inline ParStepResidual ParallelDeviceSimple::step()
 
     DeviceBuffer<scalar> dphi, psrc;
     deviceDiv(dm_, phiHbyAint, phiHbyAbnd, dphi);
+    if (ami_.active) deviceAmiAddDiv(ami_.local, dm_.V, dphi);   // AMI-face phiHbyA into continuity div (uses ami_.phi)
     deviceHadamard(psrc, dm_.V, dphi);
     DeviceBuffer<scalar> piC, pbC;
     deviceBCLaplacianCoeffsFace(dbP_, rAUbnd, piC, pbC);
     DeviceBuffer<scalar>& pDiagC = pDiagp_;   // persistent (graph-referenced)
     DeviceBuffer<scalar>& pb     = pbp_;
     deviceFold(dm_, pD, psrc, piC, pbC, pDiagC, pb);
+    if (ami_.active)   // AMI pressure laplacian: ifCoeff = rAtUFace*dc*magSf; pDiagC[own] -= ifCoeff (interp(rAtU))
+    {
+        DeviceBuffer<scalar> re;
+        distributedAmiGather(ami_, rAtU, re);
+        deviceAmiAssembleLaplacian(ami_.local, re, pDiagC, /*addToDiag*/ true);
+    }
 
     // Explicit non-orth correction of laplacian(rAU,p), from the ENTRY grad(p) (gx/gy/gz), matching the
     // single-GPU pass-0 convention. It needs BOTH halves: b += -V*div(ffc) here, and phi -= ffc at the
