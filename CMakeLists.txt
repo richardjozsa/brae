@@ -239,6 +239,18 @@ if(BRAE_WITH_NVSHMEM)
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
 
+    # Distributed AMI mapDistribute foundation: gather reproduces the global stencil values across ranks
+    add_executable(test_distributed_ami_gather tests/test_distributed_ami_gather.cu)
+    target_include_directories(test_distributed_ami_gather PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_distributed_ami_gather PRIVATE brae_core)
+    foreach(_np 1 2)
+        add_test(NAME distributed_ami_gather_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_distributed_ami_gather>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/tc_wedge_ami)
+    endforeach()
+
     # Phase 4a L8: device distributed momentum PREDICTOR vs the host predictor
     add_executable(test_gpu_parallel_predictor tests/test_gpu_parallel_predictor.cu)
     target_include_directories(test_gpu_parallel_predictor PRIVATE ${BRAE_HEADER_DIRS}
