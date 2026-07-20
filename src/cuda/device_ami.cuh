@@ -134,6 +134,9 @@ void deviceAmiInterpolateVec(const DeviceAMI& ami, const DeviceBuffer<scalar>& U
 // (interpolate-to-source THEN scale by the assembled interface coefficient). Scalar field -> no rotation. Call
 // alongside the internal-face amul; pass cyc.ifCoeff assembled by the laplacian/momentum AMI assembly.
 void deviceAmiAmul(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi);
+// deviceAmiAmul with an explicit off-diagonal coefficient (rotational momentum: ifCoeffC[kk]; else ami.ifCoeff).
+void deviceAmiAmulCoeff(const DeviceAMI& ami, const DeviceBuffer<scalar>& coeff,
+                        const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi);
 
 // assembly (mirrors device_cyclic, with the AMI weighted stencil; explicit ops use the interpolated nbr)
 // MOMENTUM M = div(phi,U) - laplacian(nuEff,U): ifCoeff[i] = -(nuFace*dc*magSf) + min(phi,0); diag[own] +=

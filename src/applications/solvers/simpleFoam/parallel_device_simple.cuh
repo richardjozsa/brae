@@ -1436,6 +1436,16 @@ inline ParStepResidual ParallelDeviceSimple::step()
             halo_.waitExchange();
             deviceGaussGrad(dm_, Uk_[k], ub, gUx[k], gUy[k], gUz[k]);
         }
+        // AMI linearUpwind correction reads the rotated neighbour stencil of ALL 3 components' gradients -> gather
+        // each of the 9 gradient arrays (extended [local|gathered]). gUE holds the extended gradients per component.
+        DeviceBuffer<scalar> gUxE[3], gUyE[3], gUzE[3];
+        if (ami_.active)
+            for (int l = 0; l < 3; ++l)
+            {
+                distributedAmiGather(ami_, gUx[l], gUxE[l]);
+                distributedAmiGather(ami_, gUy[l], gUyE[l]);
+                distributedAmiGather(ami_, gUz[l], gUzE[l]);
+            }
         DeviceBuffer<scalar> corrV[3];
         if (linUpwindV_)   // vector-limited internal correction, all 3 at once (cut faces still use the plain grad)
             deviceLinearUpwindVCorr(dm_, phiInt_, gUx, gUy, gUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
@@ -1454,6 +1464,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
                 deviceLinearCorrInterface(halo_, faceCellsD_, phiF, weightsD_, Uk_[k], lc);   // + cut faces
                 deviceAxpy(0.75, lc, corr);
             }
+            if (ami_.active) deviceAmiAddLinUpwindCorr(ami_.local, k, gUxE, gUyE, gUzE, corr);   // + AMI-face linearUpwind
             dumpStage("corr_final", corr, k);
             deviceAxpy(-1.0, corr, relaxSrc[k]);                                // source -= corr
         }
@@ -1465,6 +1476,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     // `if (ctl_.nonOrth) { deviceLaplacianCorr; +cyclic; relaxSrc -= corr; }`.
     if (nonOrth_)
     {
+        DeviceBuffer<scalar> ggx[3], ggy[3], ggz[3];
         for (int k = 0; k < 3; ++k)
         {
             DeviceBuffer<scalar> ub;
@@ -1472,13 +1484,28 @@ inline ParStepResidual ParallelDeviceSimple::step()
             halo_.exchange(Uk_[k].data());
             halo_.scatterBoundaryValues(Uk_[k].data(), weightsD_, procStart_, ub.data());
             halo_.waitExchange();
-            DeviceBuffer<scalar> ggx, ggy, ggz;
-            deviceGaussGrad(dm_, Uk_[k], ub, ggx, ggy, ggz);
-
+            deviceGaussGrad(dm_, Uk_[k], ub, ggx[k], ggy[k], ggz[k]);
+        }
+        // AMI non-orth laplacian correction reads the rotated-TENSOR neighbour stencil of all 3 components' gradients
+        // AND interp(nuEff) at the neighbour -> gather the 9 gradients + nuEff (all extended).
+        DeviceBuffer<scalar> ggxE[3], ggyE[3], ggzE[3], nuE;
+        if (ami_.active)
+        {
+            for (int l = 0; l < 3; ++l)
+            {
+                distributedAmiGather(ami_, ggx[l], ggxE[l]);
+                distributedAmiGather(ami_, ggy[l], ggyE[l]);
+                distributedAmiGather(ami_, ggz[l], ggzE[l]);
+            }
+            distributedAmiGather(ami_, nuEffCell, nuE);
+        }
+        for (int k = 0; k < 3; ++k)
+        {
             DeviceBuffer<scalar> lc;
-            deviceLaplacianCorr(dm_, nuEff_f, ggx, ggy, ggz, lc);                       // internal faces
+            deviceLaplacianCorr(dm_, nuEff_f, ggx[k], ggy[k], ggz[k], lc);              // internal faces
             deviceLapCorrInterface(halo_, faceCellsD_, nuFaceD_, magSfD_, corrVecD_,
-                                   weightsD_, ggx, ggy, ggz, lc);                       // + cut faces
+                                   weightsD_, ggx[k], ggy[k], ggz[k], lc);              // + cut faces
+            if (ami_.active) deviceAmiAddLapCorr(ami_.local, k, nuE, ggxE, ggyE, ggzE, lc);   // + AMI-face non-orth
             deviceAxpy(-1.0, lc, relaxSrc[k]);   // momentum is div - laplacian: source -= lapCorr
         }
     }
@@ -1510,6 +1537,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         deviceFold(dm_, mDiagR, s, iC[k], bC[k], diagC, b);
         const DeviceLduView mv = deviceLduView(dm_, diagC, mUp, mLo);
         const DistributedAMI* amip = ami_.active ? &ami_ : nullptr;
+        if (ami_.active) ami_.amulComp = k;   // ROTATIONAL momentum matvec uses ifCoeffC[k] (pairs with the deferred rot)
         const scalar nf = deviceParallelNormFactor(mv, halo_, ifCoeff, Uk_[k], b, ones_, P_.globalNCells, amip);
         if (!bicgGCache_[k]) bicgGCache_[k] = std::make_unique<BiCGGraphCache>();   // lazy: whole-loop graph (BRAE_PARALLEL_GRAPH=3)
         const DeviceSolverPerf up =
@@ -1676,7 +1704,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     // Explicit non-orth correction of laplacian(rAU,p), from the ENTRY grad(p) (gx/gy/gz), matching the
     // single-GPU pass-0 convention. It needs BOTH halves: b += -V*div(ffc) here, and phi -= ffc at the
     // corrector below -- the source alone leaves the reconstructed flux non-conservative on cut faces.
-    DeviceBuffer<scalar> ffcP;
+    DeviceBuffer<scalar> ffcP, ffcPami;   // ffcPami: AMI non-orth flux correction, applied to ami_.phi at the corrector
     std::vector<DeviceBuffer<scalar>> ffcPif;
     if (nonOrth_)
     {
@@ -1684,6 +1712,15 @@ inline ParStepResidual ParallelDeviceSimple::step()
         DeviceBuffer<scalar> sc;
         deviceFaceDivSource(dm_, ffcP, sc);
         deviceAxpy(1.0, sc, pb);
+        if (ami_.active)   // AMI pressure non-orth: -ffc into pb[own], ffcPami for the corrector (ami_.phi -= ffcPami)
+        {
+            DeviceBuffer<scalar> re, gxe, gye, gze;
+            distributedAmiGather(ami_, rAtU, re);
+            distributedAmiGather(ami_, gx, gxe);
+            distributedAmiGather(ami_, gy, gye);
+            distributedAmiGather(ami_, gz, gze);
+            deviceAmiLapCorrP(ami_.local, re, gxe, gye, gze, pb, ffcPami);
+        }
         // rAU at the cut faces = the halo-interpolated boundary value, sliced per interface
         std::vector<DeviceBuffer<scalar>> rAUfaceD(procStart_.size());
         for (std::size_t i = 0; i < procStart_.size(); ++i)
@@ -1703,6 +1740,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
     DeviceBuffer<scalar>& pSol = pSolp_;   // persistent: the whole-loop graph keys on pSol.data() -> capture once
     deviceCopy(pSol, dp_);
     const DeviceLduView pv = deviceLduView(dm_, pDiagC, pU_, pL_);
+    if (ami_.active) ami_.amulComp = -1;   // pressure matvec is scalar -> the base ifCoeff (from assembleLaplacian)
     const DistributedAMI* pamip = ami_.active ? &ami_ : nullptr;
     const scalar nfp = deviceParallelNormFactor(pv, halo_, pIfCoeff, pSol, pb, ones_, P_.globalNCells, pamip);
     // pressure solve: local-AMG-preconditioned distributed CG (the strong preconditioner that converges on graded
@@ -1744,6 +1782,8 @@ inline ParStepResidual ParallelDeviceSimple::step()
         DeviceBuffer<scalar> pe;
         distributedAmiGather(ami_, pSol, pe);
         deviceAmiCorrectFlux(ami_.local, pe);
+        if (nonOrth_ && ffcPami.size())
+            deviceAxpy(-1.0, ffcPami, ami_.local.phi);   // AMI non-orth flux correction (matches phiInt_ -= ffcP)
     }
     deviceCopy(phiInt_, phiHbyAint);                 // maintained across iterations
     deviceCopy(phiBnd_, phiHbyAbnd);
