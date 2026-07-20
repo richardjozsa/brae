@@ -1371,7 +1371,20 @@ inline ParStepResidual ParallelDeviceSimple::step()
     proc.weights   = &weightsD_;
     proc.procStart = &procStart_;
     DeviceBuffer<scalar> sX, sY, sZ;
-    deviceDivDevReff(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEffCell, nuEffBndEff, sX, sY, sZ, nullptr, nullptr, &proc);
+    // divDevReff stress. With cyclicAMI, the gradU at the interface reads the AMI-interpolated neighbour U -- which
+    // after decomposition is remote -- so pass the GATHERED extended U per component (its [0..nLocal) is the local
+    // field the internal Gauss grad + halo use; nbrCell reads into the gathered tail). deviceDivDevReff then does the
+    // AMI grad internally (deviceAmiInterpolateVec + deviceAmiAddGradRot rotational / deviceAmiAddGrad translational).
+    if (ami_.active)
+    {
+        DeviceBuffer<scalar> uxE, uyE, uzE;
+        distributedAmiGather(ami_, Uk_[0], uxE);
+        distributedAmiGather(ami_, Uk_[1], uyE);
+        distributedAmiGather(ami_, Uk_[2], uzE);
+        deviceDivDevReff(dm_, dbU_, uxE, uyE, uzE, nuEffCell, nuEffBndEff, sX, sY, sZ, nullptr, &ami_.local, &proc);
+    }
+    else
+        deviceDivDevReff(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEffCell, nuEffBndEff, sX, sY, sZ, nullptr, nullptr, &proc);
     DeviceBuffer<scalar>* sS[3] = { &sX, &sY, &sZ };
     dumpStage("stress", sX, 0);
     dumpStage("stress", sY, 1);
