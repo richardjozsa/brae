@@ -30,7 +30,7 @@ int main(int argc, char** argv)
     const std::string caseDir = argc > 1 ? argv[1] : "validation/tc_wedge_ami";
 
     bool ok = true;
-    scalar gMaxErr = 0;
+    scalar gMaxErr = 0, gMaxErrN = 0;
     long gChecked = 0, gRecv = 0;
     {
         PrimitiveMesh gm;
@@ -63,7 +63,7 @@ int main(int argc, char** argv)
             }
         Pstream::broadcast(cellToPart.data(), nC, 0);
         const Partition P(gm, cellToPart, rank);
-        const DistributedAMI D = buildDistributedAMI(gAMIs, cellToPart, P);
+        DistributedAMI D = buildDistributedAMI(gAMIs, cellToPart, P);
 
         // psi[localCell] = its GLOBAL index
         const label nLoc = P.nCells();
@@ -98,13 +98,32 @@ int main(int argc, char** argv)
         gMaxErr  = Pstream::allReduce(maxErr, ReduceOp::Max);
         gChecked = static_cast<long>(Pstream::allReduce(static_cast<scalar>(checked), ReduceOp::Sum));
         gRecv    = static_cast<long>(Pstream::allReduce(static_cast<scalar>(D.nRecv), ReduceOp::Sum));
-        ok = (gMaxErr < 0.5) && (gChecked > 0);
+
+        // NVSHMEM on-GPU gather must reproduce the SAME result (this is the path the implicit matvec will use).
+        scalar maxErrN = 0;
+        if (Pstream::nvshmemActive())
+        {
+            DeviceBuffer<scalar> psiExtN;
+            distributedAmiGatherNvshmem(D, psi, psiExtN);
+            std::vector<scalar> hextN;
+            psiExtN.copyTo(hextN);
+            label e2 = 0;
+            for (const AMIInterface& a : gAMIs)
+                for (std::size_t i = 0; i < a.ownCell.size(); ++i)
+                {
+                    if (cellToPart[a.ownCell[i]] != rank) continue;
+                    for (label k = a.srcOffset[i]; k < a.srcOffset[i + 1]; ++k)
+                        maxErrN = std::fmax(maxErrN, std::fabs(hextN[hNbr[e2++]] - static_cast<scalar>(a.nbrCell[k])));
+                }
+        }
+        gMaxErrN = Pstream::allReduce(maxErrN, ReduceOp::Max);
+        ok = (gMaxErr < 0.5) && (gMaxErrN < 0.5) && (gChecked > 0);
     }
 
     if (Pstream::master())
     {
-        std::printf("distributed AMI gather: np=%d  checked=%ld stencil entries  gathered=%ld remote cells  maxErr=%.3e\n",
-                    nproc, gChecked, gRecv, gMaxErr);
+        std::printf("distributed AMI gather: np=%d  checked=%ld  gathered=%ld remote cells  MPI maxErr=%.3e  NVSHMEM maxErr=%.3e\n",
+                    nproc, gChecked, gRecv, gMaxErr, gMaxErrN);
         std::printf("%s\n", ok ? "PASS" : "FAIL");
     }
     Pstream::finalize();

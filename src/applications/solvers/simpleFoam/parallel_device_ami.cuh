@@ -22,7 +22,14 @@
 #include "interface/ami_interface.cuh"
 #include "parallel_simple.cuh"      // Partition
 #include "cf_pstream.cuh"
+#include "sym_buffer.cuh"           // SymBuffer: NVSHMEM symmetric recv buffer for the on-GPU gather
+#ifdef BRAE_WITH_NVSHMEM
+#include <nvshmem_host.h>           // nvshmemx_putmem_on_stream / nvshmemx_barrier_all_on_stream (host on-stream API)
+#endif
+#include <cuda_runtime.h>
 #include <vector>
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <algorithm>
 
@@ -42,10 +49,74 @@ struct DistributedAMI
     std::vector<int>   sendRank;
     std::vector<std::vector<label>> sendCells;   // per send-block: the LOCAL cells to pack and send
 
-    // scratch (host staging for the gather; sized at build)
+    // NVSHMEM put-based gather (blocks SORTED by rank -> the remote offset in the destination's recv buffer is
+    // computable locally from the global AMI symmetry, no setup exchange): for send-block b, put the packed cells to
+    // destination sendRank[b]'s symmetric recv buffer at sendRemoteOffset[b]. recvCap = GLOBAL max nRecv (symmetric
+    // buffers must be the same size on every PE). sendIdx/sendLocalOff = the flattened pack layout for a GPU kernel.
+    std::vector<int>   sendRemoteOffset;         // per send-block: offset in the destination rank's recv buffer
+    std::vector<int>   sendLocalOff;             // per send-block: offset into the flattened sendIdx
+    std::vector<label> sendIdx;                  // flattened local cell indices to pack (all send blocks, in order)
+    int recvCap = 0;                             // global max nRecv across ranks (symmetric recv buffer capacity)
+
+    // NVSHMEM on-GPU gather resources (allocated in buildDistributedAMI; symmetric recv is collective).
+    SymBuffer<scalar>    recvSym;                // symmetric recv buffer (size recvCap); senders put my cells here
+    DeviceBuffer<scalar> sendPack;              // packed send values (size sendIdx.size())
+    DeviceBuffer<label>  sendIdxD;              // sendIdx on device (for the pack kernel)
+
+    // scratch (host staging for the MPI gather; sized at build)
     mutable std::vector<std::vector<scalar>> sendBuf;   // per send-block pack buffer
     mutable std::vector<scalar> recvBuf;                // flattened recv (size nRecv), copied to psiExt tail
 };
+
+// pack kernel for the on-GPU gather: out[i] = psi[idx[i]]. static -> internal linkage per TU (header-only, no ODR clash).
+static __global__ void amiPackKernel(
+    scalar*       __restrict__ out,
+    const scalar* __restrict__ psi,
+    const label*  __restrict__ idx,
+    int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = psi[idx[i]];
+}
+
+// NVSHMEM on-GPU gather (for the implicit matvec: no D2H/H2D, no MPI, so it can run inside every solver matvec).
+// Packs the send cells on the device, puts each block to the destination's symmetric recv buffer at the precomputed
+// remote offset, barriers, and copies the recv into psiExt[nLocal..]. The blocks/offsets align by construction (my
+// send block == the destination's recv-from-me block, placed at its recvStart for source==me). NVSHMEM active only.
+inline void distributedAmiGatherNvshmem(DistributedAMI& D, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& psiExt)
+{
+    const cudaStream_t stream = cudaStreamPerThread;
+    psiExt.resize(static_cast<std::size_t>(D.nLocal) + static_cast<std::size_t>(D.nRecv));
+    cudaCheck(cudaMemcpyAsync(psiExt.data(), psi.data(), static_cast<std::size_t>(D.nLocal) * sizeof(scalar),
+                              cudaMemcpyDeviceToDevice, stream), "amiNvshmem local head");
+    if (D.recvCap == 0) return;   // no cross-rank AMI coupling anywhere
+#ifdef BRAE_WITH_NVSHMEM
+    const int nSend = static_cast<int>(D.sendIdx.size());
+    if (nSend > 0)
+    {
+        constexpr int TPB = 128;
+        amiPackKernel<<<(nSend + TPB - 1) / TPB, TPB, 0, stream>>>(
+            D.sendPack.data(), psi.data(), D.sendIdxD.data(), nSend);
+        cudaCheck(cudaGetLastError(), "amiPackKernel");
+    }
+    for (std::size_t b = 0; b < D.sendRank.size(); ++b)
+    {
+        const int cnt = static_cast<int>(D.sendCells[b].size());
+        if (cnt <= 0) continue;
+        nvshmemx_putmem_on_stream(
+            D.recvSym.data() + D.sendRemoteOffset[b],          // symmetric addr in the destination's recv buffer
+            D.sendPack.data() + D.sendLocalOff[b],             // my packed block
+            static_cast<std::size_t>(cnt) * sizeof(scalar),
+            D.sendRank[b],
+            stream);
+    }
+    nvshmemx_barrier_all_on_stream(stream);                     // all puts land before anyone reads its recv buffer
+    if (D.nRecv > 0)
+        cudaCheck(cudaMemcpyAsync(psiExt.data() + D.nLocal, D.recvSym.data(),
+                                  static_cast<std::size_t>(D.nRecv) * sizeof(scalar),
+                                  cudaMemcpyDeviceToDevice, stream), "amiNvshmem recv tail");
+#endif
+}
 
 // Build the per-rank distributed AMI. `globalAMIs` is buildAMIInterfaces() on the GLOBAL mesh (same on every
 // rank); `cellToPart` is the global cell->rank decomposition; P is this rank's Partition. The returned .local is
@@ -70,7 +141,7 @@ inline DistributedAMI buildDistributedAMI(
     // ---- RECV side: my source faces' remote target cells, deduped per owning rank, assigned tail slots ----
     // recvSlot[globalCell] = its position in the extended tail (nLocal + slot). Built in first-seen order per rank.
     std::unordered_map<label, int> recvSlot;
-    std::unordered_map<int, std::vector<label>> recvByRank;   // owning rank -> global cells I need from it
+    std::map<int, std::vector<label>> recvByRank;   // owning rank -> global cells I need from it (SORTED by rank)
     auto tailSlotOf = [&](label gNbr, int owner) -> int
     {
         auto it = recvSlot.find(gNbr);
@@ -147,33 +218,66 @@ inline DistributedAMI buildDistributedAMI(
 
     // ---- SEND side: by symmetry, scan ALL global source faces; any whose target cell is MINE and whose source
     // cell is on another rank r means r will request that cell from me -> add it to my send-block for r. ----
-    std::unordered_map<int, std::vector<label>> sendByRank;   // dest rank -> my local cells it needs (deduped)
-    std::unordered_map<int, std::unordered_map<label, char>> seen;
+    std::map<int, std::vector<label>> sendByRank;   // dest rank -> my local cells it needs (deduped, SORTED by rank)
+    std::map<int, std::set<label>> seen;
     for (const AMIInterface& a : globalAMIs)
         for (std::size_t i = 0; i < a.ownCell.size(); ++i)
         {
             const int srcRank = static_cast<int>(cellToPart[a.ownCell[i]]);
             if (srcRank == me) continue;   // that rank's target cells it fetches; my sends are to OTHER ranks
-            const label b = a.srcOffset[i], e = a.srcOffset[i + 1];
-            for (label k = b; k < e; ++k)
+            for (label k = a.srcOffset[i]; k < a.srcOffset[i + 1]; ++k)
             {
                 const label gNbr = a.nbrCell[k];
                 if (cellToPart[gNbr] != me) continue;   // target cell not mine -> not my job to send
-                auto& s = seen[srcRank];
-                if (s.emplace(gNbr, 1).second) sendByRank[srcRank].push_back(g2l.at(gNbr));
+                if (seen[srcRank].insert(gNbr).second) sendByRank[srcRank].push_back(g2l.at(gNbr));
             }
         }
-    // The SEND order must match how the receiver laid out its recv block for this rank. Both sides iterate the
-    // SAME global AMIs in the SAME order and dedupe first-seen, so the k-th cell I send to r equals the k-th cell
-    // r placed in its recv block from me -> the orders agree by construction (no exchange of the ordering needed).
+    // The SEND order matches how the receiver laid out its recv block for this rank (both iterate the SAME global
+    // AMIs, dedupe first-seen). The REMOTE OFFSET (where my block lands in the destination's recv buffer) is the
+    // destination's recvStart for source==me = the count of distinct cells the destination fetches from ranks < me;
+    // computable here from the same global data (both sides sort blocks by rank) -> still no setup exchange.
+    auto remoteRecvOffset = [&](int dest) -> int
+    {
+        std::map<int, std::set<label>> byRank;   // dest's recv, source rank -> distinct cells (only ranks < me matter)
+        for (const AMIInterface& a : globalAMIs)
+            for (std::size_t i = 0; i < a.ownCell.size(); ++i)
+            {
+                if (static_cast<int>(cellToPart[a.ownCell[i]]) != dest) continue;   // the destination's source faces
+                for (label k = a.srcOffset[i]; k < a.srcOffset[i + 1]; ++k)
+                {
+                    const int owner = static_cast<int>(cellToPart[a.nbrCell[k]]);
+                    if (owner != dest) byRank[owner].insert(a.nbrCell[k]);
+                }
+            }
+        int off = 0;
+        for (const auto& kv : byRank) { if (kv.first < me) off += static_cast<int>(kv.second.size()); else break; }
+        return off;
+    };
+    int flat = 0;
     for (auto& kv : sendByRank)
     {
         D.sendRank.push_back(kv.first);
+        D.sendRemoteOffset.push_back(remoteRecvOffset(kv.first));
+        D.sendLocalOff.push_back(flat);
+        for (label c : kv.second) { D.sendIdx.push_back(c); ++flat; }
         D.sendCells.push_back(std::move(kv.second));
     }
     D.sendBuf.resize(D.sendCells.size());
     for (std::size_t b = 0; b < D.sendCells.size(); ++b) D.sendBuf[b].resize(D.sendCells[b].size());
     D.recvBuf.assign(static_cast<std::size_t>(D.nRecv), 0.0);
+    D.recvCap = static_cast<int>(Pstream::allReduce(static_cast<label>(D.nRecv), ReduceOp::Max));   // symmetric buffer size
+
+    // NVSHMEM resources: the symmetric recv buffer is a COLLECTIVE alloc (recvCap is the same on every rank), so all
+    // ranks construct it together even if their own nRecv is 0. The packed-send buffer + device sendIdx are local.
+    if (D.recvCap > 0)
+    {
+        D.recvSym = SymBuffer<scalar>(static_cast<std::size_t>(D.recvCap));
+        if (!D.sendIdx.empty())
+        {
+            D.sendPack.resize(D.sendIdx.size());
+            D.sendIdxD.copyFrom(D.sendIdx);
+        }
+    }
     return D;
 }
 
