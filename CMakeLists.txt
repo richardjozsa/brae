@@ -1133,9 +1133,15 @@ add_test(NAME gpu_crossover COMMAND test_gpu_crossover ${CMAKE_CURRENT_SOURCE_DI
 # slot and launches many concurrently -> on the self-hosted SINGLE-GPU runner that oversubscribes the GPU/CPU with
 # dozens of ranks at once, the cause of the flaky failures (parallel_spmv_np2, parallel_pcg_np8 under load; each
 # passes in isolation). Setting PROCESSORS=N makes the scheduler reserve N slots per test, so it never overcommits.
+# PROCESSORS alone still allowed TWO np=2 tests to run at once under -j4 (4 ranks -> 4 CUDA/NVSHMEM contexts on the
+# one GPU -> intermittent init/heap-contention crash, exit 8). RESOURCE_LOCK on the np>=2 tests makes them mutually
+# exclusive (at most one multi-rank GPU test at a time); the many np=1 / single-GPU tests still parallelise freely.
 get_property(_brae_all_tests DIRECTORY PROPERTY TESTS)
 foreach(_t ${_brae_all_tests})
     if(_t MATCHES "_np([0-9]+)$")
         set_tests_properties(${_t} PROPERTIES PROCESSORS ${CMAKE_MATCH_1})
+        if(CMAKE_MATCH_1 GREATER 1)
+            set_tests_properties(${_t} PROPERTIES RESOURCE_LOCK gpu_multirank)
+        endif()
     endif()
 endforeach()
