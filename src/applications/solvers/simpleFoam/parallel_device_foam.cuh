@@ -25,8 +25,10 @@
 #include "parallel_simple.cuh"
 #include "field_distribute.cuh"
 #include "parallel_device_simple.cuh"
+#include "parallel_device_ami.cuh"   // DistributedAMI: mapDistribute addressing + gather (distributed cyclicAMI, WIP)
 #include "mrf_read.cuh"   // readMRFProperties / readCellZones / mrfCorrectBoundaryVelocity
 #include "mrf_zone.cuh"   // MRFZone / buildMRFZone
+#include "fv_options.cuh" // readFvOptions / FvOptionsData (per-cell momentum sources + porosity)
 #include "cf_pstream.cuh"
 
 #include <cmath>
@@ -315,6 +317,17 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const label nC = gm.nCells();
         lap("meshRead");
 
+        // cyclic / cyclicAMI are NOT coupled on the multi-GPU device path yet: the distributed solver skips those
+        // faces (interface left OPEN -> wrong answer), so refuse rather than solve silently wrong. Single-GPU
+        // `brae -case` handles them. (Distributing the AMI is a many-to-many implicit interface that needs a
+        // mapDistribute-style cross-rank gather woven through the momentum/pressure/flux/H operations.)
+        for (const auto& pinfo : gm.patches())
+            if (pinfo.type == "cyclic" || pinfo.type == "cyclicAMI")
+                throw std::runtime_error(
+                    "brae -parallel: patch '" + pinfo.name + "' is type '" + pinfo.type + "', which is not coupled "
+                    "on the multi-GPU device path (the interface would be left open and the answer wrong). Use "
+                    "`brae -case <dir>` (single GPU) for cyclic/cyclicAMI cases.");
+
         // decompose in core: SCOTCH on master, broadcast so every rank agrees on the same partitioning
         std::vector<label> cellToPart(nC, 0);
         if (master) cellToPart = scotchDecomposeCached(gm, nproc, caseDir + "/constant/polyMesh");   // ~1s -> cached
@@ -378,6 +391,51 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                             mrfCfg.origin.x, mrfCfg.origin.y, mrfCfg.origin.z, static_cast<std::size_t>(nGlob));
         }
 
+        // fvOptions (system/ or constant/fvOptions), if present. Per-cell momentum sources distribute like MRF
+        // (global cell arrays -> this rank's local via cellProcAddr): vectorSemiImplicitSource(U) (Su/Sp) and
+        // explicitPorositySource (DarcyForchheimer). Global/reduction sources (meanVelocityForce, actuationDisk),
+        // scalar sources and rotorDisk are NOT yet distributed -> refused rather than solved wrong.
+        FvOptionsData localFvo;
+        if (std::filesystem::exists(caseDir + "/system/fvOptions") ||
+            std::filesystem::exists(caseDir + "/constant/fvOptions"))
+        {
+            const auto fvoZones = readCellZones(caseDir + "/constant/polyMesh");
+            FvGeometry gg;
+            gg.build(gm);
+            const FvOptionsData fvo = readFvOptions(caseDir, fvoZones, gg.V(), nC, gg.C());
+            if (!fvo.empty())
+            {
+                // Supported so far: vectorSemiImplicitSource(U) (per-cell Su/Sp, validated). Everything else --
+                // explicitPorositySource, meanVelocityForce, actuationDisk, scalar sources, rotorDisk -- is refused
+                // until it has a distributed validation case (no small/no-op test would prove correctness).
+                if (fvo.porActive || fvo.mvfActive || fvo.adActive || fvo.limUActive || fvo.vdcActive
+                    || !fvo.scaSu.empty() || !fvo.scaSp.empty() || fvo.rotor.active)
+                    throw std::runtime_error(
+                        "brae -parallel: this fvOptions type is not yet on the multi-GPU device path (supported: "
+                        "vectorSemiImplicitSource on U). Use `brae -case <dir>` (single GPU) for the full set.");
+                localFvo.count = fvo.count;
+                const label nLoc = P.nCells();
+                if (fvo.hasMomentum)
+                {
+                    localFvo.hasMomentum = true;
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        localFvo.momSu[c].resize(nLoc);
+                        for (label lc = 0; lc < nLoc; ++lc)
+                            localFvo.momSu[c][lc] = fvo.momSu[c][P.Lm.cellProcAddr[lc]];
+                    }
+                    if (!fvo.momSp.empty())
+                    {
+                        localFvo.momSp.resize(nLoc);
+                        for (label lc = 0; lc < nLoc; ++lc)
+                            localFvo.momSp[lc] = fvo.momSp[P.Lm.cellProcAddr[lc]];
+                    }
+                }
+                if (master)
+                    std::printf("  fvOptions: %d source(s) vectorSemiImplicitSource(U)\n", fvo.count);
+            }
+        }
+
         // turbulence start fields: kEps/SST read k + eps|omega + nut (+ ReThetat/gammaInt for LM); SpalartAllmaras
         // is one-equation -> nuTilda + nut only (no k/eps).
         FieldData<scalar> kfd, efd, nfd, rfd, gfd, ntfd;
@@ -430,6 +488,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             else if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
             if (mrfCfg.active) solver.setMRF(mrfZone, mrfCfg.nonRotatingPatches);   // Coriolis source + relative flux
+            if (!localFvo.empty()) solver.setFvOptions(localFvo);                   // per-cell momentum Su/Sp + porosity
             lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc
 
             auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };

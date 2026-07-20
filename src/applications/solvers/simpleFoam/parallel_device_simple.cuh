@@ -25,6 +25,8 @@
 #include "cell_wall_dist.cuh"
 #include "parallel_device_interface.cuh"   // deviceMomentumInterface / deviceInterfaceOffDiagSum (shared)
 #include "device_mrf.cuh"          // DeviceMRF: Coriolis source + makeRelative frame flux (rotating cell zone)
+#include "fv_options.cuh"          // FvOptionsData (per-cell momentum Su/Sp + porosity)
+#include "device_fvoptions.cuh"    // DevicePorosity + deviceFvoPorosityDiag/Source
 #include <cuda_runtime.h>
 #include <fstream>
 #include <string>
@@ -829,6 +831,28 @@ public:
         deviceMrfApplyFrameFlux(mrf_, +1.0, phiInt_, phiBnd_);   // initial resident phi -> relative (OF createFields)
     }
 
+    // Enable fvOptions (distributed mirror of the single-GPU device setFvOptions). `fo` must already be LOCALISED
+    // to THIS rank -- per-cell arrays sized to nCells(), zone cells in local indices (the app maps global->local
+    // via cellProcAddr). Only the per-cell source families are supported here: vectorSemiImplicitSource(U)
+    // (momSu -> relaxSrc, momSp -> diagonal) and explicitPorositySource (DarcyForchheimer, evaluated each iter);
+    // global/reduction sources (meanVelocityForce, actuationDisk) + scalar sources are refused in the app.
+    void setFvOptions(const FvOptionsData& fo)
+    {
+        hasFvoMom_ = fo.hasMomentum;
+        if (fo.hasMomentum)
+        {
+            for (int c = 0; c < 3; ++c) fvoMomSu_[c].copyFrom(fo.momSu[c]);
+            if (!fo.momSp.empty()) fvoMomSp_.copyFrom(fo.momSp);
+        }
+        if (fo.porActive)
+        {
+            por_.active = true;
+            por_.d = fo.porD;
+            por_.f = fo.porF;
+            por_.cells.copyFrom(fo.porCells);
+        }
+    }
+
     // One distributed SIMPLE iteration. U/p/phi are updated in place on the device. Returns the momentum and
     // pressure INITIAL residuals -- OpenFOAM's SIMPLE convergence measure (fvSolution residualControl).
     ParStepResidual step();
@@ -1059,6 +1083,9 @@ private:
     scalar twoByk_ = 2.0;         // limitedLinear coefficient: 2/max(k_,SMALL) (k_=1 -> 2); limiter = clamp(twoByk*r,0,1)
     bool   limitedV_ = false;     // div(phi,U) limitedLinearV (NVDVTVDV): IMPLICIT limited convection, vector limiter/face
     DeviceMRF mrf_;               // optional rotating cell zone (MRF): Coriolis source + relative flux (inactive by default)
+    bool   hasFvoMom_ = false;    // fvOptions vectorSemiImplicitSource(U): per-cell explicit Su + implicit Sp
+    DeviceBuffer<scalar> fvoMomSu_[3], fvoMomSp_;   // Su*V per component -> relaxSrc; Sp*V -> momentum diagonal
+    DevicePorosity por_;          // fvOptions explicitPorositySource (DarcyForchheimer), evaluated each iter
     std::string dumpPath_;
     int    dumpAt_ = -1;
     mutable int iter_ = 0;
@@ -1241,6 +1268,11 @@ inline ParStepResidual ParallelDeviceSimple::step()
     deviceAxpy(-1.0, lU, mUp);
     deviceAxpy(-1.0, lL, mLo);
 
+    // fvOptions vectorSemiImplicitSource(U) implicit Sp: diag -= Sp*V (== fvm::Sp(Sp,U)); the explicit Su feeds
+    // relaxSrc below. explicitPorositySource: DarcyForchheimer isotropic resistance into the diagonal (from |U|).
+    if (fvoMomSp_.size()) deviceAxpy(-1.0, fvoMomSp_, mDiag);
+    if (por_.active) deviceFvoPorosityDiag(por_, nu_, dm_.V, Uk_[0], Uk_[1], Uk_[2], mDiag);
+
     // bounded Gauss upwind: - fvm::Sp(fvc::div(phi), U). Diagonal gets -V*div(phi); it stabilises the
     // transient (a rest-start cell where div(phi)!=0 at low nu blows up otherwise) and vanishes at
     // convergence. Mirrors host parallelSimpleStepLaminar's `bounded` branch.
@@ -1314,6 +1346,10 @@ inline ParStepResidual ParallelDeviceSimple::step()
         deviceAxpy(1.0, *sS[k], relaxSrc[k]);            // + V*divSig  -> == host Ml.source
         if (mrf_.active)                                 // MRF Coriolis: source -= V*(Omega x U)_k on zone cells
             deviceMrfCoriolis(mrf_, dm_.V, Uk_[0], Uk_[1], Uk_[2], k, relaxSrc[k]);
+        if (hasFvoMom_)                                  // fvOptions explicit momentum source Su*V (== fvOptions(U))
+            deviceAxpy(1.0, fvoMomSu_[k], relaxSrc[k]);
+        if (por_.active)                                 // porosity anisotropic remainder into the source
+            deviceFvoPorositySource(por_, k, nu_, dm_.V, Uk_[0], Uk_[1], Uk_[2], relaxSrc[k]);
     }
 
     // linearUpwind: the matrix stays upwind and this deferred correction is an explicit source. It must land
