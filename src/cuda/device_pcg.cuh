@@ -88,7 +88,8 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
     scalar relTol,
     int maxIter,
     int checkEvery = 1,          // convergence-read cadence: read |r| to the host every K iters (1 = exact per-iter)
-    BiCGGraphCache* gcache = nullptr);   // if BRAE_PARALLEL_GRAPH>=3 and non-null, use the whole-loop graph path
+    BiCGGraphCache* gcache = nullptr,    // if BRAE_PARALLEL_GRAPH>=3 and non-null, use the whole-loop graph path
+    const DistributedAMI* ami = nullptr);   // optional cyclicAMI: every matvec carries the AMI coupling (graph off)
 
 // Whole-loop conditional-graph momentum BiCGStab (BRAE_PARALLEL_GRAPH=3): the entire steady-state BiCGStab WHILE
 // body -- interface-coupled matvec + on-stream NVSHMEM reductions + the recurrence -- captured once into a
