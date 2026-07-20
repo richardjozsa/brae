@@ -837,6 +837,10 @@ public:
     // via cellProcAddr). Only the per-cell source families are supported here: vectorSemiImplicitSource(U)
     // (momSu -> relaxSrc, momSp -> diagonal) and explicitPorositySource (DarcyForchheimer, evaluated each iter);
     // global/reduction sources (meanVelocityForce, actuationDisk) + scalar sources are refused in the app.
+    // No fixedValue-p patch (all zeroGradient/cyclic/AMI/empty) -> singular pressure. Set from the app's p-BC scan so
+    // the pressure step regularises the interface-coupled singular system (see needRef_). The app pins the level post-hoc.
+    void setPressureSingular(bool s) { needRef_ = s; }
+
     void setFvOptions(const FvOptionsData& fo)
     {
         hasFvoMom_ = fo.hasMomentum;
@@ -1105,6 +1109,10 @@ private:
     bool   limitedV_ = false;     // div(phi,U) limitedLinearV (NVDVTVDV): IMPLICIT limited convection, vector limiter/face
     DeviceMRF mrf_;               // optional rotating cell zone (MRF): Coriolis source + relative flux (inactive by default)
     DistributedAMI ami_;          // optional cyclicAMI interface (implicit coupling in the matvec); inactive by default
+    bool   needRef_ = false;      // no fixedValue-p patch -> SINGULAR all-Neumann pressure. With an AMI/cyclic interface
+                                  // the interface-coupled singular system needs a symmetric diagonal shift to make the CG
+                                  // well-posed (the level is pinned post-hoc in the app). Plain singular cases converge
+                                  // without it (verified 3D cavity), so the shift is applied ONLY when ami_.active.
     DeviceBuffer<scalar> amiSumOff_, amiExt_;   // AMI diagonal-dominance term + a gather scratch (explicit ops)
     bool   hasFvoMom_ = false;    // fvOptions vectorSemiImplicitSource(U): per-cell explicit Su + implicit Sp
     DeviceBuffer<scalar> fvoMomSu_[3], fvoMomSp_;   // Su*V per component -> relaxSrc; Sp*V -> momentum diagonal
@@ -1315,6 +1323,10 @@ inline ParStepResidual ParallelDeviceSimple::step()
     {
         DeviceBuffer<scalar> divPhi, sp;
         deviceDiv(dm_, phiInt_, phiBnd_, divPhi);
+        // div(phi) MUST sum ALL faces (OF fvc::div): the AMI-face flux too. Omitting it makes the AMI cells see the
+        // un-cancelled interface flux as a spurious divergence, so the bounded term injects an asymmetric diagonal ->
+        // asymmetric rAU/HbyA -> the rotational SIMPLE loop limit-cycles. Mirrors the single-GPU bounded branch.
+        if (ami_.active) deviceAmiAddDiv(ami_.local, dm_.V, divPhi);
         deviceHadamard(sp, dm_.V, divPhi);
         deviceAxpy(-1.0, sp, mDiag);
     }
@@ -1411,8 +1423,10 @@ inline ParStepResidual ParallelDeviceSimple::step()
             deviceAxpy(1.0, fvoMomSu_[k], relaxSrc[k]);
         if (por_.active)                                 // porosity anisotropic remainder into the source
             deviceFvoPorositySource(por_, k, nu_, dm_.V, Uk_[0], Uk_[1], Uk_[2], relaxSrc[k]);
-        if (ami_.active && ami_.local.rotational)        // deferred off-diagonal rotation mixing (pairs with ifCoeffC)
-            deviceAmiAddDeferredRot(ami_.local, amiUint[0], amiUint[1], amiUint[2], k, relaxSrc[k]);
+        // NOTE: the deferred off-diagonal rotation mixing is NOT added here -- relaxSrc feeds BOTH the predictor
+        // AND UEqn.H(), but the deferred split is a PREDICTOR-ONLY term (H uses the full-rotation deviceAmiAddH on
+        // the post-solve U). It is added to the per-component predictor source `s` in the momentum loop below,
+        // matching the single-GPU (device_simple_foam: deviceAmiAddDeferredRot into `s`, not relaxSrc).
     }
 
     // linearUpwind: the matrix stays upwind and this deferred correction is an explicit source. It must land
@@ -1533,6 +1547,10 @@ inline ParStepResidual ParallelDeviceSimple::step()
         deviceHadamard(s, dm_.V, *gg[k]);
         deviceScale(s, -1.0);
         deviceAxpy(1.0, relaxSrc[k], s);
+        // deferred off-diagonal rotation mixing (pairs with the diagonal ifCoeffC): PREDICTOR RHS only -- into `s`,
+        // NOT relaxSrc, so UEqn.H() below stays the exact full-rotation coupling (deviceAmiAddH on the post-solve U).
+        if (ami_.active && ami_.local.rotational)
+            deviceAmiAddDeferredRot(ami_.local, amiUint[0], amiUint[1], amiUint[2], k, s);
         DeviceBuffer<scalar> diagC, b;
         deviceFold(dm_, mDiagR, s, iC[k], bC[k], diagC, b);
         const DeviceLduView mv = deviceLduView(dm_, diagC, mUp, mLo);
@@ -1687,18 +1705,30 @@ inline ParStepResidual ParallelDeviceSimple::step()
 
     DeviceBuffer<scalar> dphi, psrc;
     deviceDiv(dm_, phiHbyAint, phiHbyAbnd, dphi);
-    if (ami_.active) deviceAmiAddDiv(ami_.local, dm_.V, dphi);   // AMI-face phiHbyA into continuity div (uses ami_.phi)
+    if (ami_.active) deviceAmiAddDiv(ami_.local, dm_.V, dphi);   // AMI-face phiHbyA into continuity div
     deviceHadamard(psrc, dm_.V, dphi);
     DeviceBuffer<scalar> piC, pbC;
     deviceBCLaplacianCoeffsFace(dbP_, rAUbnd, piC, pbC);
     DeviceBuffer<scalar>& pDiagC = pDiagp_;   // persistent (graph-referenced)
     DeviceBuffer<scalar>& pb     = pbp_;
     deviceFold(dm_, pD, psrc, piC, pbC, pDiagC, pb);
-    if (ami_.active)   // AMI pressure laplacian: ifCoeff = rAtUFace*dc*magSf; pDiagC[own] -= ifCoeff (interp(rAtU))
+    if (ami_.active)   // AMI pressure laplacian: ifCoeff = rAtUFace*dc*magSf; pDiagC[own] -= ifCoeff
     {
         DeviceBuffer<scalar> re;
         distributedAmiGather(ami_, rAtU, re);
         deviceAmiAssembleLaplacian(ami_.local, re, pDiagC, /*addToDiag*/ true);
+    }
+    // Singular all-Neumann pressure (needRef_, no fixedValue-p) WITH an AMI interface: the interface-coupled system
+    // is exactly singular, so the distributed CG returns garbage without regularisation. Match the single-GPU
+    // (device_simple_foam: cyclic/AMI branch) with a tiny SYMMETRIC diagonal shift eps = -1e-10*mean|diag| on every
+    // cell -- it lifts the null space while preserving symmetry + the zero-mean RHS; the level is pinned post-hoc.
+    // mean|diag| is a GLOBAL reduction (sum|diag| over all ranks / globalNCells) so eps is identical on every rank.
+    if (ami_.active && needRef_)
+    {
+        const scalar localSum  = deviceSumMag(pDiagC);
+        const scalar globalSum = Pstream::allReduce(localSum, ReduceOp::Sum);
+        const scalar eps = -1e-10 * (globalSum / static_cast<scalar>(P_.globalNCells));
+        deviceAxpy(eps, ones_, pDiagC);
     }
 
     // Explicit non-orth correction of laplacian(rAU,p), from the ENTRY grad(p) (gx/gy/gz), matching the
