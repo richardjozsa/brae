@@ -95,6 +95,18 @@ void deviceAmiAmul(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi, Device
     cudaCheck(cudaGetLastError(), "amiAmul");
 }
 
+// Like deviceAmiAmul but with an EXPLICIT off-diagonal coefficient: the ROTATIONAL momentum matvec must use the
+// per-component diag-scaled ifCoeffC[kk] (= ifCoeff*forwardT[kk][kk]), NOT the base ifCoeff, to be consistent with
+// the deferred-rotation source. Translational / scalar (pressure): pass ami.ifCoeff (== deviceAmiAmul).
+void deviceAmiAmulCoeff(const DeviceAMI& ami, const DeviceBuffer<scalar>& coeff,
+                        const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi)
+{
+    if (ami.n == 0) return;
+    amiAmulKernel<<<nBlocks(ami.n), TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
+                                           ami.weight.data(), coeff.data(), psi.data(), Apsi.data());
+    cudaCheck(cudaGetLastError(), "amiAmulCoeff");
+}
+
 
 namespace {
 __global__

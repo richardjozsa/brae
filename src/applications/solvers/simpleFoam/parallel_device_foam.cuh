@@ -317,16 +317,22 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const label nC = gm.nCells();
         lap("meshRead");
 
-        // cyclic / cyclicAMI are NOT coupled on the multi-GPU device path yet: the distributed solver skips those
-        // faces (interface left OPEN -> wrong answer), so refuse rather than solve silently wrong. Single-GPU
-        // `brae -case` handles them. (Distributing the AMI is a many-to-many implicit interface that needs a
-        // mapDistribute-style cross-rank gather woven through the momentum/pressure/flux/H operations.)
+        // cyclicAMI: the distributed weaving (buildDistributedAMI -> solver.setAMI) is IMPLEMENTED but NOT YET
+        // VALIDATED -- np=1 vs single-GPU still diverges on the pressure side (WIP #16). So it is REFUSED by default
+        // (correctness-safe) and only built when BRAE_AMI_EXPERIMENTAL=1 is set, for debugging. Plain conformal
+        // `cyclic` is not implemented at all. Single-GPU `brae -case` handles both correctly.
+        const bool amiExperimental = std::getenv("BRAE_AMI_EXPERIMENTAL")
+                                   && std::atoi(std::getenv("BRAE_AMI_EXPERIMENTAL")) == 1;
+        bool hasAMI = false;
         for (const auto& pinfo : gm.patches())
-            if (pinfo.type == "cyclic" || pinfo.type == "cyclicAMI")
+        {
+            if (pinfo.type == "cyclic" || (pinfo.type == "cyclicAMI" && !amiExperimental))
                 throw std::runtime_error(
                     "brae -parallel: patch '" + pinfo.name + "' is type '" + pinfo.type + "', which is not coupled "
                     "on the multi-GPU device path (the interface would be left open and the answer wrong). Use "
                     "`brae -case <dir>` (single GPU) for cyclic/cyclicAMI cases.");
+            if (pinfo.type == "cyclicAMI") hasAMI = true;
+        }
 
         // decompose in core: SCOTCH on master, broadcast so every rank agrees on the same partitioning
         std::vector<label> cellToPart(nC, 0);
@@ -489,6 +495,15 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
             if (mrfCfg.active) solver.setMRF(mrfZone, mrfCfg.nonRotatingPatches);   // Coriolis source + relative flux
             if (!localFvo.empty()) solver.setFvOptions(localFvo);                   // per-cell momentum Su/Sp + porosity
+            if (hasAMI)   // cyclicAMI: build the GLOBAL AMI (same on every rank) + this rank's DistributedAMI
+            {
+                FvGeometry gg;
+                gg.build(gm);
+                const std::vector<FvPatch> gfvp = buildPatches(gm, gg);
+                const std::vector<AMIInterface> gAMIs = buildAMIInterfaces(gm, gg, gfvp);
+                solver.setAMI(gAMIs, cellToPart);
+                if (master) std::printf("  cyclicAMI: %zu interface(s) on the distributed path\n", gAMIs.size());
+            }
             lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc
 
             auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };

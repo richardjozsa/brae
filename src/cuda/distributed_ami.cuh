@@ -39,6 +39,8 @@ struct DistributedAMI
     DeviceBuffer<scalar> sendPack;              // packed send values (size sendIdx.size())
     DeviceBuffer<label>  sendIdxD;              // sendIdx on device (for the pack kernel)
     mutable DeviceBuffer<scalar> psiExt;        // scratch extended field [local | gathered] reused across matvecs
+    mutable int amulComp = -1;                  // matvec coeff selector: -1 -> ifCoeff (pressure/translational);
+                                                // 0/1/2 -> ifCoeffC[comp] for the ROTATIONAL momentum component
 
     // scratch (host staging for the MPI gather; sized at build)
     mutable std::vector<std::vector<scalar>> sendBuf;   // per send-block pack buffer
@@ -131,7 +133,11 @@ inline void distributedAmiAmul(const DistributedAMI& D, const DeviceBuffer<scala
 {
     if (!D.active) return;
     distributedAmiGatherNvshmem(D, psi, D.psiExt);
-    deviceAmiAmul(D.local, D.psiExt, Apsi);
+    // ROTATIONAL momentum component: use ifCoeffC[comp] (matches the deferred-rotation source). Else ami.ifCoeff.
+    if (D.amulComp >= 0 && D.local.rotational)
+        deviceAmiAmulCoeff(D.local, D.local.ifCoeffC[D.amulComp], D.psiExt, Apsi);
+    else
+        deviceAmiAmul(D.local, D.psiExt, Apsi);
 }
 
 } // namespace brae
