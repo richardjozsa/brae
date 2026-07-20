@@ -268,12 +268,13 @@ scalar deviceParallelNormFactor(
     const DeviceBuffer<scalar>& psi,
     const DeviceBuffer<scalar>& b,
     const DeviceBuffer<scalar>& ones,
-    label globalNCells)
+    label globalNCells,
+    const DistributedAMI* ami)
 {
     const int nC = A.nCells;
     DeviceBuffer<scalar> Apsi(nC), sumA(nC), tmp(nC), t(nC);
-    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Apsi);          // A*psi (with interface coupling)
-    deviceParallelAmul(A, halo, ifaceCoeffs, ones, sumA);         // rowSum(A) = A*1 (includes interfaces)
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Apsi, ami);     // A*psi (with interface + AMI coupling)
+    deviceParallelAmul(A, halo, ifaceCoeffs, ones, sumA, ami);    // rowSum(A) = A*1 (includes interfaces + AMI)
     const scalar avgPsi = Pstream::allReduce(deviceDot(psi, ones), ReduceOp::Sum)
                         / static_cast<scalar>(globalNCells);
     deviceCopy(tmp, sumA);
@@ -296,12 +297,13 @@ DeviceSolverPerf deviceParallelJacobiPCG(
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter)
+    int maxIter,
+    const DistributedAMI* ami)
 {
     const int nC = A.nCells;
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
 
-    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);           // rA = b - A*psi
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax, ami);      // rA = b - A*psi (+ AMI coupling if ami)
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
 
@@ -347,7 +349,7 @@ DeviceSolverPerf deviceParallelJacobiPCG(
                 deviceScale(pA, beta);
                 deviceAxpy(1.0, wA, pA);
             }
-            deviceParallelAmul(A, halo, ifaceCoeffs, pA, ApA);   // ApA = A*pA
+            deviceParallelAmul(A, halo, ifaceCoeffs, pA, ApA, ami);   // ApA = A*pA (+ AMI coupling if ami)
             const scalar wApA  = Pstream::allReduce(deviceDot(ApA, pA), ReduceOp::Sum);
             const scalar alpha = wArA / wApA;
             deviceAxpy(alpha, pA, psi);

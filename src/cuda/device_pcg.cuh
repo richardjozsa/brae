@@ -61,7 +61,8 @@ scalar deviceParallelNormFactor(
     const DeviceBuffer<scalar>& psi,
     const DeviceBuffer<scalar>& b,
     const DeviceBuffer<scalar>& ones,
-    label globalNCells);
+    label globalNCells,
+    const DistributedAMI* ami = nullptr);
 
 DeviceSolverPerf deviceParallelJacobiPCG(
     const DeviceLduView& A,
@@ -72,7 +73,8 @@ DeviceSolverPerf deviceParallelJacobiPCG(
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter);
+    int maxIter,
+    const DistributedAMI* ami = nullptr);
 
 // Distributed Jacobi-BiCGStab for the NON-symmetric momentum matrix (upwind convection -> upper != lower):
 // the device counterpart of host parallelPBiCGStab, and the distributed twin of deviceJacobiBiCGStab. Same

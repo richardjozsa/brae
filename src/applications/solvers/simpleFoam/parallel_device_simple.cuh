@@ -25,6 +25,7 @@
 #include "cell_wall_dist.cuh"
 #include "parallel_device_interface.cuh"   // deviceMomentumInterface / deviceInterfaceOffDiagSum (shared)
 #include "device_mrf.cuh"          // DeviceMRF: Coriolis source + makeRelative frame flux (rotating cell zone)
+#include "parallel_device_ami.cuh" // DistributedAMI + buildDistributedAMI (cyclicAMI on the distributed path, WIP)
 #include "fv_options.cuh"          // FvOptionsData (per-cell momentum Su/Sp + porosity)
 #include "device_fvoptions.cuh"    // DevicePorosity + deviceFvoPorosityDiag/Source
 #include <cuda_runtime.h>
@@ -853,6 +854,16 @@ public:
         }
     }
 
+    // Enable a distributed cyclicAMI interface. `globalAMIs` = buildAMIInterfaces on the GLOBAL mesh; `cellToPart`
+    // the decomposition. Builds this rank's DistributedAMI (re-indexed stencil + NVSHMEM gather schedule); the
+    // implicit coupling then flows through the momentum + pressure matvecs (deviceParallelAmul with &ami_).
+    // WIP: the matrix diagonal (deviceAmiAssembleMomentum/Laplacian), the explicit flux/div/grad/H ops and the
+    // rotational path are NOT yet wired -- so this is not yet enabled by the app (cyclicAMI is still refused).
+    void setAMI(const std::vector<AMIInterface>& globalAMIs, const std::vector<label>& cellToPart)
+    {
+        ami_ = buildDistributedAMI(globalAMIs, cellToPart, P_);
+    }
+
     // One distributed SIMPLE iteration. U/p/phi are updated in place on the device. Returns the momentum and
     // pressure INITIAL residuals -- OpenFOAM's SIMPLE convergence measure (fvSolution residualControl).
     ParStepResidual step();
@@ -1083,6 +1094,7 @@ private:
     scalar twoByk_ = 2.0;         // limitedLinear coefficient: 2/max(k_,SMALL) (k_=1 -> 2); limiter = clamp(twoByk*r,0,1)
     bool   limitedV_ = false;     // div(phi,U) limitedLinearV (NVDVTVDV): IMPLICIT limited convection, vector limiter/face
     DeviceMRF mrf_;               // optional rotating cell zone (MRF): Coriolis source + relative flux (inactive by default)
+    DistributedAMI ami_;          // optional cyclicAMI interface (implicit coupling in the matvec); inactive by default
     bool   hasFvoMom_ = false;    // fvOptions vectorSemiImplicitSource(U): per-cell explicit Su + implicit Sp
     DeviceBuffer<scalar> fvoMomSu_[3], fvoMomSp_;   // Su*V per component -> relaxSrc; Sp*V -> momentum diagonal
     DevicePorosity por_;          // fvOptions explicitPorositySource (DarcyForchheimer), evaluated each iter
@@ -1440,10 +1452,11 @@ inline ParStepResidual ParallelDeviceSimple::step()
         DeviceBuffer<scalar> diagC, b;
         deviceFold(dm_, mDiagR, s, iC[k], bC[k], diagC, b);
         const DeviceLduView mv = deviceLduView(dm_, diagC, mUp, mLo);
-        const scalar nf = deviceParallelNormFactor(mv, halo_, ifCoeff, Uk_[k], b, ones_, P_.globalNCells);
+        const DistributedAMI* amip = ami_.active ? &ami_ : nullptr;
+        const scalar nf = deviceParallelNormFactor(mv, halo_, ifCoeff, Uk_[k], b, ones_, P_.globalNCells, amip);
         if (!bicgGCache_[k]) bicgGCache_[k] = std::make_unique<BiCGGraphCache>();   // lazy: whole-loop graph (BRAE_PARALLEL_GRAPH=3)
         const DeviceSolverPerf up =
-            deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_, 1, bicgGCache_[k].get());
+            deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_, 1, bicgGCache_[k].get(), amip);
         kIters_ += up.nIterations;
         if (validC_[k] && up.initialResidual > res.Ux) res.Ux = up.initialResidual;
         dumpStage("Upred", Uk_[k], k);
@@ -1605,7 +1618,8 @@ inline ParStepResidual ParallelDeviceSimple::step()
     DeviceBuffer<scalar>& pSol = pSolp_;   // persistent: the whole-loop graph keys on pSol.data() -> capture once
     deviceCopy(pSol, dp_);
     const DeviceLduView pv = deviceLduView(dm_, pDiagC, pU_, pL_);
-    const scalar nfp = deviceParallelNormFactor(pv, halo_, pIfCoeff, pSol, pb, ones_, P_.globalNCells);
+    const DistributedAMI* pamip = ami_.active ? &ami_ : nullptr;
+    const scalar nfp = deviceParallelNormFactor(pv, halo_, pIfCoeff, pSol, pb, ones_, P_.globalNCells, pamip);
     // pressure solve: local-AMG-preconditioned distributed CG (the strong preconditioner that converges on graded
     // meshes), else point-Jacobi CG. amgGalerkin re-coarsens the hierarchy from THIS step's pressure matrix
     // (pDiagC includes the interface + boundary diagonal terms; pU_/pL_ are the internal Laplacian off-diagonals).
@@ -1616,7 +1630,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         pp = deviceParallelAMGPCG(pv, halo_, pIfCoeff, pb, pSol, pAMG_, nfp, tolP_, 0.0, maxIter_);
     }
     else
-        pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_);
+        pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_, pamip);
     kIters_ += pp.nIterations;
     res.p = pp.initialResidual;
     dumpStage("pSol", pSol);
