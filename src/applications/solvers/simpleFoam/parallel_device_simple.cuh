@@ -1376,6 +1376,18 @@ inline ParStepResidual ParallelDeviceSimple::step()
     dumpStage("stress", sX, 0);
     dumpStage("stress", sY, 1);
     dumpStage("stress", sZ, 2);
+    // ROTATIONAL AMI deferred-rotation split: the cross-component rotation Omega->own can't be fully implicit in the
+    // segregated per-component solve. The matrix carries the diagonal part (ifCoeffC = ifCoeff*forwardT[kk][kk], from
+    // deviceAmiScaleImplicit), and the off-diagonal mixing goes to the source via the UN-rotated AMI-interp of U_old
+    // (amiUint, deviceAmiInterpolate); the full-rotation H (deviceAmiAddH above) then closes it consistently.
+    DeviceBuffer<scalar> amiUint[3];
+    if (ami_.active && ami_.local.rotational)
+        for (int l = 0; l < 3; ++l)
+        {
+            DeviceBuffer<scalar> ue;
+            distributedAmiGather(ami_, Uk_[l], ue);
+            deviceAmiInterpolate(ami_.local, ue, amiUint[l]);
+        }
     for (int k = 0; k < 3; ++k)
     {
         deviceHadamard(relaxSrc[k], delta, Uk_[k]);      // delta*U_old
@@ -1386,6 +1398,8 @@ inline ParStepResidual ParallelDeviceSimple::step()
             deviceAxpy(1.0, fvoMomSu_[k], relaxSrc[k]);
         if (por_.active)                                 // porosity anisotropic remainder into the source
             deviceFvoPorositySource(por_, k, nu_, dm_.V, Uk_[0], Uk_[1], Uk_[2], relaxSrc[k]);
+        if (ami_.active && ami_.local.rotational)        // deferred off-diagonal rotation mixing (pairs with ifCoeffC)
+            deviceAmiAddDeferredRot(ami_.local, amiUint[0], amiUint[1], amiUint[2], k, relaxSrc[k]);
     }
 
     // linearUpwind: the matrix stays upwind and this deferred correction is an explicit source. It must land
@@ -1520,6 +1534,18 @@ inline ParStepResidual ParallelDeviceSimple::step()
     }
     else
         deviceCopy(rAtU, rAU);
+    // AMI-face H contribution (all AMI, not just rotational): H[own] -= ifCoeff*UN[i]/V, UN = the rotated
+    // AMI-interp of the POST-SOLVE U (deviceAmiInterpolateVec handles rotation via forwardT; identity when
+    // translational). Needs the gathered extended field per component.
+    DeviceBuffer<scalar> amiUN[3];
+    if (ami_.active)
+    {
+        DeviceBuffer<scalar> ux, uy, uz;
+        distributedAmiGather(ami_, Uk_[0], ux);
+        distributedAmiGather(ami_, Uk_[1], uy);
+        distributedAmiGather(ami_, Uk_[2], uz);
+        deviceAmiInterpolateVec(ami_.local, ux, uy, uz, amiUN[0], amiUN[1], amiUN[2]);
+    }
     for (int k = 0; k < 3; ++k)
     {
         DeviceBuffer<scalar> bdDiag;
@@ -1527,6 +1553,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         deviceAxpy(-1.0, iC[k], bdDiag);
         DeviceBuffer<scalar> Hk;
         deviceParallelMatrixH(av, dm_, halo_, faceCellsD_, ifCoeff, Uk_[k], relaxSrc[k], bdDiag, bC[k], Hk);
+        if (ami_.active) deviceAmiAddH(ami_.local, amiUN[k], dm_.V, Hk);
         deviceHadamard(HbyA[k], rAU, Hk);
         dumpStage("HbyA", HbyA[k], k);
     }
