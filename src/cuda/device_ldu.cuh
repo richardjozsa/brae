@@ -147,17 +147,22 @@ inline DeviceLduView deviceLduViewAmi(
 
 void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi);
 
-class DeviceHalo;   // forward (parallel/pstream/device_halo.cuh)
+class DeviceHalo;      // forward (parallel/pstream/device_halo.cuh)
+struct DistributedAMI; // forward (cuda/distributed_ami.cuh) -- optional cyclicAMI coupling in the matvec
 
 // Distributed matrix-vector product: the local cell-gather Amul plus the processor-interface coupling over the
 // NVSHMEM halo (post exchange -> local product overlaps it -> wait -> interface scatter). ifaceCoeffs[i] holds
 // interface i's boundary coefficients (-upper on the owner side / -lower on the neighbour side), in the same
 // order as `halo`'s interfaces. Mirrors host parallelAmul.
+//   `ami` (optional): a cyclicAMI interface. When non-null, after the halo interface scatter the AMI target cells are
+//   gathered on-GPU (NVSHMEM) and deviceAmiAmul adds their weighted contribution -> Apsi carries the AMI coupling
+//   too, so the whole implicit solve sees it. Null (default) -> plain distributed matvec, unchanged.
 void deviceParallelAmul(
     const DeviceLduView& A,
     DeviceHalo& halo,
     const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
     const DeviceBuffer<scalar>& psi,
-    DeviceBuffer<scalar>& Apsi);
+    DeviceBuffer<scalar>& Apsi,
+    const DistributedAMI* ami = nullptr);
 
 } // namespace brae

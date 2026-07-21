@@ -268,12 +268,13 @@ scalar deviceParallelNormFactor(
     const DeviceBuffer<scalar>& psi,
     const DeviceBuffer<scalar>& b,
     const DeviceBuffer<scalar>& ones,
-    label globalNCells)
+    label globalNCells,
+    const DistributedAMI* ami)
 {
     const int nC = A.nCells;
     DeviceBuffer<scalar> Apsi(nC), sumA(nC), tmp(nC), t(nC);
-    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Apsi);          // A*psi (with interface coupling)
-    deviceParallelAmul(A, halo, ifaceCoeffs, ones, sumA);         // rowSum(A) = A*1 (includes interfaces)
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Apsi, ami);     // A*psi (with interface + AMI coupling)
+    deviceParallelAmul(A, halo, ifaceCoeffs, ones, sumA, ami);    // rowSum(A) = A*1 (includes interfaces + AMI)
     const scalar avgPsi = Pstream::allReduce(deviceDot(psi, ones), ReduceOp::Sum)
                         / static_cast<scalar>(globalNCells);
     deviceCopy(tmp, sumA);
@@ -296,12 +297,13 @@ DeviceSolverPerf deviceParallelJacobiPCG(
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter)
+    int maxIter,
+    const DistributedAMI* ami)
 {
     const int nC = A.nCells;
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
 
-    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);           // rA = b - A*psi
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax, ami);      // rA = b - A*psi (+ AMI coupling if ami)
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
 
@@ -347,7 +349,7 @@ DeviceSolverPerf deviceParallelJacobiPCG(
                 deviceScale(pA, beta);
                 deviceAxpy(1.0, wA, pA);
             }
-            deviceParallelAmul(A, halo, ifaceCoeffs, pA, ApA);   // ApA = A*pA
+            deviceParallelAmul(A, halo, ifaceCoeffs, pA, ApA, ami);   // ApA = A*pA (+ AMI coupling if ami)
             const scalar wApA  = Pstream::allReduce(deviceDot(ApA, pA), ReduceOp::Sum);
             const scalar alpha = wArA / wApA;
             deviceAxpy(alpha, pA, psi);
@@ -456,15 +458,18 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
     scalar relTol,
     int maxIter,
     int checkEvery,
-    BiCGGraphCache* gcache)
+    BiCGGraphCache* gcache,
+    const DistributedAMI* ami)
 {
     const int nC = A.nCells;
     const int K  = (checkEvery > 1) ? checkEvery : 1;            // convergence-read cadence (1 = exact per-iter)
     const cudaStream_t strm = cudaStreamPerThread;               // the halo/reduce stream: everything is stream-ordered
     // BRAE_PARALLEL_GRAPH>=3: whole-loop conditional-graph momentum solve (the momentum twin of the pressure
     // deviceParallelAMGPCGGraph). Falls through to the direct device-resident path below on CUDA<13 (sentinel -1).
+    // With a cyclicAMI (`ami`) the matvec does an NVSHMEM gather + barrier that is not captured into the while-graph,
+    // so the graph path is skipped (as the single-GPU path skips the V-cycle graph for AMI) -> direct path below.
     static const int g_parGraphLevel = std::getenv("BRAE_PARALLEL_GRAPH") ? std::atoi(std::getenv("BRAE_PARALLEL_GRAPH")) : 0;
-    if (g_parGraphLevel >= 3 && gcache)
+    if (g_parGraphLevel >= 3 && gcache && !ami)
     {
         const DeviceSolverPerf gp =
             deviceParallelJacobiBiCGStabGraph(A, halo, ifaceCoeffs, b, psi, *gcache, normFactor, tol, relTol, maxIter);
@@ -472,7 +477,7 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
     }
     DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC), AyA(nC), sA(nC), zA(nC), tA(nC), Ax(nC);
 
-    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax);           // rA = b - A*psi
+    deviceParallelAmul(A, halo, ifaceCoeffs, psi, Ax, ami);      // rA = b - A*psi (+ AMI coupling if ami)
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
     deviceCopy(rA0, rA);
@@ -520,7 +525,7 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
                 deviceFusedBicgP(rA, pA, AyA, s.beta.data(), s.negOmega.data());   // pA = rA + beta*(pA - omega*AyA)
             }
             deviceJacobi(yA, pA, A.diag);                                   // yA = M^-1 pA (local block-Jacobi)
-            deviceParallelAmul(A, halo, ifaceCoeffs, yA, AyA);
+            deviceParallelAmul(A, halo, ifaceCoeffs, yA, AyA, ami);
             gdot(rA0, AyA, s.r0Ay);
             bicgAlphaK<<<1,1,0,strm>>>(s.rr.data(), s.r0Ay.data(), s.alpha.data(), s.negAlpha.data(), s.bd.data());
             deviceFusedSxpy(sA, rA, s.negAlpha.data(), AyA);               // sA = rA - alpha*AyA
@@ -536,7 +541,7 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
                 }
             }
             deviceJacobi(zA, sA, A.diag);                                  // zA = M^-1 sA
-            deviceParallelAmul(A, halo, ifaceCoeffs, zA, tA);
+            deviceParallelAmul(A, halo, ifaceCoeffs, zA, tA, ami);
             deviceDotInto(tA, tA, R.src() + 0);                            // tt AND ts in ONE fused collective
             deviceDotInto(tA, sA, R.src() + 1);
             R.sumReduce(2, strm);

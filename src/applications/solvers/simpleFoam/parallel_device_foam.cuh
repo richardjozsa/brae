@@ -25,6 +25,10 @@
 #include "parallel_simple.cuh"
 #include "field_distribute.cuh"
 #include "parallel_device_simple.cuh"
+#include "parallel_device_ami.cuh"   // DistributedAMI: mapDistribute addressing + gather (distributed cyclicAMI, WIP)
+#include "mrf_read.cuh"   // readMRFProperties / readCellZones / mrfCorrectBoundaryVelocity
+#include "mrf_zone.cuh"   // MRFZone / buildMRFZone
+#include "fv_options.cuh" // readFvOptions / FvOptionsData (per-cell momentum sources + porosity)
 #include "cf_pstream.cuh"
 
 #include <cmath>
@@ -36,6 +40,7 @@
 #include <vector>
 #include <chrono>
 #include <cstdlib>
+#include <unordered_set>
 
 namespace brae {
 
@@ -113,17 +118,53 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const bool turbulent = (simType == "RAS");
         KEpsilonCoeffs keCoeffs;
         KOmegaSSTCoeffs sstCoeffs;
-        bool sst = false;
+        SpalartAllmarasCoeffs saCoeffs;
+        bool sst = false, lm = false, sa = false;
         if (turbulent)
         {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            if (model != "kEpsilon" && model != "kOmegaSST")
+            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE"
+                && model != "kOmegaSSTLM" && model != "SpalartAllmaras")
                 throw std::runtime_error(
                     "brae -parallel: RASModel '" + model + "' is not implemented on the multi-GPU device path "
-                    "(kEpsilon and kOmegaSST are). Use `mpirun -np N brae_simpleFoam -case <dir>` (host) or "
-                    "`brae -case <dir>` (single GPU) for other models.");
-            sst = (model == "kOmegaSST");
+                    "(kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM and SpalartAllmaras are). Use `mpirun -np N "
+                    "brae_simpleFoam -case <dir>` (host) or `brae -case <dir>` (single GPU) for other models.");
+            sst = (model == "kOmegaSST" || model == "kOmegaSSTLM");   // LM reuses the SST scaffolding (omega field)
+            lm  = (model == "kOmegaSSTLM");
+            sa  = (model == "SpalartAllmaras");
+            if (sa)   // OF defaults are in the struct; read the SpalartAllmarasCoeffs overrides if present
+            {
+                const FoamDict* sac = ras ? ras->subDict("SpalartAllmarasCoeffs") : nullptr;
+                if (sac)
+                {
+                    saCoeffs.sigmaNut = sac->scalarOr("sigmaNut", saCoeffs.sigmaNut);
+                    saCoeffs.Cb1 = sac->scalarOr("Cb1", saCoeffs.Cb1);
+                    saCoeffs.Cb2 = sac->scalarOr("Cb2", saCoeffs.Cb2);
+                    saCoeffs.Cw2 = sac->scalarOr("Cw2", saCoeffs.Cw2);
+                    saCoeffs.Cw3 = sac->scalarOr("Cw3", saCoeffs.Cw3);
+                    saCoeffs.Cv1 = sac->scalarOr("Cv1", saCoeffs.Cv1);
+                    saCoeffs.kappa = sac->scalarOr("kappa", saCoeffs.kappa);
+                }
+            }
+            if (model == "realizableKE")
+            {
+                // realizableKE (OF RAS/realizableKE): variable-Cmu strain model, shares the k-eps loop but with
+                // rCmu/magS + a strain-based eps reaction. Defaults differ from standard k-eps: A0=4, C2=1.9, sigmaEps=1.2.
+                keCoeffs.realizable = true;
+                keCoeffs.C2 = 1.9;
+                keCoeffs.sigmaEps = 1.2;
+                const FoamDict* rke = ras ? ras->subDict("realizableKECoeffs") : nullptr;
+                if (rke)
+                {
+                    keCoeffs.A0 = rke->scalarOr("A0", keCoeffs.A0);
+                    keCoeffs.C2 = rke->scalarOr("C2", keCoeffs.C2);
+                    keCoeffs.sigmaK = rke->scalarOr("sigmak", keCoeffs.sigmaK);
+                    keCoeffs.sigmaEps = rke->scalarOr("sigmaEps", keCoeffs.sigmaEps);
+                    keCoeffs.kappa = rke->scalarOr("kappa", keCoeffs.kappa);
+                    keCoeffs.E = rke->scalarOr("E", keCoeffs.E);
+                }
+            }
             const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr;
             if (kec)
             {
@@ -162,15 +203,22 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         // Anything else -- limitedLinear, LUST, linearUpwindV, plain Gauss linear -- is a DIFFERENT
         // discretisation, and silently substituting upwind produces a converged, plausible, WRONG answer (on
         // the cavity that was a ~6% field difference). Refuse those, exactly as RAS is refused above.
-        bool boundedDiv = false, linUpwind = false, lust = false, lapCorrected = false;
+        bool boundedDiv = false, linUpwind = false, lust = false, linUpwindV = false, limitedU = false, limitedVsch = false, lapCorrected = false;
+        scalar limitedTwoByk = 2.0;   // limitedLinear[V] coefficient 2/max(k_,SMALL); default k_=1 -> 2
         {
             std::string divLine, lapLine;
             std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));
             std::string ln;
-            while (std::getline(fsch, ln))
+            bool inLap = false;   // the laplacian SCHEME ("... corrected;") is on the `default`/`laplacian(...)` line
+            while (std::getline(fsch, ln))  // INSIDE the laplacianSchemes{} block, NOT the block-header line itself.
             {
                 if (ln.find("div(phi,U)") != std::string::npos)      divLine = ln;
-                if (ln.find("laplacianSchemes") != std::string::npos) lapLine = ln;
+                if (ln.find("laplacianSchemes") != std::string::npos) { inLap = true; continue; }
+                if (inLap)
+                {
+                    if (ln.find('}') != std::string::npos) inLap = false;
+                    else lapLine += ln + " ";   // accumulate the block's scheme lines (default + any per-field)
+                }
             }
             if (!divLine.empty())
             {
@@ -179,17 +227,30 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                 lust       = divLine.find("LUST") != std::string::npos;   // 0.75*linear + 0.25*linearUpwind (OF LUST.H)
                 // NB "linearUpwind" has a capital U, so it does NOT contain the substring "upwind" -- the two
                 // must be tested separately or a linearUpwind case reads as "no upwind scheme at all".
-                const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind || lust;
-                // linearUpwindV adds OF's vector direction limiter on top of linearUpwind -- NOT implemented,
-                // and it contains the substring "linearUpwind", so it must be excluded explicitly.
-                const bool unsupported = divLine.find("linearUpwindV") != std::string::npos
-                                      || divLine.find("limitedLinear") != std::string::npos;
-                if (!upwindFamily || unsupported)
+                linUpwindV = divLine.find("linearUpwindV") != std::string::npos;
+                // limitedLinear (vector) = OF NVDTVD + magSqr: reduce U to s=|U|^2, ONE limiter/face from grad(s).
+                // limitedLinearV = NVDVTVDV + null: ONE limiter/face from the VECTOR U directly. Both build the
+                // limited convection IMPLICITLY into the momentum matrix (a deferred source under-converges). NB
+                // "limitedLinear" is a prefix of "limitedLinearV", so test V FIRST.
+                limitedVsch        = divLine.find("limitedLinearV") != std::string::npos;
+                const bool limited = !limitedVsch && (divLine.find("limitedLinear") != std::string::npos);
+                const bool upwindFamily = (divLine.find("upwind") != std::string::npos) || linUpwind || lust || limited || limitedVsch;
+                if (limited || limitedVsch)   // parse the coefficient k_ in "limitedLinear[V] k_" -> twoByk = 2/max(k_,SMALL)
+                {
+                    linUpwind = false; lust = false;   // limitedLinear[V] is its own family
+                    limitedU = limited;                // magSqr path
+                    size_t q = divLine.find("limitedLinear") + std::string("limitedLinear").size();
+                    if (q < divLine.size() && divLine[q] == 'V') ++q;   // skip the trailing 'V' of limitedLinearV
+                    std::istringstream cs(divLine.substr(q));
+                    scalar kv = 1.0;
+                    limitedTwoByk = (cs >> kv) ? (2.0 / std::max(kv, static_cast<scalar>(1e-30))) : 2.0;
+                }
+                if (!upwindFamily)
                     throw std::runtime_error(
                         "brae -parallel: div(phi,U) scheme '" + divLine + "' is not implemented on the "
                         "multi-GPU device path (it supports 'Gauss upwind', 'bounded Gauss upwind', "
-                        "'[bounded] Gauss linearUpwind grad(U)' and '[bounded] Gauss LUST grad(U)'). "
-                        "Substituting a scheme would converge to a "
+                        "'[bounded] Gauss linearUpwind[V] grad(U)', '[bounded] Gauss LUST grad(U)' and "
+                        "'[bounded] Gauss limitedLinear[V] k'). Substituting a scheme would converge to a "
                         "DIFFERENT answer than fvSchemes asks for, so this is refused rather than solved "
                         "wrongly. Use `brae -case <dir>` (single GPU) for the full scheme set.");
             }
@@ -206,6 +267,9 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const scalar relaxP = fld ? fld->scalarOr("p", 1.0) : 1.0;
         const scalar relaxK   = eqs ? eqs->scalarOr("k", 1.0) : 1.0;
         const scalar relaxEps = eqs ? eqs->scalarOr("epsilon", 1.0) : 1.0;
+        // SpalartAllmaras relaxes ONE field (nuTilda) -- read it explicitly (there is no "k"); default 0.7 (a safe SA
+        // under-relaxation) rather than 1.0, else the unrelaxed nuTilda destabilises after ~200 iters.
+        const scalar relaxNuTilda = eqs ? eqs->scalarOr("nuTilda", 0.7) : 0.7;
 
         const FoamDict* solvers = fvSolution.subDict("solvers");
         auto solverTol = [&](const std::string& f, scalar def)
@@ -253,6 +317,22 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         const label nC = gm.nCells();
         lap("meshRead");
 
+        // cyclicAMI: the distributed weaving (buildDistributedAMI -> solver.setAMI) is VALIDATED -- np=1 reproduces the
+        // single-GPU BIT-FOR-BIT (U to 1e-13, p to 1e-12 after removing the singular-pressure level; both converge in
+        // the same 148 iterations on tc_wedge_ami, rotational rotor-stator), and np=2 (cross-rank NVSHMEM gather)
+        // matches to the residualControl tolerance (~1e-5). So cyclicAMI is coupled on the multi-GPU path by default.
+        // Plain conformal `cyclic` (no interpolation) is still not implemented; single-GPU `brae -case` handles it.
+        bool hasAMI = false;
+        for (const auto& pinfo : gm.patches())
+        {
+            if (pinfo.type == "cyclic")
+                throw std::runtime_error(
+                    "brae -parallel: patch '" + pinfo.name + "' is type 'cyclic', which is not coupled on the "
+                    "multi-GPU device path (the interface would be left open and the answer wrong). Use "
+                    "`brae -case <dir>` (single GPU) for plain cyclic cases.");
+            if (pinfo.type == "cyclicAMI") hasAMI = true;
+        }
+
         // decompose in core: SCOTCH on master, broadcast so every rank agrees on the same partitioning
         std::vector<label> cellToPart(nC, 0);
         if (master) cellToPart = scotchDecomposeCached(gm, nproc, caseDir + "/constant/polyMesh");   // ~1s -> cached
@@ -265,16 +345,19 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         // non-orthogonal mesh, silently dropping it solves a DIFFERENT equation than fvSchemes asks for --
         // the same failure mode as substituting a div scheme, and 96/113 cases ask for "corrected". Refuse.
         // 0.1 deg: below that the correction is numerical noise; above it, it is physics we are not doing.
+        // The non-orthogonal correction IS implemented on the distributed path: nonOrthDeltaCoeffs implicit at cut
+        // faces (computeProcNonOrth), the explicit corrVec.grad correction for the momentum, and for the pEqn BOTH
+        // the source and the face-flux correction (or continuity breaks). Gated by test_gpu_parallel_duct on a
+        // sheared 26.57 deg mesh; every piece teeth-proven. APPLY it when the scheme is "corrected" AND the mesh is
+        // actually non-orthogonal (> 0.1 deg -- below that it is numerical noise and the extra work is a no-op).
+        bool useNonOrth = false;
         if (lapCorrected)
         {
             const scalar nonOrtho = maxNonOrthogonality(P);
-            // The non-orthogonal correction IS implemented on the distributed path: nonOrthDeltaCoeffs
-            // implicit at cut faces (computeProcNonOrth), the explicit corrVec.grad correction for the
-            // momentum, and for the pEqn BOTH the source and the face-flux correction (or continuity breaks).
-            // Gated by test_gpu_parallel_duct on a sheared 26.57 deg mesh; every piece teeth-proven.
+            useNonOrth = (nonOrtho > 0.1);
             if (master)
-                std::printf("  mesh max non-orthogonality %.4g deg -> 'corrected' term negligible (< 0.1 deg)\n",
-                            nonOrtho);
+                std::printf("  mesh max non-orthogonality %.4g deg -> non-orth 'corrected' term %s\n",
+                            nonOrtho, useNonOrth ? "ON" : "negligible (off)");
         }
 
         const FieldData<vector> Ufd = readField<vector>(fieldDir + "/U");
@@ -285,17 +368,106 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         p0.evaluateBoundary();
         lap("distribute");
 
-        // turbulence start fields (RAS kEpsilon)
-        FieldData<scalar> kfd, efd, nfd;
-        GeometricField<scalar> k0, eps0, nut0;
+        // MRF rotating cell zone (constant/MRFProperties + polyMesh/cellZones), if present. Read the GLOBAL zone
+        // and map it to THIS rank's local cells (cellProcAddr is local->global); build a per-rank MRFZone. The
+        // in-zone velocity-fixing walls take U = Omega x (Cf-origin), then setMRF (after the solver is built) makes
+        // the resident flux relative and wires the Coriolis source. Done before the solver ctor so phi0 = flux(U0)
+        // already includes the rotating walls, exactly as single-GPU gpuSimpleFoam.
+        const MRFConfig mrfCfg = readMRFProperties(caseDir + "/constant");
+        MRFZone mrfZone;
+        if (mrfCfg.active)
+        {
+            const auto zones = readCellZones(caseDir + "/constant/polyMesh");
+            const auto it = zones.find(mrfCfg.cellZone);
+            if (it == zones.end())
+                throw std::runtime_error("brae -parallel: MRF cellZone '" + mrfCfg.cellZone +
+                                         "' not found in constant/polyMesh/cellZones");
+            std::unordered_set<label> gset(it->second.begin(), it->second.end());
+            std::vector<label> localZoneCells;
+            for (label c = 0; c < P.Lm.mesh.nCells(); ++c)
+                if (gset.count(P.Lm.cellProcAddr[c])) localZoneCells.push_back(c);
+            mrfZone = buildMRFZone(P.Lm.mesh, localZoneCells, mrfCfg.axis, mrfCfg.omega, mrfCfg.origin);
+            mrfCorrectBoundaryVelocity(U0, mrfZone, P.lg, P.lp, mrfCfg.nonRotatingPatches);   // in-zone walls -> Omega x r
+            const std::size_t nLoc = localZoneCells.size();
+            const std::size_t nGlob = Pstream::allReduce(static_cast<scalar>(nLoc), ReduceOp::Sum);
+            if (master)
+                std::printf("  MRF: cellZone=%s omega=%.4g axis=(%.2g %.2g %.2g) origin=(%.2g %.2g %.2g) zoneCells=%zu\n",
+                            mrfCfg.cellZone.c_str(), mrfCfg.omega, mrfCfg.axis.x, mrfCfg.axis.y, mrfCfg.axis.z,
+                            mrfCfg.origin.x, mrfCfg.origin.y, mrfCfg.origin.z, static_cast<std::size_t>(nGlob));
+        }
+
+        // fvOptions (system/ or constant/fvOptions), if present. Per-cell momentum sources distribute like MRF
+        // (global cell arrays -> this rank's local via cellProcAddr): vectorSemiImplicitSource(U) (Su/Sp) and
+        // explicitPorositySource (DarcyForchheimer). Global/reduction sources (meanVelocityForce, actuationDisk),
+        // scalar sources and rotorDisk are NOT yet distributed -> refused rather than solved wrong.
+        FvOptionsData localFvo;
+        if (std::filesystem::exists(caseDir + "/system/fvOptions") ||
+            std::filesystem::exists(caseDir + "/constant/fvOptions"))
+        {
+            const auto fvoZones = readCellZones(caseDir + "/constant/polyMesh");
+            FvGeometry gg;
+            gg.build(gm);
+            const FvOptionsData fvo = readFvOptions(caseDir, fvoZones, gg.V(), nC, gg.C());
+            if (!fvo.empty())
+            {
+                // Supported so far: vectorSemiImplicitSource(U) (per-cell Su/Sp, validated). Everything else --
+                // explicitPorositySource, meanVelocityForce, actuationDisk, scalar sources, rotorDisk -- is refused
+                // until it has a distributed validation case (no small/no-op test would prove correctness).
+                if (fvo.porActive || fvo.mvfActive || fvo.adActive || fvo.limUActive || fvo.vdcActive
+                    || !fvo.scaSu.empty() || !fvo.scaSp.empty() || fvo.rotor.active)
+                    throw std::runtime_error(
+                        "brae -parallel: this fvOptions type is not yet on the multi-GPU device path (supported: "
+                        "vectorSemiImplicitSource on U). Use `brae -case <dir>` (single GPU) for the full set.");
+                localFvo.count = fvo.count;
+                const label nLoc = P.nCells();
+                if (fvo.hasMomentum)
+                {
+                    localFvo.hasMomentum = true;
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        localFvo.momSu[c].resize(nLoc);
+                        for (label lc = 0; lc < nLoc; ++lc)
+                            localFvo.momSu[c][lc] = fvo.momSu[c][P.Lm.cellProcAddr[lc]];
+                    }
+                    if (!fvo.momSp.empty())
+                    {
+                        localFvo.momSp.resize(nLoc);
+                        for (label lc = 0; lc < nLoc; ++lc)
+                            localFvo.momSp[lc] = fvo.momSp[P.Lm.cellProcAddr[lc]];
+                    }
+                }
+                if (master)
+                    std::printf("  fvOptions: %d source(s) vectorSemiImplicitSource(U)\n", fvo.count);
+            }
+        }
+
+        // turbulence start fields: kEps/SST read k + eps|omega + nut (+ ReThetat/gammaInt for LM); SpalartAllmaras
+        // is one-equation -> nuTilda + nut only (no k/eps).
+        FieldData<scalar> kfd, efd, nfd, rfd, gfd, ntfd;
+        GeometricField<scalar> k0, eps0, nut0, ReThetat0, gammaInt0, nuTilda0;
         if (turbulent)
         {
-            kfd = readField<scalar>(fieldDir + "/k");
-            efd = readField<scalar>(fieldDir + "/" + (sst ? "omega" : "epsilon"));
             nfd = readField<scalar>(fieldDir + "/nut");
-            k0   = distributeField<scalar>(kfd, gm.patches(), P.Lm, P.lp, P.procW, rank); k0.evaluateBoundary();
-            eps0 = distributeField<scalar>(efd, gm.patches(), P.Lm, P.lp, P.procW, rank); eps0.evaluateBoundary();
             nut0 = distributeField<scalar>(nfd, gm.patches(), P.Lm, P.lp, P.procW, rank); nut0.evaluateBoundary();
+            if (sa)
+            {
+                ntfd = readField<scalar>(fieldDir + "/nuTilda");
+                nuTilda0 = distributeField<scalar>(ntfd, gm.patches(), P.Lm, P.lp, P.procW, rank); nuTilda0.evaluateBoundary();
+            }
+            else
+            {
+                kfd = readField<scalar>(fieldDir + "/k");
+                efd = readField<scalar>(fieldDir + "/" + (sst ? "omega" : "epsilon"));
+                k0   = distributeField<scalar>(kfd, gm.patches(), P.Lm, P.lp, P.procW, rank); k0.evaluateBoundary();
+                eps0 = distributeField<scalar>(efd, gm.patches(), P.Lm, P.lp, P.procW, rank); eps0.evaluateBoundary();
+                if (lm)
+                {
+                    rfd = readField<scalar>(fieldDir + "/ReThetat");
+                    gfd = readField<scalar>(fieldDir + "/gammaInt");
+                    ReThetat0 = distributeField<scalar>(rfd, gm.patches(), P.Lm, P.lp, P.procW, rank); ReThetat0.evaluateBoundary();
+                    gammaInt0 = distributeField<scalar>(gfd, gm.patches(), P.Lm, P.lp, P.procW, rank); gammaInt0.evaluateBoundary();
+                }
+            }
         }
 
         if (master)
@@ -305,7 +477,7 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             std::printf("  relax U=%.2g p=%.2g%s | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s | div(phi,U)=%s\n",
                         relaxU, relaxP, turbulent ? (" k=" + std::to_string(relaxK)).c_str() : "",
                         tolP, tolU, endTime, hasRC ? "on" : "off",
-                        (std::string(boundedDiv ? "bounded " : "") + (lust ? "Gauss LUST" : linUpwind ? "Gauss linearUpwind" : "Gauss upwind")).c_str());
+                        (std::string(boundedDiv ? "bounded " : "") + (lust ? "Gauss LUST" : limitedVsch ? "Gauss limitedLinearV" : limitedU ? "Gauss limitedLinear" : linUpwind ? (linUpwindV ? "Gauss linearUpwindV" : "Gauss linearUpwind") : "Gauss upwind")).c_str());
         }
 
         std::vector<vector> Ug;
@@ -313,10 +485,35 @@ inline int runParallelDeviceFoam(int argc, char** argv)
         int nIter = 0;
         {   // scope: the solver's symmetric-heap buffers must be freed BEFORE Pstream::finalize
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust,
-                                        /*nonOrth*/ false, /*consistent*/ consistent,
+                                        /*linUpwindV*/ linUpwindV, /*nonOrth*/ useNonOrth, /*consistent*/ consistent,
+                                        /*limitedU*/ limitedU, /*limitedTwoByk*/ limitedTwoByk, /*limitedV*/ limitedVsch,
                                         /*amgCacheDir*/ caseDir + "/constant/polyMesh");
-            if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
+            if (turbulent && sa)  solver.enableTurbulenceSA(U0, nuTilda0, nut0, saCoeffs, relaxNuTilda);
+            else if (turbulent && lm)  solver.enableTurbulenceSSTLM(U0, k0, eps0, nut0, ReThetat0, gammaInt0, sstCoeffs, relaxK, relaxEps);
+            else if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent)   solver.enableTurbulence(U0, k0, eps0, nut0, keCoeffs, relaxK, relaxEps);
+            if (mrfCfg.active) solver.setMRF(mrfZone, mrfCfg.nonRotatingPatches);   // Coriolis source + relative flux
+            if (!localFvo.empty()) solver.setFvOptions(localFvo);                   // per-cell momentum Su/Sp + porosity
+            {   // no fixedValue-type p patch -> singular pressure (needs interface regularisation when hasAMI, level
+                // pinned post-hoc below). Same scan as the post-solve pin at the bottom of this function.
+                bool needRef = true;
+                for (const PatchFieldData<scalar>& b : pfd.boundary)
+                    if (b.type == "fixedValue" || b.type == "totalPressure" || b.type == "outletInlet"
+                        || b.type == "fixedMean" || b.type == "prghPressure")
+                        needRef = false;
+                solver.setPressureSingular(needRef);
+            }
+            if (const char* sd = std::getenv("BRAE_STAGE_DUMP"))
+                solver.setStageDump(sd, std::getenv("BRAE_STAGE_DUMP_ITER") ? std::atoi(std::getenv("BRAE_STAGE_DUMP_ITER")) : 1);
+            if (hasAMI)   // cyclicAMI: build the GLOBAL AMI (same on every rank) + this rank's DistributedAMI
+            {
+                FvGeometry gg;
+                gg.build(gm);
+                const std::vector<FvPatch> gfvp = buildPatches(gm, gg);
+                const std::vector<AMIInterface> gAMIs = buildAMIInterfaces(gm, gg, gfvp);
+                solver.setAMI(gAMIs, cellToPart);
+                if (master) std::printf("  cyclicAMI: %zu interface(s) on the distributed path\n", gAMIs.size());
+            }
             lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc
 
             auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };
