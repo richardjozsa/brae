@@ -239,6 +239,18 @@ if(BRAE_WITH_NVSHMEM)
                          ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
     endforeach()
 
+    # Distributed AMI mapDistribute foundation: gather reproduces the global stencil values across ranks
+    add_executable(test_distributed_ami_gather tests/test_distributed_ami_gather.cu)
+    target_include_directories(test_distributed_ami_gather PRIVATE ${BRAE_HEADER_DIRS}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
+    target_link_libraries(test_distributed_ami_gather PRIVATE brae_core)
+    foreach(_np 1 2)
+        add_test(NAME distributed_ami_gather_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_distributed_ami_gather>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/tc_wedge_ami)
+    endforeach()
+
     # Phase 4a L8: device distributed momentum PREDICTOR vs the host predictor
     add_executable(test_gpu_parallel_predictor tests/test_gpu_parallel_predictor.cu)
     target_include_directories(test_gpu_parallel_predictor PRIVATE ${BRAE_HEADER_DIRS}
@@ -1116,3 +1128,20 @@ add_executable(test_gpu_crossover tests/test_gpu_crossover.cu)
 target_include_directories(test_gpu_crossover PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
 target_link_libraries(test_gpu_crossover PRIVATE brae_core)
 add_test(NAME gpu_crossover COMMAND test_gpu_crossover ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurbBig)
+
+# CI robustness: every MPI test is `mpirun -np N ..._npN`. Without PROCESSORS, `ctest -jK` treats each as a single
+# slot and launches many concurrently -> on the self-hosted SINGLE-GPU runner that oversubscribes the GPU/CPU with
+# dozens of ranks at once, the cause of the flaky failures (parallel_spmv_np2, parallel_pcg_np8 under load; each
+# passes in isolation). Setting PROCESSORS=N makes the scheduler reserve N slots per test, so it never overcommits.
+# PROCESSORS alone still allowed TWO np=2 tests to run at once under -j4 (4 ranks -> 4 CUDA/NVSHMEM contexts on the
+# one GPU -> intermittent init/heap-contention crash, exit 8). RESOURCE_LOCK on the np>=2 tests makes them mutually
+# exclusive (at most one multi-rank GPU test at a time); the many np=1 / single-GPU tests still parallelise freely.
+get_property(_brae_all_tests DIRECTORY PROPERTY TESTS)
+foreach(_t ${_brae_all_tests})
+    if(_t MATCHES "_np([0-9]+)$")
+        set_tests_properties(${_t} PROPERTIES PROCESSORS ${CMAKE_MATCH_1})
+        if(CMAKE_MATCH_1 GREATER 1)
+            set_tests_properties(${_t} PROPERTIES RESOURCE_LOCK gpu_multirank)
+        endif()
+    endif()
+endforeach()

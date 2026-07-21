@@ -223,6 +223,12 @@ void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phi
 void deviceDivLimitedCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& field,
                             const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
                             scalar twoByk, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
+// limitedLinearV (OF "Gauss limitedLinearV k_"): the NVDVTVDV vector limiter -- ONE limiter per face from the vector
+// U (gradfV=U[N]-U[P], gradcf=gradfV.(d&gradU[upwind]), r=2*gradcf/gradf-1), applied to all 3 components. U/gUx/gUy/gUz
+// are 3-element arrays (per component). Reduces to deviceDivUpwindCoeffs at limiter=0. Built implicitly like magSqr.
+void deviceDivLimitedVCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>* U,
+                             const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz,
+                             scalar twoByk, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
 // G5: fold the boundary + pEqn source for the pressure solve -> diagC (= rawDiag + internalCoeffs),
 // b (= V*divPhi + boundaryCoeffs). iC/bC are flattened pEqn boundary coeffs (patch order = bndCell order).
 void deviceFoldPressure(const DeviceMesh& dm, const DeviceBuffer<scalar>& rawDiag, const DeviceBuffer<scalar>& divPhi,
