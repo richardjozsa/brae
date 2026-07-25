@@ -20,10 +20,77 @@ BRAE_HD inline scalar nutkWallFunctionValue(scalar yPlus, scalar nu, scalar yplL
 }
 BRAE_HD inline scalar yPlusWall(scalar Cmu25, scalar y, scalar kNearWall, scalar nu) { return Cmu25 * y * sqrt(kNearWall) / nu; }
 
+// atmNutkWallFunction (OpenFOAM atmosphericModels): atmospheric ROUGH-wall nut using surface roughness length z0.
+// Same k-based friction velocity as nutk (yPlus = Cmu^0.25*sqrt(k)*y/nu) but the log uses the roughness blend
+// Edash = (y+z0)/z0 instead of the smooth-wall E*yPlus, and there is no viscous-sublayer cut-off:
+//   nut = nu*(yPlus*kappa/log(max(Edash, 1+1e-4)) - 1);  boundNut -> max(nut, 0)  (OF atmNutkWallFunction.C).
+BRAE_HD inline scalar atmNutkWallFunctionValue(scalar yPlus, scalar y, scalar z0, scalar nu, scalar kappa, bool boundNut)
+{
+    const scalar Edash = (y + z0) / fmax(z0, scalar(1e-300));
+    const scalar nutw  = nu * (yPlus * kappa / log(fmax(Edash, scalar(1.0 + 1e-4))) - scalar(1.0));
+    return boundNut ? fmax(nutw, scalar(0.0)) : nutw;
+}
+// Wall nut for the k-based family: z0>0 selects atmNutkWallFunction (rough), else nutkWallFunction (smooth log law).
+BRAE_HD inline scalar kBasedWallNut(scalar yPlus, scalar y, scalar z0, bool atmBoundNut, scalar nu, scalar yplLam, scalar kappa, scalar E)
+{
+    return (z0 > scalar(0.0)) ? atmNutkWallFunctionValue(yPlus, y, z0, nu, kappa, atmBoundNut)
+                              : nutkWallFunctionValue(yPlus, nu, yplLam, kappa, E);
+}
+
+// Velocity-based wall nut, SINGLE source of truth shared by the momentum wall kernels (spaldingNutKernel/
+// blendedNutKernel) AND the near-wall production G0, so the wall shear and the k-production use the SAME nutw
+// (exactly as OpenFOAM). magUp = |U_cell - U_wall|, magGradU = |snGrad U| = magUp*deltaCoeffs; nutSeed warm-starts
+// the iteration (pass 0 for a cold start). BRAE_HD: identical on host + device.
+//
+// nutUSpaldingWallFunction: Newton on Spalding's law (OF nutUSpaldingWallFunctionFvPatchScalarField, 10 iters, tol 0.01).
+BRAE_HD inline scalar spaldingNutValue(scalar magUp, scalar magGradU, scalar y, scalar nu, scalar kappa, scalar E, scalar nutSeed)
+{
+    scalar ut = sqrt((nutSeed + nu) * magGradU);   // warm seed
+    if (ut > scalar(1e-300) && magGradU > scalar(1e-300))
+    {
+        for (int it = 0; it < 10; ++it)
+        {
+            const scalar kUu = fmin(kappa*magUp/ut, scalar(50.0));
+            const scalar fkUu = exp(kUu) - scalar(1.0) - kUu*(scalar(1.0) + scalar(0.5)*kUu);
+            const scalar f  = -ut*y/nu + magUp/ut + (scalar(1.0)/E)*(fkUu - (scalar(1.0)/scalar(6.0))*kUu*kUu*kUu);
+            const scalar df =  y/nu + magUp/(ut*ut) + (scalar(1.0)/E)*kUu*fkUu/ut;
+            const scalar utNew = ut + f/df;
+            const scalar err = fabs((ut - utNew) / ut);
+            ut = utNew;
+            if (!(ut > scalar(1e-300)) || err < scalar(0.01)) break;
+        }
+    }
+    const scalar uTau = fmax(scalar(0.0), ut);
+    return fmax(scalar(0.0), uTau*uTau / (magGradU + scalar(1e-300)) - nu);
+}
+// nutUBlendedWallFunction: binomial n=4 blend of viscous/log velocity scales (OF, 10 iters, tol 1e-3, under-relaxed).
+BRAE_HD inline scalar blendedNutValue(scalar magUp, scalar magGradU, scalar y, scalar nu, scalar kappa, scalar E, scalar nutSeed)
+{
+    scalar ut = sqrt((nutSeed + nu) * magGradU);   // warm seed
+    if (ut > scalar(1e-300) && magGradU > scalar(1e-300) && magUp > scalar(1e-300))
+    {
+        scalar err = scalar(1e30);
+        for (int it = 0; it < 10 && err > scalar(1e-3); ++it)
+        {
+            const scalar yPlus   = fmax(y * ut / nu, scalar(1e-300));
+            const scalar uTauVis = magUp / yPlus;
+            const scalar uTauLog = kappa * magUp / log(fmax(E * yPlus, scalar(1.0 + 1e-4)));
+            const scalar v2 = uTauVis * uTauVis, l2 = uTauLog * uTauLog;
+            const scalar utNew = sqrt(sqrt(v2*v2 + l2*l2));   // (uTauVis^4 + uTauLog^4)^(1/4)
+            err = fabs(ut - utNew) / (ut + scalar(1e-300));
+            ut  = scalar(0.5) * (ut + utNew);
+        }
+    }
+    const scalar uTau = fmax(scalar(0.0), ut);
+    return fmax(scalar(0.0), uTau*uTau / (magGradU + scalar(1e-300)) - nu);
+}
+
 // Shared near-wall production for the kEpsilon and kOmegaSST wall functions: compute nutw + |grad(U)|_wall and scatter
 // the turbulence production into G0[c]. The G0 term is IDENTICAL for both models (this enforces that by construction,
 // the komega wall kernel used to carry a hand-copy); each caller then adds only its distinct eps0 / omega0 term.
 // __device__ (uses atomicAdd), called from the wall kernels only.
+// nutWall: 0 = nutkWallFunction (k-based), 1 = nutUSpalding, 2 = nutUBlended (velocity-based) -- MUST match the
+// momentum wall-shear choice (ctl.nutWall) so the near-wall production uses the same nutw OpenFOAM does.
 __device__ inline void wallProductionG0(
     int c,
     int wf,
@@ -42,11 +109,22 @@ __device__ inline void wallProductionG0(
     scalar Cmu25,
     scalar kappa,
     scalar E,
+    scalar atmZ0,        // >0 -> atmNutkWallFunction (rough) for the k-based path; 0 -> nutkWallFunction (smooth)
+    bool   atmBoundNut,
+    int nutWall,
     scalar* G0)
 {
-    const scalar nutw = nutkWallFunctionValue(yPlusWall(Cmu25, y, kc, nu), nu, yplLam, kappa, E);
     const scalar dux = (wux[wf]-Ux[c])*dc, duy = (wuy[wf]-Uy[c])*dc, duz = (wuz[wf]-Uz[c])*dc;
-    const scalar magG = sqrt(dux*dux + duy*duy + duz*duz);
+    const scalar magG = sqrt(dux*dux + duy*duy + duz*duz);   // |snGrad U| = magGradU
+    scalar nutw;
+    if (nutWall == 0)                                        // k-based: nutk (smooth) or atmNutk (rough, z0>0)
+        nutw = kBasedWallNut(yPlusWall(Cmu25, y, kc, nu), y, atmZ0, atmBoundNut, nu, yplLam, kappa, E);
+    else                                                     // velocity-based: magUp = |U_cell - U_wall| = magG/dc
+    {
+        const scalar magUp = magG / fmax(dc, scalar(1e-300));
+        nutw = (nutWall == 1) ? spaldingNutValue(magUp, magG, y, nu, kappa, E, scalar(0.0))
+                              : blendedNutValue (magUp, magG, y, nu, kappa, E, scalar(0.0));
+    }
     atomicAdd(&G0[c], invNwC * (nutw + nu) * magG * Cmu25 * sqrt(kc) / (kappa * y));
 }
 

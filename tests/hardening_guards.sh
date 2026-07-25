@@ -46,9 +46,11 @@ expect "field-size(#9)" "size mismatch"
 setup; printf 's { type scalarSemiImplicitSource; active yes; scalarSemiImplicitSourceCoeffs { selectionMode all; injectionRateSuSp { k (1 0); } } }\n' > "$CASE/system/fvOptions"
 expect "fvOptions-scalar(#3)" "cannot apply"
 
-# #4 nutUSpaldingWallFunction on a kEpsilon (non-SA) case
-setup; sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' "$CASE/0/nut"
-expect "wallfn-Spalding(#4)" "nutUSpaldingWallFunction"
+# #4 wall-function nut BC on a NON-wall patch -> silently inert, must fail loud.
+#    (nutUSpalding/nutUBlended on a non-SA model are now HONOURED per the BC, not errors -- see setNutWall.)
+#    Retype the inlet's nut (a 'patch') to a wall function; the first 'calculated' in 0/nut is the inlet.
+setup; sed -i '0,/calculated/s//nutkWallFunction/' "$CASE/0/nut"
+expect "wallfn-nonwall(#4)" "not 'wall'"
 
 rm -rf "$CASE"
 if [ "$fail" -ne 0 ]; then echo "HARDENING GUARDS: FAIL"; exit 1; fi
