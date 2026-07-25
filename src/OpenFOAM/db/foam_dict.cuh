@@ -248,7 +248,10 @@ inline std::string expandDictVariables(const std::string& rawIn)
         std::string val;
         std::size_t j = i + 1;
         for (; j < toks.size() && toks[j] != ";" && toks[j] != "{" && toks[j] != "}"; ++j) { if (!val.empty()) val += ' '; val += toks[j]; }
-        if (isIdent(tk)) vars[tk] = val;
+        // Skip a self-reference like `z0 $z0;` (an inner-scope entry that pulls from an outer variable of the SAME
+        // name -- OF scoping). In brae's flat var map this would overwrite the real outer value with an unresolvable
+        // self-ref, so keep the outer definition (e.g. `z0 uniform 0.1;` from an #include'd ABLConditions).
+        if (isIdent(tk) && val != "$" + tk && val != "${" + tk + "}") vars[tk] = val;
         i = j;
         atKey = true;
     }

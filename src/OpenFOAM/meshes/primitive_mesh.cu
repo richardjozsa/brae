@@ -23,13 +23,8 @@ struct FastScan
     const char* end = nullptr;
     explicit FastScan(const std::string& path)
     {
-        std::ifstream is(path, std::ios::binary);
-        if (!is) throw std::runtime_error("brae: cannot open " + path);
-        is.seekg(0, std::ios::end);
-        const std::streamoff n = is.tellg();
-        is.seekg(0, std::ios::beg);
-        buf.resize(n > 0 ? static_cast<std::size_t>(n) : 0);
-        if (n > 0) is.read(&buf[0], n);
+        const std::vector<char> b = gzSlurp(path);   // gz-transparent: reads <path> or <path>.gz (OF writeCompression on)
+        buf.assign(b.begin(), b.end());
         p = buf.data();
         end = p + buf.size();
         skipHeader();

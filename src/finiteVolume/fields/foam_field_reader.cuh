@@ -65,6 +65,7 @@ struct PatchFieldData
     // eps=u*^3/(kappa(z-d+z0)); omega=u*/(sqrt(Cmu)kappa(z-d+z0)); z = Cf.zDir.
     bool   hasABL = false;
     scalar ablUref = 0, ablZref = 0, ablZ0 = 0.1, ablD = 0, ablKappa = 0.41, ablCmu = 0.09;
+    bool   atmBoundNut = true;   // atmNutkWallFunction boundNut option (clamp nut>=0); z0 is stored in ablZ0.
     vector ablFlowDir{1, 0, 0}, ablZDir{0, 0, 1};
 };
 
@@ -192,8 +193,19 @@ inline FieldData<T> readField(const std::string& path)
             ts.expect("{");
             while (ts.peek() != "}")
             {
+                const std::string pname = ts.next();
+                if (ts.peek() != "{")
+                {
+                    // Non-sub-dict entry at the boundaryField level: a leftover variable definition spliced from an
+                    // #include'd ABLConditions/initialConditions at that scope (e.g. "Uref 10.0;", referenced later
+                    // via $z0 -- turbineSiting). OpenFOAM keeps these as dict variables; brae's $-expansion has already
+                    // resolved the references, so skip the definition to its ';'. Real patches are always "name { ... }".
+                    skipToSemicolon(ts);
+                    ts.expect(";");
+                    continue;
+                }
                 PatchFieldData<T> p;
-                p.name = ts.next();
+                p.name = pname;
                 ts.expect("{");
                 while (ts.peek() != "}")
                 {
@@ -221,6 +233,12 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         if (ts.peek() == "uniform" || ts.peek() == "constant") ts.next();
                         p.ablZ0 = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "boundNut")   // atmNutkWallFunction: clamp nut>=0 (true/false)
+                    {
+                        const std::string v = ts.next();
+                        p.atmBoundNut = (v == "true" || v == "yes" || v == "on" || v == "1");
                         ts.expect(";");
                     }
                     else if (key == "flowDir" || key == "zDir")
