@@ -60,6 +60,11 @@ struct FvOptionsData
     std::vector<label>  adDiskCells, adMonitorCells;
     RotorDiskParams     rotor;                      // rotorDiskSource (BEM); geometry built later from the mesh
     int  count = 0;                      // number of options read (0 => no file / empty => all hooks no-op)
+    // Sources whose NAME brae recognizes but that it CANNOT apply here (unsupported selectionMode cellSet, a
+    // parsed-but-unapplied scalarSemiImplicitSource, or an unknown type). Recorded instead of silently dropped;
+    // the single-GPU driver throws on a non-empty list so a valid-looking case never runs with wrong physics. The
+    // parallel path (readFvOptions is shared) ignores this field, so its behaviour is unchanged.
+    std::vector<std::string> unsupported;
     bool empty() const { return count == 0; }
 };
 
@@ -125,10 +130,19 @@ inline FvOptionsData readFvOptions(
         const bool isAd  = (type == "actuationDiskSource");
         const bool isRot = (type == "rotorDisk" || type == "rotorDiskSource");
         const bool isVdc = (type == "velocityDampingConstraint");
-        if (!isVec && !isSca && !isPor && !isMvf && !isLim && !isAd && !isRot && !isVdc) continue;   // (other source types: future)
         const std::string act = opt.wordOr("active", "yes");
-        if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;
+        if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;   // inactive -> skip (OF)
+        if (!isVec && !isSca && !isPor && !isMvf && !isLim && !isAd && !isRot && !isVdc)
+        {
+            fo.unsupported.push_back("source '" + s.first + "' has unsupported type '" + type + "'");
+            continue;
+        }
         const FoamDict& co = fvoptions_detail::coeffsOf(opt, type);
+        if (co.wordOr("selectionMode", opt.wordOr("selectionMode", "all")) == "cellSet")   // no cellSet reader
+        {
+            fo.unsupported.push_back("source '" + s.first + "' uses selectionMode cellSet (use cellZone instead)");
+            continue;
+        }
 
         if (isMvf)   // meanVelocityForce (channel-flow driver)
         {
@@ -225,6 +239,7 @@ inline FvOptionsData readFvOptions(
                 if (it != zones.end()) fo.adMonitorCells = it->second;
             }
             if (fo.adMonitorCells.empty()) continue;
+            if (fo.adActive) fo.unsupported.push_back("source '" + s.first + "': a 2nd actuationDiskSource -- brae keeps only one");
             fo.adActive = true;
             ++fo.count;
             continue;
@@ -290,6 +305,7 @@ inline FvOptionsData readFvOptions(
                 if (it != zones.end()) rp.cells = it->second;
             }
             if (rp.cells.empty() || rp.bladeR.empty() || rp.pAlpha.empty()) continue;
+            if (rp.active) fo.unsupported.push_back("source '" + s.first + "': a 2nd rotorDisk -- brae keeps only one");
             rp.active = true;
             ++fo.count;
             continue;
@@ -298,7 +314,12 @@ inline FvOptionsData readFvOptions(
         if (isPor)   // explicitPorositySource (DarcyForchheimer)
         {
             const std::string pm = co.wordOr("type", "");
-            if (pm != "DarcyForchheimer") continue;                       // (powerLaw/fixedCoeff: future)
+            if (pm != "DarcyForchheimer")   // powerLaw / fixedCoeff not implemented -> would silently apply ZERO resistance
+            {
+                fo.unsupported.push_back("porosity source '" + s.first + "' uses model '" + pm
+                                         + "' -- only DarcyForchheimer is supported (others would apply no resistance)");
+                continue;
+            }
             const std::string zn = co.wordOr("cellZone", "");
             const auto it = zones.find(zn);
             if (it == zones.end() || it->second.empty()) continue;
@@ -312,6 +333,7 @@ inline FvOptionsData readFvOptions(
             fo.porD = adjustNeg(last3(df.scalarListOr("d", {})));
             fo.porF = adjustNeg(last3(df.scalarListOr("f", {})));
             fo.porCells = it->second;
+            if (fo.porActive) fo.unsupported.push_back("source '" + s.first + "': a 2nd explicitPorositySource -- brae keeps only one");
             fo.porActive = true;
             ++fo.count;
             continue;
@@ -363,21 +385,9 @@ inline FvOptionsData readFvOptions(
                 if (Sp != 0.0) fo.momSp[c] += Sp * V[c];                  // diag -= Sp*V applied by the solver
             }
         }
-        else   // scalar: every field listed in injectionRateSuSp
-        {
-            for (const auto& leaf : inj->leaves)
-            {
-                const std::string& field = leaf.first;
-                const std::vector<scalar> n = fvoptions_detail::suSpNumbers(*inj, field);
-                const scalar Su = n.size() > 0 ? n[0] : 0.0, Sp = n.size() > 1 ? n[1] : 0.0;
-                ensure(fo.scaSu[field]);
-                if (Sp != 0.0) ensure(fo.scaSp[field]);
-                for (label c : cells)
-                {
-                    fo.scaSu[field][c] += Su * (V[c] / VDash);
-                    if (Sp != 0.0) fo.scaSp[field][c] += Sp * V[c];
-                }
-            }
+        else   // scalarSemiImplicitSource: brae PARSES it but never applies it (fvOptionsAddSupScalar has no callers),
+        {      // so the source would be silently ignored. Record it; the single-GPU driver refuses to run.
+            fo.unsupported.push_back("source '" + s.first + "' is a scalarSemiImplicitSource (parsed but not applied)");
         }
     }
     return fo;
