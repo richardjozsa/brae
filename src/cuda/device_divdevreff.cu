@@ -213,12 +213,12 @@ void deviceDivDevReff(
         if (cyc)   // + cyclic faces in gradU (periodic consistency)
         {
             if (cyc->rotational) deviceCyclicAddGradRot(*cyc, Ux, Uy, Uz, i, dm.V, gx, gy, gz);   // neighbour rotated
-            else deviceCyclicAddGrad(*cyc, *Uc[i], dm.V, gx, gy, gz);
+            else interfaceAddGrad(*cyc, *Uc[i], dm.V, gx, gy, gz);
         }
         if (ami)
         {
             if (ami->rotational) deviceAmiAddGradRot(*ami, *Uc[i], *amiUN[i], dm.V, gx, gy, gz);   // neighbour rotated
-            else deviceAmiAddGrad(*ami, *Uc[i], dm.V, gx, gy, gz);
+            else interfaceAddGrad(*ami, *Uc[i], dm.V, gx, gy, gz);
         }
 
         cudaCheck(cudaMemcpy(gradU.data() + (0*3+i)*nC, gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice), "ddr g");
@@ -279,8 +279,8 @@ void deviceDivDevReff(
                                           dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(),
                                           sigmaC.data(), sigmaB.data(), nB, dm.V.data(), srcX.data(), srcY.data(), srcZ.data());
     cudaCheck(cudaGetLastError(), "ddr tensorDiv");
-    if (cyc) deviceCyclicAddTensorDiv(*cyc, sigmaC, nC, srcX, srcY, srcZ);   // + cyclic-face stress flux (V*fvc::div)
-    if (ami) deviceAmiAddTensorDiv(*ami, sigmaC, nC, srcX, srcY, srcZ);      // + AMI-face stress flux
+    if (cyc) interfaceAddTensorDiv(*cyc, sigmaC, nC, srcX, srcY, srcZ);   // + cyclic-face stress flux (V*fvc::div)
+    if (ami) interfaceAddTensorDiv(*ami, sigmaC, nC, srcX, srcY, srcZ);      // + AMI-face stress flux
 }
 
 } // namespace brae
