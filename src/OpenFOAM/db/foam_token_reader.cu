@@ -13,12 +13,13 @@
 #include <zlib.h>    // transparent gzip read of OF's default-gzipped polyMesh (points.gz, faces.gz, ...) and fields
 
 namespace brae {
-namespace {
 
+// gzSlurp is EXTERNAL (declared in foam_token_reader.cuh; the mesh reader FastScan uses it too), so it lives
+// OUTSIDE the file-local anonymous namespace that begins after it.
 // Read a file into bytes, transparently gunzipping. OF gzips polyMesh/fields by default (`points.gz`, ...); zlib's
 // gzread reads BOTH gzip and plain files, so this also handles uncompressed files. Resolves <base> -> <base>.gz when
 // <base> itself is absent (prefers the uncompressed file if both exist). maxBytes>0 stops early (header sniffing).
-std::vector<char> gzSlurp(const std::string& base, std::size_t maxBytes = 0)
+std::vector<char> gzSlurp(const std::string& base, std::size_t maxBytes)   // default in foam_token_reader.cuh
 {
     std::string path = base;
     {
@@ -42,6 +43,8 @@ std::vector<char> gzSlurp(const std::string& base, std::size_t maxBytes = 0)
     gzclose(f);
     return out;
 }
+
+namespace {   // file-local parser helpers below
 
 std::string readWhole(const std::string& path)
 {
@@ -170,6 +173,11 @@ std::string expandIncludes(const std::string& text, const std::string& baseDir, 
             std::size_t j = i + 1;
             while (j < text.size() && std::isalpha(static_cast<unsigned char>(text[j]))) ++j;
             const std::string dir = text.substr(i + 1, j - i - 1);
+            // brae does not evaluate #calc/#eval/#codeStream: the raw expression string flows into stod/stoi and is
+            // silently mis-parsed (e.g. endTime #calc "1000*2" -> 1000). Fail loud rather than run a wrong control value.
+            if (dir == "calc" || dir == "eval" || dir == "codeStream")
+                throw std::runtime_error("brae does not evaluate #" + dir + " directives -- the expression would be"
+                    " silently mis-parsed into a wrong value. Replace it with a literal value.");
             if (dir == "includeFunc")
             {
                 // #includeFunc <name>[(args)] (unquoted; OF function-template include). brae only RUNS force/forceCoeffs
@@ -517,6 +525,83 @@ void readBinaryCompactFaces(const std::string& path, std::vector<label>& offsets
     verts.resize(k);
     readRaw(b, i, verts.data(), k);
     expectCloseParen(b, i);
+}
+
+// Byte-level helpers for the mixed ASCII/binary cellZones parser below.
+namespace {
+
+// Skip whitespace/comments, then read a token up to the next whitespace or a ( ) { } ; delimiter.
+// Reads compound tokens like "List<label>" whole (the '<' '>' are not delimiters).
+std::string readWordBytes(const std::vector<char>& b, std::size_t& i)
+{
+    skipSpaceAndComments(b, i);
+    std::string w;
+    while (i < b.size())
+    {
+        const char c = b[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r'
+            || c == '(' || c == ')' || c == '{' || c == '}' || c == ';') break;
+        w += c;
+        ++i;
+    }
+    return w;
+}
+
+// Skip whitespace/comments, then require and consume the single byte `ch`.
+void expectByte(const std::vector<char>& b, std::size_t& i, char ch)
+{
+    skipSpaceAndComments(b, i);
+    if (i >= b.size() || b[i] != ch)
+        throw std::runtime_error(std::string("brae binary cellZones: expected '") + ch + "'");
+    ++i;
+}
+
+// Advance past the next occurrence of `ch` (consuming it). Used to skip flat entries like "type cellZone;".
+void skipPastByte(const std::vector<char>& b, std::size_t& i, char ch)
+{
+    while (i < b.size() && b[i] != ch) ++i;
+    if (i < b.size()) ++i;
+}
+
+} // namespace
+
+std::vector<std::pair<std::string, std::vector<label>>> readBinaryCellZones(const std::string& path)
+{
+    const std::vector<char> b = readBytes(path);
+    std::size_t i = headerPayloadOffset(b);        // past the FoamFile header (incl. nested meta{})
+    const std::size_t nz = readAsciiCount(b, i);   // nZones, cursor left just past the outer '('
+    std::vector<std::pair<std::string, std::vector<label>>> zones;
+    zones.reserve(nz);
+    for (std::size_t z = 0; z < nz; ++z)
+    {
+        const std::string name = readWordBytes(b, i);   // zone name (glued after '(' / previous '}')
+        expectByte(b, i, '{');
+        std::vector<label> cells;
+        for (;;)
+        {
+            skipSpaceAndComments(b, i);
+            if (i < b.size() && b[i] == '}') { ++i; break; }
+            const std::string key = readWordBytes(b, i);
+            if (key == "cellLabels")
+            {
+                // Optional compound token "List<label>" (some writers omit it: `cellLabels N(...)`).
+                skipSpaceAndComments(b, i);
+                if (i < b.size() && !(b[i] >= '0' && b[i] <= '9'))
+                    readWordBytes(b, i);
+                const std::size_t n = readAsciiCount(b, i);   // count, cursor just past '('
+                cells.resize(n);
+                readRaw(b, i, cells.data(), n);               // n raw int32 labels
+                expectCloseParen(b, i);
+                skipPastByte(b, i, ';');
+            }
+            else
+            {
+                skipPastByte(b, i, ';');   // e.g. "type cellZone;"
+            }
+        }
+        zones.emplace_back(name, std::move(cells));
+    }
+    return zones;
 }
 
 } // namespace brae
