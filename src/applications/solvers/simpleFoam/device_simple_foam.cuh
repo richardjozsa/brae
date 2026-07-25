@@ -39,6 +39,12 @@
 
 namespace brae {
 
+// Which nut wall function to apply, chosen from the 0/nut boundaryField TYPE (matching OpenFOAM),
+// NOT from the turbulence model. nutk = k-based stepwise log law (nutkWallFunction); Spalding =
+// velocity-based Spalding blend (nutUSpaldingWallFunction); Blended = velocity-based binomial n=4
+// blend (nutUBlendedWallFunction). All three are honoured on any RAS model, exactly as OF does.
+enum class NutWall { Nutk, Spalding, Blended };
+
 struct DeviceSimpleControls
 {
     scalar nu = 1e-5, relaxU = 0.7, relaxP = 0.3, relaxK = 0.7, relaxEps = 0.7;
@@ -68,6 +74,10 @@ struct DeviceSimpleControls
     KOmegaSSTCoeffs ksstCoeffs;                    // kOmegaSST coeffs (default = OF); read from RAS.kOmegaSSTCoeffs.
     bool   sa = false;                             // RASModel SpalartAllmaras (one-equation: the "k" slot holds nuTilda; no 2nd scalar).
     SpalartAllmarasCoeffs saCoeffs;                // SA coeffs (default = OF) + nutUSpaldingWallFunction E/kappa.
+    NutWall nutWall = NutWall::Nutk;               // nut wall function, read from the 0/nut wall BC TYPE (not the model),
+                                                   // so nutUBlended/nutUSpalding are honoured on kEpsilon/kOmegaSST like OF.
+    scalar atmZ0 = 0.0;                            // atmNutkWallFunction roughness length z0 (>0 -> rough-wall nut on the
+    bool   atmBoundNut = true;                     // k-based path); read from the 0/nut wall BC. 0 -> smooth nutkWallFunction.
     bool   needRef = false;                        // no fixedValue-p patch -> singular pressure: adjustPhi + setReference.
     label  pRefCell = 0;
     scalar pRefValue = 0.0;                        // pressure reference (fvSolution SIMPLE.pRefCell/pRefValue).
@@ -377,15 +387,21 @@ public:
         if (ctl_.turbulent)
         {
             deviceCopy(nuEffBnd, nuBndConst_);
-            if (ctl_.sa)   // SA wall nut via nutUSpaldingWallFunction (Newton uTau); other faces = adjacent cell nut
+            // Wall nut chosen by the 0/nut BC TYPE (ctl_.nutWall), matching OpenFOAM, NOT the model.
+            if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA always, or the BC on any model
             {
                 deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
                 deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
             }
-            else   // k-eps / kOmegaSST: nutkWallFunction (k-based) at walls
+            else if (ctl_.nutWall == NutWall::Blended)   // nutUBlendedWallFunction (velocity-based binomial n=4 blend) on kEps/kOmegaSST
+            {
+                deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_);
+                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
+            }
+            else   // k-based wall nut: nutkWallFunction (smooth), or atmNutkWallFunction (rough) when ctl_.atmZ0>0
             {
                 DeviceBuffer<scalar> nutBnd;
-                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs);
+                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs, ctl_.atmZ0, ctl_.atmBoundNut);
                 deviceAxpy(1.0, nutBnd, nuEffBnd);
             }
         }
@@ -894,7 +910,9 @@ public:
                                        phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
                                        ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
-                                       ctl_.lm ? gammaIntEff_.data() : nullptr);   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
+                                       ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
+                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
+                                       ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
@@ -905,7 +923,9 @@ public:
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
-                                      ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                                      ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
+                                      static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
+                                      ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
         }
         // OF continuityErrs.H: contErr = fvc::div(phi) on the CORRECTED flux; sum local = sum(V|contErr|)/sumV,
         // global = sum(V contErr)/sumV. deviceDiv gives Sum(phi)/V per cell, so R = V*div = the cell flux balance.

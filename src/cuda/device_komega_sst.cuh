@@ -66,7 +66,8 @@ void deviceOmegaReaction(const DeviceBuffer<scalar>& V, const DeviceBuffer<scala
 // invNw), G0 identical to the epsilon wall function. Zeroes omega0/G0 then scatters. (Validated end-to-end at C7.)
 void deviceWallOmegaG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& Ux,
                        const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
-                       DeviceBuffer<scalar>& omega0, DeviceBuffer<scalar>& G0, const KOmegaSSTCoeffs& co);
+                       DeviceBuffer<scalar>& omega0, DeviceBuffer<scalar>& G0, const KOmegaSSTCoeffs& co, int nutWall = 0,
+                       scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
 
 // C6 k equation
 // k reaction (adds to diag + source). Mirrors the k block of kOmegaSSTBase::correct() (incompressible):

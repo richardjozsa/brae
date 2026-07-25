@@ -248,7 +248,8 @@ if(BRAE_WITH_NVSHMEM)
         add_test(NAME distributed_ami_gather_np${_np}
                  COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
                          $<TARGET_FILE:test_distributed_ami_gather>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/tc_wedge_ami)
+                         # committed cyclicAMI fixture (tc_wedge_ami is gitignored -> absent on a fresh CI checkout)
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelAMI)
     endforeach()
 
     # Phase 4a L8: device distributed momentum PREDICTOR vs the host predictor
@@ -893,6 +894,37 @@ add_test(NAME komegasstlm_flatplate
                  $<TARGET_FILE:brae> ${CMAKE_CURRENT_SOURCE_DIR}/validation/lmFlatPlate)
 set_tests_properties(komegasstlm_flatplate PROPERTIES LABELS slow TIMEOUT 600)
 
+# Distributed cyclicAMI FULL-SOLVE oracle: run tc_wedge_ami (rotational rotor-stator, linearUpwind + non-orth)
+# through the single-GPU device path AND the distributed path, then compare. This is the comparison that catches
+# real AMI-coupling bugs -- the bounded-div/deferred-rot/linearUpwind-grad fixes all lived in SHARED distributed
+# code, so a np2-vs-np1 oracle passes with both ranks wrong; only distributed-vs-single-GPU exposes them. np=1 is
+# bit-exact (tol 1e-6); np=2 exercises the cross-rank NVSHMEM AMI gather (tol 1e-3, the residualControl floor).
+# _np(N)$ names auto-pick up PROCESSORS=N + (N>1) RESOURCE_LOCK gpu_multirank from the block below.
+foreach(_np 1 2)
+    if(_np EQUAL 1)
+        set(_amitol 1e-6)
+    else()
+        set(_amitol 1e-3)
+    endif()
+    add_test(NAME ami_oracle_np${_np}
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_oracle.sh
+                     $<TARGET_FILE:brae>
+                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/tc_wedge_ami
+                     ${CMAKE_CURRENT_BINARY_DIR}/ami_oracle_work_np${_np}
+                     ${_np} ${_amitol} ${_amitol}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/compare_ami_fields.py)
+    set_tests_properties(ami_oracle_np${_np} PROPERTIES LABELS slow TIMEOUT 400)
+endforeach()
+
+# Single-GPU hardening regression lock: assert each fail-loud guard still fires on a mutated case
+# (non-Newtonian, endTime<1, #calc, missing div(phi,U), field-size, unsupported fvOptions, wall-fn) -> a future
+# edit that silently drops a guard fails here. See cudafoam/single-gpu-hardening.md.
+add_test(NAME hardening_guards
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/hardening_guards.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCase
+                 ${CMAKE_CURRENT_BINARY_DIR}/hardening_guards_work)
+
 # Cyclic increment C1: cyclic interface geometry (serial)
 add_executable(test_cyclic_geometry tests/test_cyclic_geometry.cu)
 target_include_directories(test_cyclic_geometry PRIVATE ${BRAE_HEADER_DIRS})
@@ -1145,3 +1177,15 @@ foreach(_t ${_brae_all_tests})
         endif()
     endif()
 endforeach()
+
+# ---------------------------------------------------------------------------
+# Demo instrumentation (demo/amgpcg): dumps the real brae AMG hierarchy and the
+# per-iteration AMG-PCG state as CSV, for the replay animation. Not a test.
+# demo/ is gitignored (local-only, exceeds GitHub's file-size limit), so this
+# target is built ONLY when the source is present -- CI (no demo/) skips it.
+# ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo/amgpcg/trace_brae.cu")
+    add_executable(trace_brae demo/amgpcg/trace_brae.cu)
+    target_include_directories(trace_brae PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(trace_brae PRIVATE brae_core)
+endif()
