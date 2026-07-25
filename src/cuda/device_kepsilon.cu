@@ -166,6 +166,9 @@ void wallFnKernel(
     scalar Cmu75,
     scalar kappa,
     scalar E,
+    scalar atmZ0,
+    bool   atmBoundNut,
+    int nutWall,
     scalar* __restrict__ eps0,
     scalar* __restrict__ G0)
 {
@@ -174,7 +177,7 @@ void wallFnKernel(
 
     const int c = wfCell[wf];
     const scalar y = wfY[wf], dc = wfDc[wf], kc = k[c];
-    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nu, yplLam, Cmu25, kappa, E, G0);
+    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nu, yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall, G0);
     atomicAdd(&eps0[c], invNw[c] * Cmu75 * pow(kc, 1.5) / (kappa * y));   // kEpsilon: distinct eps wall value
 }
 
@@ -193,6 +196,8 @@ void boundaryNutKernel(
     scalar Cmu25,
     scalar kappa,
     scalar E,
+    scalar atmZ0,        // >0 -> atmNutkWallFunction (rough); 0 -> nutkWallFunction (smooth)
+    bool   atmBoundNut,
     scalar* __restrict__ nutBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -201,7 +206,7 @@ void boundaryNutKernel(
     const int c = fc[i];
     if (isWall[i])
     {
-        nutBnd[i] = nutkWallFunctionValue(yPlusWall(Cmu25, y[i], k[c], nu), nu, yplLam, kappa, E);
+        nutBnd[i] = kBasedWallNut(yPlusWall(Cmu25, y[i], k[c], nu), y[i], atmZ0, atmBoundNut, nu, yplLam, kappa, E);
     }
     else
     {
@@ -518,7 +523,10 @@ void deviceWallEpsG0(
     scalar nu,
     DeviceBuffer<scalar>& eps0,
     DeviceBuffer<scalar>& G0,
-    const KEpsilonCoeffs& co)
+    const KEpsilonCoeffs& co,
+    int nutWall,
+    scalar atmZ0,
+    bool   atmBoundNut)
 {
     const int nC = static_cast<int>(k.size());
     eps0.resize(nC);
@@ -529,7 +537,7 @@ void deviceWallEpsG0(
     if (w.nWF > 0)
         wallFnKernel<<<nBlocks(w.nWF), TPB>>>(w.nWF, w.wfCell.data(), w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
                                               w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(), Uy.data(),
-                                              Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, eps0.data(), G0.data());
+                                              Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, eps0.data(), G0.data());
     cudaCheck(cudaGetLastError(), "wallFn");
 }
 
@@ -572,12 +580,14 @@ void deviceBoundaryNut(
     const DeviceBuffer<scalar>& nut,
     scalar nu,
     DeviceBuffer<scalar>& nutBnd,
-    const KEpsilonCoeffs& co)
+    const KEpsilonCoeffs& co,
+    scalar atmZ0,
+    bool   atmBoundNut)
 {
     nutBnd.resize(db.n);
     const scalar Cmu25 = std::pow(co.Cmu, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
     boundaryNutKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), isWall.data(), y.data(), k.data(), nut.data(),
-                                              nu, yplLam, Cmu25, co.kappa, co.E, nutBnd.data());
+                                              nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, nutBnd.data());
     cudaCheck(cudaGetLastError(), "boundaryNut");
 }
 
@@ -708,7 +718,10 @@ void deviceKEpsilonCorrect(
     bool gsK,
     bool gsEps,
     DeviceAMI* ami,
-    DeviceCyclic* cyc)
+    DeviceCyclic* cyc,
+    int nutWall,
+    scalar atmZ0,
+    bool atmBoundNut)
 {
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
@@ -728,7 +741,7 @@ void deviceKEpsilonCorrect(
     if (ami && ami->n) deviceAmiAddDiv(*ami, dm.V, divU);   // interface flux into div(phi) (bounded term + reaction Sp)
     if (cyc && cyc->n) deviceCyclicAddDiv(*cyc, dm.V, divU);
     DeviceBuffer<scalar> eps0, G0;
-    deviceWallEpsG0(wall, k, Ux, Uy, Uz, nu, eps0, G0, co);
+    deviceWallEpsG0(wall, k, Ux, Uy, Uz, nu, eps0, G0, co, nutWall, atmZ0, atmBoundNut);
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data());
 
     // epsilon equation (loose solve) with the near-wall setValues constraint
@@ -823,7 +836,10 @@ void deviceKOmegaSSTCorrect(
     bool gsEps,
     DeviceAMI* ami,
     DeviceCyclic* cyc,
-    const scalar* gammaIntEff)
+    const scalar* gammaIntEff,
+    int nutWall,
+    scalar atmZ0,
+    bool atmBoundNut)
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -844,7 +860,7 @@ void deviceKOmegaSSTCorrect(
     // omega wall function FIRST (OF updateCoeffs before CDkOmega): omega0/G0, override omega & G at wall cells, so
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
-    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co);
+    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut);
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data());
 
     // CDkOmega from grad(k), grad(omega); F1, F2.
@@ -1380,24 +1396,40 @@ void spaldingNutKernel(
     const int c = fc[i];
     if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
-    const scalar magGradU = magUp * dc[i], yy = y[i];
-    scalar ut = sqrt((nutBnd[i] + nu) * magGradU);   // warm seed
-    if (ut > 1e-300 && magGradU > 1e-300)
-    {
-        for (int it = 0; it < 10; ++it)
-        {
-            const scalar kUu = fmin(kappa*magUp/ut, 50.0);
-            const scalar fkUu = exp(kUu) - 1.0 - kUu*(1.0 + 0.5*kUu);
-            const scalar f  = -ut*yy/nu + magUp/ut + (1.0/E)*(fkUu - (1.0/6.0)*kUu*kUu*kUu);
-            const scalar df =  yy/nu + magUp/(ut*ut) + (1.0/E)*kUu*fkUu/ut;
-            const scalar utNew = ut + f/df;
-            const scalar err = fabs((ut - utNew) / ut);
-            ut = utNew;
-            if (!(ut > 1e-300) || err < 0.01) break;
-        }
-    }
-    const scalar uTau = fmax(0.0, ut);
-    nutBnd[i] = fmax(0.0, uTau*uTau / (magGradU + 1e-300) - nu);
+    const scalar magGradU = magUp * dc[i];
+    nutBnd[i] = spaldingNutValue(magUp, magGradU, y[i], nu, kappa, E, nutBnd[i]);   // shared with G0 (nut_wall_function.cuh)
+}
+
+
+// nutUBlendedWallFunction (OpenFOAM v2412): wall faces -> uTau from the binomial blend of the viscous and
+// log velocity scales, nut = max(0, uTau^2/magGradU - nu). uTau = (uTauVis^n + uTauLog^n)^(1/n), n=4:
+//   yPlus = y*uTau/nu ; uTauVis = magUp/yPlus ; uTauLog = kappa*magUp/log(max(E*yPlus, 1+1e-4)).
+// 10 iters, tol 1e-3, under-relaxed uTau update (ut = 0.5*(ut+utNew)), warm-started like the Spalding kernel.
+// magUp/magGradU use the same convention as spaldingNutKernel (|U_cell|, |snGrad U|=|U_cell|*deltaCoeffs).
+__global__
+void blendedNutKernel(
+    int n,
+    const label* __restrict__ fc,
+    const label* __restrict__ isWall,
+    const scalar* __restrict__ y,
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    const scalar* __restrict__ nutCell,
+    scalar nu,
+    scalar kappa,
+    scalar E,
+    scalar* __restrict__ nutBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const int c = fc[i];
+    if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
+    const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    const scalar magGradU = magUp * dc[i];
+    nutBnd[i] = blendedNutValue(magUp, magGradU, y[i], nu, kappa, E, nutBnd[i]);   // shared with G0 (nut_wall_function.cuh)
 }
 } // namespace
 
@@ -1424,6 +1456,34 @@ void deviceBoundaryNutSpalding(
                                            dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                            nutCell.data(), nu, co.kappa, co.E, nutBnd.data());
     cudaCheck(cudaGetLastError(), "spaldingNut");
+}
+
+
+// nutUBlendedWallFunction wall nut (velocity-based binomial blend). kappa/E passed explicitly so it works
+// on ANY RAS model (kEpsilon/kOmegaSST/SA), honouring the 0/nut BC type rather than the model.
+void deviceBoundaryNutBlended(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<label>& isWall,
+    const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& nutCell,
+    scalar nu,
+    scalar kappa,
+    scalar E,
+    DeviceBuffer<scalar>& nutBnd)
+{
+    const int n = dbU.comp[0].n;
+    if (static_cast<int>(nutBnd.size()) != n)   // first call: zero seed (warm-starts thereafter)
+    {
+        nutBnd.resize(n);
+        cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "blended init");
+    }
+    blendedNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
+                                          dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
+                                          nutCell.data(), nu, kappa, E, nutBnd.data());
+    cudaCheck(cudaGetLastError(), "blendedNut");
 }
 
 

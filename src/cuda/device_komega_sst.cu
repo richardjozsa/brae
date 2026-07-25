@@ -276,7 +276,10 @@ void wallOmegaG0Kernel(
     scalar Cmu25,
     scalar kappa,
     scalar E,
+    scalar atmZ0,
+    bool   atmBoundNut,
     scalar beta1,
+    int nutWall,
     scalar* __restrict__ omega0,
     scalar* __restrict__ G0)
 {
@@ -285,7 +288,7 @@ void wallOmegaG0Kernel(
 
     const int c = wfCell[wf];
     const scalar y = wfY[wf], dc = wfDc[wf], kc = k[c];
-    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nu, yplLam, Cmu25, kappa, E, G0);
+    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nu, yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall, G0);
     const scalar omegaVis = 6.0 * nu / (beta1 * y * y);
     const scalar omegaLog = sqrt(kc) / (Cmu25 * kappa * y);
     atomicAdd(&omega0[c], invNw[c] * sqrt(omegaVis*omegaVis + omegaLog*omegaLog));   // BINOMIAL n=2 (distinct omega wall value)
@@ -449,7 +452,10 @@ void deviceWallOmegaG0(
     scalar nu,
     DeviceBuffer<scalar>& omega0,
     DeviceBuffer<scalar>& G0,
-    const KOmegaSSTCoeffs& co)
+    const KOmegaSSTCoeffs& co,
+    int nutWall,
+    scalar atmZ0,
+    bool   atmBoundNut)
 {
     const int nC = static_cast<int>(k.size());
     omega0.resize(nC); G0.resize(nC);
@@ -459,8 +465,8 @@ void deviceWallOmegaG0(
     if (w.nWF > 0)
         wallOmegaG0Kernel<<<nBlocks(w.nWF), TPB>>>(w.nWF, w.wfCell.data(), w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
                                                    w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(),
-                                                   Uy.data(), Uz.data(), nu, yplLam, Cmu25, co.kappa, co.E, co.beta1,
-                                                   omega0.data(), G0.data());
+                                                   Uy.data(), Uz.data(), nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, co.beta1,
+                                                   nutWall, omega0.data(), G0.data());
     cudaCheck(cudaGetLastError(), "wallOmegaG0");
 }
 

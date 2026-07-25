@@ -138,10 +138,23 @@ inline FvOptionsData readFvOptions(
             continue;
         }
         const FoamDict& co = fvoptions_detail::coeffsOf(opt, type);
-        if (co.wordOr("selectionMode", opt.wordOr("selectionMode", "all")) == "cellSet")   // no cellSet reader
+        // selection cells by selectionMode: cellZone -> named zone; cellSet -> the same-named cellZone (topoSet usually
+        // creates both, e.g. turbineSiting actuationDisk1/2); all -> whole domain. Fail loud if a named set/zone is absent.
+        auto selZoneName = [&](const FoamDict& c, const FoamDict& o) -> std::string {
+            const std::string sm = c.wordOr("selectionMode", o.wordOr("selectionMode", "all"));
+            if (sm == "cellZone") return c.wordOr("cellZone", o.wordOr("cellZone", ""));
+            if (sm == "cellSet")  return c.wordOr("cellSet",  o.wordOr("cellSet",  ""));   // mapped to the same-named cellZone
+            return "";
+        };
+        if (co.wordOr("selectionMode", opt.wordOr("selectionMode", "all")) == "cellSet")
         {
-            fo.unsupported.push_back("source '" + s.first + "' uses selectionMode cellSet (use cellZone instead)");
-            continue;
+            const std::string cs = co.wordOr("cellSet", opt.wordOr("cellSet", ""));
+            if (zones.find(cs) == zones.end())   // brae reads cellZones; no same-named cellZone -> can't locate the cells
+            {
+                fo.unsupported.push_back("source '" + s.first + "' uses selectionMode cellSet '" + cs + "' with no matching"
+                    " cellZone -- brae selects cells by cellZone; convert the set (topoSet: cellZoneSet), or use selectionMode cellZone");
+                continue;
+            }   // else: the same-named cellZone exists -> the sources below resolve it via selZoneName
         }
 
         if (isMvf)   // meanVelocityForce (channel-flow driver)
@@ -203,9 +216,9 @@ inline FvOptionsData readFvOptions(
             const scalar Cp = co.scalarOr("Cp", 0.0), Ct = co.scalarOr("Ct", 0.0);
             if (fo.adArea <= 0 || Ct <= 0 || Cp <= 0) continue;
             fo.adA = 1.0 - Cp/Ct;                                        // induction (sink cancels)
-            // disk cells: the selection cellZone (selectionMode cellZone).
+            // disk cells: the selection cellZone (cellZone, or a cellSet mapped to the same-named cellZone).
             {
-                const auto it = zones.find(co.wordOr("cellZone", opt.wordOr("cellZone", "")));
+                const auto it = zones.find(selZoneName(co, opt));
                 if (it != zones.end()) fo.adDiskCells = it->second;
             }
             if (fo.adDiskCells.empty()) continue;

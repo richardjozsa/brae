@@ -553,12 +553,12 @@ int main(int argc, char** argv)
         SurfaceScalarField phi = fvc::flux(U, m, g, fvp);
 
         const std::string secondName = ctl.sst ? "omega" : "epsilon";   // the 2nd turbulence scalar
-        // Wall-function fidelity guard -- fail loud on the two silently-wrong cases the BC parser can't catch:
-        //  (1) nutUSpaldingWallFunction on a non-SA model: brae picks the wall model from the RAS model (Spalding for
-        //      SA, nutk otherwise), NOT the BC, so it would silently apply nutkWallFunction (wrong wall shear/Cf/Cd).
-        //  (2) a nut/epsilon/omega wall-function BC on a patch NOT typed 'wall': brae gates the near-wall model on the
-        //      geometric patch type, so the wall function would be SILENTLY inert. Conservative on the patch match --
-        //      only errors when the BC patch resolves to a concrete non-'wall' patch (group/regex names are skipped).
+        // Wall-function fidelity guard -- fail loud on a nut/epsilon/omega wall-function BC placed on a patch NOT typed
+        // 'wall': brae gates the near-wall model on the geometric patch type, so the wall function would be SILENTLY
+        // inert. Conservative on the patch match -- only errors when the BC patch resolves to a concrete non-'wall'
+        // patch (group/regex names are skipped). NOTE: nutUSpalding/nutUBlended on a non-SA model are NO LONGER an
+        // error -- brae now honours the velocity-based nut wall function on any RAS model (see setNutWall + the
+        // NutWall dispatch in device_simple_foam.cuh), matching OpenFOAM.
         auto patchGeoType = [&](const std::string& nm) -> std::string {
             for (const auto& q : fvp) if (q.name == nm) return q.type;
             return "";
@@ -566,7 +566,7 @@ int main(int argc, char** argv)
         auto guardWallFn = [&](const FieldData<scalar>& fd, const std::string& field) {
             auto isWF = [](const std::string& t) {
                 return t == "nutkWallFunction" || t == "nutUSpaldingWallFunction" || t == "nutLowReWallFunction"
-                    || t == "nutUBlendedWallFunction" || t == "epsilonWallFunction" || t == "omegaWallFunction";
+                    || t == "nutUBlendedWallFunction" || t == "atmNutkWallFunction" || t == "epsilonWallFunction" || t == "omegaWallFunction";
             };
             for (const auto& pb : fd.boundary)
             {
@@ -577,12 +577,33 @@ int main(int argc, char** argv)
                         " is type '" + gt + "' (not 'wall'). brae applies the near-wall model only on 'wall' patches, so"
                         " it would be SILENTLY inert (no wall shear / near-wall constraint). Retype the patch as 'wall'"
                         " in constant/polyMesh/boundary.");
-                if (pb.type == "nutUSpaldingWallFunction" && !ctl.sa)
-                    throw std::runtime_error(field + " boundary '" + pb.name + "' uses nutUSpaldingWallFunction, but"
-                        " this is a " + std::string(ctl.sst ? "kOmegaSST" : "kEpsilon") + " case -- brae applies"
-                        " nutkWallFunction there (Spalding is SA-only), silently changing the wall shear. Use"
-                        " nutkWallFunction, or run the SpalartAllmaras model.");
             }
+        };
+        // Pick the nut wall function from the 0/nut wall-patch BC TYPE (OpenFOAM does this per-BC, not by model):
+        // nutUSpalding -> Spalding, nutUBlended -> Blended, else nutk. Warn once on nutLowRe (mapped to nutk: identical
+        // only on a resolved y+<yPlusLam mesh). SA keeps its Spalding path regardless (ctl.sa short-circuits below).
+        auto setNutWall = [&](const FieldData<scalar>& fd) {
+            for (const auto& pb : fd.boundary)
+            {
+                const std::string gt = patchGeoType(pb.name);
+                if (!gt.empty() && gt != "wall") continue;                 // only wall patches drive the choice
+                if (pb.type == "nutUSpaldingWallFunction") { ctl.nutWall = NutWall::Spalding; }
+                else if (pb.type == "nutUBlendedWallFunction") { ctl.nutWall = NutWall::Blended; }
+                else if (pb.type == "atmNutkWallFunction")   // atmospheric rough-wall nut (k-based path + roughness z0)
+                {
+                    ctl.atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
+                    ctl.atmBoundNut = pb.atmBoundNut;  // clamp nut>=0 option
+                    printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s) on %s per the BC\n",
+                           (double)ctl.atmZ0, ctl.atmBoundNut ? "true" : "false", ctl.sst ? "kOmegaSST" : "kEpsilon");
+                }
+                else if (pb.type == "nutLowReWallFunction")
+                    fprintf(stderr, "brae WARNING: nut boundary '%s' uses nutLowReWallFunction; brae applies "
+                        "nutkWallFunction (log law). Identical only where y+<yPlusLam (resolved mesh).\n", pb.name.c_str());
+            }
+            if (!ctl.sa && ctl.nutWall != NutWall::Nutk)
+                printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
+                       ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction" : "nutUBlendedWallFunction",
+                       ctl.sst ? "kOmegaSST" : "kEpsilon");
         };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
         if (ctl.sa)   // Spalart-Allmaras (one-equation): nuTilda -> the "k" slot, nut. BCs (freestream + fixedValue-0 wall) need no inlet calc.
@@ -605,6 +626,7 @@ int main(int argc, char** argv)
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
             guardWallFn(nutFD, "nut");
             guardWallFn(sFD, secondName);
+            setNutWall(nutFD);   // honour the BC-specified velocity-based nut wall function (nutUSpalding/nutUBlended)
             nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
             if (ctl.lm)   // kOmegaSSTLM transition fields
@@ -930,9 +952,11 @@ int main(int argc, char** argv)
                 const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
                 const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
                 const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
-                // SA: use the device nutUSpaldingWallFunction wall nut for the viscous force (not the k-based one).
-                const std::vector<scalar> saNutWall = ctl.sa ? solver.nutWall() : std::vector<scalar>();
-                const std::vector<scalar>* nwb = ctl.sa ? &saNutWall : nullptr;
+                // Velocity-based wall nut (SA-Spalding, or nutUSpalding/nutUBlended on kEps/kOmegaSST): use the device
+                // wall nut for the viscous force, not the k-based one, matching the BC. nutk cases keep nwb=nullptr.
+                const bool velNutWall = ctl.sa || ctl.nutWall != NutWall::Nutk;
+                const std::vector<scalar> saNutWall = velNutWall ? solver.nutWall() : std::vector<scalar>();
+                const std::vector<scalar>* nwb = velNutWall ? &saNutWall : nullptr;
                 const ForceResult F = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, walls, 1.0, 0.0, vector{0,0,0}, wCmu, wKappa, wE, nwb);
                 std::printf("forces (walls, rhoInf=1):  pressure=(%.5e %.5e %.5e)  viscous=(%.5e %.5e %.5e)  total=(%.5e %.5e %.5e)\n",
                             F.pressure.x, F.pressure.y, F.pressure.z, F.viscous.x, F.viscous.y, F.viscous.z, F.total().x, F.total().y, F.total().z);

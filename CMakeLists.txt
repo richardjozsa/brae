@@ -1181,7 +1181,11 @@ endforeach()
 # ---------------------------------------------------------------------------
 # Demo instrumentation (demo/amgpcg): dumps the real brae AMG hierarchy and the
 # per-iteration AMG-PCG state as CSV, for the replay animation. Not a test.
+# demo/ is gitignored (local-only, exceeds GitHub's file-size limit), so this
+# target is built ONLY when the source is present -- CI (no demo/) skips it.
 # ---------------------------------------------------------------------------
-add_executable(trace_brae demo/amgpcg/trace_brae.cu)
-target_include_directories(trace_brae PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(trace_brae PRIVATE brae_core)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo/amgpcg/trace_brae.cu")
+    add_executable(trace_brae demo/amgpcg/trace_brae.cu)
+    target_include_directories(trace_brae PRIVATE ${BRAE_HEADER_DIRS})
+    target_link_libraries(trace_brae PRIVATE brae_core)
+endif()

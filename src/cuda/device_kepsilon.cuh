@@ -119,7 +119,8 @@ inline DeviceWallData buildDeviceWallData(
 // |snGrad U|*Cmu^.25 sqrt(k)/(kappa y); nutw = nutkWallFunction. (eps0/G0 zeroed then scattered with atomics.)
 void deviceWallEpsG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& Ux,
                      const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
-                     DeviceBuffer<scalar>& eps0, DeviceBuffer<scalar>& G0, const KEpsilonCoeffs& co = {});
+                     DeviceBuffer<scalar>& eps0, DeviceBuffer<scalar>& G0, const KEpsilonCoeffs& co = {}, int nutWall = 0,
+                     scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
 
 // add the eps / k reaction (Sp/Su) + SuSp(divU) terms to a matrix's diag/source (in place).
 void deviceEpsReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,
@@ -166,7 +167,7 @@ void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, c
 // true wall eddy viscosity for the momentum boundary nuEff (vs the cell-value approximation).
 void deviceBoundaryNut(const DeviceBoundary& db, const DeviceBuffer<label>& isWall, const DeviceBuffer<scalar>& y,
                        const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& nut, scalar nu, DeviceBuffer<scalar>& nutBnd,
-                       const KEpsilonCoeffs& co = {});
+                       const KEpsilonCoeffs& co = {}, scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction
 
 // The full device kEpsilon::correct(): production -> wall functions/override -> eps eqn (with the wall
 // setValues constraint) -> k eqn -> correctNut. Updates k/eps/nut in place. Mirrors the CPU correct().
@@ -181,7 +182,9 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                            bool limitedK = false, bool limitedEps = false, scalar twoBykK = 2.0, scalar twoBykEps = 2.0,
                            const KEpsilonCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
                            bool linearUpwindK = false, bool linearUpwindEps = false, bool nonOrth = false,
-                           bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
+                           bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
+                           int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
+                           scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough wall)
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -197,7 +200,9 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const KOmegaSSTCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
                             bool linearUpwindK = false, bool linearUpwindOmega = false, bool nonOrth = false, scalar gradULimitK = 0.0,
                             bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
-                            const scalar* gammaIntEff = nullptr);   // kOmegaSSTLM transition: scales k Pk/epsilonByk
+                            const scalar* gammaIntEff = nullptr,   // kOmegaSSTLM transition: scales k Pk/epsilonByk
+                            int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
+                            scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough wall)
 
 // kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition) extra step: after the SST k/omega solve, transport ReThetat
 // and gammaInt and update gammaIntEff (fed back into the SST k equation next iteration). See PORTING_KOMEGASSTLM.md.
@@ -246,5 +251,12 @@ void deviceBoundaryNutSpalding(const DeviceVectorBoundary& dbU, const DeviceBuff
                                const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                const DeviceBuffer<scalar>& nutCell, scalar nu, const SpalartAllmarasCoeffs& co,
                                DeviceBuffer<scalar>& nutBnd);
+
+// nutUBlendedWallFunction wall nut (velocity-based binomial n=4 blend); kappa/E explicit (any RAS model).
+void deviceBoundaryNutBlended(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
+                              const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
+                              const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                              const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
+                              DeviceBuffer<scalar>& nutBnd);
 
 } // namespace brae
