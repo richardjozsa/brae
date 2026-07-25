@@ -11,6 +11,7 @@
 #include "device_boundary.cuh"
 #include "device_cyclic.cuh"
 #include "device_ami.cuh"
+#include "device_interface.cuh"   // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_halo.cuh"
 #include <vector>
 

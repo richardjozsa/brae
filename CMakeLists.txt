@@ -76,13 +76,16 @@ add_library(brae_core STATIC
     src/OpenFOAM/matrices/pcg.cu
     src/OpenFOAM/matrices/gamg.cu
     src/OpenFOAM/matrices/pbicgstab.cu
-    src/cuda/device_blas.cu
+    src/cuda/blas1.cu
+    src/cuda/reductions.cu
     src/cuda/device_spmv.cu
     src/cuda/device_pcg.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
     src/cuda/device_simple.cu
-    src/cuda/device_boundary.cu
+    src/cuda/device_deferred_correction.cu
+    src/cuda/device_boundary_assembly.cu
+    src/cuda/device_boundary_flow.cu
     src/cuda/device_divdevreff.cu
     src/cuda/device_kepsilon.cu
     src/cuda/device_komega_sst.cu
@@ -90,6 +93,8 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
     src/cuda/device_amg.cu
+    src/cuda/device_amg_cache.cu
+    src/cuda/device_amg_coarse.cu
     src/cuda/device_cluster.cu
     src/cuda/device_cyclic.cu
     src/cuda/device_ami.cu

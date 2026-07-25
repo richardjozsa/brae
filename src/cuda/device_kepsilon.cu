@@ -9,6 +9,7 @@
 #include "device_blas.cuh"
 #include "device_ami.cuh"        // cyclicAMI scalar-transport interface coupling
 #include "device_cyclic.cuh"     // cyclic scalar-transport interface coupling
+#include "device_interface.cuh"  // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_amg.cuh"        // deviceSymGaussSeidel (scalar smoothSolver, for stiff low-Re k/omega)
 #include "nut_wall_function.cuh" // nutkWallFunctionValue / yPlusWall (shared wall-nut physics, BRAE_HD)
 #include <cuda_runtime.h>
@@ -403,9 +404,9 @@ void deviceGradU(
         DeviceBuffer<scalar> gx, gy, gz;
         deviceGaussGrad(dm, *Uc[i], bval, gx, gy, gz);
         if (ami && ami->n) { if (ami->rotational) deviceAmiAddGradRot(*ami, *Uc[i], amiURot[i], dm.V, gx, gy, gz);
-                             else deviceAmiAddGrad(*ami, *Uc[i], dm.V, gx, gy, gz); }
+                             else interfaceAddGrad(*ami, *Uc[i], dm.V, gx, gy, gz); }
         if (cyc && cyc->n) { if (cyc->rotational) deviceCyclicAddGradRot(*cyc, Ux, Uy, Uz, i, dm.V, gx, gy, gz);
-                             else deviceCyclicAddGrad(*cyc, *Uc[i], dm.V, gx, gy, gz); }
+                             else interfaceAddGrad(*cyc, *Uc[i], dm.V, gx, gy, gz); }
         // async D2D on the per-thread stream (ordered before the consumer kernel): a plain cudaMemcpy here would
         // drain the GPU pipeline every turbulence iteration.
         cudaCheck(cudaMemcpyAsync(gradU.data() + (0*3+i)*nC, gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "gradU g");
@@ -649,10 +650,10 @@ static void deviceSolveScalarTransport(
     // set the off-diagonal ifCoeff. A scalar is invariant under the cyclic transform (no rotation of the value), so the
     // translational momentum assembly + a plain weighted off-diagonal apply even for a ROTATIONAL interface.
     DeviceBuffer<scalar> ifSumOff;
-    if (ami && ami->n) { deviceAmiAssembleMomentum(*ami, D, aD);
-        ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); deviceAmiOffDiagSum(*ami, ifSumOff); }
-    else if (cyc && cyc->n) { deviceCyclicAssembleMomentum(*cyc, D, aD);
-        ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); deviceCyclicOffDiagSum(*cyc, ifSumOff); }
+    if (ami && ami->n) { interfaceAssembleMomentum(*ami, D, aD);
+        ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); interfaceOffDiagSum(*ami, ifSumOff); }
+    else if (cyc && cyc->n) { interfaceAssembleMomentum(*cyc, D, aD);
+        ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); interfaceOffDiagSum(*cyc, ifSumOff); }
     DeviceBuffer<scalar> aRD, aDelta; deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
                                                       ifSumOff.size() ? ifSumOff.data() : nullptr);
     { DeviceBuffer<scalar> t; deviceHadamard(t, aDelta, field); deviceAxpy(1.0, t, src); }
@@ -661,8 +662,8 @@ static void deviceSolveScalarTransport(
         svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), wall->isWallCell.data(), eps0->data(), aU.data(), aL.data(), src.data());
         svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), wall->isWallCell.data(), aIC.data(), aBC.data());
         svCellKernel<<<nBlocks(nC), TPB>>>(nC, wall->isWallCell.data(), aRD.data(), eps0->data(), src.data());
-        if (ami && ami->n) deviceAmiZeroWallIfCoeff(*ami, wall->isWallCell);   // wall/interface cells: don't perturb the fixed eps
-        if (cyc && cyc->n) deviceCyclicZeroWallIfCoeff(*cyc, wall->isWallCell);
+        if (ami && ami->n) interfaceZeroWallIfCoeff(*ami, wall->isWallCell);   // wall/interface cells: don't perturb the fixed eps
+        if (cyc && cyc->n) interfaceZeroWallIfCoeff(*cyc, wall->isWallCell);
         cudaCheck(cudaGetLastError(), "setValues");
     }
     DeviceBuffer<scalar> diagC, B; deviceFold(dm, aRD, src, aIC, aBC, diagC, B);
@@ -738,8 +739,8 @@ void deviceKEpsilonCorrect(
     deviceHadamard(G, nut, gByNu);
     DeviceBuffer<scalar> divU;
     deviceDiv(dm, phiInt, phiBnd, divU);
-    if (ami && ami->n) deviceAmiAddDiv(*ami, dm.V, divU);   // interface flux into div(phi) (bounded term + reaction Sp)
-    if (cyc && cyc->n) deviceCyclicAddDiv(*cyc, dm.V, divU);
+    if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);   // interface flux into div(phi) (bounded term + reaction Sp)
+    if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
     DeviceBuffer<scalar> eps0, G0;
     deviceWallEpsG0(wall, k, Ux, Uy, Uz, nu, eps0, G0, co, nutWall, atmZ0, atmBoundNut);
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data());
@@ -852,8 +853,8 @@ void deviceKOmegaSSTCorrect(
     deviceHadamard(G, nut, GbyNu0);
     DeviceBuffer<scalar> divU;
     deviceDiv(dm, phiInt, phiBnd, divU);
-    if (ami && ami->n) deviceAmiAddDiv(*ami, dm.V, divU);
-    if (cyc && cyc->n) deviceCyclicAddDiv(*cyc, dm.V, divU);
+    if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
+    if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
     DeviceBuffer<scalar> S2;
     deviceS2(gradU, nC, S2);
 
@@ -1180,8 +1181,8 @@ void deviceKOmegaSSTLMCorrect(
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);
     DeviceBuffer<scalar> divU;
     deviceDiv(dm, phiInt, phiBnd, divU);
-    if (ami && ami->n) deviceAmiAddDiv(*ami, dm.V, divU);
-    if (cyc && cyc->n) deviceCyclicAddDiv(*cyc, dm.V, divU);
+    if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
+    if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
 
     // ReThetat: DReThetatEff = sigmaThetat*(nut+nu); reaction = Pthetat*ReThetat0 - Sp(Pthetat). Fthetat stored for gammaSep.
     DeviceBuffer<scalar> Fth(nC), spR(nC), suR(nC);
@@ -1556,8 +1557,8 @@ void deviceSpalartAllmarasCorrect(
     saDEffKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.sigmaNut, D.data());
     DeviceBuffer<scalar> divU;
     deviceDiv(dm, phiInt, phiBnd, divU);   // for the bounded term
-    if (ami && ami->n) deviceAmiAddDiv(*ami, dm.V, divU);
-    if (cyc && cyc->n) deviceCyclicAddDiv(*cyc, dm.V, divU);
+    if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
+    if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
     cudaCheck(cudaGetLastError(), "SA assemble");
     deviceSolveScalarTransport(dm, dbNuTilda, nuTilda, "nuTilda", D, phiInt, phiBnd, divU, bounded, limited, linearUpwind, nonOrth, twoByk,
                                relax, tol, relTol, checkEvery, gsK,

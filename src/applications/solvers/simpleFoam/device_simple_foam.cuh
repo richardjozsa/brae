@@ -25,6 +25,7 @@
 #include "device_boundary.cuh"
 #include "device_cyclic.cuh"
 #include "device_ami.cuh"
+#include "device_interface.cuh"   // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_kepsilon.cuh"
 #include "device_komega_sst.cuh"   // deviceS2/deviceF2/deviceNutSST for the startup validate() correctNut
 #include "cell_wall_dist.cuh"
@@ -33,70 +34,14 @@
 #include "device_amg.cuh"
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
+#include "simple_controls.cuh"   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
 #include <cstdlib>
 #include <vector>
 #include <cuda_runtime.h>
 
 namespace brae {
 
-// Which nut wall function to apply, chosen from the 0/nut boundaryField TYPE (matching OpenFOAM),
-// NOT from the turbulence model. nutk = k-based stepwise log law (nutkWallFunction); Spalding =
-// velocity-based Spalding blend (nutUSpaldingWallFunction); Blended = velocity-based binomial n=4
-// blend (nutUBlendedWallFunction). All three are honoured on any RAS model, exactly as OF does.
-enum class NutWall { Nutk, Spalding, Blended };
-
-struct DeviceSimpleControls
-{
-    scalar nu = 1e-5, relaxU = 0.7, relaxP = 0.3, relaxK = 0.7, relaxEps = 0.7;
-    vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
-    scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
-    scalar relTolU = 0.0, relTolP = 0.0, relTolKE = 0.0;   // solver relTol (fvSolution solvers.{U,p,k,epsilon}.relTol). 0 = abs tol.
-    int    bicgCheckEvery = 1;      // batched convergence for ALL BiCGStab solves (momentum + k/eps); BRAE_BICG_CHECK_EVERY.
-    bool   turbulent = false;
-    bool   useGraph  = true;     // replay the pressure V-cycle from a cached CUDA graph (#7c-loop)
-    bool   bounded   = false;    // "bounded Gauss upwind": add -Sp(div(phi),U). Set from fvSchemes; default off.
-    bool   consistent = false;   // SIMPLEC (rAtU consistency correction, p=1). Set from fvSolution SIMPLE.consistent.
-    bool   linearUpwind = false; // div(phi,U) "linearUpwind": add the deferred gradient correction. Set from fvSchemes.
-    bool   linearUpwindV = false;// div(phi,U) "linearUpwindV": linearUpwind + OF's vector direction limiter (also sets linearUpwind).
-    bool   lust = false;         // div(phi,U) "LUST": deferred correction = 0.75*linear + 0.25*linearUpwind (OF LUST.H).
-    bool   nonOrth = false;      // laplacian "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction. Set from fvSchemes.
-    scalar nonOrthLimit = 1.0;   // snGrad "limited <psi>" coeff (OF fv::limitedSnGrad); 1.0 = "corrected" (unlimited). Set from fvSchemes.
-    int    nNonOrth = 0;         // SIMPLE.nNonOrthogonalCorrectors: extra pressure-correction passes (pEqn re-solved nNonOrth+1 times). Set from fvSolution.
-    scalar gradULimitK = 0.0;    // grad(U) "cellLimited Gauss linear <k>" coeff (OF cellLimitedGrad<minmod>); 0 = unlimited. Set from fvSchemes.
-    bool   limitedK = false, limitedEps = false;  // div(phi,k|epsilon) "limitedLinear": implicit limited weight. Set from fvSchemes.
-    bool   luK = false, luEps = false;             // div(phi,k|epsilon|nuTilda) "linearUpwind": deferred gradient correction. Set from fvSchemes.
-    bool   gsK = false, gsEps = false;             // scalar linear solver = smoothSolver+symGaussSeidel (read from fvSolution solvers.{k|nuTilda} / {epsilon|omega}).
-    bool   gsU = false;                            // momentum linear solver = smoothSolver+(sym)GaussSeidel (read from fvSolution solvers.U).
-    scalar twoBykK = 2.0, twoBykEps = 2.0;         // 2/max(k_,SMALL) from the limitedLinear coefficient (k_=1 -> 2).
-    KEpsilonCoeffs keCoeffs;                       // k-eps model coeffs (default = OF); read from turbulenceProperties RAS.kEpsilonCoeffs.
-    bool   sst = false;                            // RASModel kOmegaSST (the "second turbulence scalar" eps slot holds omega).
-    bool   lm = false;                             // RASModel kOmegaSSTLM (sst + Langtry-Menter gamma-ReThetat transition).
-    KOmegaSSTCoeffs ksstCoeffs;                    // kOmegaSST coeffs (default = OF); read from RAS.kOmegaSSTCoeffs.
-    bool   sa = false;                             // RASModel SpalartAllmaras (one-equation: the "k" slot holds nuTilda; no 2nd scalar).
-    SpalartAllmarasCoeffs saCoeffs;                // SA coeffs (default = OF) + nutUSpaldingWallFunction E/kappa.
-    NutWall nutWall = NutWall::Nutk;               // nut wall function, read from the 0/nut wall BC TYPE (not the model),
-                                                   // so nutUBlended/nutUSpalding are honoured on kEpsilon/kOmegaSST like OF.
-    scalar atmZ0 = 0.0;                            // atmNutkWallFunction roughness length z0 (>0 -> rough-wall nut on the
-    bool   atmBoundNut = true;                     // k-based path); read from the 0/nut wall BC. 0 -> smooth nutkWallFunction.
-    bool   needRef = false;                        // no fixedValue-p patch -> singular pressure: adjustPhi + setReference.
-    label  pRefCell = 0;
-    scalar pRefValue = 0.0;                        // pressure reference (fvSolution SIMPLE.pRefCell/pRefValue).
-    int    pcgCheckEvery = 1;      // pressure AMG-PCG residual-read cadence (BRAE_PCG_CHECK_EVERY). 1 = exact per-iter
-                                   // (bit-identical); K>1 cuts (K-1)/K of the PCG host syncs (overshoots conv by <K).
-    bool   corrScaling = false;    // AMG coarse-correction scaling + flexible CG (BRAE_CORR_SCALING). Cuts AMG cycles
-                                   // ~2x at scale (graded meshes); nonlinear precond -> not bit-identical to off.
-    std::string caseDir = ".";     // case directory, for the AMG hierarchy cache (constant/polyMesh/.brae_amgcache).
-    bool   writeCache = false;     // write the mesh + AMG caches this run (set by -partition or BRAE_MESH_CACHE).
-};
-// OF-style per-field solve report for one SIMPLE step (matches OpenFOAM's "Solving for Ux/Uy/Uz/p" + continuity block).
-struct DeviceSimpleResidual
-{
-    scalar Ux = 0, Uy = 0, Uz = 0, p = 0, pFinal = 0;
-    scalar UxFinal = 0, UyFinal = 0, UzFinal = 0;
-    int UxIters = 0, UyIters = 0, UzIters = 0;     // U per-component final + nIter
-    int pIters = 0;
-    scalar contLocal = 0, contGlobal = 0;          // time step continuity errors, raw (driver applies deltaT + cumulative)
-};
+// NutWall, DeviceSimpleControls, DeviceSimpleResidual now live in simple_controls.cuh (included above).
 
 class DeviceSimpleSolver
 {
@@ -255,9 +200,9 @@ public:
         if (hasCyclic_)
         {
             if (cyc_.rotational) deviceCyclicFluxRot(cyc_, Uk_[0], Uk_[1], Uk_[2]);
-            else                 deviceCyclicFlux   (cyc_, Uk_[0], Uk_[1], Uk_[2]);
+            else                 interfaceFlux(cyc_, Uk_[0], Uk_[1], Uk_[2]);
         }
-        if (hasAMI_) deviceAmiFlux(ami_, Uk_[0], Uk_[1], Uk_[2]);   // conservative initial AMI flux from U_init
+        if (hasAMI_) interfaceFlux(ami_, Uk_[0], Uk_[1], Uk_[2]);   // conservative initial AMI flux from U_init
         {
             std::vector<scalar> o;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -416,8 +361,8 @@ public:
         deviceBCValue(dbP_, dp_, pbv);
         DeviceBuffer<scalar> gx, gy, gz;
         deviceGaussGrad(dm, dp_, pbv, gx, gy, gz);
-        if (hasCyclic_) deviceCyclicAddGrad(cyc_, dp_, dm.V, gx, gy, gz);   // cyclic-face contribution to grad(p) in the momentum source
-        if (hasAMI_)    deviceAmiAddGrad(ami_, dp_, dm.V, gx, gy, gz);       // AMI-face contribution to grad(p)
+        if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);   // cyclic-face contribution to grad(p) in the momentum source
+        if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);       // AMI-face contribution to grad(p)
         DeviceBuffer<scalar> mDiag, mUp, mLo, lD, lU, lL;
         deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
         deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
@@ -433,8 +378,8 @@ public:
         {
             DeviceBuffer<scalar> dphiM;
             deviceDiv(dm, phiInt_, phiBnd_, dphiM);
-            if (hasCyclic_) deviceCyclicAddDiv(cyc_, dm.V, dphiM);
-            if (hasAMI_)    deviceAmiAddDiv(ami_, dm.V, dphiM);
+            if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, dphiM);
+            if (hasAMI_)    interfaceAddDiv(ami_, dm.V, dphiM);
             DeviceBuffer<scalar> bM;
             deviceHadamard(bM, dphiM, dm.V);
             deviceAxpy(-1.0, bM, mDiag);
@@ -444,18 +389,18 @@ public:
         DeviceBuffer<scalar> cycSumOff;
         if (hasCyclic_)
         {
-            deviceCyclicAssembleMomentum(cyc_, nuEff, mDiag);
+            interfaceAssembleMomentum(cyc_, nuEff, mDiag);
             cycSumOff.copyFrom(std::vector<scalar>(nC_, 0.0));
-            deviceCyclicOffDiagSum(cyc_, cycSumOff);
-            if (cyc_.rotational) deviceCyclicScaleImplicit(cyc_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
+            interfaceOffDiagSum(cyc_, cycSumOff);
+            if (cyc_.rotational) interfaceScaleImplicit(cyc_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
         }
         DeviceBuffer<scalar> amiSumOff;                              // cyclicAMI momentum coupling (translational)
         if (hasAMI_)
         {
-            deviceAmiAssembleMomentum(ami_, nuEff, mDiag);
+            interfaceAssembleMomentum(ami_, nuEff, mDiag);
             amiSumOff.copyFrom(std::vector<scalar>(nC_, 0.0));
-            deviceAmiOffDiagSum(ami_, amiSumOff);
-            if (ami_.rotational) deviceAmiScaleImplicit(ami_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
+            interfaceOffDiagSum(ami_, amiSumOff);
+            if (ami_.rotational) interfaceScaleImplicit(ami_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
         }
         if (fvoMomSp_.size()) deviceAxpy(-1.0, fvoMomSp_, mDiag);   // fvOptions implicit momentum Sp: diag -= Sp*V (== fvm::Sp)
         // explicitPorositySource (DarcyForchheimer): isotropic resistance into the diagonal (mDiag += V*tr(Cd)); the
@@ -523,12 +468,12 @@ public:
                 if (hasCyclic_)
                 {
                     if (cyc_.rotational) deviceCyclicAddGradRot(cyc_, Uk_[0], Uk_[1], Uk_[2], l, dm.V, gUx[l], gUy[l], gUz[l]);
-                    else deviceCyclicAddGrad(cyc_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]);
+                    else interfaceAddGrad(cyc_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]);
                 }
                 if (hasAMI_)
                 {
                     if (ami_.rotational) deviceAmiAddGradRot(ami_, Uk_[l], amiURot[l], dm.V, gUx[l], gUy[l], gUz[l]);
-                    else deviceAmiAddGrad(ami_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]);
+                    else interfaceAddGrad(ami_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]);
                 }
                 // grad(U) cellLimited Gauss linear <k>: clamp this component's gradient so the linearUpwind/non-orth
                 // reconstruction stays bounded, OF's primary stabiliser on skewed (snappy) meshes. (min/max gather is
@@ -571,8 +516,8 @@ public:
                 DeviceBuffer<scalar> corr;
                 if (ctl_.linearUpwindV) corr = std::move(corrV[kk]);                          // vector-limited (computed once above)
                 else                    deviceLinearUpwindCorr(dm, phiInt_, gUx[kk], gUy[kk], gUz[kk], corr);
-                if (hasCyclic_) deviceCyclicAddLinUpwindCorr(cyc_, kk, gUx, gUy, gUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
-                if (hasAMI_)    deviceAmiAddLinUpwindCorr(ami_, kk, gUx, gUy, gUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
+                if (hasCyclic_) interfaceAddLinUpwindCorr(cyc_, kk, gUx, gUy, gUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
+                if (hasAMI_)    interfaceAddLinUpwindCorr(ami_, kk, gUx, gUy, gUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
                 if (ctl_.lust)   // OF LUST.H = 0.75*linear + 0.25*linearUpwind: scale the lU corr 0.25, add 0.75*linear corr
                 {
                     deviceScale(corr, 0.25);
@@ -586,8 +531,8 @@ public:
             {
                 DeviceBuffer<scalar> lc;
                 deviceLaplacianCorr(dm, nuEff_f, gUx[kk], gUy[kk], gUz[kk], lc);
-                if (hasCyclic_) deviceCyclicAddLapCorr(cyc_, kk, nuEff, gUx, gUy, gUz, lc);   // + cyclic-face non-orth (rotated tensor)
-                if (hasAMI_)    deviceAmiAddLapCorr(ami_, kk, nuEff, gUx, gUy, gUz, lc);       // + AMI-face non-orth (rotated tensor stencil)
+                if (hasCyclic_) interfaceAddLapCorr(cyc_, kk, nuEff, gUx, gUy, gUz, lc);   // + cyclic-face non-orth (rotated tensor)
+                if (hasAMI_)    interfaceAddLapCorr(ami_, kk, nuEff, gUx, gUy, gUz, lc);       // + AMI-face non-orth (rotated tensor stencil)
                 deviceAxpy(-nonOrthRelaxU, lc, relaxSrc[kk]);
             }
             // constant body force (drives periodic channels) is an explicit momentum SOURCE: it must go into relaxSrc
@@ -611,8 +556,8 @@ public:
             // (forwardT.U[nbr])[kk] in the predictor RHS, but with a consistent (diagonal-dominant) matrix that
             // converges where OF's full-implicit limit-cycles in cf's segregated SIMPLE. Built from the U_old snapshot
             // (order-independent). H() below uses the FULL rotation on the post-solve U (OF-faithful), NOT this term.
-            if (hasCyclic_ && cyc_.rotational) deviceCyclicAddDeferredRot(cyc_, Usnap[0], Usnap[1], Usnap[2], kk, s);
-            if (hasAMI_ && ami_.rotational)    deviceAmiAddDeferredRot(ami_, Uint[0], Uint[1], Uint[2], kk, s);
+            if (hasCyclic_ && cyc_.rotational) interfaceAddDeferredRot(cyc_, Usnap[0], Usnap[1], Usnap[2], kk, s);
+            if (hasAMI_ && ami_.rotational)    interfaceAddDeferredRot(ami_, Uint[0], Uint[1], Uint[2], kk, s);
             DeviceBuffer<scalar> diagC,b;
             deviceFold(dm, mDiagR, s, iC[kk], bCb[kk], diagC, b);
             // rotational: the implicit off-diagonal for component kk is scaled by forwardT[kk][kk] (OF transformCoupleField).
@@ -711,8 +656,8 @@ public:
                     deviceAxpy(-1.0, iC[kk], bdH);
                 }
                 deviceMatrixH(Uview, dm, Uk_[kk], relaxSrc[kk], hasSym_ ? bdH : zeroBndU_, bCb[kk], Hk[kk]);
-                if (hasCyclic_ && !cyc_.rotational) deviceCyclicAddH(cyc_, Uk_[kk], dm.V, Hk[kk]);   // translational off-diag
-                if (hasAMI_) deviceAmiAddH(ami_, *UN[kk], dm.V, Hk[kk]);
+                if (hasCyclic_ && !cyc_.rotational) interfaceAddH(cyc_, Uk_[kk], dm.V, Hk[kk]);   // translational off-diag
+                if (hasAMI_) interfaceAddH(ami_, *UN[kk], dm.V, Hk[kk]);
             }
             // rotational cyclic H: the FULL rotation -ifCoeff.(forwardT.U[nbr])[kk] on the POST-solve U, evaluated once
             // for the whole vector (matches OF UEqn.H(), which re-evaluates patchNeighbourField from the new U). The
@@ -727,9 +672,9 @@ public:
         if (hasCyclic_)
         {
             if (cyc_.rotational) deviceCyclicFluxRot(cyc_, HbyA[0], HbyA[1], HbyA[2]);   // rotate the neighbour HbyA
-            else deviceCyclicFlux(cyc_, HbyA[0], HbyA[1], HbyA[2]);   // cyclic-face phiHbyA = interp(HbyA).Sf -> cyc_.phi
+            else interfaceFlux(cyc_, HbyA[0], HbyA[1], HbyA[2]);   // cyclic-face phiHbyA = interp(HbyA).Sf -> cyc_.phi
         }
-        if (hasAMI_) deviceAmiFlux(ami_, HbyA[0], HbyA[1], HbyA[2]);   // AMI-face phiHbyA = (w*HbyA[own]+(1-w)*interp(HbyA[nbr])).Sf
+        if (hasAMI_) interfaceFlux(ami_, HbyA[0], HbyA[1], HbyA[2]);   // AMI-face phiHbyA = (w*HbyA[own]+(1-w)*interp(HbyA[nbr])).Sf
         DeviceBuffer<scalar> hxb,hyb,hzb;
         deviceBCValue(dbU_.comp[0],HbyA[0],hxb);
         deviceBCValue(dbU_.comp[1],HbyA[1],hyb);
@@ -802,19 +747,19 @@ public:
                 DeviceBuffer<scalar> pbvN;
                 deviceBCValue(dbP_, dp_, pbvN);
                 deviceGaussGrad(dm, dp_, pbvN, gx, gy, gz);
-                if (hasCyclic_) deviceCyclicAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
-                if (hasAMI_)    deviceAmiAddGrad(ami_, dp_, dm.V, gx, gy, gz);
+                if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
+                if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
             }
             deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth);
             deviceBCLaplacianCoeffs(dbP_, rAtU, pIC, pBC);
             DeviceBuffer<scalar> divPhiH;
             deviceDiv(dm, phiHi, phiHb, divPhiH);
-            if (hasCyclic_) deviceCyclicAddDiv(cyc_, dm.V, divPhiH);            // + cyclic-face flux into continuity div(phiHbyA)
-            if (hasAMI_)    deviceAmiAddDiv(ami_, dm.V, divPhiH);               // + AMI-face flux into continuity div(phiHbyA)
+            if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, divPhiH);            // + cyclic-face flux into continuity div(phiHbyA)
+            if (hasAMI_)    interfaceAddDiv(ami_, dm.V, divPhiH);               // + AMI-face flux into continuity div(phiHbyA)
             deviceFoldPressure(dm, pD_, divPhiH, pIC, pBC, diagCp_, bp_);
             // cyclic pressure Laplacian laplacian(rAtU,p): fold the interface diagonal into diagCp_ + set cyc_.ifCoeff.
-            if (hasCyclic_) deviceCyclicAssembleLaplacian(cyc_, rAtU, diagCp_, /*addToDiag*/true);
-            if (hasAMI_)    deviceAmiAssembleLaplacian(ami_, rAtU, diagCp_, /*addToDiag*/true);   // AMI pressure laplacian
+            if (hasCyclic_) interfaceAssembleLaplacian(cyc_, rAtU, diagCp_, /*addToDiag*/true);
+            if (hasAMI_)    interfaceAssembleLaplacian(ami_, rAtU, diagCp_, /*addToDiag*/true);   // AMI pressure laplacian
             // explicit non-orth correction: faceFluxCorr from grad(p) for THIS pass; add -V*div(ffc) to b, and subtract
             // ffc from the reconstructed flux below (so div(phi)=0 on non-orth faces). gx/gy/gz = grad(p) this pass.
             ffcP = DeviceBuffer<scalar>();
@@ -826,8 +771,8 @@ public:
                 DeviceBuffer<scalar> sc;
                 deviceFaceDivSource(dm, ffcP, sc);
                 deviceAxpy(1.0, sc, bp_);
-                if (hasCyclic_) deviceCyclicLapCorrP(cyc_, rAtU, gx, gy, gz, bp_, ffcPcyc);
-                if (hasAMI_)    deviceAmiLapCorrP(ami_, rAtU, gx, gy, gz, bp_, ffcPami);
+                if (hasCyclic_) interfaceLapCorrP(cyc_, rAtU, gx, gy, gz, bp_, ffcPcyc);
+                if (hasAMI_)    interfaceLapCorrP(ami_, rAtU, gx, gy, gz, bp_, ffcPami);
             }
             // No fixedValue-p patch -> singular all-Neumann pressure. cyclic/AMI use a tiny SYMMETRIC diagonal shift
             // (the periodic RHS is zero-mean); non-cyclic keeps the OF single-cell setReference (doubles a fresh diag).
@@ -873,8 +818,8 @@ public:
         deviceMatrixFluxBoundary(dbP_, pIC, pBC, dp_, pfb);
         deviceCopy(phiBnd_, phiHb);
         deviceAxpy(-1.0, pfb, phiBnd_);
-        if (hasCyclic_) deviceCyclicCorrectFlux(cyc_, dp_);   // cyc_.phi -= ifCoeff*(p_nbr - p_own) : conservative periodic flux (pre-relax dp_)
-        if (hasAMI_)    deviceAmiCorrectFlux(ami_, dp_);       // ami_.phi -= ifCoeff*(interp(p_nbr) - p_own)
+        if (hasCyclic_) interfaceCorrectFlux(cyc_, dp_);   // cyc_.phi -= ifCoeff*(p_nbr - p_own) : conservative periodic flux (pre-relax dp_)
+        if (hasAMI_)    interfaceCorrectFlux(ami_, dp_);       // ami_.phi -= ifCoeff*(interp(p_nbr) - p_own)
         if (hasCyclic_ && ctl_.nonOrth && ffcPcyc.size()) deviceAxpy(-1.0, ffcPcyc, cyc_.phi);   // cyclic-face non-orth flux correction (matches phiInt_ -= ffcP)
         if (hasAMI_ && ctl_.nonOrth && ffcPami.size()) deviceAxpy(-1.0, ffcPami, ami_.phi);       // AMI-face non-orth flux correction
         deviceScale(dp_, ctl_.relaxP);
@@ -883,8 +828,8 @@ public:
         deviceBCValue(dbP_, dp_, pbv2);
         DeviceBuffer<scalar> gnx,gny,gnz;
         deviceGaussGrad(dm, dp_, pbv2, gnx,gny,gnz);
-        if (hasCyclic_) deviceCyclicAddGrad(cyc_, dp_, dm.V, gnx,gny,gnz);   // + cyclic-face contribution to grad(p)
-        if (hasAMI_)    deviceAmiAddGrad(ami_, dp_, dm.V, gnx,gny,gnz);       // + AMI-face contribution to grad(p)
+        if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gnx,gny,gnz);   // + cyclic-face contribution to grad(p)
+        if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gnx,gny,gnz);       // + AMI-face contribution to grad(p)
         DeviceBuffer<scalar>* gn[3]={&gnx,&gny,&gnz};
         for (int kk = 0; kk < 3; ++kk)   // SIMPLEC: rAtU
         {
