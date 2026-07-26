@@ -3,14 +3,22 @@
 #include "device_komega_sst.cuh"
 #include "device_kepsilon.cuh"   // DeviceWallData (shared wall geometry)
 #include "nut_wall_function.cuh" // nutkWallFunctionValue / yPlusWall (shared wall-nut physics, "G0 IDENTICAL to eps WF")
+#include "device_scalar_transport.cuh"  // deviceSolveScalarTransport scaffold + depsKernel/overrideKernel + nBlocks/TPB
+#include "device_ldu.cuh"
+#include "device_pcg.cuh"
+#include "device_simple.cuh"
+#include "device_blas.cuh"
+#include "device_ami.cuh"
+#include "device_cyclic.cuh"
+#include "device_interface.cuh"
+#include "device_amg.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 
 namespace brae {
 
 namespace {
-constexpr int TPB = 256;
-inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
+// TPB/nBlocks now come from device_scalar_transport.cuh (shared with device_kepsilon.cu / device_spalart.cu).
 inline scalar yPlusLamHost(scalar kappa, scalar E) { scalar y = 11.0; for (int i = 0; i < 10; ++i) y = std::log(std::fmax(E*y, 1.0)) / kappa; return y; }
 
 
@@ -486,6 +494,506 @@ void deviceKReactionSST(
     kReactionSSTKernel<<<nBlocks(nC), TPB>>>(nC, V.data(), k.data(), omega.data(), G.data(), divU.data(),
                                              co.betaStar, co.c1 * co.betaStar, gammaIntEff, diag.data(), source.data());
     cudaCheck(cudaGetLastError(), "kReactionSST");
+}
+
+
+// ---- kOmegaSST + Langtry-Menter transition (moved from device_kepsilon.cu; uses the SST helpers above + the scaffold) ----
+
+// S2 (nut) and the production GbyNu0. When grad(U) is `cellLimited Gauss linear <k>` (motorBike), that gradient is
+// LIMITED, else on skewed cells the unlimited strain is huge and the SST nut limiter max(a1*omega, b1*F2*sqrt(S2))
+// wrongly fires. Apply the per-component minmod limiter to the gradU TENSOR:
+// limiter_j scales gradU[j],[3+j],[6+j] (= dU_j/dx_i, i=0..2). Reuses deviceCellLimitGrad (the momentum limiter).
+void deviceCellLimitGradU(
+    const DeviceMesh& dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    DeviceBuffer<scalar>& gradU,
+    scalar kc)
+{
+    const int nC = dm.nCells;
+    const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+    for (int j = 0; j < 3; ++j)
+    {
+        DeviceBuffer<scalar> gx(nC), gy(nC), gz(nC);
+        cudaMemcpyAsync(gx.data(), gradU.data()+(std::size_t)j*nC,     nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(gy.data(), gradU.data()+(std::size_t)(3+j)*nC, nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(gz.data(), gradU.data()+(std::size_t)(6+j)*nC, nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        DeviceBuffer<scalar> ubv;
+        deviceBCValue(dbU.comp[j], *U[j], ubv);
+        deviceCellLimitGrad(dm, *U[j], ubv, gx, gy, gz, kc);
+        cudaMemcpyAsync(gradU.data()+(std::size_t)j*nC,     gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(gradU.data()+(std::size_t)(3+j)*nC, gy.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(gradU.data()+(std::size_t)(6+j)*nC, gz.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    }
+    cudaCheck(cudaGetLastError(), "cellLimitGradUTensor");
+}
+
+
+void deviceKOmegaSSTCorrect(
+    const DeviceMesh& dm,
+    const DeviceWallData& wall,
+    const DeviceBoundary& dbOmega,
+    const DeviceBoundary& dbK,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    DeviceBuffer<scalar>& k,
+    DeviceBuffer<scalar>& omega,
+    DeviceBuffer<scalar>& nut,
+    const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& phiBnd,
+    scalar nu,
+    scalar relaxOmega,
+    scalar relaxK,
+    scalar tol,
+    bool bounded,
+    bool limitedK,
+    bool limitedOmega,
+    scalar twoBykK,
+    scalar twoBykOmega,
+    const KOmegaSSTCoeffs& co,
+    scalar relTolKE,
+    int keCheckEvery,
+    bool linearUpwindK,
+    bool linearUpwindOmega,
+    bool nonOrth,
+    scalar gradULimitK,
+    bool gsK,
+    bool gsEps,
+    DeviceAMI* ami,
+    DeviceCyclic* cyc,
+    const scalar* gammaIntEff,
+    int nutWall,
+    scalar atmZ0,
+    bool atmBoundNut)
+{
+    const int nC = dm.nCells;
+    // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
+    DeviceBuffer<scalar> gradU;
+    deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);   // interface-aware grad(U)
+    if (gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK);   // grad(U) cellLimited (OF)
+    DeviceBuffer<scalar> GbyNu0;
+    deviceGByNuFromGradU(gradU, nC, GbyNu0);
+    DeviceBuffer<scalar> G;
+    deviceHadamard(G, nut, GbyNu0);
+    DeviceBuffer<scalar> divU;
+    deviceDiv(dm, phiInt, phiBnd, divU);
+    if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
+    if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
+    DeviceBuffer<scalar> S2;
+    deviceS2(gradU, nC, S2);
+
+    // omega wall function FIRST (OF updateCoeffs before CDkOmega): omega0/G0, override omega & G at wall cells, so
+    // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
+    DeviceBuffer<scalar> omega0, G0;
+    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut);
+    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data());
+
+    // CDkOmega from grad(k), grad(omega); F1, F2.
+    DeviceBuffer<scalar> kbv;
+    deviceBCValue(dbK, k, kbv);
+    DeviceBuffer<scalar> kgx, kgy, kgz;
+    deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
+    DeviceBuffer<scalar> obv;
+    deviceBCValue(dbOmega, omega, obv);
+    DeviceBuffer<scalar> ogx, ogy, ogz;
+    deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
+    DeviceBuffer<scalar> CD;
+    deviceCDkOmega(kgx, kgy, kgz, ogx, ogy, ogz, omega, co.alphaOmega2, CD);
+    DeviceBuffer<scalar> F1;
+    deviceF1(k, omega, y, CD, nu, co, F1, gammaIntEff != nullptr);   // LM: F1=max(F1,F3) near-wall override
+    DeviceBuffer<scalar> F2;
+    deviceF2(k, omega, y, nu, co, F2);
+
+    // blends, limited production-by-nu, DomegaEff.
+    DeviceBuffer<scalar> gamma;
+    deviceBlend(F1, co.gamma1, co.gamma2, gamma);
+    DeviceBuffer<scalar> beta;
+    deviceBlend(F1, co.beta1,  co.beta2,  beta);
+    DeviceBuffer<scalar> GbyNu0lim;
+    deviceGbyNuLimit(GbyNu0, omega, F2, S2, co, GbyNu0lim);
+    DeviceBuffer<scalar> DomegaEff;
+    deviceDEff(F1, nut, co.alphaOmega1, co.alphaOmega2, nu, DomegaEff);
+
+    // omega equation (loose solve) with the near-wall setValues constraint (omega0)
+    deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divU, bounded, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
+                               relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src); },
+                               &wall, &omega0, ami, cyc);
+    deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
+
+    // k equation (loose solve)
+    DeviceBuffer<scalar> DkEff;
+    deviceDEff(F1, nut, co.alphaK1, co.alphaK2, nu, DkEff);
+    deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divU, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
+                               relaxK, tol, relTolKE, keCheckEvery, gsK,
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff); },
+                               nullptr, nullptr, ami, cyc);
+    deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
+
+    // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
+    deviceNutSST(k, omega, F2, S2, co, nut);
+}
+
+
+// kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition)
+// LM coeffs (OF defaults): ca1=2, ca2=0.06, ce1=1, ce2=50, cThetat=0.03, sigmaThetat=2; lambdaErr=1e-6, maxIter=10.
+namespace { struct LMCoeffs { scalar ca1=2.0, ca2=0.06, ce1=1.0, ce2=50.0, cThetat=0.03, sigmaThetat=2.0, lambdaErr=1e-6; int maxIter=10; }; }
+
+
+// DReThetatEff = sigmaThetat*(nut + nu)  (NOT nut/sigma + nu, depsKernel can't express this).
+__global__
+void lmReDiffKernel(int nC, const scalar* __restrict__ nut, scalar sigma, scalar nu, scalar* __restrict__ D)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < nC) D[c] = sigma*(nut[c] + nu);
+}
+
+
+// diag += V*sp ; source += V*su  (apply a precomputed semi-implicit reaction).
+__global__
+void lmAddReactionKernel(
+    int nC,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ sp,
+    const scalar* __restrict__ su,
+    scalar* __restrict__ diag,
+    scalar* __restrict__ source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    diag[c] += V[c] * sp[c];
+    source[c] += V[c] * su[c];
+}
+
+
+// per-cell strain helpers from the OF-convention gradU tensor (t[i*3+j] = dU_j/dx_i).
+__device__ __forceinline__
+void lmStrain(const scalar* t, scalar ux, scalar uy, scalar uz, scalar deltaU,
+              scalar& S, scalar& Omega, scalar& Us, scalar& dUsds)
+{
+    scalar symSq = 0.0, skSq = 0.0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+        {
+            const scalar sy = 0.5*(t[i*3+j]+t[j*3+i]), sk = 0.5*(t[i*3+j]-t[j*3+i]);
+            symSq += sy*sy;
+            skSq += sk*sk;
+        }
+    S = sqrt(2.0*symSq);
+    Omega = sqrt(2.0*skSq);
+    Us = fmax(sqrt(ux*ux+uy*uy+uz*uz), deltaU);
+    const scalar Uv[3] = {ux, uy, uz};
+    scalar num = 0.0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            num += Uv[i]*Uv[j]*t[i*3+j];
+    dUsds = num/(Us*Us);
+}
+
+
+// Fthetat (OF kOmegaSSTLM::Fthetat), uses the lagged gammaInt; reused by both the ReThetat source and gammaSep.
+__device__ __forceinline__
+scalar lmFthetat(scalar S, scalar Omega, scalar Us, scalar nu, scalar y, scalar om,
+                 scalar ReThetat, scalar gammaInt, scalar ce2)
+{
+    const scalar delta = fmax(375.0*Omega*nu*ReThetat*y/(Us*Us), 1e-37);
+    const scalar ReOmega = y*y*om/nu;
+    const scalar Fwake = exp(-(ReOmega/1e5)*(ReOmega/1e5));
+    scalar ywd = y/delta; ywd *= ywd; ywd *= ywd;   // (y/delta)^4
+    const scalar invCe2 = 1.0/ce2, b = (gammaInt - invCe2)/(1.0 - invCe2);
+    return fmin(fmax(Fwake*exp(-ywd), 1.0 - b*b), 1.0);
+}
+
+
+// ReThetac(ReThetat) and Flength(ReThetat) empirical correlations (OF).
+__device__ __forceinline__
+scalar lmReThetac(scalar R)
+{
+    return (R <= 1870.0) ? R - 396.035e-2 + 120.656e-4*R - 868.230e-6*R*R + 696.506e-9*R*R*R - 174.105e-12*R*R*R*R
+                         : R - 593.11 - 0.482*(R - 1870.0);
+}
+
+
+__device__ __forceinline__
+scalar lmFlength(scalar R, scalar y, scalar om, scalar nu)
+{
+    scalar Fl;
+    if (R < 400.0)       Fl = 398.189e-1 - 119.270e-4*R - 132.567e-6*R*R;
+    else if (R < 596.0)  Fl = 263.404 - 123.939e-2*R + 194.548e-5*R*R - 101.695e-8*R*R*R;
+    else if (R < 1200.0) Fl = 0.5 - 3e-4*(R - 596.0);
+    else                 Fl = 0.3188;
+    const scalar fs = y*y*om/(200.0*nu);
+    const scalar Fsub = exp(-(fs*fs));
+    return Fl*(1.0 - Fsub) + 40.0*Fsub;
+}
+
+
+// ReThetat reaction prep: ReThetat0 Newton loop + Pthetat; outputs sp=Pthetat, su=Pthetat*ReThetat0, and Fthetat.
+__global__
+void lmReThetatPrepKernel(
+    int nC,
+    const scalar* __restrict__ gradU,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    const scalar* __restrict__ k,
+    const scalar* __restrict__ om,
+    const scalar* __restrict__ y,
+    const scalar* __restrict__ ReThetat,
+    const scalar* __restrict__ gammaInt,
+    scalar nu,
+    scalar cThetat,
+    scalar ce2,
+    scalar deltaU,
+    scalar lambdaErr,
+    int maxIter,
+    scalar* __restrict__ Fth,
+    scalar* __restrict__ sp,
+    scalar* __restrict__ su)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    scalar t[9];
+    for (int q = 0; q < 9; ++q)
+        t[q] = gradU[q*nC+c];
+    scalar S, Omega, Us, dUsds;
+    lmStrain(t, Ux[c], Uy[c], Uz[c], deltaU, S, Omega, Us, dUsds);
+    const scalar kc = k[c], nuc = nu, yc = y[c], omc = om[c], ret = ReThetat[c], gi = gammaInt[c];
+    const scalar Tu = fmax(100.0*sqrt((2.0/3.0)*kc)/Us, 0.027);
+    scalar lambda = 0.0, thetat = 0.0;
+    int iter = 0;
+    for (;;)
+    {
+        const scalar lam0 = lambda;
+        scalar Fl;
+        if (Tu <= 1.3)
+        {
+            Fl = (dUsds <= 0.0) ? 1.0 - (-12.986*lambda - 123.66*lambda*lambda - 405.689*lambda*lambda*lambda)*exp(-pow(Tu/1.5, 1.5))
+                                : 1.0 + 0.275*(1.0 - exp(-35.0*lambda))*exp(-Tu/0.5);
+            thetat = (1173.51 - 589.428*Tu + 0.2196/(Tu*Tu))*Fl*nuc/Us;
+        }
+        else
+        {
+            Fl = (dUsds <= 0.0) ? 1.0 - (-12.986*lambda - 123.66*lambda*lambda - 405.689*lambda*lambda*lambda)*exp(-pow(Tu/1.5, 1.5))
+                                : 1.0 + 0.275*(1.0 - exp(-35.0*lambda))*exp(-2.0*Tu);
+            thetat = 331.50*pow(Tu - 0.5658, -0.671)*Fl*nuc/Us;
+        }
+        lambda = fmin(fmax(thetat*thetat/nuc*dUsds, -0.1), 0.1);
+        if (fabs(lambda - lam0) <= lambdaErr || ++iter >= maxIter) break;
+    }
+    const scalar ReThetat0 = fmax(thetat*Us/nuc, 20.0);
+    const scalar Fthetat = lmFthetat(S, Omega, Us, nuc, yc, omc, ret, gi, ce2);
+    Fth[c] = Fthetat;
+    const scalar Pthetat = (cThetat/(500.0*nuc/(Us*Us)))*(1.0 - Fthetat);   // cThetat/t, t=500*nu/Us^2
+    sp[c] = Pthetat;
+    su[c] = Pthetat*ReThetat0;
+}
+
+
+// gammaInt reaction prep: Pgamma, Egamma -> sp=ce1*Pgamma+ce2*Egamma, su=Pgamma+Egamma.
+__global__
+void lmGammaPrepKernel(
+    int nC,
+    const scalar* __restrict__ gradU,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    const scalar* __restrict__ k,
+    const scalar* __restrict__ om,
+    const scalar* __restrict__ y,
+    const scalar* __restrict__ ReThetat,
+    const scalar* __restrict__ gammaInt,
+    scalar nu,
+    scalar ca1,
+    scalar ca2,
+    scalar ce1,
+    scalar ce2,
+    scalar deltaU,
+    scalar* __restrict__ sp,
+    scalar* __restrict__ su)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    scalar t[9];
+    for (int q = 0; q < 9; ++q)
+        t[q] = gradU[q*nC+c];
+    scalar S, Omega, Us, dUsds;
+    lmStrain(t, Ux[c], Uy[c], Uz[c], deltaU, S, Omega, Us, dUsds);
+    const scalar kc = k[c], omc = om[c], yc = y[c], gi = gammaInt[c];
+    const scalar ReThetac = lmReThetac(ReThetat[c]);
+    const scalar Rev = yc*yc*S/nu, RT = kc/(nu*omc);
+    const scalar Fonset1 = Rev/(2.193*ReThetac);
+    const scalar Fonset2 = fmin(fmax(Fonset1, Fonset1*Fonset1*Fonset1*Fonset1), 2.0);
+    const scalar Fonset3 = fmax(1.0 - (RT/2.5)*(RT/2.5)*(RT/2.5), 0.0);
+    const scalar Fonset = fmax(Fonset2 - Fonset3, 0.0);
+    const scalar Fturb = exp(-(0.25*RT)*(0.25*RT)*(0.25*RT)*(0.25*RT));
+    const scalar Pgamma = ca1*lmFlength(ReThetat[c], yc, omc, nu)*S*sqrt(gi*Fonset);
+    const scalar Egamma = ca2*Omega*Fturb*gi;
+    sp[c] = ce1*Pgamma + ce2*Egamma;
+    su[c] = Pgamma + Egamma;
+}
+
+
+// gammaIntEff = max(gammaInt, gammaSep); gammaSep = min(2*max(Rev/(3.235*ReThetac)-1,0)*Freattach, 2)*Fthetat.
+__global__
+void lmGammaEffKernel(
+    int nC,
+    const scalar* __restrict__ gradU,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    const scalar* __restrict__ k,
+    const scalar* __restrict__ om,
+    const scalar* __restrict__ y,
+    const scalar* __restrict__ ReThetat,
+    const scalar* __restrict__ gammaInt,
+    const scalar* __restrict__ Fth,
+    scalar nu,
+    scalar deltaU,
+    scalar* __restrict__ gammaIntEff)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    scalar t[9];
+    for (int q = 0; q < 9; ++q)
+        t[q] = gradU[q*nC+c];
+    scalar S, Omega, Us, dUsds;
+    lmStrain(t, Ux[c], Uy[c], Uz[c], deltaU, S, Omega, Us, dUsds);
+    const scalar ReThetac = lmReThetac(ReThetat[c]);
+    const scalar Rev = y[c]*y[c]*S/nu, RT = k[c]/(nu*om[c]);
+    const scalar Freattach = exp(-(RT/20.0)*(RT/20.0)*(RT/20.0)*(RT/20.0));
+    const scalar gammaSep = fmin(2.0*fmax(Rev/(3.235*ReThetac) - 1.0, 0.0)*Freattach, 2.0)*Fth[c];
+    gammaIntEff[c] = fmax(gammaInt[c], gammaSep);
+}
+
+
+void deviceKOmegaSSTLMCorrect(
+    const DeviceMesh& dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBoundary& dbReThetat,
+    const DeviceBoundary& dbGammaInt,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k,
+    const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& nut,
+    const DeviceBuffer<scalar>& y,
+    DeviceBuffer<scalar>& ReThetat,
+    DeviceBuffer<scalar>& gammaInt,
+    DeviceBuffer<scalar>& gammaIntEff,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& phiBnd,
+    scalar nu,
+    scalar relax,
+    scalar tol,
+    scalar relTolKE,
+    int keCheckEvery,
+    bool bounded,
+    bool nonOrth,
+    bool gsEps,
+    DeviceAMI* ami,
+    DeviceCyclic* cyc)
+{
+    const int nC = dm.nCells;
+    const LMCoeffs lm;
+    DeviceBuffer<scalar> gradU;
+    deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);
+    DeviceBuffer<scalar> divU;
+    deviceDiv(dm, phiInt, phiBnd, divU);
+    if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
+    if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
+
+    // ReThetat: DReThetatEff = sigmaThetat*(nut+nu); reaction = Pthetat*ReThetat0 - Sp(Pthetat). Fthetat stored for gammaSep.
+    DeviceBuffer<scalar> Fth(nC), spR(nC), suR(nC);
+    lmReThetatPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.cThetat, lm.ce2, 1e-37, lm.lambdaErr, lm.maxIter,
+        Fth.data(), spR.data(), suR.data());
+    cudaCheck(cudaGetLastError(), "lmReThetatPrep");
+    DeviceBuffer<scalar> DRe(nC);
+    lmReDiffKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), lm.sigmaThetat, nu, DRe.data());   // sigmaThetat*(nut+nu)
+    deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
+                               relax, tol, relTolKE, keCheckEvery, gsEps,
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spR.data(), suR.data(), diag.data(), src.data()); },
+                               nullptr, nullptr, ami, cyc);
+    deviceBoundField(dm, ReThetat, 0.0);
+
+    // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
+    DeviceBuffer<scalar> spG(nC), suG(nC);
+    lmGammaPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, 1e-37, spG.data(), suG.data());
+    cudaCheck(cudaGetLastError(), "lmGammaPrep");
+    DeviceBuffer<scalar> DgI(nC);
+    depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), 1.0, nu, DgI.data());   // nut/1 + nu
+    deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
+                               relax, tol, relTolKE, keCheckEvery, gsEps,
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spG.data(), suG.data(), diag.data(), src.data()); },
+                               nullptr, nullptr, ami, cyc);
+    deviceBoundField(dm, gammaInt, 0.0);
+    gammaIntEff.resize(nC);
+    lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, 1e-37, gammaIntEff.data());
+    cudaCheck(cudaGetLastError(), "lmGammaEff");
+}
+
+// ---- Exported LM (kOmegaSSTLM transition) source-prep wrappers ----------------------------------------------
+// The transition kernels + LMCoeffs are cell-local (only gradU needs the halo, which the DISTRIBUTED SST correct
+// already builds). These thin wrappers expose them so parallelDeviceKOmegaSSTLMCorrect can reuse the exact same
+// physics + coefficients, feeding the distributed scalar-transport core -- the realizableKE pattern, two equations.
+void deviceLMReDiff(const DeviceBuffer<scalar>& nut, scalar nu, DeviceBuffer<scalar>& D)
+{
+    const int nC = static_cast<int>(nut.size()); const LMCoeffs lm; D.resize(nC);
+    lmReDiffKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), lm.sigmaThetat, nu, D.data());   // sigmaThetat*(nut+nu)
+    cudaCheck(cudaGetLastError(), "deviceLMReDiff");
+}
+void deviceLMReThetatPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, scalar nu,
+    DeviceBuffer<scalar>& Fth, DeviceBuffer<scalar>& spR, DeviceBuffer<scalar>& suR)
+{
+    const int nC = dm.nCells; const LMCoeffs lm; Fth.resize(nC); spR.resize(nC); suR.resize(nC);
+    lmReThetatPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.cThetat, lm.ce2, 1e-37, lm.lambdaErr, lm.maxIter,
+        Fth.data(), spR.data(), suR.data());
+    cudaCheck(cudaGetLastError(), "deviceLMReThetatPrep");
+}
+void deviceLMGammaPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, scalar nu,
+    DeviceBuffer<scalar>& spG, DeviceBuffer<scalar>& suG)
+{
+    const int nC = dm.nCells; const LMCoeffs lm; spG.resize(nC); suG.resize(nC);
+    lmGammaPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, 1e-37, spG.data(), suG.data());
+    cudaCheck(cudaGetLastError(), "deviceLMGammaPrep");
+}
+void deviceLMGammaEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, const DeviceBuffer<scalar>& Fth,
+    scalar nu, DeviceBuffer<scalar>& gammaIntEff)
+{
+    const int nC = dm.nCells; gammaIntEff.resize(nC);
+    lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
+        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, 1e-37, gammaIntEff.data());
+    cudaCheck(cudaGetLastError(), "deviceLMGammaEff");
+}
+void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, const DeviceBuffer<scalar>& su,
+    DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source)
+{
+    lmAddReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), sp.data(), su.data(), diag.data(), source.data());
+    cudaCheck(cudaGetLastError(), "deviceLMAddReaction");
 }
 
 } // namespace brae

@@ -10,6 +10,15 @@
 # and thus bit-exact at np=1 (single-GPU smoothSolver vs distributed BiCGStab otherwise stop at different residuals).
 set -u
 BRAE="$1"; SRC="$2"; WORK="$3"; NP="$4"; UTOL="$5"; PTOL="$6"; CMP="$7"
+
+# tc_wedge_ami is a gitignored, local-only fixture (absent on a fresh CI checkout). When it isn't present, SKIP this
+# test (ctest SKIP_RETURN_CODE) rather than fail -- the committed cyclicAMI fixtures cover AMI in CI; this full-solve
+# oracle is a local regression. See .gitignore + CMakeLists (ami_oracle SKIP_RETURN_CODE 125).
+if [ ! -d "$SRC" ]; then
+    echo "SKIP: AMI oracle source case '$SRC' absent (gitignored local-only fixture) -- skipping on this checkout"
+    exit 125
+fi
+
 END=400   # generous ceiling: tc_wedge_ami converges (residualControl) in ~148; a BUGGY AMI limit-cycles instead and
           # hits this endTime with a very different field -> the comparison fails (that is the regression signal).
 
