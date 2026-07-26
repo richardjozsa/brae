@@ -88,6 +88,7 @@ add_library(brae_core STATIC
     src/cuda/device_boundary_assembly.cu
     src/cuda/device_boundary_flow.cu
     src/cuda/device_divdevreff.cu
+    src/cuda/device_ddt.cu
     src/cuda/device_kepsilon.cu
     src/cuda/device_spalart.cu
     src/cuda/device_komega_sst.cu
@@ -530,6 +531,12 @@ target_include_directories(test_gpu_komega_sst PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_komega_sst PRIVATE brae_core)
 add_test(NAME gpu_komega_sst
          COMMAND test_gpu_komega_sst ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282/komega_sst.dat)
+
+# Transient ddt (PIMPLE foundation): deviceFvmDdt reproduces OF EulerDdtScheme/backwardDdtScheme exactly.
+add_executable(test_gpu_ddt tests/test_gpu_ddt.cu)
+target_include_directories(test_gpu_ddt PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_ddt PRIVATE brae_core)
+add_test(NAME gpu_ddt COMMAND test_gpu_ddt)
 
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
