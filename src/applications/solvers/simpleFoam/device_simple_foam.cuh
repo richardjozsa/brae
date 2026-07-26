@@ -184,6 +184,7 @@ private:
     DeviceBuffer<scalar> Uold_[3], Uold2_[3];
     // Turbulence old-time levels for the URANS fvm::ddt(k/eps/omega/nuTilda): dk_ (k or nuTilda) + de_ (epsilon or omega).
     DeviceBuffer<scalar> kOld_, kOld2_, e2Old_, e2Old2_;
+    DeviceBuffer<scalar> ReThetatOld_, ReThetatOld2_, gammaIntOld_, gammaIntOld2_;   // kOmegaSSTLM transition old-time
     // Momentum-predictor outputs, shared with the pressure-velocity phase (PIMPLE foundation: solveMomentumPredictor()
     // fills them once per outer corrector; correctPressureVelocity() reads them). Members so both phases see them + to
     // avoid per-step reallocation. mDiagR/mUp/mLo = relaxed momentum matrix; iC/bCb = per-component boundary coeffs;

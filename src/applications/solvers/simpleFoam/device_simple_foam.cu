@@ -241,6 +241,8 @@ namespace brae {
             const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_);
             const ScalarDdt kDdt{ ddtc, &kOld_,  kOld2_.size()  ? &kOld2_  : nullptr };
             const ScalarDdt sDdt{ ddtc, &e2Old_, e2Old2_.size() ? &e2Old2_ : nullptr };
+            const ScalarDdt reDdt{ ddtc, &ReThetatOld_, ReThetatOld2_.size() ? &ReThetatOld2_ : nullptr };   // kOmegaSSTLM
+            const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
                                              ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
@@ -260,7 +262,7 @@ namespace brae {
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
                                              ctl_.tolKE, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
-                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, reDdt, giDdt);   // LM transition ddt
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
@@ -898,6 +900,13 @@ namespace brae {
             {
                 if (bwd && e2Old_.size()) deviceCopy(e2Old2_, e2Old_);
                 deviceCopy(e2Old_, de_);
+            }
+            if (ctl_.lm)   // kOmegaSSTLM transition fields (ReThetat, gammaInt)
+            {
+                if (bwd && ReThetatOld_.size()) deviceCopy(ReThetatOld2_, ReThetatOld_);
+                deviceCopy(ReThetatOld_, ReThetat_);
+                if (bwd && gammaIntOld_.size()) deviceCopy(gammaIntOld2_, gammaIntOld_);
+                deviceCopy(gammaIntOld_, gammaInt_);
             }
         }
         deltaT0_ = deltaT_;
