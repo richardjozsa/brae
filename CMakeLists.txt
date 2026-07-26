@@ -905,6 +905,12 @@ add_executable(brae src/applications/solvers/simpleFoam/gpuSimpleFoam.cu)
 target_include_directories(brae PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae PRIVATE brae_core)
 
+# The single-GPU device-resident TRANSIENT solver app (PIMPLE): brae_pimpleFoam <caseDir>. Reuses DeviceSimpleSolver's
+# three composable phases via pimpleStep, with implicit fvm::ddt(U). v1 laminar.
+add_executable(brae_pimpleFoam src/applications/solvers/pimpleFoam/gpuPimpleFoam.cu)
+target_include_directories(brae_pimpleFoam PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
+target_link_libraries(brae_pimpleFoam PRIVATE brae_core)
+
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
 # slow-labelled (~2 min); regenerate the oracle with validation/komegasstlm_wall_vs_openfoam.sh.
