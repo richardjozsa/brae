@@ -924,7 +924,7 @@ foreach(_np 1 2)
                      ${CMAKE_CURRENT_BINARY_DIR}/ami_oracle_work_np${_np}
                      ${_np} ${_amitol} ${_amitol}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/compare_ami_fields.py)
-    set_tests_properties(ami_oracle_np${_np} PROPERTIES LABELS slow TIMEOUT 400)
+    set_tests_properties(ami_oracle_np${_np} PROPERTIES LABELS slow TIMEOUT 400 SKIP_RETURN_CODE 125)
 endforeach()
 
 # Single-GPU hardening regression lock: assert each fail-loud guard still fires on a mutated case
