@@ -618,15 +618,12 @@ public:
             else              { res.Uz = ur; res.UzFinal = uperf.finalResidual; res.UzIters = uperf.nIterations; }
         }
     }
-
-
-
-
-
-    DeviceSimpleResidual step()
+    // PIMPLE-foundation composable phase: pressure-velocity coupling (SIMPLE/SIMPLEC corrector). Reads the
+    // predictor outputs (member relaxed matrix + boundary coeffs + source), forms rAU/HbyA, solves the pressure
+    // correction (with non-orth passes) and corrects U + the conservative face flux. res gets the p residuals.
+    void correctPressureVelocity(DeviceSimpleResidual& res)
     {
         const DeviceMesh& dm = dm_;
-        DeviceSimpleResidual res;
         // Non-orth pressure-correction limiter (OF fv::limitedSnGrad), read by the pressure phase below: per-face caps the
         // lagged corrVec.grad(p) correction to (psi/(1-psi))*|orthogonal snGrad| on pathological high-non-orth meshes
         // (T3A: AR 3232, 43.8deg), where the once-lagged correction outruns the over-relaxed diagonal and diverges. Only
@@ -634,7 +631,6 @@ public:
         // OF-accurate). psi=1.0 -> unlimited (bit-identical to the validated cases). The momentum-viscous correction is
         // stable at full strength (it is the PRESSURE correction that destabilizes on T3A), so the predictor keeps psi=1.
         const scalar nonOrthLimitP = std::getenv("BRAE_NONORTH_LIMIT") ? std::atof(std::getenv("BRAE_NONORTH_LIMIT")) : ctl_.nonOrthLimit;
-        solveMomentumPredictor(res);
         // The predictor's LDU view + grad-pointer array, rebuilt over the (now member) relaxed-matrix + gradient buffers
         // for the pressure-velocity phase below (H() at deviceMatrixH, and the HbyA non-orth grad term). The predictor
         // does not modify mUp/mLo/gx/gy/gz after filling them, so these are identical pointers -> identical results.
@@ -894,6 +890,20 @@ public:
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);
+    }
+
+
+
+
+
+
+
+    DeviceSimpleResidual step()
+    {
+        const DeviceMesh& dm = dm_;
+        DeviceSimpleResidual res;
+        solveMomentumPredictor(res);
+        correctPressureVelocity(res);
 
         correctTurbulence();
         // OF continuityErrs.H: contErr = fvc::div(phi) on the CORRECTED flux; sum local = sum(V|contErr|)/sumV,
