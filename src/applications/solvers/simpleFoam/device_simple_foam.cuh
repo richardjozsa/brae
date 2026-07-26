@@ -276,20 +276,52 @@ public:
             deviceNut(dk_, de_, dnut_, ctl_.keCoeffs);               // nut = Cmu*k^2/eps
         }
     }
-
-    DeviceSimpleResidual step()
+    // PIMPLE-foundation composable phase: turbulence transport (k/eps/omega/nuTilda -> nut). Uses only members,
+    // so SIMPLE's step() and a future PIMPLE outer loop both call it (once per outer corrector) unchanged.
+    void correctTurbulence()
+    {
+        const DeviceMesh& dm = dm_;
+        clearTurbulenceReport();   // OF-style report: collect this step's turbulence solves (Solving for k/omega/...)
+        if (ctl_.turbulent)
+        {
+            if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
+                deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
+                                             ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
+                                             ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
+                                             ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
+            {
+                deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
+                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
+                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
+                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
+                                       ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
+                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
+                                       ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
+                if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
+                    deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
+                                             ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
+                                             ctl_.tolKE, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
+                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            }
+            else
+                deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
+                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
+                                      ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
+                                      ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
+                                      static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
+                                      ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
+        }
+    }
+    // PIMPLE-foundation composable phase 1: the momentum predictor -- assemble div(phi,U) - laplacian(nuEff,U)
+    // - fvc::div(nuEff dev2(grad U)^T) + fvOptions/MRF/limiters + body force, relax, and solve each U component
+    // (BiCGStab/GaussSeidel). Fills Uk_ + the shared members mDiagR/mUp/mLo/iC/bCb/relaxSrc (the relaxed matrix
+    // + boundary coeffs + relaxed source) that correctPressureVelocity() reads. res gets the U-solve residuals.
+    void solveMomentumPredictor(DeviceSimpleResidual& res)
     {
         const DeviceMesh& dm = dm_;
         const scalar tol = ctl_.tolU;
-        DeviceSimpleResidual res;
-        // Non-orth pressure-correction limiter (OF fv::limitedSnGrad). The explicit corrVec.grad(p) correction in the
-        // pressure equation is LAGGED by one outer iteration; on extreme-aspect-ratio + high-non-orth meshes (T3A:
-        // AR 3232, 43.8deg) it feeds back faster than the over-relaxed implicit diagonal can damp -> divergence. The
-        // per-face limiter caps the correction to (psi/(1-psi))*|orthogonal snGrad| ONLY on the pathological faces
-        // (where |corr|>|orth|); well-behaved faces keep limiter==1 (full "corrected", OF-accurate). psi=1.0 -> the
-        // unlimited path (bit-identical to the validated cases). The momentum-viscous correction is stable at full
-        // strength (verified on T3A: it is the PRESSURE correction that destabilizes), so it keeps psi=1.
-        const scalar nonOrthLimitP = std::getenv("BRAE_NONORTH_LIMIT") ? std::atof(std::getenv("BRAE_NONORTH_LIMIT")) : ctl_.nonOrthLimit;
+        // nonOrthLimitP (the pressure non-orth limiter) is declared in step() -- it is read only by the pressure phase.
         const scalar nonOrthRelaxU = std::getenv("BRAE_NONORTH_RELAX_U") ? std::atof(std::getenv("BRAE_NONORTH_RELAX_U")) : 1.0;
 
         // inletOutlet BCs: resolve each IO face to fixedValue|zeroGradient from the PREVIOUS step's boundary flux
@@ -359,11 +391,11 @@ public:
 
         DeviceBuffer<scalar> pbv;
         deviceBCValue(dbP_, dp_, pbv);
-        DeviceBuffer<scalar> gx, gy, gz;
+        // gx/gy/gz are members (shared with the pressure phase).
         deviceGaussGrad(dm, dp_, pbv, gx, gy, gz);
         if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);   // cyclic-face contribution to grad(p) in the momentum source
         if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);       // AMI-face contribution to grad(p)
-        DeviceBuffer<scalar> mDiag, mUp, mLo, lD, lU, lL;
+        DeviceBuffer<scalar> mDiag, lD, lU, lL;   // mUp/mLo are now members (shared with the pressure phase)
         deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
         deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
         deviceAxpy(-1.0,lD,mDiag);
@@ -426,7 +458,7 @@ public:
             deviceAxpy(-1.0,r2lIC,r2IC);
             deviceCmptMaxMag3(r0IC, r1IC, r2IC, iCmaxMag);   // OF fvMatrix::relax adds cmptMax(cmptMag(iC)) to the diagonal
         }
-        DeviceBuffer<scalar> mDiagR, delta;
+        DeviceBuffer<scalar> delta;   // mDiagR is now a member
         deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.relaxU, mDiagR, delta,
                         hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
                         hasSym_ ? iCmaxMag.data() : nullptr);
@@ -434,7 +466,6 @@ public:
         // sink (no source) where |U|>UMax. Add to the relaxed diagonal so it feeds the predictor AND rAU/HbyA (= OF A()).
         if (vdcActive_) deviceFvoVelocityDamping(vdcCells_, vdcUMax_, vdcC_, dm.V, Uk_[0], Uk_[1], Uk_[2], mDiagR);
         const DeviceLduView Uview = deviceLduView(dm, mDiagR, mUp, mLo);
-        DeviceBuffer<scalar> iC[3], bCb[3], relaxSrc[3];
         // rotational cyclic: snapshot U_old so the deferred rotation MIXING is built from ONE consistent field for
         // all three components. OF evaluates the cyclic patchNeighbourField (forwardT.U[nbr]) ONCE at UEqn assembly,
         // from U_old, for the whole vector. cf solves the 3 components SEQUENTIALLY in place (Uk_[kk] is the solution
@@ -586,6 +617,29 @@ public:
             else if (kk == 1) { res.Uy = ur; res.UyFinal = uperf.finalResidual; res.UyIters = uperf.nIterations; }
             else              { res.Uz = ur; res.UzFinal = uperf.finalResidual; res.UzIters = uperf.nIterations; }
         }
+    }
+
+
+
+
+
+    DeviceSimpleResidual step()
+    {
+        const DeviceMesh& dm = dm_;
+        DeviceSimpleResidual res;
+        // Non-orth pressure-correction limiter (OF fv::limitedSnGrad), read by the pressure phase below: per-face caps the
+        // lagged corrVec.grad(p) correction to (psi/(1-psi))*|orthogonal snGrad| on pathological high-non-orth meshes
+        // (T3A: AR 3232, 43.8deg), where the once-lagged correction outruns the over-relaxed diagonal and diverges. Only
+        // the pathological faces (|corr|>|orth|) are limited; well-behaved faces keep limiter==1 (full "corrected",
+        // OF-accurate). psi=1.0 -> unlimited (bit-identical to the validated cases). The momentum-viscous correction is
+        // stable at full strength (it is the PRESSURE correction that destabilizes on T3A), so the predictor keeps psi=1.
+        const scalar nonOrthLimitP = std::getenv("BRAE_NONORTH_LIMIT") ? std::atof(std::getenv("BRAE_NONORTH_LIMIT")) : ctl_.nonOrthLimit;
+        solveMomentumPredictor(res);
+        // The predictor's LDU view + grad-pointer array, rebuilt over the (now member) relaxed-matrix + gradient buffers
+        // for the pressure-velocity phase below (H() at deviceMatrixH, and the HbyA non-orth grad term). The predictor
+        // does not modify mUp/mLo/gx/gy/gz after filling them, so these are identical pointers -> identical results.
+        const DeviceLduView Uview = deviceLduView(dm, mDiagR, mUp, mLo);
+        DeviceBuffer<scalar>* gg[3] = { &gx, &gy, &gz };
         // OF A() = (relaxed_diag + cmptAv(internalCoeffs))/V  (fvMatrix::D() -> addCmptAvBoundaryDiag, fvMatrix::A()).
         // For component-INDEPENDENT BCs cmptAv(iC) == iC[0] (bit-identical to before). For slip/symmetry the boundary
         // diagonal is PER-COMPONENT (vf_k=|n_k|), so the SHARED rAU must use the component-AVERAGE, NOT iC[0]: iC[0]
@@ -841,37 +895,7 @@ public:
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);
 
-        clearTurbulenceReport();   // OF-style report: collect this step's turbulence solves (Solving for k/omega/...)
-        if (ctl_.turbulent)
-        {
-            if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
-                deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
-                                             ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
-                                             ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
-                                             ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-            else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
-            {
-                deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
-                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
-                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
-                                       ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
-                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
-                                       ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
-                if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
-                    deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                             ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
-                                             ctl_.tolKE, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
-                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-            }
-            else
-                deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
-                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
-                                      ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
-                                      ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
-                                      static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
-                                      ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
-        }
+        correctTurbulence();
         // OF continuityErrs.H: contErr = fvc::div(phi) on the CORRECTED flux; sum local = sum(V|contErr|)/sumV,
         // global = sum(V contErr)/sumV. deviceDiv gives Sum(phi)/V per cell, so R = V*div = the cell flux balance.
         {
@@ -1057,6 +1081,13 @@ private:
     DeviceBuffer<scalar> rotorFx_, rotorFy_, rotorFz_;
     AMGData amg_;
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_, dk_, de_, dnut_, y_;   // y_ = cell wall distance (SST/SA)
+    // Momentum-predictor outputs, shared with the pressure-velocity phase (PIMPLE foundation: solveMomentumPredictor()
+    // fills them once per outer corrector; correctPressureVelocity() reads them). Members so both phases see them + to
+    // avoid per-step reallocation. mDiagR/mUp/mLo = relaxed momentum matrix; iC/bCb = per-component boundary coeffs;
+    // relaxSrc = relaxed momentum source (feeds both the predictor solve AND H()/HbyA).
+    DeviceBuffer<scalar> mDiagR, mUp, mLo;
+    DeviceBuffer<scalar> iC[3], bCb[3], relaxSrc[3];
+    DeviceBuffer<scalar> gx, gy, gz;   // gradient workspace: grad(U) in the predictor, reused as grad(p) in the pressure phase
     DeviceBuffer<scalar> ReThetat_, gammaInt_, gammaIntEff_;                   // kOmegaSSTLM transition fields
     DeviceBuffer<scalar> dnutBndWall_;                                          // persistent Spalding wall-nut (SA warm seed)
     DeviceBuffer<scalar> nuConst_, zeroSrc_, zeroBndU_, ones_;
