@@ -904,7 +904,9 @@ void deviceKOmegaSSTLMCorrect(
     bool nonOrth,
     bool gsEps,
     DeviceAMI* ami,
-    DeviceCyclic* cyc)
+    DeviceCyclic* cyc,
+    const ScalarDdt& reDdt,
+    const ScalarDdt& giDdt)
 {
     const int nC = dm.nCells;
     const LMCoeffs lm;
@@ -926,7 +928,7 @@ void deviceKOmegaSSTLMCorrect(
     deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spR.data(), suR.data(), diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc);
+                               nullptr, nullptr, ami, cyc, reDdt);
     deviceBoundField(dm, ReThetat, 0.0);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
@@ -939,7 +941,7 @@ void deviceKOmegaSSTLMCorrect(
     deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spG.data(), suG.data(), diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc);
+                               nullptr, nullptr, ami, cyc, giDdt);
     deviceBoundField(dm, gammaInt, 0.0);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),

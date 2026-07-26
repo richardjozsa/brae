@@ -216,7 +216,8 @@ void deviceKOmegaSSTLMCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& 
                               DeviceBuffer<scalar>& ReThetat, DeviceBuffer<scalar>& gammaInt, DeviceBuffer<scalar>& gammaIntEff,
                               const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd, scalar nu,
                               scalar relax, scalar tol, scalar relTolKE, int keCheckEvery, bool bounded, bool nonOrth,
-                              bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
+                              bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
+                              const ScalarDdt& reDdt = {}, const ScalarDdt& giDdt = {});   // transient fvm::ddt(ReThetat)/ddt(gammaInt)
 
 // Spalart-Allmaras (one-equation): solve the nuTilda transport (div - laplacian(DnuTildaEff) + Sp(destruction) ==
 // production + Cb2 grad^2) via the shared scaffold, then nut = nuTilda*fv1. Mirrors SpalartAllmarasBase::correct()
