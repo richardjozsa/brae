@@ -270,6 +270,10 @@ namespace brae {
     {
         const DeviceMesh& dm = dm_;
         const scalar tol = ctl_.tolU;
+        // Transient fvm::ddt(U): the ONE term steady SIMPLE lacks. steadyState (SIMPLE) -> ddtc.active==false -> the two
+        // deviceFvmDdt* calls below are exact no-ops (this method stays byte-for-byte SIMPLE). pimpleStep() sets the
+        // scheme + rotates the old-time fields, so the transient (PIMPLE) path folds ddt into the SAME predictor.
+        const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_);
         // nonOrthLimitP (the pressure non-orth limiter) is declared in step() -- it is read only by the pressure phase.
         const scalar nonOrthRelaxU = std::getenv("BRAE_NONORTH_RELAX_U") ? std::atof(std::getenv("BRAE_NONORTH_RELAX_U")) : 1.0;
 
@@ -407,6 +411,9 @@ namespace brae {
             deviceAxpy(-1.0,r2lIC,r2IC);
             deviceCmptMaxMag3(r0IC, r1IC, r2IC, iCmaxMag);   // OF fvMatrix::relax adds cmptMax(cmptMag(iC)) to the diagonal
         }
+        // + implicit fvm::ddt(U) DIAGONAL (rho=1 incompressible): coefft*rDeltaT*V, shared by all 3 components, added
+        // to the assembled diagonal BEFORE relax -- OF assembles fvm::ddt into UEqn, then UEqn.relax(). No-op for SIMPLE.
+        deviceFvmDdtDiag(dm.V, ddtc, 1.0, mDiag);
         DeviceBuffer<scalar> delta;   // mDiagR is now a member
         deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.relaxU, mDiagR, delta,
                         hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
@@ -487,6 +494,9 @@ namespace brae {
             bCb[kk]=std::move(dBC);
             deviceHadamard(relaxSrc[kk], delta, Uk_[kk]);
             deviceAxpy(1.0, *ddr[kk], relaxSrc[kk]);                                  // += explicit divDevReff stress
+            // + fvm::ddt(U) SOURCE for this component: rDeltaT*V*(coefft0*Uold - coefft00*Uold2). Into relaxSrc so it
+            // feeds BOTH the predictor solve AND H()/HbyA (OF's UEqn.H() includes the ddt source). No-op for SIMPLE.
+            deviceFvmDdtSource(dm.V, ddtc, 1.0, Uold_[kk], Uold2_[kk], relaxSrc[kk]);
             if (mrf_.active) deviceMrfCoriolis(mrf_, dm.V, Uk_[0], Uk_[1], Uk_[2], kk, relaxSrc[kk]);   // MRF Coriolis: -V*(Omega x U)_kk on zone cells
             // Explicit momentum corrections (linearUpwind deferred + non-orth laplacian) go into relaxSrc so they
             // feed BOTH the predictor solve AND H()/HbyA, OF's UEqn.H() includes them. Adding them only to the
@@ -849,6 +859,53 @@ namespace brae {
         correctTurbulence();
         // OF continuityErrs.H: contErr = fvc::div(phi) on the CORRECTED flux; sum local = sum(V|contErr|)/sumV,
         // global = sum(V contErr)/sumV. deviceDiv gives Sum(phi)/V per cell, so R = V*div = the cell flux balance.
+        {
+            DeviceBuffer<scalar> divPhi;
+            deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            DeviceBuffer<scalar> R;
+            deviceHadamard(R, divPhi, dm.V);
+            const scalar sumV = deviceDot(dm.V, ones_) + 1e-300;
+            res.contLocal  = deviceSumMag(R) / sumV;
+            res.contGlobal = deviceDot(R, ones_) / sumV;
+        }
+        return res;
+    }
+
+    // Advance one time level: roll the old-time velocity fields (t-2 <- t-1 <- current) and the time steps
+    // (deltaT0 <- deltaT). Call ONCE at the top of each time step, before the outer-corrector loop -- OF does this at
+    // runTime++ (the registry ages every field's oldTime). First call: Uold2_ stays empty + deltaT0_=0, so ddtCoeffs()
+    // bootstraps to Euler exactly like pimpleFoam's first step (only one old level exists yet).
+    void DeviceSimpleSolver::advanceTime(scalar deltaT)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            if (ddtScheme_ == DdtScheme::backward && Uold_[k].size())
+                deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (backward only, and only once t-1 exists)
+            deviceCopy(Uold_[k], Uk_[k]);          // t-1 <- current
+        }
+        deltaT0_ = deltaT_;
+        deltaT_  = deltaT;
+    }
+
+    // One PIMPLE time step -- the transient counterpart of step(): the SAME three composable phases re-orchestrated under
+    // outer (momentum<->pressure<->turbulence) + inner (pressure) corrector loops, with fvm::ddt(U) folded into the
+    // predictor (active once setDdtScheme() set ddtScheme_ != steadyState). The momentum matrix is re-assembled each
+    // outer corrector from the latest U/phi, exactly as OF's while(pimple.loop()) re-forms UEqn.
+    DeviceSimpleResidual DeviceSimpleSolver::pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors)
+    {
+        const DeviceMesh& dm = dm_;
+        advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
+        DeviceSimpleResidual res;
+        const int nOuter = nOuterCorrectors > 0 ? nOuterCorrectors : 1;
+        const int nCorr  = nCorrectors      > 0 ? nCorrectors      : 1;
+        for (int oc = 0; oc < nOuter; ++oc)
+        {
+            solveMomentumPredictor(res);                     // momentum incl. implicit ddt
+            for (int pc = 0; pc < nCorr; ++pc)               // PIMPLE pressure (inner) correctors
+                correctPressureVelocity(res);
+            correctTurbulence();
+        }
+        // continuity errors on the corrected flux (identical to step()).
         {
             DeviceBuffer<scalar> divPhi;
             deviceDiv(dm, phiInt_, phiBnd_, divPhi);

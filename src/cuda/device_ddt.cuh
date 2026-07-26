@@ -57,7 +57,8 @@ inline DdtCoeffs ddtCoeffs(DdtScheme scheme, scalar deltaT, scalar deltaT0)
 // Add the implicit ddt of ONE scalar component (a velocity component, or a transported scalar) to (diag, source).
 // diag/source are the assembled fvMatrix arrays (size == nCells); this ACCUMULATES, matching ddt being one UEqn term.
 // psiOld2 may be empty (Euler / bootstrap). rho is the constant density (1 for incompressible pimpleFoam). No-op when
-// c.active is false. V is the cell-volume field (mesh V; brae is always a fixed mesh so Vsc == V).
+// c.active is false. V is the cell-volume field (mesh V; brae is always a fixed mesh so Vsc == V). Use this when diag +
+// source belong to the SAME matrix (a scalar transport, e.g. k/epsilon in PIMPLE).
 void deviceFvmDdt(
     const DeviceBuffer<scalar>& V,
     const DdtCoeffs&            c,
@@ -65,6 +66,24 @@ void deviceFvmDdt(
     const DeviceBuffer<scalar>& psiOld,
     const DeviceBuffer<scalar>& psiOld2,
     DeviceBuffer<scalar>&       diag,
+    DeviceBuffer<scalar>&       source);
+
+// The two halves of deviceFvmDdt, split for the vector momentum predictor where the ddt DIAGONAL is shared across the 3
+// components (added once to the assembled diag, BEFORE relax) but the ddt SOURCE is per component (uses that component's
+// oldTime). deviceFvmDdt(...) == Diag(...) then Source(...). Both no-op when !c.active.
+//   diag[c]   += coefft*rDeltaT*rho*V[c]
+void deviceFvmDdtDiag(
+    const DeviceBuffer<scalar>& V,
+    const DdtCoeffs&            c,
+    scalar                      rho,
+    DeviceBuffer<scalar>&       diag);
+//   source[c] += rDeltaT*rho*V[c]*( coefft0*psiOld[c] - coefft00*psiOld2[c] )
+void deviceFvmDdtSource(
+    const DeviceBuffer<scalar>& V,
+    const DdtCoeffs&            c,
+    scalar                      rho,
+    const DeviceBuffer<scalar>& psiOld,
+    const DeviceBuffer<scalar>& psiOld2,
     DeviceBuffer<scalar>&       source);
 
 }  // namespace brae

@@ -31,6 +31,7 @@
 #include "cell_wall_dist.cuh"
 #include "device_mrf.cuh"
 #include "device_divdevreff.cuh"
+#include "device_ddt.cuh"          // transient fvm::ddt(U) for the PIMPLE path (no-op in steady SIMPLE)
 #include "device_amg.cuh"
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
@@ -82,6 +83,16 @@ public:
     void correctPressureVelocity(DeviceSimpleResidual& res);
 
     DeviceSimpleResidual step();
+
+    // --- Transient (PIMPLE) interface -- reuses the three composable phases above under an outer/inner-corrector loop,
+    // with the implicit fvm::ddt(U) folded into solveMomentumPredictor. setDdtScheme() switches this solver from steady
+    // (SIMPLE, the default) to transient; the steady step() path is completely unaffected (ddt stays a no-op).
+    void setDdtScheme(DdtScheme s) { ddtScheme_ = s; }
+    // Advance one time level: store U.oldTime()[.oldTime()] + roll deltaT -> deltaT0 (OF runTime++ / GeometricField::oldTime).
+    void advanceTime(scalar deltaT);
+    // One PIMPLE time step: advanceTime, then nOuterCorrectors x { momentum predictor (ddt folded in); nCorrectors x
+    // pressure-velocity correction; turbulence }, then continuity errors. Returns the outer-loop residual signal.
+    DeviceSimpleResidual pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors);
 
     // Enable an MRF rotating zone: builds the device frame data + makes the resident flux RELATIVE (so the
     // momentum/pressure are solved in the rotating frame). Call once after construction, before stepping.
@@ -166,6 +177,11 @@ private:
     DeviceBuffer<scalar> rotorFx_, rotorFy_, rotorFz_;
     AMGData amg_;
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_, dk_, de_, dnut_, y_;   // y_ = cell wall distance (SST/SA)
+    // Transient (PIMPLE) state: ddt scheme + time steps + old-time velocity levels (U.oldTime()[.oldTime()]), rotated by
+    // advanceTime(). steadyState + empty old-time buffers in the default steady SIMPLE path, where ddt is a no-op.
+    DdtScheme ddtScheme_ = DdtScheme::steadyState;
+    scalar    deltaT_ = 0, deltaT0_ = 0;
+    DeviceBuffer<scalar> Uold_[3], Uold2_[3];
     // Momentum-predictor outputs, shared with the pressure-velocity phase (PIMPLE foundation: solveMomentumPredictor()
     // fills them once per outer corrector; correctPressureVelocity() reads them). Members so both phases see them + to
     // avoid per-step reallocation. mDiagR/mUp/mLo = relaxed momentum matrix; iC/bCb = per-component boundary coeffs;
