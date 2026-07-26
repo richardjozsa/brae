@@ -104,6 +104,7 @@ add_library(brae_core STATIC
     src/cuda/device_cluster.cu
     src/cuda/device_cyclic.cu
     src/cuda/device_ami.cu
+    src/applications/solvers/simpleFoam/device_simple_foam.cu
 )
 target_include_directories(brae_core PUBLIC ${BRAE_HEADER_DIRS} ${MPI_CXX_INCLUDE_DIRS} ${SCOTCH_INCLUDE_DIR})
 # Link MPI libraries directly (not the imported target) so its CXX compile flags do not
