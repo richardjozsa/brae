@@ -1158,6 +1158,16 @@ target_link_libraries(test_gpu_pimple PRIVATE brae_core)
 add_test(NAME gpu_pimple COMMAND test_gpu_pimple ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 set_tests_properties(gpu_pimple PROPERTIES SKIP_RETURN_CODE 125)
 
+# Driver-level ctest: run the brae_pimpleFoam EXECUTABLE end-to-end on a transient variant of the committed pitzDaily
+# (kEpsilon URANS) -- exercises the controlDict/fvSchemes(ddt)/fvSolution(PIMPLE) parse + turbulence I/O + time loop +
+# OF writer. Fixture is committed, so this runs on CI (skips only if it is somehow absent).
+add_test(NAME pimple_run
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_run.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/pimple_run_work)
+set_tests_properties(pimple_run PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
+
 # GPU offload #7: thread-block clusters + DSM, foundational cluster reduction vs the global reduction.
 add_executable(test_gpu_cluster tests/test_gpu_cluster.cu)
 target_include_directories(test_gpu_cluster PRIVATE ${BRAE_HEADER_DIRS})
