@@ -95,6 +95,10 @@ add_library(brae_core STATIC
     src/cuda/device_amg.cu
     src/cuda/device_amg_cache.cu
     src/cuda/device_amg_coarse.cu
+    src/cuda/device_amg_smoothers.cu
+    src/cuda/device_amg_gauss_seidel.cu
+    src/cuda/device_amg_vcycle.cu
+    src/cuda/device_amg_pcg.cu
     src/cuda/device_cluster.cu
     src/cuda/device_cyclic.cu
     src/cuda/device_ami.cu

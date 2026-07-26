@@ -13,6 +13,13 @@
 #include <cuda_runtime.h>   // __shfl_down_sync, __syncthreads
 #include <cstdlib>          // std::getenv / std::atoi (env-flag readers)
 
+// Device-resident (conditional-graph WHILE) solver variants require CUDA 13's stream-capture-to-graph + conditional
+// nodes. Defined here (not inline in device_amg.cu) so it gates BOTH the device-resident GS solver and the
+// device-resident AMG-PCG driver consistently across the (to-be-split) AMG-core translation units.
+#if CUDART_VERSION >= 13000
+#define BRAE_HAS_GS_DEVICE 1
+#endif
+
 namespace brae {
 
 // finalizeAMG builds the V-cycle scratch + persistent PCG buffers + graph caches for a hierarchy. It is the one
