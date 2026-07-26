@@ -561,7 +561,9 @@ void deviceKEpsilonCorrect(
     DeviceCyclic* cyc,
     int nutWall,
     scalar atmZ0,
-    bool atmBoundNut)
+    bool atmBoundNut,
+    const ScalarDdt& kDdt,
+    const ScalarDdt& eDdt)
 {
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
@@ -592,7 +594,7 @@ void deviceKEpsilonCorrect(
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    if (co.realizable) deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, diag, src);
                                    else               deviceEpsReaction(dm, eps, k, gByNu, divU, diag, src, co); },
-                               &wall, &eps0, ami, cyc);
+                               &wall, &eps0, ami, cyc, eDdt);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));
@@ -600,7 +602,7 @@ void deviceKEpsilonCorrect(
     deviceSolveScalarTransport(dm, dbK, k, "k", Dk, phiInt, phiBnd, divU, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReaction(dm, k, eps, G, divU, diag, src); },
-                               nullptr, nullptr, ami, cyc);
+                               nullptr, nullptr, ami, cyc, kDdt);
 
     // correctNut (cell): nut = Cmu k^2 / eps (realizableKE: rCmu k^2 / eps with the variable Cmu).
     if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);

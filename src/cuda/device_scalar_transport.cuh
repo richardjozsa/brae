@@ -13,6 +13,7 @@
 #include "device_cyclic.cuh"
 #include "device_interface.cuh"   // interfaceAssembleMomentum/OffDiagSum/ZeroWallIfCoeff
 #include "device_amg.cuh"         // deviceSymGaussSeidel
+#include "device_ddt.cuh"         // ScalarDdt + deviceFvmDdtDiag/Source (transient turbulence)
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -123,7 +124,8 @@ void deviceSolveScalarTransport(
     const DeviceWallData* wall = nullptr,
     const DeviceBuffer<scalar>* eps0 = nullptr,
     DeviceAMI* ami = nullptr,
-    DeviceCyclic* cyc = nullptr)
+    DeviceCyclic* cyc = nullptr,
+    const ScalarDdt& ddt = ScalarDdt{})   // transient fvm::ddt(f); default (steady) -> no-op
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -157,6 +159,11 @@ void deviceSolveScalarTransport(
         ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); interfaceOffDiagSum(*ami, ifSumOff); }
     else if (cyc && cyc->n) { interfaceAssembleMomentum(*cyc, D, aD);
         ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); interfaceOffDiagSum(*cyc, ifSumOff); }
+    // implicit fvm::ddt(f) (URANS transient turbulence): the diagonal into the assembled aD (BEFORE relax = OF assembles
+    // ddt into the eqn then relaxes), the source (old-time) into src. steady (ddt.c.active==false) -> exact no-op, so this
+    // stays byte-for-byte the steady scalar transport. rho=1 (incompressible). Matches the momentum ddt wiring.
+    deviceFvmDdtDiag(dm.V, ddt.c, 1.0, aD);
+    if (ddt.old) { DeviceBuffer<scalar> e2; deviceFvmDdtSource(dm.V, ddt.c, 1.0, *ddt.old, ddt.old2 ? *ddt.old2 : e2, src); }
     DeviceBuffer<scalar> aRD, aDelta; deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
                                                       ifSumOff.size() ? ifSumOff.data() : nullptr);
     { DeviceBuffer<scalar> t; deviceHadamard(t, aDelta, field); deviceAxpy(1.0, t, src); }

@@ -569,7 +569,9 @@ void deviceKOmegaSSTCorrect(
     const scalar* gammaIntEff,
     int nutWall,
     scalar atmZ0,
-    bool atmBoundNut)
+    bool atmBoundNut,
+    const ScalarDdt& kDdt,
+    const ScalarDdt& sDdt)
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -623,7 +625,7 @@ void deviceKOmegaSSTCorrect(
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divU, bounded, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src); },
-                               &wall, &omega0, ami, cyc);
+                               &wall, &omega0, ami, cyc, sDdt);
     deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
@@ -632,7 +634,7 @@ void deviceKOmegaSSTCorrect(
     deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divU, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff); },
-                               nullptr, nullptr, ami, cyc);
+                               nullptr, nullptr, ami, cyc, kDdt);
     deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).

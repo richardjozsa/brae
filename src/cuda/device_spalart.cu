@@ -148,7 +148,8 @@ void deviceSpalartAllmarasCorrect(
     bool nonOrth,
     bool gsK,
     DeviceAMI* ami,
-    DeviceCyclic* cyc)
+    DeviceCyclic* cyc,
+    const ScalarDdt& ntDdt)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
@@ -200,7 +201,7 @@ void deviceSpalartAllmarasCorrect(
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    saReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), nuTilda.data(), Stilda.data(),
                                        fw.data(), y.data(), gradNt2.data(), co, diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc);
+                               nullptr, nullptr, ami, cyc, ntDdt);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut");
