@@ -68,6 +68,17 @@ void deviceFvmDdt(
     DeviceBuffer<scalar>&       diag,
     DeviceBuffer<scalar>&       source);
 
+// Per-scalar transient-ddt bundle for a transported turbulence scalar (k / epsilon / omega / nuTilda). Threaded into
+// deviceSolveScalarTransport so a transient (PIMPLE) turbulence solve folds fvm::ddt(f) into its matrix, while the steady
+// (SIMPLE) path passes the default (c.active==false, old==nullptr) -> an exact no-op. `old`/`old2` are that scalar's
+// oldTime()[.oldTime()] device fields (owned by the solver, rotated each time step); old2 may be null (Euler/bootstrap).
+struct ScalarDdt
+{
+    DdtCoeffs                   c{};
+    const DeviceBuffer<scalar>* old  = nullptr;
+    const DeviceBuffer<scalar>* old2 = nullptr;
+};
+
 // The two halves of deviceFvmDdt, split for the vector momentum predictor where the ddt DIAGONAL is shared across the 3
 // components (added once to the assembled diag, BEFORE relax) but the ddt SOURCE is per component (uses that component's
 // oldTime). deviceFvmDdt(...) == Diag(...) then Source(...). Both no-op when !c.active.

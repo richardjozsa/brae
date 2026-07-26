@@ -6,6 +6,7 @@
 #include "cf_types.cuh"
 #include "kepsilon_coeffs.cuh"
 #include "device_buffer.cuh"
+#include "device_ddt.cuh"          // ScalarDdt (transient turbulence ddt bundle)
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "primitive_mesh.cuh"
@@ -184,7 +185,8 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                            bool linearUpwindK = false, bool linearUpwindEps = false, bool nonOrth = false,
                            bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                            int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
-                           scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough wall)
+                           scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough wall)
+                           const ScalarDdt& kDdt = {}, const ScalarDdt& eDdt = {});   // transient fvm::ddt(k)/ddt(eps)
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -202,7 +204,8 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                             const scalar* gammaIntEff = nullptr,   // kOmegaSSTLM transition: scales k Pk/epsilonByk
                             int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
-                            scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough wall)
+                            scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough wall)
+                            const ScalarDdt& kDdt = {}, const ScalarDdt& sDdt = {});   // transient fvm::ddt(k)/ddt(omega)
 
 // kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition) extra step: after the SST k/omega solve, transport ReThetat
 // and gammaInt and update gammaIntEff (fed back into the SST k equation next iteration). See PORTING_KOMEGASSTLM.md.
@@ -226,7 +229,8 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   scalar nu, scalar relax, scalar tol, bool bounded = false, bool limited = false,
                                   scalar twoByk = 2.0, const SpalartAllmarasCoeffs& co = {}, scalar relTol = 0.0, int checkEvery = 1,
                                   bool linearUpwind = false, bool nonOrth = false,
-                                  bool gsK = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
+                                  bool gsK = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
+                                  const ScalarDdt& ntDdt = {});   // transient fvm::ddt(nuTilda)
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

@@ -236,11 +236,16 @@ namespace brae {
         clearTurbulenceReport();   // OF-style report: collect this step's turbulence solves (Solving for k/omega/...)
         if (ctl_.turbulent)
         {
+            // transient URANS fvm::ddt(k/eps/omega/nuTilda): a per-scalar bundle (steady -> active==false -> no-op, so
+            // the steady SIMPLE turbulence stays byte-for-byte). dk_=k|nuTilda (kOld_), de_=epsilon|omega (e2Old_).
+            const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_);
+            const ScalarDdt kDdt{ ddtc, &kOld_,  kOld2_.size()  ? &kOld2_  : nullptr };
+            const ScalarDdt sDdt{ ddtc, &e2Old_, e2Old2_.size() ? &e2Old2_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
                                              ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
-                                             ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                                             ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt);   // nuTilda ddt (kOld_)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -249,7 +254,8 @@ namespace brae {
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
                                        static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
-                                       ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
+                                       ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
+                                       kDdt, sDdt);   // transient fvm::ddt(k)/ddt(omega)
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
@@ -262,7 +268,8 @@ namespace brae {
                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
-                                      ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
+                                      ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
+                                      kDdt, sDdt);   // transient fvm::ddt(k)/ddt(epsilon)  (sDdt = the 2nd-scalar bundle)
         }
     }
 
@@ -877,11 +884,21 @@ namespace brae {
     // bootstraps to Euler exactly like pimpleFoam's first step (only one old level exists yet).
     void DeviceSimpleSolver::advanceTime(scalar deltaT)
     {
+        const bool bwd = (ddtScheme_ == DdtScheme::backward);
         for (int k = 0; k < 3; ++k)
         {
-            if (ddtScheme_ == DdtScheme::backward && Uold_[k].size())
-                deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (backward only, and only once t-1 exists)
-            deviceCopy(Uold_[k], Uk_[k]);          // t-1 <- current
+            if (bwd && Uold_[k].size()) deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (backward only, once t-1 exists)
+            deviceCopy(Uold_[k], Uk_[k]);                                  // t-1 <- current
+        }
+        if (ctl_.turbulent)   // turbulence old-time levels for fvm::ddt(k/eps): dk_ = k (or nuTilda), de_ = epsilon|omega
+        {
+            if (bwd && kOld_.size()) deviceCopy(kOld2_, kOld_);
+            deviceCopy(kOld_, dk_);
+            if (!ctl_.sa)   // SA is one-equation (no second scalar)
+            {
+                if (bwd && e2Old_.size()) deviceCopy(e2Old2_, e2Old_);
+                deviceCopy(e2Old_, de_);
+            }
         }
         deltaT0_ = deltaT_;
         deltaT_  = deltaT;
