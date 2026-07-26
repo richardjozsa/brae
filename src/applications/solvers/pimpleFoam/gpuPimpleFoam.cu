@@ -1,12 +1,15 @@
 // cf gpuPimpleFoam -- transient incompressible PIMPLE solver, single-GPU device-resident. Reads a standard OpenFOAM
-// case (controlDict / fvSolution / fvSchemes / transportProperties + start fields) and marches the transient loop on the
-// GPU via DeviceSimpleSolver::pimpleStep -- the SAME three composable phases as steady brae (momentum predictor /
-// pressure-velocity / turbulence), with the implicit fvm::ddt(U) folded into the predictor. Writes standard time dirs.
+// case (controlDict / fvSolution / fvSchemes / transportProperties / turbulenceProperties + start fields) and marches
+// the transient loop on the GPU via DeviceSimpleSolver::pimpleStep -- the SAME three composable phases as steady brae
+// (momentum predictor / pressure-velocity / turbulence), with the implicit fvm::ddt(U) folded into the predictor.
+// Writes standard OpenFOAM time directories.
 //
-// v1 scope: LAMINAR, Euler/backward ddt, the essential controlDict/fvSolution/PIMPLE controls. Deliberately reuses the
-// steady driver's field I/O (foam_field_reader/writer) + dict parsing (foam_dict). Follow-ups (lift from gpuSimpleFoam):
-// turbulence (ctl.turbulent + k/eps/omega fields), the full fvSchemes div/laplacian-scheme parse, fvOptions, MRF, phi
-// output + restart. Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae.
+// v1 scope: Euler/backward ddt, laminar OR RAS (kEpsilon/realizableKE/kOmegaSST/kOmegaSSTLM/SpalartAllmaras). Reuses the
+// steady driver's field I/O (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. NOTE: the
+// MOMENTUM ddt is fully implicit + OF-exact; the TURBULENCE transport currently runs quasi-steady per time step (no
+// fvm::ddt(k/eps/omega) yet -- that ddt wiring through the scalar-transport scaffold is the next step). Follow-ups: the
+// full fvSchemes div/laplacian-scheme parse (v1 uses brae defaults: upwind div), phi output + restart, fvOptions/MRF.
+// Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -14,6 +17,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
+#include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include <cctype>
@@ -32,7 +36,6 @@ using namespace brae;
 
 namespace {
 
-// OF-style time-directory name: an integer for whole times (deltaT=1), else %g (matches Foam::Time::timeName).
 std::string timeName(scalar t)
 {
     if (t == std::floor(t) && std::fabs((double)t) < 1e15)
@@ -42,8 +45,7 @@ std::string timeName(scalar t)
     return std::string(b);
 }
 
-// Parse fvSchemes ddtSchemes.default from raw text (fvSchemes holds multi-token scheme values + $-vars, so it is not a
-// plain key/value dict -- the steady driver text-parses it too). Returns the word after "default" inside ddtSchemes{}.
+// fvSchemes holds multi-token scheme values + $-vars (not a plain key/value dict), so text-parse ddtSchemes.default.
 DdtScheme parseDdtScheme(const std::string& fvSchemesPath)
 {
     std::ifstream f(fvSchemesPath);
@@ -54,15 +56,14 @@ DdtScheme parseDdtScheme(const std::string& fvSchemesPath)
         throw std::runtime_error("fvSchemes has no ddtSchemes block (transient pimpleFoam needs Euler|backward).");
     std::size_t d = text.find("default", blk);
     if (d == std::string::npos) throw std::runtime_error("fvSchemes ddtSchemes has no 'default' entry.");
-    d += 7;                                                        // skip "default"
+    d += 7;
     while (d < text.size() && std::isspace((unsigned char)text[d])) ++d;
     std::string w;
     while (d < text.size() && !std::isspace((unsigned char)text[d]) && text[d] != ';') w += text[d++];
     if (w == "steadyState")
-        throw std::runtime_error("fvSchemes ddtSchemes.default = steadyState -> use the steady solver 'brae'. "
-                                 "pimpleFoam needs Euler or backward.");
-    if (w == "backward")                          return DdtScheme::backward;
-    if (w == "Euler" || w == "bounded")           return DdtScheme::Euler;   // "bounded Euler" -> Euler (bounding is a no-op here)
+        throw std::runtime_error("fvSchemes ddtSchemes.default = steadyState -> use the steady solver 'brae'.");
+    if (w == "backward")                return DdtScheme::backward;
+    if (w == "Euler" || w == "bounded") return DdtScheme::Euler;
     throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|steadyState).");
 }
 
@@ -86,7 +87,7 @@ try
     const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);
     const int    purgeWrite    = std::max(0, controlDict.intOr("purgeWrite", 0));
     const int    precision     = controlDict.intOr("writePrecision", 16);
-    if (deltaT <= 0)      throw std::runtime_error("controlDict deltaT must be > 0.");
+    if (deltaT <= 0)          throw std::runtime_error("controlDict deltaT must be > 0.");
     if (endTime <= startTime) throw std::runtime_error("controlDict endTime must be > startTime.");
 
     // ---- PIMPLE + solver controls (fvSolution) ----
@@ -99,13 +100,60 @@ try
     const FoamDict* rfFl = rf ? rf->subDict("fields") : nullptr;
     const scalar relaxU  = rfEq ? rfEq->scalarOr("U", 1.0) : 1.0;   // transient default: no relaxation
     const scalar relaxP  = rfFl ? rfFl->scalarOr("p", 1.0) : 1.0;
+    const scalar relaxK  = rfEq ? rfEq->scalarOr("k", 1.0) : 1.0;
     const FoamDict* solvers = fvSolution.subDict("solvers");
     auto solveTol = [&](const char* f, scalar dflt) {
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         return s ? s->scalarOr("tolerance", dflt) : dflt;
     };
-    const scalar tolU = solveTol("U", 1e-7), tolP = solveTol("p", 1e-7);
     const scalar nu = transport.scalarOr("nu", 1e-5);
+
+    DeviceSimpleControls ctl;
+    ctl.nu = nu; ctl.relaxU = relaxU; ctl.relaxP = relaxP; ctl.relaxK = relaxK; ctl.relaxEps = relaxK;
+    ctl.tolU = solveTol("U", 1e-7); ctl.tolP = solveTol("p", 1e-7); ctl.tolKE = solveTol("k", 1e-8);
+    ctl.nNonOrth = nNonOrth;
+
+    // ---- turbulence model (constant/turbulenceProperties). Absent -> laminar. ----
+    std::string secondName = "epsilon";
+    if (std::filesystem::exists(caseDir + "/constant/turbulenceProperties"))
+    {
+        const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
+        const std::string simType = turbProps.wordOr("simulationType", "laminar");
+        if (simType != "RAS" && simType != "laminar")
+            throw std::runtime_error("pimpleFoam: unsupported simulationType '" + simType + "' (RAS or laminar).");
+        ctl.turbulent = (simType == "RAS");
+        if (ctl.turbulent)
+        {
+            const FoamDict* ras = turbProps.subDict("RAS");
+            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            ctl.lm  = (model == "kOmegaSSTLM");
+            ctl.sst = (model == "kOmegaSST") || ctl.lm;
+            ctl.sa  = (model == "SpalartAllmaras");
+            const bool rke = (model == "realizableKE");
+            if (model != "kEpsilon" && !rke && !ctl.sst && !ctl.sa)
+                throw std::runtime_error("pimpleFoam: unsupported RASModel '" + model
+                    + "' (kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras).");
+            secondName = ctl.sst ? "omega" : "epsilon";
+            if (ctl.sst)
+                readKOmegaSSTCoeffs(ras, ctl.ksstCoeffs);
+            else if (!ctl.sa)
+            {
+                KEpsilonCoeffs& c = ctl.keCoeffs;
+                if (rke) { c.realizable = true; c.A0 = 4.0; c.C2 = 1.9; c.sigmaK = 1.0; c.sigmaEps = 1.2;
+                    if (const FoamDict* rkc = ras ? ras->subDict("realizableKECoeffs") : nullptr) {
+                        c.A0 = rkc->scalarOr("A0", c.A0); c.C2 = rkc->scalarOr("C2", c.C2);
+                        c.sigmaK = rkc->scalarOr("sigmak", c.sigmaK); c.sigmaEps = rkc->scalarOr("sigmaEps", c.sigmaEps);
+                        c.kappa = rkc->scalarOr("kappa", c.kappa); c.E = rkc->scalarOr("E", c.E);
+                    }
+                } else if (const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr) {
+                    c.Cmu = kec->scalarOr("Cmu", c.Cmu); c.C1 = kec->scalarOr("C1", c.C1);
+                    c.C2 = kec->scalarOr("C2", c.C2); c.C3 = kec->scalarOr("C3", c.C3);
+                    c.sigmaK = kec->scalarOr("sigmak", c.sigmaK); c.sigmaEps = kec->scalarOr("sigmaEps", c.sigmaEps);
+                    c.kappa = kec->scalarOr("kappa", c.kappa); c.E = kec->scalarOr("E", c.E);
+                }
+            }
+        }
+    }
 
     // ---- mesh + start fields ----
     PrimitiveMesh m; m.read(caseDir + "/constant/polyMesh");
@@ -113,23 +161,51 @@ try
     const std::vector<FvPatch> fvp = buildPatches(m, g);
     const label nC = m.nCells();
     const std::string fieldDir = caseDir + "/" + timeName(startTime);
-    const FieldData<vector> Ufd = readField<vector>(fieldDir + "/U");
-    const FieldData<scalar> pfd = readField<scalar>(fieldDir + "/p");
-    GeometricField<vector> U = buildField<vector>(Ufd, fvp, nC); U.evaluateBoundary();
-    GeometricField<scalar> p = buildField<scalar>(pfd, fvp, nC); p.evaluateBoundary();
+    GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
+    GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC); p.evaluateBoundary();
     SurfaceScalarField phi = fvc::flux(U, m, g, fvp);
 
-    DeviceSimpleControls ctl;
-    ctl.nu = nu; ctl.relaxU = relaxU; ctl.relaxP = relaxP;
-    ctl.tolU = tolU; ctl.tolP = tolP; ctl.nNonOrth = nNonOrth;
-    ctl.turbulent = false;                                          // v1: laminar
-    DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl);
+    // nut wall-function type from the 0/nut wall BC (OF picks per-BC, not by model): Spalding/Blended/atm else nutk.
+    auto patchGeoType = [&](const std::string& nm) -> std::string {
+        for (const auto& q : fvp) if (q.name == nm) return q.type;
+        return "";
+    };
+    auto setNutWall = [&](const FieldData<scalar>& fd) {
+        for (const auto& pb : fd.boundary) {
+            const std::string gt = patchGeoType(pb.name);
+            if (!gt.empty() && gt != "wall") continue;
+            if (pb.type == "nutUSpaldingWallFunction")       ctl.nutWall = NutWall::Spalding;
+            else if (pb.type == "nutUBlendedWallFunction")   ctl.nutWall = NutWall::Blended;
+            else if (pb.type == "atmNutkWallFunction")     { ctl.atmZ0 = pb.ablZ0; ctl.atmBoundNut = pb.atmBoundNut; }
+        }
+    };
+    GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;
+    if (ctl.sa) {                                                   // one-equation: nuTilda -> the "k" slot
+        k = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC); k.evaluateBoundary();
+        nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, nC);   nut.evaluateBoundary();
+    } else if (ctl.turbulent) {
+        k   = buildField<scalar>(readField<scalar>(fieldDir + "/k"), fvp, nC);            k.evaluateBoundary();
+        eps = buildField<scalar>(readField<scalar>(fieldDir + "/" + secondName), fvp, nC); eps.evaluateBoundary();
+        const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+        setNutWall(nutFD);
+        nut = buildField<scalar>(nutFD, fvp, nC); nut.evaluateBoundary();
+        if (ctl.lm) {
+            ReThetat = buildField<scalar>(readField<scalar>(fieldDir + "/ReThetat"), fvp, nC); ReThetat.evaluateBoundary();
+            gammaInt = buildField<scalar>(readField<scalar>(fieldDir + "/gammaInt"), fvp, nC); gammaInt.evaluateBoundary();
+        }
+    }
+
+    DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
+                              ctl.turbulent ? &k : nullptr, (ctl.turbulent && !ctl.sa) ? &eps : nullptr,
+                              ctl.turbulent ? &nut : nullptr, ctl.lm ? &ReThetat : nullptr, ctl.lm ? &gammaInt : nullptr);
     solver.setDdtScheme(ddtScheme);
 
-    std::printf("gpuPimpleFoam (laminar): deltaT=%g endTime=%g ddt=%s nOuterCorrectors=%d nCorrectors=%d "
-                "nNonOrth=%d nCells=%d\n\n",
+    std::printf("gpuPimpleFoam: deltaT=%g endTime=%g ddt=%s nOuterCorrectors=%d nCorrectors=%d nNonOrth=%d nu=%g "
+                "turbulence=%s nCells=%d\n\n",
                 (double)deltaT, (double)endTime, ddtScheme == DdtScheme::backward ? "backward" : "Euler",
-                nOuter, nCorr, nNonOrth, nC);
+                nOuter, nCorr, nNonOrth, (double)nu,
+                !ctl.turbulent ? "laminar" : ctl.sa ? "SpalartAllmaras" : ctl.sst ? (ctl.lm ? "kOmegaSSTLM" : "kOmegaSST") : "kEpsilon",
+                nC);
 
     // ---- write cadence (Foam::Time: writeControl timeStep|runTime + writeInterval + purgeWrite FIFO) ----
     long writeTimeIndex = 0;
@@ -153,7 +229,19 @@ try
                 std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
         writeVolField(fieldDir + "/U", outDir + "/U", solver.U(), fvp, precision);
         writeVolField(fieldDir + "/p", outDir + "/p", solver.p(), fvp, precision);
-        std::printf("written %s/{U,p}\n", outDir.c_str());
+        if (ctl.sa) {
+            writeVolField(fieldDir + "/nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
+            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
+        } else if (ctl.turbulent) {
+            writeVolField(fieldDir + "/k",          outDir + "/k",          solver.k(),   fvp, precision);
+            writeVolField(fieldDir + "/" + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision);
+            writeVolField(fieldDir + "/nut",        outDir + "/nut",        solver.nut(), fvp, precision);
+            if (ctl.lm) {
+                writeVolField(fieldDir + "/ReThetat", outDir + "/ReThetat", solver.ReThetat(), fvp, precision);
+                writeVolField(fieldDir + "/gammaInt", outDir + "/gammaInt", solver.gammaInt(), fvp, precision);
+            }
+        }
+        std::printf("written %s\n", outDir.c_str());
         if (purgeWrite > 0) {
             if (writtenTimes.empty() || writtenTimes.back() != tname) writtenTimes.push_back(tname);
             while ((int)writtenTimes.size() > purgeWrite) {
@@ -165,7 +253,7 @@ try
     };
 
     // ---- transient time loop ----
-    const scalar tEnd = endTime + 0.5 * deltaT;                     // include endTime against FP drift
+    const scalar tEnd = endTime + 0.5 * deltaT;
     long timeIndex = 0;
     std::string lastWritten;
     for (scalar t = startTime + deltaT; t <= tEnd; t += deltaT) {
@@ -176,14 +264,11 @@ try
                     tn.c_str(), r.Ux, r.Uy, r.Uz, r.p, r.contLocal, r.contGlobal);
         if (!std::getenv("BRAE_ALLOW_NONFINITE")
             && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
-            throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn
-                + ". Reduce deltaT (CFL), or check the case. No field written past here.");
+            throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
         if (isWriteTime(timeIndex, t)) { writeTimeDir(tn); lastWritten = tn; }
     }
-    // Always write the final state (OF writes endTime even if writeInterval did not land on it).
     {
-        scalar tLast = startTime + deltaT * (scalar)timeIndex;
-        const std::string tn = timeName(tLast);
+        const std::string tn = timeName(startTime + deltaT * (scalar)timeIndex);
         if (tn != lastWritten) writeTimeDir(tn);
     }
     return 0;
