@@ -80,6 +80,7 @@ add_library(brae_core STATIC
     src/cuda/reductions.cu
     src/cuda/device_spmv.cu
     src/cuda/device_pcg.cu
+    src/cuda/device_pcg_distributed.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
     src/cuda/device_simple.cu
@@ -88,6 +89,7 @@ add_library(brae_core STATIC
     src/cuda/device_boundary_flow.cu
     src/cuda/device_divdevreff.cu
     src/cuda/device_kepsilon.cu
+    src/cuda/device_spalart.cu
     src/cuda/device_komega_sst.cu
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
