@@ -18,6 +18,7 @@
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
 #include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
+#include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
@@ -126,37 +127,8 @@ try
         if (simType != "RAS" && simType != "laminar")
             throw std::runtime_error("pimpleFoam: unsupported simulationType '" + simType + "' (RAS or laminar).");
         ctl.turbulent = (simType == "RAS");
-        if (ctl.turbulent)
-        {
-            const FoamDict* ras = turbProps.subDict("RAS");
-            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            ctl.lm  = (model == "kOmegaSSTLM");
-            ctl.sst = (model == "kOmegaSST") || ctl.lm;
-            ctl.sa  = (model == "SpalartAllmaras");
-            const bool rke = (model == "realizableKE");
-            if (model != "kEpsilon" && !rke && !ctl.sst && !ctl.sa)
-                throw std::runtime_error("pimpleFoam: unsupported RASModel '" + model
-                    + "' (kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras).");
-            secondName = ctl.sst ? "omega" : "epsilon";
-            if (ctl.sst)
-                readKOmegaSSTCoeffs(ras, ctl.ksstCoeffs);
-            else if (!ctl.sa)
-            {
-                KEpsilonCoeffs& c = ctl.keCoeffs;
-                if (rke) { c.realizable = true; c.A0 = 4.0; c.C2 = 1.9; c.sigmaK = 1.0; c.sigmaEps = 1.2;
-                    if (const FoamDict* rkc = ras ? ras->subDict("realizableKECoeffs") : nullptr) {
-                        c.A0 = rkc->scalarOr("A0", c.A0); c.C2 = rkc->scalarOr("C2", c.C2);
-                        c.sigmaK = rkc->scalarOr("sigmak", c.sigmaK); c.sigmaEps = rkc->scalarOr("sigmaEps", c.sigmaEps);
-                        c.kappa = rkc->scalarOr("kappa", c.kappa); c.E = rkc->scalarOr("E", c.E);
-                    }
-                } else if (const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr) {
-                    c.Cmu = kec->scalarOr("Cmu", c.Cmu); c.C1 = kec->scalarOr("C1", c.C1);
-                    c.C2 = kec->scalarOr("C2", c.C2); c.C3 = kec->scalarOr("C3", c.C3);
-                    c.sigmaK = kec->scalarOr("sigmak", c.sigmaK); c.sigmaEps = kec->scalarOr("sigmaEps", c.sigmaEps);
-                    c.kappa = kec->scalarOr("kappa", c.kappa); c.E = kec->scalarOr("E", c.E);
-                }
-            }
-        }
+        readTurbulenceModel(turbProps, ctl);
+        secondName = ctl.sst ? "omega" : "epsilon";
     }
 
     // ---- mesh + start fields ----
@@ -169,39 +141,11 @@ try
     GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC); p.evaluateBoundary();
     SurfaceScalarField phi = fvc::flux(U, m, g, fvp);
 
-    // nut wall-function type from the 0/nut wall BC (OF picks per-BC, not by model): Spalding/Blended/atm else nutk.
-    auto patchGeoType = [&](const std::string& nm) -> std::string {
-        for (const auto& q : fvp) if (q.name == nm) return q.type;
-        return "";
-    };
-    auto setNutWall = [&](const FieldData<scalar>& fd) {
-        for (const auto& pb : fd.boundary) {
-            const std::string gt = patchGeoType(pb.name);
-            if (!gt.empty() && gt != "wall") continue;
-            if (pb.type == "nutUSpaldingWallFunction")       ctl.nutWall = NutWall::Spalding;
-            else if (pb.type == "nutUBlendedWallFunction")   ctl.nutWall = NutWall::Blended;
-            else if (pb.type == "atmNutkWallFunction")     { ctl.atmZ0 = pb.ablZ0; ctl.atmBoundNut = pb.atmBoundNut; }
-        }
-    };
-    GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;
-    if (ctl.sa) {                                                   // one-equation: nuTilda -> the "k" slot
-        k = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC); k.evaluateBoundary();
-        nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, nC);   nut.evaluateBoundary();
-    } else if (ctl.turbulent) {
-        k   = buildField<scalar>(readField<scalar>(fieldDir + "/k"), fvp, nC);            k.evaluateBoundary();
-        eps = buildField<scalar>(readField<scalar>(fieldDir + "/" + secondName), fvp, nC); eps.evaluateBoundary();
-        const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
-        setNutWall(nutFD);
-        nut = buildField<scalar>(nutFD, fvp, nC); nut.evaluateBoundary();
-        if (ctl.lm) {
-            ReThetat = buildField<scalar>(readField<scalar>(fieldDir + "/ReThetat"), fvp, nC); ReThetat.evaluateBoundary();
-            gammaInt = buildField<scalar>(readField<scalar>(fieldDir + "/gammaInt"), fvp, nC); gammaInt.evaluateBoundary();
-        }
-    }
+    TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
 
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
-                              ctl.turbulent ? &k : nullptr, (ctl.turbulent && !ctl.sa) ? &eps : nullptr,
-                              ctl.turbulent ? &nut : nullptr, ctl.lm ? &ReThetat : nullptr, ctl.lm ? &gammaInt : nullptr);
+                              ctl.turbulent ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa) ? &tf.eps : nullptr,
+                              ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
     solver.setDdtScheme(ddtScheme);
 
     std::printf("gpuPimpleFoam: deltaT=%g endTime=%g ddt=%s nOuterCorrectors=%d nCorrectors=%d nNonOrth=%d nu=%g "
