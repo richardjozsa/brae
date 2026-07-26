@@ -1,0 +1,73 @@
+#pragma once
+// SIMPLE solver configuration + per-step residual report -- the PODs that parameterise DeviceSimpleSolver.
+// Split out of device_simple_foam.cuh so the solver interface, PIMPLE, rhoSimple etc. can share the controls
+// without pulling in the full solver implementation. Pure data (+ the model-coeff PODs); no device code.
+#include "cf_types.cuh"
+#include "kepsilon_coeffs.cuh"
+#include "komega_sst_coeffs.cuh"
+#include "spalart_coeffs.cuh"
+#include <string>
+
+namespace brae {
+
+// Which nut wall function to apply, chosen from the 0/nut boundaryField TYPE (matching OpenFOAM),
+// NOT from the turbulence model. nutk = k-based stepwise log law (nutkWallFunction); Spalding =
+// velocity-based Spalding blend (nutUSpaldingWallFunction); Blended = velocity-based binomial n=4
+// blend (nutUBlendedWallFunction). All three are honoured on any RAS model, exactly as OF does.
+enum class NutWall { Nutk, Spalding, Blended };
+
+struct DeviceSimpleControls
+{
+    scalar nu = 1e-5, relaxU = 0.7, relaxP = 0.3, relaxK = 0.7, relaxEps = 0.7;
+    vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
+    scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
+    scalar relTolU = 0.0, relTolP = 0.0, relTolKE = 0.0;   // solver relTol (fvSolution solvers.{U,p,k,epsilon}.relTol). 0 = abs tol.
+    int    bicgCheckEvery = 1;      // batched convergence for ALL BiCGStab solves (momentum + k/eps); BRAE_BICG_CHECK_EVERY.
+    bool   turbulent = false;
+    bool   useGraph  = true;     // replay the pressure V-cycle from a cached CUDA graph (#7c-loop)
+    bool   bounded   = false;    // "bounded Gauss upwind": add -Sp(div(phi),U). Set from fvSchemes; default off.
+    bool   consistent = false;   // SIMPLEC (rAtU consistency correction, p=1). Set from fvSolution SIMPLE.consistent.
+    bool   linearUpwind = false; // div(phi,U) "linearUpwind": add the deferred gradient correction. Set from fvSchemes.
+    bool   linearUpwindV = false;// div(phi,U) "linearUpwindV": linearUpwind + OF's vector direction limiter (also sets linearUpwind).
+    bool   lust = false;         // div(phi,U) "LUST": deferred correction = 0.75*linear + 0.25*linearUpwind (OF LUST.H).
+    bool   nonOrth = false;      // laplacian "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction. Set from fvSchemes.
+    scalar nonOrthLimit = 1.0;   // snGrad "limited <psi>" coeff (OF fv::limitedSnGrad); 1.0 = "corrected" (unlimited). Set from fvSchemes.
+    int    nNonOrth = 0;         // SIMPLE.nNonOrthogonalCorrectors: extra pressure-correction passes (pEqn re-solved nNonOrth+1 times). Set from fvSolution.
+    scalar gradULimitK = 0.0;    // grad(U) "cellLimited Gauss linear <k>" coeff (OF cellLimitedGrad<minmod>); 0 = unlimited. Set from fvSchemes.
+    bool   limitedK = false, limitedEps = false;  // div(phi,k|epsilon) "limitedLinear": implicit limited weight. Set from fvSchemes.
+    bool   luK = false, luEps = false;             // div(phi,k|epsilon|nuTilda) "linearUpwind": deferred gradient correction. Set from fvSchemes.
+    bool   gsK = false, gsEps = false;             // scalar linear solver = smoothSolver+symGaussSeidel (read from fvSolution solvers.{k|nuTilda} / {epsilon|omega}).
+    bool   gsU = false;                            // momentum linear solver = smoothSolver+(sym)GaussSeidel (read from fvSolution solvers.U).
+    scalar twoBykK = 2.0, twoBykEps = 2.0;         // 2/max(k_,SMALL) from the limitedLinear coefficient (k_=1 -> 2).
+    KEpsilonCoeffs keCoeffs;                       // k-eps model coeffs (default = OF); read from turbulenceProperties RAS.kEpsilonCoeffs.
+    bool   sst = false;                            // RASModel kOmegaSST (the "second turbulence scalar" eps slot holds omega).
+    bool   lm = false;                             // RASModel kOmegaSSTLM (sst + Langtry-Menter gamma-ReThetat transition).
+    KOmegaSSTCoeffs ksstCoeffs;                    // kOmegaSST coeffs (default = OF); read from RAS.kOmegaSSTCoeffs.
+    bool   sa = false;                             // RASModel SpalartAllmaras (one-equation: the "k" slot holds nuTilda; no 2nd scalar).
+    SpalartAllmarasCoeffs saCoeffs;                // SA coeffs (default = OF) + nutUSpaldingWallFunction E/kappa.
+    NutWall nutWall = NutWall::Nutk;               // nut wall function, read from the 0/nut wall BC TYPE (not the model),
+                                                   // so nutUBlended/nutUSpalding are honoured on kEpsilon/kOmegaSST like OF.
+    scalar atmZ0 = 0.0;                            // atmNutkWallFunction roughness length z0 (>0 -> rough-wall nut on the
+    bool   atmBoundNut = true;                     // k-based path); read from the 0/nut wall BC. 0 -> smooth nutkWallFunction.
+    bool   needRef = false;                        // no fixedValue-p patch -> singular pressure: adjustPhi + setReference.
+    label  pRefCell = 0;
+    scalar pRefValue = 0.0;                        // pressure reference (fvSolution SIMPLE.pRefCell/pRefValue).
+    int    pcgCheckEvery = 1;      // pressure AMG-PCG residual-read cadence (BRAE_PCG_CHECK_EVERY). 1 = exact per-iter
+                                   // (bit-identical); K>1 cuts (K-1)/K of the PCG host syncs (overshoots conv by <K).
+    bool   corrScaling = false;    // AMG coarse-correction scaling + flexible CG (BRAE_CORR_SCALING). Cuts AMG cycles
+                                   // ~2x at scale (graded meshes); nonlinear precond -> not bit-identical to off.
+    std::string caseDir = ".";     // case directory, for the AMG hierarchy cache (constant/polyMesh/.brae_amgcache).
+    bool   writeCache = false;     // write the mesh + AMG caches this run (set by -partition or BRAE_MESH_CACHE).
+};
+
+// OF-style per-field solve report for one SIMPLE step (matches OpenFOAM's "Solving for Ux/Uy/Uz/p" + continuity block).
+struct DeviceSimpleResidual
+{
+    scalar Ux = 0, Uy = 0, Uz = 0, p = 0, pFinal = 0;
+    scalar UxFinal = 0, UyFinal = 0, UzFinal = 0;
+    int UxIters = 0, UyIters = 0, UzIters = 0;     // U per-component final + nIter
+    int pIters = 0;
+    scalar contLocal = 0, contGlobal = 0;          // time step continuity errors, raw (driver applies deltaT + cumulative)
+};
+
+} // namespace brae

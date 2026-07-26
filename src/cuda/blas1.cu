@@ -1,6 +1,6 @@
-// cf GPU offload (G0): BLAS-1 device kernels. Block-reduction dot (shared memory + atomicAdd to a device
-// accumulator); the reduction order differs from the CPU sequential sum, so the result matches to
-// machine precision (FP non-associativity), not bit-for-bit, the validation criterion for reductions.
+// cf GPU offload -- BLAS-1 ELEMENTWISE ops: axpy/scale/copy/jacobi/hadamard, the device-resident-scalar variants
+// (coefficient by pointer, no host sync), the single-thread scalar-recurrence ops, and the FUSED multi-term Krylov
+// updates (one pass, bit-identical FP sequence). Split from device_blas.cu (reductions in reductions.cu).
 #include "device_blas.cuh"
 #include <cuda_runtime.h>
 
@@ -9,19 +9,6 @@ namespace brae {
 namespace {
 constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
-
-// Persistent reduction scratch (one-time alloc, process-lifetime): a device accumulator + a PINNED host mirror.
-// Removes the per-reduction cudaMalloc/cudaFree + H2D-zero-init that dominated the device SIMPLE-loop wall; the
-// zero-init is now a cheap async memset on the per-thread stream and the result D2H uses pinned memory. Single
-// solve at a time (cf is one host thread per solve), so a function-local static accumulator is safe.
-scalar* g_redDev = nullptr;       // device accumulator (1 scalar)
-scalar* g_redPinned = nullptr;    // pinned host mirror (1 scalar)
-scalar* g_readPinned = nullptr;   // pinned host mirror for deviceReadScalar (separate so it never clobbers g_redPinned)
-inline void ensureRedScratch()
-{
-    if (!g_redDev)    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&g_redDev), sizeof(scalar)), "red dev alloc");
-    if (!g_redPinned) cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&g_redPinned), sizeof(scalar)), "red pinned alloc");
-}
 
 
 __global__
@@ -37,40 +24,6 @@ void scaleKernel(scalar a, scalar* __restrict__ x, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= a;
-}
-
-
-__global__
-void dotKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scalar* result, int n)
-{
-    __shared__ scalar sdata[TPB];
-    const int tid = threadIdx.x;
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    sdata[tid] = (i < n) ? x[i] * y[i] : 0.0;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
-    {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) atomicAdd(result, sdata[0]);
-}
-
-
-__global__
-void sumMagKernel(const scalar* __restrict__ x, scalar* result, int n)
-{
-    __shared__ scalar sdata[TPB];
-    const int tid = threadIdx.x;
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    sdata[tid] = (i < n) ? fabs(x[i]) : 0.0;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
-    {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) atomicAdd(result, sdata[0]);
 }
 
 
@@ -205,7 +158,6 @@ void fusedScaleAxpyK(scalar* __restrict__ p, const scalar* __restrict__ b, const
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) p[i] = __dmul_rn(*b, p[i]) + w[i];   // b*p (scale) + w (axpy)
 }
-
 } // namespace
 
 
@@ -222,18 +174,6 @@ void deviceScale(DeviceBuffer<scalar>& x, scalar a)
     const int n = static_cast<int>(x.size());
     scaleKernel<<<nBlocks(n), TPB>>>(a, x.data(), n);
     cudaCheck(cudaGetLastError(), "scale");
-}
-
-
-scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
-{
-    const int n = static_cast<int>(x.size());
-    ensureRedScratch();
-    cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "dot zero");
-    dotKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), g_redDev, n);
-    cudaCheck(cudaGetLastError(), "dot");
-    cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "dot result");
-    return *g_redPinned;
 }
 
 
@@ -254,18 +194,6 @@ void deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const 
     z.resize(n);
     jacobiKernel<<<nBlocks(n), TPB>>>(r.data(), diag, z.data(), n);
     cudaCheck(cudaGetLastError(), "jacobi");
-}
-
-
-scalar deviceSumMag(const DeviceBuffer<scalar>& x)
-{
-    const int n = static_cast<int>(x.size());
-    ensureRedScratch();
-    cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "summag zero");
-    sumMagKernel<<<nBlocks(n), TPB>>>(x.data(), g_redDev, n);
-    cudaCheck(cudaGetLastError(), "summag");
-    cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "summag result");
-    return *g_redPinned;
 }
 
 
@@ -317,25 +245,6 @@ void deviceFusedScaleAxpy(DeviceBuffer<scalar>& p, const scalar* b, const Device
 }
 
 
-// device-resident scalar plumbing (no host sync)
-void deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar* dResult)
-{
-    const int n = static_cast<int>(x.size());
-    cudaCheck(cudaMemsetAsync(dResult, 0, sizeof(scalar), cudaStreamPerThread), "dotInto zero");
-    dotKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), dResult, n);
-    cudaCheck(cudaGetLastError(), "dotInto");
-}
-
-
-void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
-{
-    const int n = static_cast<int>(x.size());
-    cudaCheck(cudaMemsetAsync(dResult, 0, sizeof(scalar), cudaStreamPerThread), "summagInto zero");
-    sumMagKernel<<<nBlocks(n), TPB>>>(x.data(), dResult, n);
-    cudaCheck(cudaGetLastError(), "summagInto");
-}
-
-
 void deviceAxpyDev(const scalar* dA, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
@@ -384,15 +293,6 @@ void deviceScalarAdd2(const scalar* a, const scalar* b, scalar c, scalar* out)
 {
     scalarAdd2K<<<1, 1>>>(a, b, c, out);
     cudaCheck(cudaGetLastError(), "scalarAdd2");
-}
-
-
-scalar deviceReadScalar(const scalar* dSrc)
-{
-    ensureRedScratch();
-    if (!g_readPinned) cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&g_readPinned), sizeof(scalar)), "read pinned alloc");
-    cudaCheck(cudaMemcpy(g_readPinned, dSrc, sizeof(scalar), cudaMemcpyDeviceToHost), "readScalar");
-    return *g_readPinned;
 }
 
 } // namespace brae
