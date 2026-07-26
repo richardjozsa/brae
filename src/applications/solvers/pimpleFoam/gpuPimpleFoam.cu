@@ -17,6 +17,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
+#include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
@@ -112,6 +113,9 @@ try
     ctl.nu = nu; ctl.relaxU = relaxU; ctl.relaxP = relaxP; ctl.relaxK = relaxK; ctl.relaxEps = relaxK;
     ctl.tolU = solveTol("U", 1e-7); ctl.tolP = solveTol("p", 1e-7); ctl.tolKE = solveTol("k", 1e-8);
     ctl.nNonOrth = nNonOrth;
+    // fvSchemes div/laplacian/grad scheme flags (2nd-order div(phi,U) linearUpwind, non-orth correction, limitedLinear
+    // turbulence scalars, ...). Same parse as steady brae -> the transient solve honours the case's schemes, not upwind.
+    parseFvSchemesControls(caseDir, ctl);
 
     // ---- turbulence model (constant/turbulenceProperties). Absent -> laminar. ----
     std::string secondName = "epsilon";
