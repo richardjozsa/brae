@@ -1144,6 +1144,14 @@ target_include_directories(test_gpu_driver PRIVATE ${BRAE_HEADER_DIRS} src/appli
 target_link_libraries(test_gpu_driver PRIVATE brae_core)
 add_test(NAME gpu_driver COMMAND test_gpu_driver ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
+# PIMPLE foundation: transient pimpleStep() steady-limit consistency vs step() + transient stability (skips if the
+# case fixture is absent, like ami_oracle -- validation/ is local-only on CI).
+add_executable(test_gpu_pimple tests/test_gpu_pimple.cu)
+target_include_directories(test_gpu_pimple PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
+target_link_libraries(test_gpu_pimple PRIVATE brae_core)
+add_test(NAME gpu_pimple COMMAND test_gpu_pimple ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(gpu_pimple PROPERTIES SKIP_RETURN_CODE 125)
+
 # GPU offload #7: thread-block clusters + DSM, foundational cluster reduction vs the global reduction.
 add_executable(test_gpu_cluster tests/test_gpu_cluster.cu)
 target_include_directories(test_gpu_cluster PRIVATE ${BRAE_HEADER_DIRS})
