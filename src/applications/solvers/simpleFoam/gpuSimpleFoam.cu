@@ -22,6 +22,7 @@
 #include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
+#include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
 #include "parallel_device_foam.cuh"   // brae ... -parallel: the distributed DEVICE path (one rank per GPU)
 
 #include <algorithm>
@@ -413,6 +414,11 @@ int main(int argc, char** argv)
             return 0;
         }
         if (mrfCfg.active) solver.setMRF(mrfZone, m, g, mrfCfg.nonRotatingPatches);
+
+        // codedFixedValue / codedMixed on U / p / turbulence scalars -> NVRTC device kernel per coded patch (compiled
+        // once; applied each SIMPLE iteration in the momentum predictor). Steady: the coded `t` stays 0 (position-based
+        // profiles); a codedFixedValue set here overrides its seed `value`. Fully device-resident.
+        setupCodedBCs(solver, fieldDir, fvp, ctl, secondName, "gpuSimpleFoam");
 
         // fvOptions (system/fvOptions or constant/fvOptions), if present (else an empty no-op list)
         // Read cellZones only when an fvOptions file exists (avoids touching cellZones on cases that have none,
