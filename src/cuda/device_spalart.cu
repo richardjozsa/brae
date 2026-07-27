@@ -155,7 +155,7 @@ void saDdesDTildaKernel(
 __global__
 void saIddesDTildaKernel(
     int nC, const scalar* __restrict__ y, const scalar* __restrict__ gradU,
-    const scalar* __restrict__ nt, scalar nu, const scalar* __restrict__ hmax,
+    const scalar* __restrict__ nt, scalar nu, const scalar* __restrict__ hmax, const scalar* __restrict__ hwn,
     SpalartAllmarasCoeffs co, scalar* __restrict__ dTilda)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -180,7 +180,7 @@ void saIddesDTildaKernel(
     const scalar fe1 = (alpha >= scalar(0)) ? scalar(2)*exp(scalar(-11.09)*alpha*alpha)
                                             : scalar(2)*exp(scalar(-9.0)*alpha*alpha);
     const scalar fe  = fmax(fe1 - scalar(1), scalar(0)) * fe2;
-    const scalar delta = fmin(fmax(co.Cw*y[c], co.Cw*hm), hm);         // IDDES delta (hwn omitted)
+    const scalar delta = fmin(fmax(fmax(co.Cw*y[c], co.Cw*hm), hwn[c]), hm);   // IDDES delta = min(max(max(Cw*y,Cw*hmax),hwn), hmax)
     const scalar lLES  = co.CDES * delta;
     dTilda[c] = fmax(fdTilde*(scalar(1) + fe)*y[c] + (scalar(1) - fdTilde)*lLES, scalar(1e-300));
 }
@@ -215,7 +215,8 @@ void deviceSpalartAllmarasCorrect(
     const ScalarDdt& ntDdt,
     bool des,
     bool iddes,
-    const DeviceBuffer<scalar>* hmax)
+    const DeviceBuffer<scalar>* hmax,
+    const DeviceBuffer<scalar>* hwn)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
@@ -227,8 +228,8 @@ void deviceSpalartAllmarasCorrect(
     if (des)
     {
         dTilda.resize(static_cast<std::size_t>(nC));
-        if (iddes && hmax)
-            saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax->data(), co, dTilda.data());
+        if (iddes && hmax && hwn)
+            saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax->data(), hwn->data(), co, dTilda.data());
         else
             saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), dm.V.data(), gradU.data(), nuTilda.data(), nu, co, dTilda.data());
     }
@@ -311,11 +312,11 @@ void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffe
 // Exported SA-IDDES length-scale wrapper: the improved (WMLES) dTilda from y, hmax (maxDeltaxyz), |gradU|, nuTilda
 // (a unit-test hook + a future distributed entry). Uses hmax (not cubeRootVol) for the IDDES delta.
 void deviceSAIDDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax,
-    const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
+    const DeviceBuffer<scalar>& hwn, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
     const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda)
 {
     dTilda.resize(nC);
-    saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax.data(), co, dTilda.data());
+    saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax.data(), hwn.data(), co, dTilda.data());
     cudaCheck(cudaGetLastError(), "deviceSAIDDESdTilda");
 }
 

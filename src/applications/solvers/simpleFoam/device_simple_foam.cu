@@ -185,8 +185,17 @@ namespace brae {
                     dbEps_ = buildDeviceBoundary(*eps, fvp, g);
                     de_.copyFrom(eps->internal);   // 2nd scalar (omega/eps); SA has none
                 }
-                if (ctl_.sst || ctl_.sa) y_.copyFrom(cellWallDist(m, g, fvp));   // wall distance (SST F1/F2/F3; SA dTilda)
-                if (ctl_.iddes) hmax_.copyFrom(cellMaxDeltaXYZ(m));   // SA-IDDES filter width (maxDeltaxyz), uploaded once at setup
+                if (ctl_.sst || ctl_.sa)
+                {
+                    std::vector<vector> wallOrigin;                              // nearest wall-face centre (IDDES wall-normal source)
+                    y_.copyFrom(cellWallDist(m, g, fvp, ctl_.iddes ? &wallOrigin : nullptr));   // wall distance (SST F1/F2/F3; SA dTilda)
+                    if (ctl_.iddes)   // IDDES filter widths (maxDeltaxyz + wall-normal spacing), uploaded once at setup
+                    {
+                        const std::vector<scalar> hmax = cellMaxDeltaXYZ(m);
+                        hmax_.copyFrom(hmax);
+                        hwn_.copyFrom(cellWallNormalSpacing(m, g, wallOrigin, hmax));
+                    }
+                }
                 if (ctl_.lm && ReThetat && gammaInt)   // kOmegaSSTLM transition fields
                 {
                     dbReThetat_ = buildDeviceBoundary(*ReThetat, fvp, g);
@@ -266,7 +275,7 @@ namespace brae {
                                              ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
-                                             ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
+                                             ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -276,7 +285,7 @@ namespace brae {
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
                                        static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
                                        ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
-                                       kDdt, sDdt, ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr);   // ddt(k)/ddt(omega) + kOmegaSSTDDES/IDDES DES limiter (no-op for RANS)
+                                       kDdt, sDdt, ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // ddt(k)/ddt(omega) + kOmegaSSTDDES/IDDES DES limiter (no-op for RANS)
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,

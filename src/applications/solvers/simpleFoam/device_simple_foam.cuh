@@ -179,7 +179,8 @@ private:
     DeviceBuffer<scalar> rotorFx_, rotorFy_, rotorFz_;
     AMGData amg_;
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_, dk_, de_, dnut_, y_;   // y_ = cell wall distance (SST/SA)
-    DeviceBuffer<scalar> hmax_;   // per-cell maxDeltaxyz (SA-IDDES filter width); built only when ctl_.iddes
+    DeviceBuffer<scalar> hmax_;   // per-cell maxDeltaxyz (IDDES filter width); built only when ctl_.iddes
+    DeviceBuffer<scalar> hwn_;    // per-cell wall-normal grid spacing (IDDES delta 3rd term); built only when ctl_.iddes
     // Transient (PIMPLE) state: ddt scheme + time steps + old-time velocity levels (U.oldTime()[.oldTime()]), rotated by
     // advanceTime(). steadyState + empty old-time buffers in the default steady SIMPLE path, where ddt is a no-op.
     DdtScheme ddtScheme_ = DdtScheme::steadyState;
