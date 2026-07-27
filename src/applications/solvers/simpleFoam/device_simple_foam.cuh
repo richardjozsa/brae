@@ -29,6 +29,7 @@
 #include "device_kepsilon.cuh"
 #include "device_komega_sst.cuh"   // deviceS2/deviceF2/deviceNutSST for the startup validate() correctNut
 #include "device_smagorinsky.cuh"  // deviceSmagorinskyNut for the pure-LES (algebraic sub-grid nut) path
+#include "device_coded_bc.cuh"     // NVRTC device-resident coded (runtime-compiled) boundary conditions
 #include "cell_wall_dist.cuh"
 #include "cell_max_delta.cuh"      // cellMaxDeltaXYZ -> hmax_ (SA-IDDES filter width, maxDeltaxyz)
 #include "device_mrf.cuh"
@@ -165,6 +166,13 @@ public:
     // Prime the CrankNicolson time state on restart: deltaT_=deltaT0 makes the FIRST advanceTime set deltaT0_=deltaT0
     // (so the first post-restart step is full CN, not the Euler bootstrap), and the ddt0 recurrence is already warm.
     void setCnRestart(scalar deltaT0) { deltaT_ = deltaT0; cnWarm_ = true; }
+
+    // NVRTC device-coded BC (codedFixedValue on U): compile `code` once into a device kernel over the patch's boundary
+    // faces [offset, offset+count) in the flat boundary order. Applied each step in solveMomentumPredictor (writes the
+    // patch's dbU_ refValue on the device). setTime feeds the current time to the snippet's `t`.
+    // target: 0=U (vector), 1=p, 2=k/nuTilda, 3=second (omega/epsilon) -- selects which field's boundary the kernel writes.
+    void addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target = 0);
+    void setTime(scalar t) { time_ = t; }
     std::vector<vector> Uddt0() const
     {
         const auto x = Uddt0_[0].host(), y = Uddt0_[1].host(), z = Uddt0_[2].host();
@@ -231,6 +239,11 @@ private:
     scalar    deltaT_ = 0, deltaT0_ = 0;
     scalar    ocCoeff_ = 1;         // CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>"); 0=Euler-like, 1=pure CN
     bool      cnWarm_  = false;     // CrankNicolson: the ddt0 recurrence has done its first (Euler-startup) update
+    // NVRTC device-coded BCs (codedFixedValue). bndCf* = flat boundary face centres (patch order, cyclic excluded).
+    struct SolverCodedBC { CodedBcKernel kernel; int offset = 0, count = 0; int target = 0; };   // target: 0=U 1=p 2=k 3=second
+    std::vector<SolverCodedBC> codedBCs_;
+    DeviceBuffer<scalar> bndCfX_, bndCfY_, bndCfZ_;
+    scalar    time_ = 0;            // current time, fed to the coded-BC snippet's `t`
     DeviceBuffer<scalar> Uold_[3], Uold2_[3];
     // Turbulence old-time levels for the URANS fvm::ddt(k/eps/omega/nuTilda): dk_ (k or nuTilda) + de_ (epsilon or omega).
     DeviceBuffer<scalar> kOld_, kOld2_, e2Old_, e2Old2_;

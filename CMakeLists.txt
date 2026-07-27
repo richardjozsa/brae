@@ -39,6 +39,10 @@ if(OpenMP_CXX_FOUND)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp")
 endif()
 
+# CUDAToolkit: the NVRTC runtime compiler (CUDA::nvrtc) + the driver API (CUDA::cuda_driver) for the device-resident
+# runtime-compiled boundary conditions (device_coded_bc.cu: nvrtc -> PTX -> cuModuleLoadData -> cuLaunchKernel).
+find_package(CUDAToolkit REQUIRED)
+
 # SCOTCH, cell-graph partitioner (the decomposePar-equivalent), matching OpenFOAM.
 find_path(SCOTCH_INCLUDE_DIR NAMES scotch.h PATH_SUFFIXES scotch REQUIRED)
 find_library(SCOTCH_LIBRARY NAMES scotch REQUIRED)
@@ -93,6 +97,7 @@ add_library(brae_core STATIC
     src/cuda/device_spalart.cu
     src/cuda/device_komega_sst.cu
     src/cuda/device_smagorinsky.cu
+    src/cuda/device_coded_bc.cu
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
@@ -111,7 +116,7 @@ add_library(brae_core STATIC
 target_include_directories(brae_core PUBLIC ${BRAE_HEADER_DIRS} ${MPI_CXX_INCLUDE_DIRS} ${SCOTCH_INCLUDE_DIR})
 # Link MPI libraries directly (not the imported target) so its CXX compile flags do not
 # reach nvcc, which would reject them.
-target_link_libraries(brae_core PUBLIC ${MPI_CXX_LIBRARIES} ${SCOTCH_LIBRARY} ${SCOTCH_ERR_LIBRARY} ZLIB::ZLIB)
+target_link_libraries(brae_core PUBLIC ${MPI_CXX_LIBRARIES} ${SCOTCH_LIBRARY} ${SCOTCH_ERR_LIBRARY} ZLIB::ZLIB CUDA::nvrtc CUDA::cuda_driver)
 # OpenMP runtime (libgomp) linked directly, like MPI above, the imported target's CXX compile flags would reach nvcc.
 if(OpenMP_CXX_FOUND)
     target_link_libraries(brae_core PUBLIC ${OpenMP_CXX_LIBRARIES})
@@ -570,6 +575,11 @@ add_executable(test_gpu_ddt_cn tests/test_gpu_ddt_cn.cu)
 target_include_directories(test_gpu_ddt_cn PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_ddt_cn PRIVATE brae_core)
 add_test(NAME gpu_ddt_cn COMMAND test_gpu_ddt_cn)
+
+add_executable(test_gpu_coded_bc tests/test_gpu_coded_bc.cu)
+target_include_directories(test_gpu_coded_bc PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_coded_bc PRIVATE brae_core)
+add_test(NAME gpu_coded_bc COMMAND test_gpu_coded_bc)
 
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
