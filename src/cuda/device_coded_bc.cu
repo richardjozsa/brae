@@ -155,4 +155,89 @@ void launchCodedScalarBc(
             "launchKernel");
 }
 
+// ---- codedMixed (Robin): the snippet sets `out` (refValue) AND `vf` (valueFraction, 1=fixedValue .. 0=zeroGradient) ----
+
+CodedBcKernel compileCodedMixedVectorBc(const std::string& name, const std::string& body)
+{
+    const std::string fn = "bc_" + name;
+    const std::string src = std::string(VEC3_PREAMBLE) +
+        "extern \"C\" __global__ void " + fn + "(\n"
+        "    int n, int offset,\n"
+        "    const double* CfX, const double* CfY, const double* CfZ, double t,\n"
+        "    const double* Ux, const double* Uy, const double* Uz, const int* faceCell,\n"
+        "    double* refX, double* refY, double* refZ, double* vfX, double* vfY, double* vfZ)\n"
+        "{\n"
+        "    int tid = blockIdx.x*blockDim.x + threadIdx.x;\n"
+        "    if (tid >= n) return;\n"
+        "    int g = offset + tid;\n"
+        "    const double fx = CfX[g], fy = CfY[g], fz = CfZ[g];\n"
+        "    const int ic = faceCell[g];\n"
+        "    const double cx = Ux[ic], cy = Uy[ic], cz = Uz[ic];\n"
+        "    (void)fx;(void)fy;(void)fz;(void)cx;(void)cy;(void)cz;(void)t;\n"
+        "    vec3 out; out.x = 0; out.y = 0; out.z = 0; double vf = 1;\n"
+        "    {\n" + body + "\n    }\n"
+        "    refX[g]=out.x; refY[g]=out.y; refZ[g]=out.z; vfX[g]=vf; vfY[g]=vf; vfZ[g]=vf;\n"
+        "}\n";
+    return compileSource(src, fn, name);
+}
+
+CodedBcKernel compileCodedMixedScalarBc(const std::string& name, const std::string& body)
+{
+    const std::string fn = "bc_" + name;
+    const std::string src = std::string(VEC3_PREAMBLE) +
+        "extern \"C\" __global__ void " + fn + "(\n"
+        "    int n, int offset,\n"
+        "    const double* CfX, const double* CfY, const double* CfZ, double t,\n"
+        "    const double* fld, const int* faceCell,\n"
+        "    double* ref, double* vfrac)\n"
+        "{\n"
+        "    int tid = blockIdx.x*blockDim.x + threadIdx.x;\n"
+        "    if (tid >= n) return;\n"
+        "    int g = offset + tid;\n"
+        "    const double fx = CfX[g], fy = CfY[g], fz = CfZ[g];\n"
+        "    const int ic = faceCell[g];\n"
+        "    const double cc = fld[ic];\n"
+        "    (void)fx;(void)fy;(void)fz;(void)cc;(void)t;\n"
+        "    double out = 0; double vf = 1;\n"
+        "    {\n" + body + "\n    }\n"
+        "    ref[g] = out; vfrac[g] = vf;\n"
+        "}\n";
+    return compileSource(src, fn, name);
+}
+
+void launchCodedMixedVectorBc(
+    const CodedBcKernel& k, int offset, int count, scalar t,
+    const DeviceBuffer<scalar>& CfX, const DeviceBuffer<scalar>& CfY, const DeviceBuffer<scalar>& CfZ,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<label>& faceCell,
+    DeviceBuffer<scalar>& refX, DeviceBuffer<scalar>& refY, DeviceBuffer<scalar>& refZ,
+    DeviceBuffer<scalar>& vfX, DeviceBuffer<scalar>& vfY, DeviceBuffer<scalar>& vfZ)
+{
+    if (!k.valid() || count <= 0) return;
+    int n = count, off = offset; scalar tt = t;
+    const scalar* cfx = CfX.data(); const scalar* cfy = CfY.data(); const scalar* cfz = CfZ.data();
+    const scalar* ux = Ux.data(); const scalar* uy = Uy.data(); const scalar* uz = Uz.data();
+    const label* fc = faceCell.data();
+    scalar* rx = refX.data(); scalar* ry = refY.data(); scalar* rz = refZ.data();
+    scalar* vx = vfX.data(); scalar* vy = vfY.data(); scalar* vz = vfZ.data();
+    void* args[] = { &n, &off, &cfx, &cfy, &cfz, &tt, &ux, &uy, &uz, &fc, &rx, &ry, &rz, &vx, &vy, &vz };
+    cuCheck(cuLaunchKernel(static_cast<CUfunction>(k.func), nBlocks(count),1,1, TPB,1,1, 0, CU_STREAM_PER_THREAD, args, nullptr), "launchKernel");
+}
+
+void launchCodedMixedScalarBc(
+    const CodedBcKernel& k, int offset, int count, scalar t,
+    const DeviceBuffer<scalar>& CfX, const DeviceBuffer<scalar>& CfY, const DeviceBuffer<scalar>& CfZ,
+    const DeviceBuffer<scalar>& fld, const DeviceBuffer<label>& faceCell,
+    DeviceBuffer<scalar>& ref, DeviceBuffer<scalar>& vfrac)
+{
+    if (!k.valid() || count <= 0) return;
+    int n = count, off = offset; scalar tt = t;
+    const scalar* cfx = CfX.data(); const scalar* cfy = CfY.data(); const scalar* cfz = CfZ.data();
+    const scalar* f = fld.data();
+    const label* fc = faceCell.data();
+    scalar* r = ref.data(); scalar* v = vfrac.data();
+    void* args[] = { &n, &off, &cfx, &cfy, &cfz, &tt, &f, &fc, &r, &v };
+    cuCheck(cuLaunchKernel(static_cast<CUfunction>(k.func), nBlocks(count),1,1, TPB,1,1, 0, CU_STREAM_PER_THREAD, args, nullptr), "launchKernel");
+}
+
 } // namespace brae

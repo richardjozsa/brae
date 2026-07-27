@@ -229,14 +229,16 @@ namespace brae {
         validateTurbulence();                                    // OF turbulenceModel ctor bound() + simpleFoam.C:92 validate()
     }
 
-    void DeviceSimpleSolver::addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target)
+    void DeviceSimpleSolver::addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target, bool mixed)
     {
         SolverCodedBC cbc;
-        cbc.kernel = (target == 0) ? compileCodedVectorBc(name, code)    // U -> vec3 out
-                                   : compileCodedScalarBc(name, code);   // p/k/second -> scalar out
+        const bool vec = (target == 0);   // U is vector; p/k/second are scalar
+        cbc.kernel = mixed ? (vec ? compileCodedMixedVectorBc(name, code) : compileCodedMixedScalarBc(name, code))
+                           : (vec ? compileCodedVectorBc(name, code)      : compileCodedScalarBc(name, code));
         cbc.offset = offset;
         cbc.count  = count;
         cbc.target = target;
+        cbc.mixed  = mixed;
         codedBCs_.push_back(std::move(cbc));
     }
 
@@ -374,15 +376,26 @@ namespace brae {
         for (const SolverCodedBC& cbc : codedBCs_)
         {
             if (cbc.target == 0)         // U (vector)
-                launchCodedVectorBc(cbc.kernel, cbc.offset, cbc.count, time_,
-                                    bndCfX_, bndCfY_, bndCfZ_, Uk_[0], Uk_[1], Uk_[2], dbU_.comp[0].faceCell,
-                                    dbU_.comp[0].refValue, dbU_.comp[1].refValue, dbU_.comp[2].refValue);
-            else if (cbc.target == 1)    // p
-                launchCodedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, dp_, dbP_.faceCell, dbP_.refValue);
-            else if (cbc.target == 2)    // k (or nuTilda for SA)
-                launchCodedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, dk_, dbK_.faceCell, dbK_.refValue);
-            else if (cbc.target == 3)    // second turbulence scalar (omega / epsilon)
-                launchCodedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, de_, dbEps_.faceCell, dbEps_.refValue);
+            {
+                if (cbc.mixed)
+                    launchCodedMixedVectorBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_,
+                                             Uk_[0], Uk_[1], Uk_[2], dbU_.comp[0].faceCell,
+                                             dbU_.comp[0].refValue, dbU_.comp[1].refValue, dbU_.comp[2].refValue,
+                                             dbU_.comp[0].valueFraction, dbU_.comp[1].valueFraction, dbU_.comp[2].valueFraction);
+                else
+                    launchCodedVectorBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_,
+                                        Uk_[0], Uk_[1], Uk_[2], dbU_.comp[0].faceCell,
+                                        dbU_.comp[0].refValue, dbU_.comp[1].refValue, dbU_.comp[2].refValue);
+            }
+            else                         // scalar: p (1), k/nuTilda (2), second omega|epsilon (3)
+            {
+                DeviceBoundary& db = (cbc.target == 1) ? dbP_ : (cbc.target == 2) ? dbK_ : dbEps_;
+                const DeviceBuffer<scalar>& fld = (cbc.target == 1) ? dp_ : (cbc.target == 2) ? dk_ : de_;
+                if (cbc.mixed)
+                    launchCodedMixedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, fld, db.faceCell, db.refValue, db.valueFraction);
+                else
+                    launchCodedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, fld, db.faceCell, db.refValue);
+            }
         }
 
         DeviceBuffer<scalar> nuEff;

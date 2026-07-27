@@ -119,8 +119,9 @@ SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<F
     return ssf;
 }
 
-// A codedFixedValue patch parsed from a field file: the patch name, the `code #{ ... #}` body, and the kernel `name`.
-struct CodedBCSpec { std::string patch, code, name; };
+// A coded (codedFixedValue / codedMixed) patch parsed from a field file: the patch name, the `code #{ ... #}` body, the
+// kernel `name`, and whether it is a mixed (Robin) BC (the snippet also sets valueFraction `vf`).
+struct CodedBCSpec { std::string patch, code, name; bool mixed = false; };
 
 // Scan a field file's boundaryField for codedFixedValue patches, extracting each patch's code snippet + name. Handles
 // the OF verbatim `#{ ... #}` block (its braces do not count toward the patch's brace depth). Empty if none.
@@ -156,9 +157,10 @@ inline std::vector<CodedBCSpec> parseCodedBCs(const std::string& fieldPath)
         }
         const std::string body = t.substr(bodyStart, (q - 1) - bodyStart);
         p = q;
-        if (body.find("codedFixedValue") != std::string::npos)
+        const bool isMixed = body.find("codedMixed") != std::string::npos;
+        if (isMixed || body.find("codedFixedValue") != std::string::npos)
         {
-            CodedBCSpec s; s.patch = pname;
+            CodedBCSpec s; s.patch = pname; s.mixed = isMixed;
             const std::size_t cs = body.find("#{");
             if (cs != std::string::npos) { const std::size_t ce = body.find("#}", cs + 2); if (ce != std::string::npos) s.code = body.substr(cs + 2, ce - (cs + 2)); }
             std::size_t nm = body.find("name");
@@ -317,10 +319,10 @@ try
                     if (q.name == s.patch) { cnt = (int)q.size; break; }
                     off += (int)q.size;
                 }
-                if (cnt < 0) throw std::runtime_error("codedFixedValue: patch '" + s.patch + "' not in the mesh boundary");
-                solver.addCodedBC(s.name, s.code, off, cnt, target);
-                std::printf("gpuPimpleFoam: codedFixedValue '%s' on '%s' (field %s) -> NVRTC device kernel (%d faces)\n",
-                            s.name.c_str(), s.patch.c_str(), field.c_str(), cnt);
+                if (cnt < 0) throw std::runtime_error("coded BC: patch '" + s.patch + "' not in the mesh boundary");
+                solver.addCodedBC(s.name, s.code, off, cnt, target, s.mixed);
+                std::printf("gpuPimpleFoam: %s '%s' on '%s' (field %s) -> NVRTC device kernel (%d faces)\n",
+                            s.mixed ? "codedMixed" : "codedFixedValue", s.name.c_str(), s.patch.c_str(), field.c_str(), cnt);
             }
         };
         registerCoded("U", 0);                        // U (vector)

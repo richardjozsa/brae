@@ -53,4 +53,23 @@ void launchCodedScalarBc(
     const DeviceBuffer<scalar>& fld, const DeviceBuffer<label>& faceCell,
     DeviceBuffer<scalar>& ref);
 
+// codedMixed (Robin): the snippet sets `out` (refValue) AND `vf` (valueFraction: 1=fixedValue .. 0=zeroGradient). The
+// kernel writes the boundary refValue AND valueFraction; the device mixed assembly blends value = vf*refValue + (1-vf)*internal.
+CodedBcKernel compileCodedMixedVectorBc(const std::string& name, const std::string& body);
+CodedBcKernel compileCodedMixedScalarBc(const std::string& name, const std::string& body);
+
+void launchCodedMixedVectorBc(
+    const CodedBcKernel& k, int offset, int count, scalar t,
+    const DeviceBuffer<scalar>& CfX, const DeviceBuffer<scalar>& CfY, const DeviceBuffer<scalar>& CfZ,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<label>& faceCell,
+    DeviceBuffer<scalar>& refX, DeviceBuffer<scalar>& refY, DeviceBuffer<scalar>& refZ,
+    DeviceBuffer<scalar>& vfX, DeviceBuffer<scalar>& vfY, DeviceBuffer<scalar>& vfZ);
+
+void launchCodedMixedScalarBc(
+    const CodedBcKernel& k, int offset, int count, scalar t,
+    const DeviceBuffer<scalar>& CfX, const DeviceBuffer<scalar>& CfY, const DeviceBuffer<scalar>& CfZ,
+    const DeviceBuffer<scalar>& fld, const DeviceBuffer<label>& faceCell,
+    DeviceBuffer<scalar>& ref, DeviceBuffer<scalar>& vfrac);
+
 } // namespace brae

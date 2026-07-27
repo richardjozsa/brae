@@ -170,8 +170,8 @@ public:
     // NVRTC device-coded BC (codedFixedValue on U): compile `code` once into a device kernel over the patch's boundary
     // faces [offset, offset+count) in the flat boundary order. Applied each step in solveMomentumPredictor (writes the
     // patch's dbU_ refValue on the device). setTime feeds the current time to the snippet's `t`.
-    // target: 0=U (vector), 1=p, 2=k/nuTilda, 3=second (omega/epsilon) -- selects which field's boundary the kernel writes.
-    void addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target = 0);
+    // target: 0=U (vector), 1=p, 2=k/nuTilda, 3=second (omega/epsilon). mixed=true -> codedMixed (also writes valueFraction).
+    void addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target = 0, bool mixed = false);
     void setTime(scalar t) { time_ = t; }
     std::vector<vector> Uddt0() const
     {
@@ -240,7 +240,7 @@ private:
     scalar    ocCoeff_ = 1;         // CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>"); 0=Euler-like, 1=pure CN
     bool      cnWarm_  = false;     // CrankNicolson: the ddt0 recurrence has done its first (Euler-startup) update
     // NVRTC device-coded BCs (codedFixedValue). bndCf* = flat boundary face centres (patch order, cyclic excluded).
-    struct SolverCodedBC { CodedBcKernel kernel; int offset = 0, count = 0; int target = 0; };   // target: 0=U 1=p 2=k 3=second
+    struct SolverCodedBC { CodedBcKernel kernel; int offset = 0, count = 0; int target = 0; bool mixed = false; };   // target: 0=U 1=p 2=k 3=second
     std::vector<SolverCodedBC> codedBCs_;
     DeviceBuffer<scalar> bndCfX_, bndCfY_, bndCfZ_;
     scalar    time_ = 0;            // current time, fed to the coded-BC snippet's `t`
