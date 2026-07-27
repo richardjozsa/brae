@@ -22,6 +22,7 @@ struct SpalartAllmarasCoeffs {
     scalar Cl       = 5.0;       // f_l  = tanh((Cl^2*rd_l)^10)
     scalar Ct       = 1.87;      // f_t  = tanh((Ct^2*rd_t)^3)
     scalar Cw       = 0.15;      // IDDES length scale delta = min(max(Cw*y, Cw*hmax), hmax)
+    scalar fwStar   = 0.424;     // low-Re DES correction Psi: f_w in the log layer (Spalart et al. 2006)
     BRAE_HD scalar Cw1() const { return Cb1 / (kappa * kappa) + (scalar(1) + Cb2) / sigmaNut; }
 };
 
