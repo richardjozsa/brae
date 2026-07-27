@@ -173,4 +173,51 @@ inline void writeVolField(
     out << "}\n\n\n// ************************************************************************* //\n";
 }
 
+// Write a surfaceScalarField (the face flux phi) in OpenFOAM structure, matching OF's own output: internalField = the
+// internal-face flux, boundaryField per patch (`type calculated` + the face-flux value list, except `empty` patches
+// which write only the type). phiBoundary is the FLAT boundary flux in patch order EXCLUDING cyclic/cyclicAMI patches
+// (their flux lives on the interface, not in phiBnd) -- those coupled patches write just their constraint type (v1: no
+// value). Loads in any OpenFOAM reader (paraFoam/postProcess) as the case's phi.
+template <typename Patch>
+inline void writeSurfaceField(
+    const std::string& outPath,
+    const std::vector<scalar>& phiInternal,   // nInternalFaces
+    const std::vector<scalar>& phiBoundary,   // flat, patch order, EXCLUDING cyclic/cyclicAMI
+    const std::vector<Patch>& patches,
+    int precision = 16)
+{
+    std::ofstream out(outPath);
+    if (!out) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
+    out << std::setprecision(precision);
+    out << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       surfaceScalarField;\n"
+           "    location    \"" << outPath << "\";\n    object      phi;\n}\n\n";
+    out << "dimensions      [0 3 -1 0 0 0 0];\n\n";
+    out << "internalField   nonuniform List<scalar> \n" << phiInternal.size() << "\n(\n";
+    for (scalar v : phiInternal) out << v << '\n';
+    out << ")\n;\n\n";
+    out << "boundaryField\n{\n";
+    std::size_t off = 0;
+    for (const auto& p : patches)
+    {
+        out << "    " << p.name << "\n    {\n";
+        if (p.type == "cyclic" || p.type == "cyclicAMI")   // coupled: flux held on the interface, not in phiBoundary
+        {
+            out << "        type            " << p.type << ";\n    }\n";
+            continue;                                       // do NOT advance off (phiBoundary skips these)
+        }
+        const std::size_t n = static_cast<std::size_t>(p.size);
+        if (p.type == "empty")
+            out << "        type            empty;\n";
+        else
+        {
+            out << "        type            calculated;\n        value           nonuniform List<scalar> \n" << n << "\n(\n";
+            for (std::size_t i = 0; i < n; ++i) out << phiBoundary[off + i] << '\n';
+            out << ")\n;\n";
+        }
+        off += n;
+        out << "    }\n";
+    }
+    out << "}\n\n\n// ************************************************************************* //\n";
+}
+
 } // namespace brae
