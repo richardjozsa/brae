@@ -28,6 +28,7 @@
 #include "device_interface.cuh"   // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_kepsilon.cuh"
 #include "device_komega_sst.cuh"   // deviceS2/deviceF2/deviceNutSST for the startup validate() correctNut
+#include "device_smagorinsky.cuh"  // deviceSmagorinskyNut for the pure-LES (algebraic sub-grid nut) path
 #include "cell_wall_dist.cuh"
 #include "device_mrf.cuh"
 #include "device_divdevreff.cuh"

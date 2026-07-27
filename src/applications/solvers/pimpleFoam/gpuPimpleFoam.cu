@@ -214,7 +214,7 @@ try
     TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
 
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
-                              ctl.turbulent ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa) ? &tf.eps : nullptr,
+                              (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
     solver.setDdtScheme(ddtScheme);
 
@@ -222,7 +222,7 @@ try
                 "turbulence=%s nCells=%d\n\n",
                 (double)deltaT, (double)endTime, ddtScheme == DdtScheme::backward ? "backward" : "Euler",
                 nOuter, nCorr, nNonOrth, (double)nu,
-                !ctl.turbulent ? "laminar" : ctl.sa ? "SpalartAllmaras" : ctl.sst ? (ctl.lm ? "kOmegaSSTLM" : "kOmegaSST") : "kEpsilon",
+                !ctl.turbulent ? "laminar" : ctl.les ? "Smagorinsky (LES)" : ctl.sa ? "SpalartAllmaras" : ctl.sst ? (ctl.lm ? "kOmegaSSTLM" : "kOmegaSST") : "kEpsilon",
                 nC);
 
     // ---- write cadence (Foam::Time: writeControl timeStep|runTime + writeInterval + purgeWrite FIFO) ----
@@ -251,7 +251,9 @@ try
         // write->read round-trip is bit-identical (16 sig figs loses the last bit) and a restart resumes the EXACT flux
         // with no continuity transient. The viz fields (U/p/turbulence) keep the user's writePrecision.
         writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp, std::max(precision, 17));
-        if (ctl.sa) {
+        if (ctl.les) {   // pure LES Smagorinsky: only the algebraic sub-grid nut (no k/epsilon/omega/nuTilda field)
+            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
+        } else if (ctl.sa) {
             writeVolField(fieldDir + "/nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
             writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
         } else if (ctl.turbulent) {
