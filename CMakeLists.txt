@@ -544,6 +544,12 @@ target_include_directories(test_gpu_saddes PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_saddes PRIVATE brae_core)
 add_test(NAME gpu_saddes COMMAND test_gpu_saddes)
 
+# kOmegaSST-DDES DES factor: deviceKOmegaSSTDESfactor reproduces the OF kOmegaSSTDDES k-destruction enhancement.
+add_executable(test_gpu_ksstddes tests/test_gpu_ksstddes.cu)
+target_include_directories(test_gpu_ksstddes PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_ksstddes PRIVATE brae_core)
+add_test(NAME gpu_ksstddes COMMAND test_gpu_ksstddes)
+
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_forces PRIVATE brae_core)

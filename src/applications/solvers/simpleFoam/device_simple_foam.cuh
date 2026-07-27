@@ -35,14 +35,14 @@
 #include "device_amg.cuh"
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
-#include "simple_controls.cuh"   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
+#include "solver_controls.cuh"   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
 #include <cstdlib>
 #include <vector>
 #include <cuda_runtime.h>
 
 namespace brae {
 
-// NutWall, DeviceSimpleControls, DeviceSimpleResidual now live in simple_controls.cuh (included above).
+// NutWall, DeviceSimpleControls, DeviceSimpleResidual now live in solver_controls.cuh (included above).
 
 class DeviceSimpleSolver
 {

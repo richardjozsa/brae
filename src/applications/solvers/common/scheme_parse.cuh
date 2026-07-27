@@ -4,7 +4,7 @@
 // system/fvSchemes ($-expanded): div(phi,U) bounded/linearUpwind[V]/LUST + div(phi,{k,epsilon,omega,nuTilda})
 // limitedLinear/linearUpwind, laplacian/snGrad corrected/limited (non-orth), grad(U) cellLimited. Extracted
 // verbatim from gpuSimpleFoam; throws (OF-style) on a missing/unsupported div(phi,U) scheme.
-#include "simple_controls.cuh"
+#include "solver_controls.cuh"
 #include "foam_dict.cuh"    // readFileExpanded
 #include <cctype>
 #include <cstdio>
