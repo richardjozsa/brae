@@ -89,7 +89,22 @@ public:
     // --- Transient (PIMPLE) interface -- reuses the three composable phases above under an outer/inner-corrector loop,
     // with the implicit fvm::ddt(U) folded into solveMomentumPredictor. setDdtScheme() switches this solver from steady
     // (SIMPLE, the default) to transient; the steady step() path is completely unaffected (ddt stays a no-op).
-    void setDdtScheme(DdtScheme s) { ddtScheme_ = s; }
+    void setDdtScheme(DdtScheme s, scalar ocCoeff = scalar(1))
+    {
+        ddtScheme_ = s;
+        ocCoeff_   = ocCoeff;
+        if (s == DdtScheme::CrankNicolson)   // allocate + zero each transported variable's stored old ddt (ddt0)
+        {
+            const std::vector<scalar> z(nC_, scalar(0));
+            for (int k = 0; k < 3; ++k) Uddt0_[k].copyFrom(z);
+            if (ctl_.turbulent && !ctl_.les)
+            {
+                kddt0_.copyFrom(z);
+                if (!ctl_.sa) e2ddt0_.copyFrom(z);
+                if (ctl_.lm) { ReThetatddt0_.copyFrom(z); gammaIntddt0_.copyFrom(z); }
+            }
+        }
+    }
     // Advance one time level: store U.oldTime()[.oldTime()] + roll deltaT -> deltaT0 (OF runTime++ / GeometricField::oldTime).
     void advanceTime(scalar deltaT);
     // One PIMPLE time step: advanceTime, then nOuterCorrectors x { momentum predictor (ddt folded in); nCorrectors x
@@ -185,10 +200,13 @@ private:
     // advanceTime(). steadyState + empty old-time buffers in the default steady SIMPLE path, where ddt is a no-op.
     DdtScheme ddtScheme_ = DdtScheme::steadyState;
     scalar    deltaT_ = 0, deltaT0_ = 0;
+    scalar    ocCoeff_ = 1;         // CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>"); 0=Euler-like, 1=pure CN
+    bool      cnWarm_  = false;     // CrankNicolson: the ddt0 recurrence has done its first (Euler-startup) update
     DeviceBuffer<scalar> Uold_[3], Uold2_[3];
     // Turbulence old-time levels for the URANS fvm::ddt(k/eps/omega/nuTilda): dk_ (k or nuTilda) + de_ (epsilon or omega).
     DeviceBuffer<scalar> kOld_, kOld2_, e2Old_, e2Old2_;
     DeviceBuffer<scalar> ReThetatOld_, ReThetatOld2_, gammaIntOld_, gammaIntOld2_;   // kOmegaSSTLM transition old-time
+    DeviceBuffer<scalar> Uddt0_[3], kddt0_, e2ddt0_, ReThetatddt0_, gammaIntddt0_;   // CrankNicolson stored old ddt (per variable); allocated only for CN
     // Momentum-predictor outputs, shared with the pressure-velocity phase (PIMPLE foundation: solveMomentumPredictor()
     // fills them once per outer corrector; correctPressureVelocity() reads them). Members so both phases see them + to
     // avoid per-step reallocation. mDiagR/mUp/mLo = relaxed momentum matrix; iC/bCb = per-component boundary coeffs;

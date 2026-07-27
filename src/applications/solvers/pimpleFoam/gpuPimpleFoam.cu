@@ -50,8 +50,9 @@ std::string timeName(scalar t)
 }
 
 // fvSchemes holds multi-token scheme values + $-vars (not a plain key/value dict), so text-parse ddtSchemes.default.
-DdtScheme parseDdtScheme(const std::string& fvSchemesPath)
+DdtScheme parseDdtScheme(const std::string& fvSchemesPath, scalar& ocCoeff)
 {
+    ocCoeff = 1.0;                                    // CrankNicolson off-centring; default = pure CN (1)
     std::ifstream f(fvSchemesPath);
     if (!f) throw std::runtime_error("cannot read " + fvSchemesPath);
     const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -68,7 +69,16 @@ DdtScheme parseDdtScheme(const std::string& fvSchemesPath)
         throw std::runtime_error("fvSchemes ddtSchemes.default = steadyState -> use the steady solver 'brae'.");
     if (w == "backward")                return DdtScheme::backward;
     if (w == "Euler" || w == "bounded") return DdtScheme::Euler;
-    throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|steadyState).");
+    if (w == "CrankNicolson")
+    {
+        // read the off-centring coefficient (OF "CrankNicolson <ocCoeff>", oc in [0,1]); absent -> pure CN (1).
+        while (d < text.size() && std::isspace((unsigned char)text[d])) ++d;
+        std::string oc;
+        while (d < text.size() && !std::isspace((unsigned char)text[d]) && text[d] != ';') oc += text[d++];
+        if (!oc.empty()) { try { ocCoeff = std::stod(oc); } catch (...) {} }
+        return DdtScheme::CrankNicolson;
+    }
+    throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|CrankNicolson|steadyState).");
 }
 
 // Read a surfaceScalarField (phi) written by writeSurfaceField (or by OpenFOAM) back into a SurfaceScalarField shaped
@@ -120,7 +130,8 @@ try
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
-    const DdtScheme ddtScheme  = parseDdtScheme(caseDir + "/system/fvSchemes");
+    scalar ddtOcCoeff = 1.0;
+    const DdtScheme ddtScheme  = parseDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
 
     scalar       startTime     = controlDict.scalarOr("startTime", 0.0);   // resolved below for startFrom latestTime (restart)
     const scalar deltaT        = controlDict.scalarOr("deltaT", 1e-3);
@@ -220,11 +231,11 @@ try
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
-    solver.setDdtScheme(ddtScheme);
+    solver.setDdtScheme(ddtScheme, ddtOcCoeff);
 
     std::printf("gpuPimpleFoam: deltaT=%g endTime=%g ddt=%s nOuterCorrectors=%d nCorrectors=%d nNonOrth=%d nu=%g "
                 "turbulence=%s nCells=%d\n\n",
-                (double)deltaT, (double)endTime, ddtScheme == DdtScheme::backward ? "backward" : "Euler",
+                (double)deltaT, (double)endTime, ddtScheme == DdtScheme::backward ? "backward" : ddtScheme == DdtScheme::CrankNicolson ? "CrankNicolson" : "Euler",
                 nOuter, nCorr, nNonOrth, (double)nu,
                 !ctl.turbulent ? "laminar" : ctl.les ? "Smagorinsky (LES)" : ctl.iddes ? (ctl.sst ? "kOmegaSSTIDDES" : "SpalartAllmarasIDDES") : ctl.sa ? "SpalartAllmaras" : ctl.sst ? (ctl.lm ? "kOmegaSSTLM" : "kOmegaSST") : "kEpsilon",
                 nC);

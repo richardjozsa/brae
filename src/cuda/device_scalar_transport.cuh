@@ -163,7 +163,7 @@ void deviceSolveScalarTransport(
     // ddt into the eqn then relaxes), the source (old-time) into src. steady (ddt.c.active==false) -> exact no-op, so this
     // stays byte-for-byte the steady scalar transport. rho=1 (incompressible). Matches the momentum ddt wiring.
     deviceFvmDdtDiag(dm.V, ddt.c, 1.0, aD);
-    if (ddt.old) { DeviceBuffer<scalar> e2; deviceFvmDdtSource(dm.V, ddt.c, 1.0, *ddt.old, ddt.old2 ? *ddt.old2 : e2, src); }
+    if (ddt.old) { DeviceBuffer<scalar> e2; deviceFvmDdtSource(dm.V, ddt.c, 1.0, *ddt.old, ddt.old2 ? *ddt.old2 : e2, src, ddt.ddt0); }
     DeviceBuffer<scalar> aRD, aDelta; deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
                                                       ifSumOff.size() ? ifSumOff.data() : nullptr);
     { DeviceBuffer<scalar> t; deviceHadamard(t, aDelta, field); deviceAxpy(1.0, t, src); }
