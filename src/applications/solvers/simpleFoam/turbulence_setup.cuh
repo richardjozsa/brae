@@ -25,6 +25,24 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
 {
         if (ctl.turbulent)
         {
+            // simulationType LES: DES/LES models live under an LES{} sub-dict (OF convention). SA-DDES reuses the SA
+            // transport (ctl.sa) plus the DES length-scale limiter (ctl.des); only cubeRootVol delta is supported (v1).
+            if (const FoamDict* les = turbProps.subDict("LES"))
+            {
+                const std::string model = les->wordOr("LESModel", "");
+                if (model != "SpalartAllmarasDDES" && model != "SpalartAllmarasDES")
+                    throw std::runtime_error("brae: unsupported LESModel '" + model + "' (SpalartAllmarasDDES or SpalartAllmarasDES)");
+                ctl.sa = true;
+                ctl.des = true;
+                const std::string delta = les->wordOr("delta", "cubeRootVol");
+                if (delta != "cubeRootVol")
+                    std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
+                if (const FoamDict* dc = les->subDict(model + "Coeffs"))
+                    ctl.saCoeffs.CDES = dc->scalarOr("CDES", ctl.saCoeffs.CDES);
+                std::printf("  %s (SA-DES, delta=cubeRootVol): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
+                            model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.kappa, ctl.saCoeffs.Cb1, ctl.saCoeffs.Cw1(), ctl.saCoeffs.Cv1);
+                return;
+            }
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
             ctl.lm  = (model == "kOmegaSSTLM");                 // Langtry-Menter transition = kOmegaSST + gamma-ReThetat

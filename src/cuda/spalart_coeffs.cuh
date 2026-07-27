@@ -15,6 +15,7 @@ struct SpalartAllmarasCoeffs {
     scalar Cv1      = 7.1;
     scalar Cs       = 0.3;
     scalar E        = 9.8;       // nutUSpaldingWallFunction wall E (Spalding law)
+    scalar CDES     = 0.65;      // SA-DES/DDES model constant (OF SpalartAllmarasDES default)
     BRAE_HD scalar Cw1() const { return Cb1 / (kappa * kappa) + (scalar(1) + Cb2) / sigmaNut; }
 };
 

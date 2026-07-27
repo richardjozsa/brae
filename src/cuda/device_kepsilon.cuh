@@ -231,10 +231,15 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   scalar twoByk = 2.0, const SpalartAllmarasCoeffs& co = {}, scalar relTol = 0.0, int checkEvery = 1,
                                   bool linearUpwind = false, bool nonOrth = false,
                                   bool gsK = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
-                                  const ScalarDdt& ntDdt = {});   // transient fvm::ddt(nuTilda)
+                                  const ScalarDdt& ntDdt = {},   // transient fvm::ddt(nuTilda)
+                                  bool des = false);   // SpalartAllmarasDDES: DES length-scale limiter on the SA destruction
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
+// SA-DDES length scale dTilda = y - fd*max(0, y - CDES*cubeRootVol(V)); fd = 1 - tanh((8 rd)^3). (Unit-test/DES hook.)
+void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& V,
+    const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda);
 // Spalart-Allmaras source-prep, exported for the distributed SA correct. Cell-local (gradU + grad(nuTilda) supplied
 // by the caller). Stilda/Fw/DEff/Reaction reuse the anon kernels; deviceSAReaction ACCUMULATES (+=) -> zero first.
 void deviceSAStilda(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda,
