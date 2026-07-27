@@ -30,15 +30,16 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             if (const FoamDict* les = turbProps.subDict("LES"))
             {
                 const std::string model = les->wordOr("LESModel", "");
-                const bool saIddes = (model == "SpalartAllmarasIDDES");
+                const bool saIddes  = (model == "SpalartAllmarasIDDES");
+                const bool sstIddes = (model == "kOmegaSSTIDDES");
                 const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES" || saIddes);
-                const bool sstDes = (model == "kOmegaSSTDDES" || model == "kOmegaSSTDES");
+                const bool sstDes = (model == "kOmegaSSTDDES" || model == "kOmegaSSTDES" || sstIddes);
                 const bool smag   = (model == "Smagorinsky");
                 if (!saDes && !sstDes && !smag)
                     throw std::runtime_error("brae: unsupported LESModel '" + model
-                        + "' (Smagorinsky, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES)");
+                        + "' (Smagorinsky, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES/IDDES)");
                 const std::string delta = les->wordOr("delta", "cubeRootVol");
-                if (!saIddes && delta != "cubeRootVol")   // IDDES computes its own (maxDeltaxyz-based) length scale internally
+                if (!saIddes && !sstIddes && delta != "cubeRootVol")   // IDDES computes its own (maxDeltaxyz-based) length scale internally
                     std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
                 const FoamDict* dc = les->subDict(model + "Coeffs");
                 if (smag)   // pure LES Smagorinsky: ALGEBRAIC sub-grid nut (no transport scalar, no DES length-scale limiter)
@@ -70,14 +71,26 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         std::printf("  %s (SA-DES, delta=cubeRootVol): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
                                     model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.kappa, ctl.saCoeffs.Cb1, ctl.saCoeffs.Cw1(), ctl.saCoeffs.Cv1);
                 }
-                else         // kOmegaSST-DDES: reuse the kOmegaSST transport + the DES factor on the k destruction
+                else         // kOmegaSST-DDES/IDDES: reuse the kOmegaSST transport + the DES factor on the k destruction
                 {
                     ctl.sst = true;
+                    ctl.iddes = sstIddes;   // IDDES -> the improved (WMLES) length scale (maxDeltaxyz + blending); else plain DDES
                     readKOmegaSSTCoeffs(les, ctl.ksstCoeffs);   // honour an inline kOmegaSSTCoeffs under LES{} if present
                     if (dc) { ctl.ksstCoeffs.CDES1 = dc->scalarOr("CDES1", ctl.ksstCoeffs.CDES1);
                               ctl.ksstCoeffs.CDES2 = dc->scalarOr("CDES2", ctl.ksstCoeffs.CDES2); }
-                    std::printf("  %s (kOmegaSST-DES, delta=cubeRootVol): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
-                                model.c_str(), ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
+                    if (sstIddes && dc)   // IDDES blending-constant overrides (defaults = Gritskevich et al. 2012)
+                    {
+                        ctl.ksstCoeffs.Cdt1 = dc->scalarOr("Cdt1", ctl.ksstCoeffs.Cdt1);
+                        ctl.ksstCoeffs.Cl   = dc->scalarOr("Cl",   ctl.ksstCoeffs.Cl);
+                        ctl.ksstCoeffs.Ct   = dc->scalarOr("Ct",   ctl.ksstCoeffs.Ct);
+                        ctl.ksstCoeffs.Cw   = dc->scalarOr("Cw",   ctl.ksstCoeffs.Cw);
+                    }
+                    if (sstIddes)
+                        std::printf("  %s (kOmegaSST-IDDES, delta=maxDeltaxyz; hwn omitted): CDES1=%.4g CDES2=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g betaStar=%.4g\n",
+                                    model.c_str(), ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.Cdt1, ctl.ksstCoeffs.Cl, ctl.ksstCoeffs.Ct, ctl.ksstCoeffs.Cw, ctl.ksstCoeffs.betaStar);
+                    else
+                        std::printf("  %s (kOmegaSST-DES, delta=cubeRootVol): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
+                                    model.c_str(), ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
                 }
                 return;
             }
