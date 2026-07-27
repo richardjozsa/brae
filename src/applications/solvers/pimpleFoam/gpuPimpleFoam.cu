@@ -232,6 +232,25 @@ try
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
     solver.setDdtScheme(ddtScheme, ddtOcCoeff);
+    // CrankNicolson RESTART: if the previous run wrote the ddt0 fields (present in the restart time dir), reload them and
+    // prime the time state so the FIRST resumed step is full CN using the exact stored old ddt -> seamless (like OF's
+    // DDt0Field). Fresh start / no ddt0 file -> ddt0 stays 0 and the first step Euler-bootstraps, exactly as before.
+    if (ddtScheme == DdtScheme::CrankNicolson && std::filesystem::exists(fieldDir + "/ddt0(U)")) {
+        solver.setUddt0(buildField<vector>(readField<vector>(fieldDir + "/ddt0(U)"), fvp, nC).internal);
+        if (ctl.turbulent && !ctl.les) {
+            const std::string kn = ctl.sa ? "nuTilda" : "k";
+            if (std::filesystem::exists(fieldDir + "/ddt0(" + kn + ")"))
+                solver.setKddt0(buildField<scalar>(readField<scalar>(fieldDir + "/ddt0(" + kn + ")"), fvp, nC).internal);
+            if (!ctl.sa && std::filesystem::exists(fieldDir + "/ddt0(" + secondName + ")"))
+                solver.setE2ddt0(buildField<scalar>(readField<scalar>(fieldDir + "/ddt0(" + secondName + ")"), fvp, nC).internal);
+            if (ctl.lm) {
+                if (std::filesystem::exists(fieldDir + "/ddt0(ReThetat)")) solver.setReThetatddt0(buildField<scalar>(readField<scalar>(fieldDir + "/ddt0(ReThetat)"), fvp, nC).internal);
+                if (std::filesystem::exists(fieldDir + "/ddt0(gammaInt)")) solver.setGammaIntddt0(buildField<scalar>(readField<scalar>(fieldDir + "/ddt0(gammaInt)"), fvp, nC).internal);
+            }
+        }
+        solver.setCnRestart(deltaT);
+        std::printf("gpuPimpleFoam: read CrankNicolson ddt0 from %s (seamless CN restart)\n", fieldDir.c_str());
+    }
 
     std::printf("gpuPimpleFoam: deltaT=%g endTime=%g ddt=%s nOuterCorrectors=%d nCorrectors=%d nNonOrth=%d nu=%g "
                 "turbulence=%s nCells=%d\n\n",
@@ -278,6 +297,22 @@ try
             if (ctl.lm) {
                 writeVolField(fieldDir + "/ReThetat", outDir + "/ReThetat", solver.ReThetat(), fvp, precision);
                 writeVolField(fieldDir + "/gammaInt", outDir + "/gammaInt", solver.gammaInt(), fvp, precision);
+            }
+        }
+        if (solver.isCrankNicolson()) {
+            // CrankNicolson stored old ddt (ddt0) per transported variable -> LOSSLESS (>=17) so a restart resumes the
+            // EXACT recurrence (seamless CN restart, like OF's registered DDt0Field). No 0/ template -> writeVolFieldRaw.
+            const int p17 = std::max(precision, 17);
+            writeVolFieldRaw(outDir + "/ddt0(U)", "ddt0(U)", "[0 1 -2 0 0 0 0]", solver.Uddt0(), fvp, p17);
+            if (ctl.turbulent && !ctl.les) {
+                const std::string kn = ctl.sa ? "nuTilda" : "k";
+                writeVolFieldRaw(outDir + "/ddt0(" + kn + ")", "ddt0(" + kn + ")", "[0 0 0 0 0 0 0]", solver.kddt0(), fvp, p17);
+                if (!ctl.sa)
+                    writeVolFieldRaw(outDir + "/ddt0(" + secondName + ")", "ddt0(" + secondName + ")", "[0 0 0 0 0 0 0]", solver.e2ddt0(), fvp, p17);
+                if (ctl.lm) {
+                    writeVolFieldRaw(outDir + "/ddt0(ReThetat)", "ddt0(ReThetat)", "[0 0 0 0 0 0 0]", solver.reThetatddt0(), fvp, p17);
+                    writeVolFieldRaw(outDir + "/ddt0(gammaInt)", "ddt0(gammaInt)", "[0 0 0 0 0 0 0]", solver.gammaIntddt0(), fvp, p17);
+                }
             }
         }
         std::printf("written %s\n", outDir.c_str());

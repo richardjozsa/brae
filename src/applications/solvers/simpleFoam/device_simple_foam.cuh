@@ -158,6 +158,35 @@ public:
     std::vector<scalar> phiInternal() const { return phiInt_.host(); }
     std::vector<scalar> phiBoundary() const { return phiBnd_.host(); }
 
+    // CrankNicolson ddt0 (stored old ddt) persistence -- get/set for seamless restart (the driver writes+reads these).
+    bool isCrankNicolson() const { return ddtScheme_ == DdtScheme::CrankNicolson; }
+    bool cnWarm() const { return cnWarm_; }
+    void setCnWarm(bool w) { cnWarm_ = w; }
+    // Prime the CrankNicolson time state on restart: deltaT_=deltaT0 makes the FIRST advanceTime set deltaT0_=deltaT0
+    // (so the first post-restart step is full CN, not the Euler bootstrap), and the ddt0 recurrence is already warm.
+    void setCnRestart(scalar deltaT0) { deltaT_ = deltaT0; cnWarm_ = true; }
+    std::vector<vector> Uddt0() const
+    {
+        const auto x = Uddt0_[0].host(), y = Uddt0_[1].host(), z = Uddt0_[2].host();
+        std::vector<vector> r(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i) r[i] = vector{x[i], y[i], z[i]};
+        return r;
+    }
+    void setUddt0(const std::vector<vector>& v)
+    {
+        std::vector<scalar> x(v.size()), y(v.size()), z(v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) { x[i] = v[i].x; y[i] = v[i].y; z[i] = v[i].z; }
+        Uddt0_[0].copyFrom(x); Uddt0_[1].copyFrom(y); Uddt0_[2].copyFrom(z);
+    }
+    std::vector<scalar> kddt0()  const { return kddt0_.host(); }
+    void setKddt0(const std::vector<scalar>& v)  { kddt0_.copyFrom(v); }
+    std::vector<scalar> e2ddt0() const { return e2ddt0_.host(); }
+    void setE2ddt0(const std::vector<scalar>& v) { e2ddt0_.copyFrom(v); }
+    std::vector<scalar> reThetatddt0() const { return ReThetatddt0_.host(); }
+    void setReThetatddt0(const std::vector<scalar>& v) { ReThetatddt0_.copyFrom(v); }
+    std::vector<scalar> gammaIntddt0() const { return gammaIntddt0_.host(); }
+    void setGammaIntddt0(const std::vector<scalar>& v) { gammaIntddt0_.copyFrom(v); }
+
 private:
     const std::vector<FvPatch>& fvp_;
     DeviceSimpleControls ctl_;
