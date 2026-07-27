@@ -563,6 +563,8 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         // (device_coded_bc) OVERWRITES this patch's refValue each step from the compiled `code` snippet (the driver
         // parses the code + wires the solver's coded-BC apply). Building it as fixedValue makes buildField/buildDeviceBoundary succeed.
         return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    if (d.type == "codedMixed")   // Robin: seeded as mixed (vf=0.5); the NVRTC device kernel overwrites refValue + valueFraction each step
+        return std::make_unique<MixedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values, false);
     if (d.type == "noSlip")          return std::make_unique<NoSlipPatchField<T>>(p);
     if (d.type == "zeroGradient")    return std::make_unique<ZeroGradientPatchField<T>>(p);
     // fixedFluxPressure = fixedGradient p whose gradient constrainPressure sets to (phiHbyA - Sf&U)/(magSf*rAU).
