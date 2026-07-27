@@ -22,6 +22,8 @@ inline void formatFoamValue(std::ostream& os, scalar v) { os << v; }
 inline void formatFoamValue(std::ostream& os, const vector& v) { os << '(' << v.x << ' ' << v.y << ' ' << v.z << ')'; }
 inline const char* foamListType(scalar) { return "List<scalar>"; }
 inline const char* foamListType(const vector&) { return "List<vector>"; }
+inline const char* foamClassName(scalar) { return "volScalarField"; }
+inline const char* foamClassName(const vector&) { return "volVectorField"; }
 
 // Write "uniform <v>;" or "nonuniform List<...> N (...);" for a boundary entry field.
 template <typename T>
@@ -215,6 +217,45 @@ inline void writeSurfaceField(
             out << ")\n;\n";
         }
         off += n;
+        out << "    }\n";
+    }
+    out << "}\n\n\n// ************************************************************************* //\n";
+}
+
+// Write a vol field with NO template (the CrankNicolson ddt0 fields, which have no 0/ prototype): a constructed OF header
+// (class from T, the given object name + dimensions), the internalField, and a minimal boundaryField (constraint patches
+// keep their type; every other patch is `calculated` with a zero uniform value). Loads in any OF reader; on a brae
+// restart only the internalField is consumed (ddt0's boundary is unused by the pointwise recurrence).
+template <typename T, typename Patch>
+inline void writeVolFieldRaw(
+    const std::string& outPath,
+    const std::string& objectName,
+    const std::string& dims,
+    const std::vector<T>& values,
+    const std::vector<Patch>& patches,
+    int precision = 16)
+{
+    std::ofstream out(outPath);
+    if (!out) throw std::runtime_error("writeVolFieldRaw: cannot write " + outPath);
+    out << std::setprecision(precision);
+    out << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       " << foamClassName(T{}) << ";\n"
+           "    object      " << objectName << ";\n}\n\n";
+    out << "dimensions      " << dims << ";\n\n";
+    out << "internalField   nonuniform " << foamListType(T{}) << "\n" << values.size() << "\n(\n";
+    for (const T& v : values) { formatFoamValue(out, v); out << '\n'; }
+    out << ")\n;\n\n";
+    out << "boundaryField\n{\n";
+    for (const Patch& p : patches)
+    {
+        out << "    " << p.name << "\n    {\n";
+        if (isConstraintPatchType(p.type))
+            out << "        type            " << p.type << ";\n";
+        else
+        {
+            out << "        type            calculated;\n        value           uniform ";
+            formatFoamValue(out, T{});
+            out << ";\n";
+        }
         out << "    }\n";
     }
     out << "}\n\n\n// ************************************************************************* //\n";
