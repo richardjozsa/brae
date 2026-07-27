@@ -538,6 +538,12 @@ target_include_directories(test_gpu_ddt PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_ddt PRIVATE brae_core)
 add_test(NAME gpu_ddt COMMAND test_gpu_ddt)
 
+# SA-DDES length scale (DES/LES): deviceSADDESdTilda reproduces the OF SpalartAllmarasDDES delayed length scale.
+add_executable(test_gpu_saddes tests/test_gpu_saddes.cu)
+target_include_directories(test_gpu_saddes PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_saddes PRIVATE brae_core)
+add_test(NAME gpu_saddes COMMAND test_gpu_saddes)
+
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_forces PRIVATE brae_core)

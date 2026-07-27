@@ -164,9 +164,9 @@ try
     {
         const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
         const std::string simType = turbProps.wordOr("simulationType", "laminar");
-        if (simType != "RAS" && simType != "laminar")
-            throw std::runtime_error("pimpleFoam: unsupported simulationType '" + simType + "' (RAS or laminar).");
-        ctl.turbulent = (simType == "RAS");
+        if (simType != "RAS" && simType != "laminar" && simType != "LES")
+            throw std::runtime_error("pimpleFoam: unsupported simulationType '" + simType + "' (RAS, LES or laminar).");
+        ctl.turbulent = (simType == "RAS" || simType == "LES");   // LES here == SA-DDES (a URANS-based hybrid); readTurbulenceModel sets ctl.des
         readTurbulenceModel(turbProps, ctl);
         secondName = ctl.sst ? "omega" : "epsilon";
     }

@@ -121,6 +121,31 @@ void saMagSqrKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c < nC) out[c] = gx[c]*gx[c]+gy[c]*gy[c]+gz[c]*gz[c];
 }
+
+// SA-DDES length scale dTilda that REPLACES the wall distance y in the SA destruction (and Stilda/fw): the delayed
+// detached-eddy limiter dTilda = y - fd*max(0, y - CDES*Delta), Delta = cubeRootVol = V^(1/3). The DDES shielding
+// fd = 1 - tanh((8 rd)^3), rd = (nut+nu)/(|gradU| kappa^2 y^2) clamped to 10, keeps RANS in the boundary layer (fd->0 ->
+// dTilda=y) and switches to LES in detached regions (fd->1 -> dTilda=CDES*Delta). |gradU| = sqrt(sum_ij (dU_i/dx_j)^2)
+// (full 9-cmpt tensor magnitude); nut recomputed from nuTilda via fv1. psi (low-Re) = 1 (brae's SA runs ft2 off).
+// Matches OF SpalartAllmarasDDES. dTilda == y wherever fd==0, so a RANS (des=false) run is untouched.
+__global__
+void saDdesDTildaKernel(
+    int nC, const scalar* __restrict__ y, const scalar* __restrict__ V, const scalar* __restrict__ gradU,
+    const scalar* __restrict__ nt, scalar nu, SpalartAllmarasCoeffs co, scalar* __restrict__ dTilda)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar delta = cbrt(V[c]);                                   // LES filter width (cubeRootVol)
+    scalar g2 = 0;
+    for (int k = 0; k < 9; ++k) { const scalar gk = gradU[k*nC + c]; g2 += gk*gk; }   // |gradU|^2 (all 9 components)
+    const scalar chi = nt[c]/nu, chi3 = chi*chi*chi, Cv13 = co.Cv1*co.Cv1*co.Cv1;
+    const scalar nutc = nt[c] * (chi3 / (chi3 + Cv13));                 // nut = nuTilda*fv1
+    const scalar kd2 = fmax(co.kappa*co.kappa*y[c]*y[c], 1e-300);
+    const scalar rd = fmin((nutc + nu) / (fmax(sqrt(g2), 1e-300) * kd2), scalar(10));
+    const scalar t8 = scalar(8) * rd;
+    const scalar fd = scalar(1) - tanh(t8*t8*t8);
+    dTilda[c] = y[c] - fd * fmax(scalar(0), y[c] - co.CDES * delta);
+}
 } // namespace (SA kernels)
 
 void deviceSpalartAllmarasCorrect(
@@ -149,15 +174,25 @@ void deviceSpalartAllmarasCorrect(
     bool gsK,
     DeviceAMI* ami,
     DeviceCyclic* cyc,
-    const ScalarDdt& ntDdt)
+    const ScalarDdt& ntDdt,
+    bool des)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);   // interface-aware grad(U) for vorticity/production
+    // SA-DDES: replace the wall distance y with the DES length scale dTilda in the SA length-scale terms (Stilda, fw,
+    // destruction). des==false (RANS) -> dScale aliases y, so the model is byte-for-byte the standard SA.
+    DeviceBuffer<scalar> dTilda;
+    if (des)
+    {
+        dTilda.resize(static_cast<std::size_t>(nC));
+        saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), dm.V.data(), gradU.data(), nuTilda.data(), nu, co, dTilda.data());
+    }
+    const DeviceBuffer<scalar>& dScale = des ? dTilda : y;
     DeviceBuffer<scalar> Stilda(static_cast<std::size_t>(nC));
-    saStildaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuTilda.data(), y.data(), nu, co, Stilda.data());
+    saStildaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuTilda.data(), dScale.data(), nu, co, Stilda.data());
     DeviceBuffer<scalar> fw(static_cast<std::size_t>(nC));
-    saFwKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), Stilda.data(), y.data(), co, fw.data());
+    saFwKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), Stilda.data(), dScale.data(), co, fw.data());
     DeviceBuffer<scalar> nbv;
     deviceBCValue(dbNuTilda, nuTilda, nbv);   // |grad nuTilda|^2
     DeviceBuffer<scalar> gnx, gny, gnz;
@@ -200,7 +235,7 @@ void deviceSpalartAllmarasCorrect(
                                relax, tol, relTol, checkEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    saReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), nuTilda.data(), Stilda.data(),
-                                       fw.data(), y.data(), gradNt2.data(), co, diag.data(), src.data()); },
+                                       fw.data(), dScale.data(), gradNt2.data(), co, diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, ntDdt);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
@@ -216,6 +251,17 @@ void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, Dev
     nut.resize(nC);
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut (validate)");
+}
+
+// Exported SA-DDES length-scale wrapper: dTilda from y, cubeRootVol(V), |gradU| and nuTilda (a unit-test hook + a future
+// distributed-DES entry). Takes nC + V directly (no DeviceMesh) so it is callable without building a full mesh.
+void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& V,
+    const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda)
+{
+    dTilda.resize(nC);
+    saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), V.data(), gradU.data(), nuTilda.data(), nu, co, dTilda.data());
+    cudaCheck(cudaGetLastError(), "deviceSADDESdTilda");
 }
 
 // ---- Exported SA (Spalart-Allmaras) source-prep wrappers for the DISTRIBUTED SA correct -----------------------
