@@ -186,6 +186,7 @@ namespace brae {
                     de_.copyFrom(eps->internal);   // 2nd scalar (omega/eps); SA has none
                 }
                 if (ctl_.sst || ctl_.sa) y_.copyFrom(cellWallDist(m, g, fvp));   // wall distance (SST F1/F2/F3; SA dTilda)
+                if (ctl_.iddes) hmax_.copyFrom(cellMaxDeltaXYZ(m));   // SA-IDDES filter width (maxDeltaxyz), uploaded once at setup
                 if (ctl_.lm && ReThetat && gammaInt)   // kOmegaSSTLM transition fields
                 {
                     dbReThetat_ = buildDeviceBoundary(*ReThetat, fvp, g);
@@ -265,7 +266,7 @@ namespace brae {
                                              ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
-                                             ctl_.des);   // SA-DDES length-scale limiter (no-op for plain SA-RANS)
+                                             ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
