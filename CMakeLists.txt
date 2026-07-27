@@ -566,6 +566,11 @@ target_include_directories(test_gpu_ksstiddes PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_ksstiddes PRIVATE brae_core)
 add_test(NAME gpu_ksstiddes COMMAND test_gpu_ksstiddes)
 
+add_executable(test_gpu_ddt_cn tests/test_gpu_ddt_cn.cu)
+target_include_directories(test_gpu_ddt_cn PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_ddt_cn PRIVATE brae_core)
+add_test(NAME gpu_ddt_cn COMMAND test_gpu_ddt_cn)
+
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_forces PRIVATE brae_core)

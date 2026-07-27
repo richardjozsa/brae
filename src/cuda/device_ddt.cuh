@@ -21,23 +21,33 @@
 
 namespace brae {
 
-// fvSchemes ddtSchemes.default. steadyState == SIMPLE (no ddt); Euler/backward == transient.
-enum class DdtScheme { steadyState = 0, Euler = 1, backward = 2 };
+// fvSchemes ddtSchemes.default. steadyState == SIMPLE (no ddt); Euler/backward/CrankNicolson == transient.
+enum class DdtScheme { steadyState = 0, Euler = 1, backward = 2, CrankNicolson = 3 };
 
 // The time-scheme weights, computed ONCE per time step (host side) exactly as OF does. `active == false` (steadyState,
 // or before the first advance) makes deviceFvmDdt a no-op, so the same code path serves SIMPLE unchanged.
+// CrankNicolson replaces the psi.old2 source term (-coefft00*psi_old2) with an auxiliary stored-old-ddt term
+// (+ocCoeff*ddt0), where ddt0 is carried per transported variable and updated each step (OF CrankNicolsonDdtScheme).
 struct DdtCoeffs
 {
     scalar rDeltaT  = 0;      // 1/deltaT
-    scalar coefft   = 1;      // implicit diagonal weight
-    scalar coefft0  = 1;      // psi.oldTime()          source weight
-    scalar coefft00 = 0;      // psi.oldTime().oldTime() source weight
+    scalar coefft   = 1;      // implicit diagonal weight (backward: 1+dt/(dt+dt0); CrankNicolson: 1+ocCoeff)
+    scalar coefft0  = 1;      // psi.oldTime()          source weight (CrankNicolson: 1+ocCoeff)
+    scalar coefft00 = 0;      // psi.oldTime().oldTime() source weight (backward only)
+    scalar ocCoeff  = 0;      // CrankNicolson off-centring: ddt0 source weight + ddt0 recurrence blend (0=Euler, 1=pure CN)
+    scalar rDeltaT0 = 0;      // 1/deltaT0, for the ddt0 recurrence (CrankNicolson)
+    scalar coefft0dd = 0;     // CrankNicolson ddt0-recurrence coef (OF coef0_): 1 on the FIRST ddt0 update (Euler ddt0), 1+oc after
+    bool   cn       = false;  // CrankNicolson: source uses +ocCoeff*ddt0 instead of -coefft00*psi.old2
     bool   active   = false;
 };
 
-// Build the coefficients exactly as OF (backwardDdtScheme.C:96-98). First transient step (deltaT0<=0) falls back to
-// Euler, matching OF (oldTime().oldTime() is uninitialised until two levels exist -> pimpleFoam bootstraps with Euler).
-inline DdtCoeffs ddtCoeffs(DdtScheme scheme, scalar deltaT, scalar deltaT0)
+// Build the coefficients exactly as OF (backwardDdtScheme.C:96-98; CrankNicolsonDdtScheme rDtCoef/offCentre). First
+// transient step (deltaT0<=0) falls back to Euler, matching OF (oldTime().oldTime()/ddt0 are uninitialised until two
+// levels exist -> pimpleFoam bootstraps with Euler). ocCoeff is the CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>").
+// cnWarm=false on the FIRST ddt0 update (second overall step) -> Euler ddt0 (OF coef0_=1); true afterwards (OF coef0_=1+oc).
+// This Euler-startup of the ddt0 recurrence is what makes CrankNicolson genuinely 2nd order (else the first ddt0 is 2x too
+// large and, at oc=1, oscillates without decaying -> 1st order).
+inline DdtCoeffs ddtCoeffs(DdtScheme scheme, scalar deltaT, scalar deltaT0, scalar ocCoeff = scalar(1), bool cnWarm = false)
 {
     DdtCoeffs c;
     if (scheme == DdtScheme::steadyState || deltaT <= scalar(0))
@@ -50,7 +60,16 @@ inline DdtCoeffs ddtCoeffs(DdtScheme scheme, scalar deltaT, scalar deltaT0)
         c.coefft00 = deltaT * deltaT / (deltaT0 * (deltaT + deltaT0));
         c.coefft0  = c.coefft + c.coefft00;
     }
-    // else Euler: coefft=1, coefft0=1, coefft00=0 (struct defaults)
+    else if (scheme == DdtScheme::CrankNicolson && deltaT0 > scalar(0))
+    {
+        c.cn        = true;
+        c.ocCoeff   = ocCoeff;
+        c.rDeltaT0  = scalar(1) / deltaT0;
+        c.coefft    = scalar(1) + ocCoeff;          // diag = (1+oc)*rDeltaT*V   (OF coef_)
+        c.coefft0   = scalar(1) + ocCoeff;          // source psi.old weight = (1+oc)*rDeltaT
+        c.coefft0dd = cnWarm ? (scalar(1) + ocCoeff) : scalar(1);   // ddt0 recurrence coef (OF coef0_): Euler on first update
+    }
+    // else Euler: coefft=1, coefft0=1, coefft00=0, cn=false (struct defaults). CrankNicolson first step lands here.
     return c;
 }
 
@@ -66,7 +85,8 @@ void deviceFvmDdt(
     const DeviceBuffer<scalar>& psiOld,
     const DeviceBuffer<scalar>& psiOld2,
     DeviceBuffer<scalar>&       diag,
-    DeviceBuffer<scalar>&       source);
+    DeviceBuffer<scalar>&       source,
+    const DeviceBuffer<scalar>* ddt0 = nullptr);   // CrankNicolson stored old ddt (else nullptr)
 
 // Per-scalar transient-ddt bundle for a transported turbulence scalar (k / epsilon / omega / nuTilda). Threaded into
 // deviceSolveScalarTransport so a transient (PIMPLE) turbulence solve folds fvm::ddt(f) into its matrix, while the steady
@@ -77,6 +97,7 @@ struct ScalarDdt
     DdtCoeffs                   c{};
     const DeviceBuffer<scalar>* old  = nullptr;
     const DeviceBuffer<scalar>* old2 = nullptr;
+    const DeviceBuffer<scalar>* ddt0 = nullptr;   // CrankNicolson stored old ddt (that scalar's ddt0_ member); null otherwise
 };
 
 // The two halves of deviceFvmDdt, split for the vector momentum predictor where the ddt DIAGONAL is shared across the 3
@@ -88,13 +109,24 @@ void deviceFvmDdtDiag(
     const DdtCoeffs&            c,
     scalar                      rho,
     DeviceBuffer<scalar>&       diag);
-//   source[c] += rDeltaT*rho*V[c]*( coefft0*psiOld[c] - coefft00*psiOld2[c] )
+//   backward/Euler : source[c] += rDeltaT*rho*V[c]*( coefft0*psiOld[c] - coefft00*psiOld2[c] )
+//   CrankNicolson  : source[c] += rho*V[c]*( coefft0*rDeltaT*psiOld[c] + ocCoeff*ddt0[c] )   (ddt0 non-null when c.cn)
 void deviceFvmDdtSource(
     const DeviceBuffer<scalar>& V,
     const DdtCoeffs&            c,
     scalar                      rho,
     const DeviceBuffer<scalar>& psiOld,
     const DeviceBuffer<scalar>& psiOld2,
-    DeviceBuffer<scalar>&       source);
+    DeviceBuffer<scalar>&       source,
+    const DeviceBuffer<scalar>* ddt0 = nullptr);   // CrankNicolson stored old ddt (else nullptr)
+
+// CrankNicolson ddt0 recurrence (OF DDt0Field update), run ONCE per time step after the old-time rotation:
+//   ddt0[c] = coefft*rDeltaT0*( psiOld[c] - psiOld2[c] ) - ocCoeff*ddt0[c]     (in place; uses the OLD ddt0)
+// No-op unless c.cn (steady/Euler/backward carry no ddt0). psiOld2 must hold two old levels (skipped on the first step).
+void deviceFvmDdtUpdateDdt0(
+    const DdtCoeffs&            c,
+    const DeviceBuffer<scalar>& psiOld,
+    const DeviceBuffer<scalar>& psiOld2,
+    DeviceBuffer<scalar>&       ddt0);
 
 }  // namespace brae

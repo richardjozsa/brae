@@ -154,6 +154,10 @@ try
     ctl.nu = nu; ctl.relaxU = relaxU; ctl.relaxP = relaxP; ctl.relaxK = relaxK; ctl.relaxEps = relaxK;
     ctl.tolU = solveTol("U", 1e-7); ctl.tolP = solveTol("p", 1e-7); ctl.tolKE = solveTol("k", 1e-8);
     ctl.nNonOrth = nNonOrth;
+    ctl.caseDir = caseDir;                                          // AMG-hierarchy cache lives in <caseDir>/constant/polyMesh
+    ctl.writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;     // BRAE_MESH_CACHE=1 -> build the AMG hierarchy ONCE, cache it, reload next run
+    // (BRAE_AMG_SA=1 enables smoothed aggregation -- the mesh-independent fast path -- read inside buildAMG; when set at
+    //  cache-build time the SA hierarchy is what gets cached, so later runs reload the SA hierarchy directly.)
     // fvSchemes div/laplacian/grad scheme flags (2nd-order div(phi,U) linearUpwind, non-orth correction, limitedLinear
     // turbulence scalars, ...). Same parse as steady brae -> the transient solve honours the case's schemes, not upwind.
     parseFvSchemesControls(caseDir, ctl);
