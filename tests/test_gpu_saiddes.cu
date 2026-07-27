@@ -15,6 +15,15 @@
 
 using namespace brae;
 
+static double hostPsi(double chi, const SpalartAllmarasCoeffs& co)
+{
+    const double chi3 = chi*chi*chi, Cv13 = co.Cv1*co.Cv1*co.Cv1;
+    const double fv1 = chi3/(chi3 + Cv13);
+    const double fv2 = 1.0 - chi/(1.0 + chi*fv1);
+    const double K = co.Cb1/(co.Cw1()*co.kappa*co.kappa*co.fwStar);
+    return std::sqrt(std::fmax(std::fmin(100.0, (1.0 - K*fv2)/std::fmax(fv1, 1e-300)), 0.0));
+}
+
 static double hostIddes(const double g[9], double y, double hmax, double hwn, double nt, double nu, const SpalartAllmarasCoeffs& co)
 {
     double g2 = 0; for (int k = 0; k < 9; ++k) g2 += g[k]*g[k];
@@ -36,7 +45,8 @@ static double hostIddes(const double g[9], double y, double hmax, double hwn, do
     const double fe1 = (alpha >= 0.0) ? 2.0*std::exp(-11.09*alpha*alpha) : 2.0*std::exp(-9.0*alpha*alpha);
     const double fe = std::fmax(fe1 - 1.0, 0.0)*fe2;
     const double delta = std::fmin(std::fmax(std::fmax(co.Cw*y, co.Cw*hm), hwn), hm);
-    return std::fmax(fdTilde*(1.0 + fe)*y + (1.0 - fdTilde)*co.CDES*delta, 1e-300);
+    const double lLES = hostPsi(nt/nu, co)*co.CDES*delta;
+    return std::fmax(fdTilde*(1.0 + fe)*y + (1.0 - fdTilde)*lLES, 1e-300);
 }
 
 int main()
@@ -83,9 +93,9 @@ int main()
 
     std::printf("physical limits (by hand):\n");
     chk("deep near-wall (shielded) -> dTilda=y", d[0], yc[0], 1e-9);
-    chk("far-field -> dTilda=CDES*hmax (LES)",   d[1], co.CDES*hmaxc[1], 1e-6);
+    chk("far-field -> dTilda=Psi*CDES*hmax (LES)", d[1], hostPsi(ntc[1]/nu, co)*co.CDES*hmaxc[1], 1e-6);
     chk("elevated-stress band -> dTilda>y",      (d[2] > yc[2]) ? 1.0 : 0.0, 1.0, 0.0);
-    chk("hwn binds -> dTilda ~ CDES*hwn (LES)",  d[4], co.CDES*hwnc[4], 3e-2);
+    chk("hwn binds -> dTilda ~ Psi*CDES*hwn (LES)", d[4], hostPsi(ntc[4]/nu, co)*co.CDES*hwnc[4], 3e-2);
     // hwn actually enters: cell4 differs from the hwn-omitted (hwn=0) length scale.
     chk("hwn changes dTilda (vs hwn=0)", (std::fabs(d[4] - hostIddes(g[4], yc[4], hmaxc[4], 0.0, ntc[4], nu, co)) > 1e-6) ? 1.0 : 0.0, 1.0, 0.0);
     chk("all dTilda > 0", (d[0]>0&&d[1]>0&&d[2]>0&&d[3]>0&&d[4]>0)?1.0:0.0, 1.0, 0.0);
