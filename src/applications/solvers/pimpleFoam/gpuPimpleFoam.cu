@@ -198,8 +198,9 @@ try
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
     GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC); p.evaluateBoundary();
     // phi: on restart READ the previously-written conservative face flux (surfaceScalarField) so the resumed run
-    // continues the EXACT flux state (exact to writePrecision, default 16) -- no first-step continuity transient. Fresh
-    // start / no phi file -> recompute from U (fvc::flux is only continuity-consistent to the prior solver tolerance).
+    // continues the EXACT flux state (the >=17-digit write makes the phi write->read round-trip bit-identical) -- no
+    // first-step continuity transient. The overall restart is seamless to ~1e-10 (nut re-validated at startup, like OF),
+    // not literally bit-for-bit. Fresh start / no phi -> recompute from U (fvc::flux).
     SurfaceScalarField phi;
     const std::string phiPath = fieldDir + "/phi";
     if (std::filesystem::exists(phiPath))
@@ -246,7 +247,10 @@ try
                 std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
         writeVolField(fieldDir + "/U", outDir + "/U", solver.U(), fvp, precision);
         writeVolField(fieldDir + "/p", outDir + "/p", solver.p(), fvp, precision);
-        writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp, precision);   // face flux (OF writes phi)
+        // phi is the restart-critical conservative flux -> write it LOSSLESS (>=17 = double max_digits10) so its
+        // write->read round-trip is bit-identical (16 sig figs loses the last bit) and a restart resumes the EXACT flux
+        // with no continuity transient. The viz fields (U/p/turbulence) keep the user's writePrecision.
+        writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp, std::max(precision, 17));
         if (ctl.sa) {
             writeVolField(fieldDir + "/nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
             writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
