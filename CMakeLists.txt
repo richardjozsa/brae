@@ -92,6 +92,7 @@ add_library(brae_core STATIC
     src/cuda/device_kepsilon.cu
     src/cuda/device_spalart.cu
     src/cuda/device_komega_sst.cu
+    src/cuda/device_smagorinsky.cu
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
@@ -549,6 +550,11 @@ add_executable(test_gpu_ksstddes tests/test_gpu_ksstddes.cu)
 target_include_directories(test_gpu_ksstddes PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_ksstddes PRIVATE brae_core)
 add_test(NAME gpu_ksstddes COMMAND test_gpu_ksstddes)
+
+add_executable(test_gpu_smagorinsky tests/test_gpu_smagorinsky.cu)
+target_include_directories(test_gpu_smagorinsky PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_smagorinsky PRIVATE brae_core)
+add_test(NAME gpu_smagorinsky COMMAND test_gpu_smagorinsky)
 
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})

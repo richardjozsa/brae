@@ -32,14 +32,24 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 const std::string model = les->wordOr("LESModel", "");
                 const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES");
                 const bool sstDes = (model == "kOmegaSSTDDES" || model == "kOmegaSSTDES");
-                if (!saDes && !sstDes)
+                const bool smag   = (model == "Smagorinsky");
+                if (!saDes && !sstDes && !smag)
                     throw std::runtime_error("brae: unsupported LESModel '" + model
-                        + "' (SpalartAllmarasDDES/DES or kOmegaSSTDDES/DES)");
-                ctl.des = true;
+                        + "' (Smagorinsky, SpalartAllmarasDDES/DES or kOmegaSSTDDES/DES)");
                 const std::string delta = les->wordOr("delta", "cubeRootVol");
                 if (delta != "cubeRootVol")
                     std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
                 const FoamDict* dc = les->subDict(model + "Coeffs");
+                if (smag)   // pure LES Smagorinsky: ALGEBRAIC sub-grid nut (no transport scalar, no DES length-scale limiter)
+                {
+                    ctl.les = true;
+                    if (dc) { ctl.smagCoeffs.Ck = dc->scalarOr("Ck", ctl.smagCoeffs.Ck);
+                              ctl.smagCoeffs.Ce = dc->scalarOr("Ce", ctl.smagCoeffs.Ce); }
+                    std::printf("  Smagorinsky (LES, delta=cubeRootVol): Ck=%.4g Ce=%.4g (equivalent Cs=%.4g)\n",
+                                ctl.smagCoeffs.Ck, ctl.smagCoeffs.Ce, ctl.smagCoeffs.Cs());
+                    return;
+                }
+                ctl.des = true;
                 if (saDes)   // SA-DDES: reuse the SA transport + the DES length-scale limiter
                 {
                     ctl.sa = true;
@@ -185,7 +195,15 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                        ctl.sst ? "kOmegaSST" : "kEpsilon");
         };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
-        if (ctl.sa)   // Spalart-Allmaras (one-equation): nuTilda -> the "k" slot, nut. BCs (freestream + fixedValue-0 wall) need no inlet calc.
+        if (ctl.les)   // pure LES Smagorinsky: ONLY nut (algebraic sub-grid viscosity); no k/epsilon/omega/nuTilda transport.
+        {
+            const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardWallFn(nutFD, "nut");
+            setNutWall(nutFD);   // honour a velocity-based nut wall function (nutUSpaldingWallFunction) if the case uses one
+            nut = buildField<scalar>(nutFD, fvp, nC);
+            nut.evaluateBoundary();
+        }
+        else if (ctl.sa)   // Spalart-Allmaras (one-equation): nuTilda -> the "k" slot, nut. BCs (freestream + fixedValue-0 wall) need no inlet calc.
         {
             k   = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC);
             k.evaluateBoundary();

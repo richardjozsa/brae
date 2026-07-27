@@ -175,22 +175,25 @@ namespace brae {
         std::vector<scalar> nv(nC_, 0.0);
         if (ctl_.turbulent)
         {
-            dbK_   = buildDeviceBoundary(*k, fvp, g);        // SA: the "k" slot holds nuTilda
-            dk_.copyFrom(k->internal);
-            if (!ctl_.sa)
+            nv = nut->internal;   // nut is the ONLY turbulence field for pure LES (Smagorinsky); read it for every model.
+            if (!ctl_.les)        // RAS/DES transport scalars: pure-LES Smagorinsky is ALGEBRAIC (no k/epsilon/omega/nuTilda, no wall distance).
             {
-                dbEps_ = buildDeviceBoundary(*eps, fvp, g);
-                de_.copyFrom(eps->internal);   // 2nd scalar (omega/eps); SA has none
-            }
-            nv = nut->internal;
-            if (ctl_.sst || ctl_.sa) y_.copyFrom(cellWallDist(m, g, fvp));   // wall distance (SST F1/F2/F3; SA dTilda)
-            if (ctl_.lm && ReThetat && gammaInt)   // kOmegaSSTLM transition fields
-            {
-                dbReThetat_ = buildDeviceBoundary(*ReThetat, fvp, g);
-                ReThetat_.copyFrom(ReThetat->internal);
-                dbGammaInt_ = buildDeviceBoundary(*gammaInt, fvp, g);
-                gammaInt_.copyFrom(gammaInt->internal);
-                gammaIntEff_.copyFrom(std::vector<scalar>(nC_, 0.0));   // OF kOmegaSSTLM ctor: gammaIntEff_ = Zero (no Pk on iter 1, before correctReThetatGammaInt updates it)
+                dbK_   = buildDeviceBoundary(*k, fvp, g);        // SA: the "k" slot holds nuTilda
+                dk_.copyFrom(k->internal);
+                if (!ctl_.sa)
+                {
+                    dbEps_ = buildDeviceBoundary(*eps, fvp, g);
+                    de_.copyFrom(eps->internal);   // 2nd scalar (omega/eps); SA has none
+                }
+                if (ctl_.sst || ctl_.sa) y_.copyFrom(cellWallDist(m, g, fvp));   // wall distance (SST F1/F2/F3; SA dTilda)
+                if (ctl_.lm && ReThetat && gammaInt)   // kOmegaSSTLM transition fields
+                {
+                    dbReThetat_ = buildDeviceBoundary(*ReThetat, fvp, g);
+                    ReThetat_.copyFrom(ReThetat->internal);
+                    dbGammaInt_ = buildDeviceBoundary(*gammaInt, fvp, g);
+                    gammaInt_.copyFrom(gammaInt->internal);
+                    gammaIntEff_.copyFrom(std::vector<scalar>(nC_, 0.0));   // OF kOmegaSSTLM ctor: gammaIntEff_ = Zero (no Pk on iter 1, before correctReThetatGammaInt updates it)
+                }
             }
         }
         dnut_.copyFrom(nv);
@@ -205,6 +208,13 @@ namespace brae {
     {
         if (!ctl_.turbulent) return;
         const DeviceMesh& dm = dm_;
+        if (ctl_.les)   // pure LES Smagorinsky: nut is algebraic (no bound(k)/bound(omega)); seed it from the initial U.
+        {
+            DeviceBuffer<scalar> gradU;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);   // nut = Ck*delta*sqrt(k_sgs)
+            return;
+        }
         deviceBoundField(dm, dk_, 1e-15);                              // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
         if (!ctl_.sa) deviceBoundField(dm, de_, 1e-15);               // bound(omega_|epsilon_, ...Min_)
         // validate() -> correctNut(): recompute internal nut from the bounded fields + the initial U.
@@ -234,6 +244,13 @@ namespace brae {
     {
         const DeviceMesh& dm = dm_;
         clearTurbulenceReport();   // OF-style report: collect this step's turbulence solves (Solving for k/omega/...)
+        if (ctl_.les)   // pure LES Smagorinsky: algebraic sub-grid nut = Ck*delta*sqrt(k_sgs) from the current U. No
+        {              // transport solve (report stays empty -> no "Solving for k/omega" lines), so no ddt(k/omega) either.
+            DeviceBuffer<scalar> gradU;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);
+            return;
+        }
         if (ctl_.turbulent)
         {
             // transient URANS fvm::ddt(k/eps/omega/nuTilda): a per-scalar bundle (steady -> active==false -> no-op, so
@@ -291,7 +308,7 @@ namespace brae {
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);
         deviceUpdateInletOutlet(dbP_, phiBnd_);
-        if (ctl_.turbulent)
+        if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
         {
             deviceUpdateInletOutlet(dbK_, phiBnd_);
             deviceUpdateInletOutlet(dbEps_, phiBnd_);
@@ -324,7 +341,22 @@ namespace brae {
         // nuEff at boundary FACES: turbulent uses the TRUE wall nut (nutkWallFunction), not the cell value, so the
         // wall shear matches OpenFOAM; laminar/non-wall faces use the adjacent cell value.
         DeviceBuffer<scalar> nuEffBnd;
-        if (ctl_.turbulent)
+        if (ctl_.turbulent && ctl_.les)
+        {
+            // pure LES Smagorinsky: NO k-based wall function (there is no k field). Honour a velocity-based nut wall
+            // function (nutUSpaldingWallFunction) if the 0/nut BC selects it; otherwise extrapolate the cell nuEff
+            // (nu+nut) to the boundary (calculated/zeroGradient/fixedValue nut -> adjacent-cell sub-grid nut), exactly
+            // as the laminar path does.
+            if (ctl_.nutWall == NutWall::Spalding)
+            {
+                deviceCopy(nuEffBnd, nuBndConst_);
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
+                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
+            }
+            else
+                deviceBCValue(dbExtrap_, nuEff, nuEffBnd);
+        }
+        else if (ctl_.turbulent)
         {
             deviceCopy(nuEffBnd, nuBndConst_);
             // Wall nut chosen by the 0/nut BC TYPE (ctl_.nutWall), matching OpenFOAM, NOT the model.
@@ -893,7 +925,7 @@ namespace brae {
             if (bwd && Uold_[k].size()) deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (backward only, once t-1 exists)
             deviceCopy(Uold_[k], Uk_[k]);                                  // t-1 <- current
         }
-        if (ctl_.turbulent)   // turbulence old-time levels for fvm::ddt(k/eps): dk_ = k (or nuTilda), de_ = epsilon|omega
+        if (ctl_.turbulent && !ctl_.les)   // turbulence old-time levels for fvm::ddt(k/eps): dk_ = k (or nuTilda), de_ = epsilon|omega. Pure LES nut is algebraic -> no ddt.
         {
             if (bwd && kOld_.size()) deviceCopy(kOld2_, kOld_);
             deviceCopy(kOld_, dk_);
