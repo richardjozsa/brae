@@ -85,5 +85,10 @@ void deviceKReactionSST(const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar
 void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
     const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& F2,
     const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES);
+// kOmegaSST-IDDES factor FDES = lRAS/lIDDES (Gritskevich et al. 2012): the improved (WMLES) length scale. (Unit-test/DES hook.)
+void deviceKOmegaSSTIDDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nut,
+    const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax, scalar nu,
+    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES);
 
 } // namespace brae

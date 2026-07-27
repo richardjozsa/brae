@@ -222,7 +222,7 @@ try
                 "turbulence=%s nCells=%d\n\n",
                 (double)deltaT, (double)endTime, ddtScheme == DdtScheme::backward ? "backward" : "Euler",
                 nOuter, nCorr, nNonOrth, (double)nu,
-                !ctl.turbulent ? "laminar" : ctl.les ? "Smagorinsky (LES)" : ctl.iddes ? "SpalartAllmarasIDDES" : ctl.sa ? "SpalartAllmaras" : ctl.sst ? (ctl.lm ? "kOmegaSSTLM" : "kOmegaSST") : "kEpsilon",
+                !ctl.turbulent ? "laminar" : ctl.les ? "Smagorinsky (LES)" : ctl.iddes ? (ctl.sst ? "kOmegaSSTIDDES" : "SpalartAllmarasIDDES") : ctl.sa ? "SpalartAllmaras" : ctl.sst ? (ctl.lm ? "kOmegaSSTLM" : "kOmegaSST") : "kEpsilon",
                 nC);
 
     // ---- write cadence (Foam::Time: writeControl timeStep|runTime + writeInterval + purgeWrite FIFO) ----
