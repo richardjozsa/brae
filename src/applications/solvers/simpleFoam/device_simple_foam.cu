@@ -265,11 +265,11 @@ namespace brae {
         {
             // transient URANS fvm::ddt(k/eps/omega/nuTilda): a per-scalar bundle (steady -> active==false -> no-op, so
             // the steady SIMPLE turbulence stays byte-for-byte). dk_=k|nuTilda (kOld_), de_=epsilon|omega (e2Old_).
-            const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_);
-            const ScalarDdt kDdt{ ddtc, &kOld_,  kOld2_.size()  ? &kOld2_  : nullptr };
-            const ScalarDdt sDdt{ ddtc, &e2Old_, e2Old2_.size() ? &e2Old2_ : nullptr };
-            const ScalarDdt reDdt{ ddtc, &ReThetatOld_, ReThetatOld2_.size() ? &ReThetatOld2_ : nullptr };   // kOmegaSSTLM
-            const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr };
+            const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
+            const ScalarDdt kDdt{ ddtc, &kOld_,  kOld2_.size()  ? &kOld2_  : nullptr, ddtc.cn ? &kddt0_ : nullptr };
+            const ScalarDdt sDdt{ ddtc, &e2Old_, e2Old2_.size() ? &e2Old2_ : nullptr, ddtc.cn ? &e2ddt0_ : nullptr };
+            const ScalarDdt reDdt{ ddtc, &ReThetatOld_, ReThetatOld2_.size() ? &ReThetatOld2_ : nullptr, ddtc.cn ? &ReThetatddt0_ : nullptr };   // kOmegaSSTLM
+            const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr, ddtc.cn ? &gammaIntddt0_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
                                              ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
@@ -310,7 +310,7 @@ namespace brae {
         // Transient fvm::ddt(U): the ONE term steady SIMPLE lacks. steadyState (SIMPLE) -> ddtc.active==false -> the two
         // deviceFvmDdt* calls below are exact no-ops (this method stays byte-for-byte SIMPLE). pimpleStep() sets the
         // scheme + rotates the old-time fields, so the transient (PIMPLE) path folds ddt into the SAME predictor.
-        const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_);
+        const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
         // nonOrthLimitP (the pressure non-orth limiter) is declared in step() -- it is read only by the pressure phase.
         const scalar nonOrthRelaxU = std::getenv("BRAE_NONORTH_RELAX_U") ? std::atof(std::getenv("BRAE_NONORTH_RELAX_U")) : 1.0;
 
@@ -548,7 +548,7 @@ namespace brae {
             deviceAxpy(1.0, *ddr[kk], relaxSrc[kk]);                                  // += explicit divDevReff stress
             // + fvm::ddt(U) SOURCE for this component: rDeltaT*V*(coefft0*Uold - coefft00*Uold2). Into relaxSrc so it
             // feeds BOTH the predictor solve AND H()/HbyA (OF's UEqn.H() includes the ddt source). No-op for SIMPLE.
-            deviceFvmDdtSource(dm.V, ddtc, 1.0, Uold_[kk], Uold2_[kk], relaxSrc[kk]);
+            deviceFvmDdtSource(dm.V, ddtc, 1.0, Uold_[kk], Uold2_[kk], relaxSrc[kk], ddtc.cn ? &Uddt0_[kk] : nullptr);   // CrankNicolson: + ocCoeff*ddt0
             if (mrf_.active) deviceMrfCoriolis(mrf_, dm.V, Uk_[0], Uk_[1], Uk_[2], kk, relaxSrc[kk]);   // MRF Coriolis: -V*(Omega x U)_kk on zone cells
             // Explicit momentum corrections (linearUpwind deferred + non-orth laplacian) go into relaxSrc so they
             // feed BOTH the predictor solve AND H()/HbyA, OF's UEqn.H() includes them. Adding them only to the
@@ -929,28 +929,45 @@ namespace brae {
     // bootstraps to Euler exactly like pimpleFoam's first step (only one old level exists yet).
     void DeviceSimpleSolver::advanceTime(scalar deltaT)
     {
-        const bool bwd = (ddtScheme_ == DdtScheme::backward);
+        const bool cn  = (ddtScheme_ == DdtScheme::CrankNicolson);
+        const bool two = (ddtScheme_ == DdtScheme::backward) || cn;   // backward (coefft00 term) + CrankNicolson (ddt0 recurrence) both need the 2nd old level
         for (int k = 0; k < 3; ++k)
         {
-            if (bwd && Uold_[k].size()) deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (backward only, once t-1 exists)
+            if (two && Uold_[k].size()) deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (once t-1 exists)
             deviceCopy(Uold_[k], Uk_[k]);                                  // t-1 <- current
         }
         if (ctl_.turbulent && !ctl_.les)   // turbulence old-time levels for fvm::ddt(k/eps): dk_ = k (or nuTilda), de_ = epsilon|omega. Pure LES nut is algebraic -> no ddt.
         {
-            if (bwd && kOld_.size()) deviceCopy(kOld2_, kOld_);
+            if (two && kOld_.size()) deviceCopy(kOld2_, kOld_);
             deviceCopy(kOld_, dk_);
             if (!ctl_.sa)   // SA is one-equation (no second scalar)
             {
-                if (bwd && e2Old_.size()) deviceCopy(e2Old2_, e2Old_);
+                if (two && e2Old_.size()) deviceCopy(e2Old2_, e2Old_);
                 deviceCopy(e2Old_, de_);
             }
             if (ctl_.lm)   // kOmegaSSTLM transition fields (ReThetat, gammaInt)
             {
-                if (bwd && ReThetatOld_.size()) deviceCopy(ReThetatOld2_, ReThetatOld_);
+                if (two && ReThetatOld_.size()) deviceCopy(ReThetatOld2_, ReThetatOld_);
                 deviceCopy(ReThetatOld_, ReThetat_);
-                if (bwd && gammaIntOld_.size()) deviceCopy(gammaIntOld2_, gammaIntOld_);
+                if (two && gammaIntOld_.size()) deviceCopy(gammaIntOld2_, gammaIntOld_);
                 deviceCopy(gammaIntOld_, gammaInt_);
             }
+        }
+        if (cn)   // CrankNicolson: update each transported variable's stored old ddt (ddt0) from the just-rotated old levels.
+        {         // deltaT0 = the PREVIOUS deltaT (deltaT_ not yet overwritten); no-op on the first step (no oldTime.oldTime).
+            const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT, deltaT_, ocCoeff_, cnWarm_);
+            for (int k = 0; k < 3; ++k) deviceFvmDdtUpdateDdt0(ddtc, Uold_[k], Uold2_[k], Uddt0_[k]);
+            if (ctl_.turbulent && !ctl_.les)
+            {
+                deviceFvmDdtUpdateDdt0(ddtc, kOld_, kOld2_, kddt0_);
+                if (!ctl_.sa) deviceFvmDdtUpdateDdt0(ddtc, e2Old_, e2Old2_, e2ddt0_);
+                if (ctl_.lm)
+                {
+                    deviceFvmDdtUpdateDdt0(ddtc, ReThetatOld_, ReThetatOld2_, ReThetatddt0_);
+                    deviceFvmDdtUpdateDdt0(ddtc, gammaIntOld_, gammaIntOld2_, gammaIntddt0_);
+                }
+            }
+            if (ddtc.cn && Uold2_[0].size()) cnWarm_ = true;   // first (Euler-startup) ddt0 update done -> subsequent updates use 1+oc
         }
         deltaT0_ = deltaT_;
         deltaT_  = deltaT;
