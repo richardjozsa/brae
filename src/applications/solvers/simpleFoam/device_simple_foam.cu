@@ -107,6 +107,21 @@ namespace brae {
             bndIsWall_.copyFrom(isW);
             bndY_.copyFrom(yv);
         }
+        // flat boundary face centres (patch order, cyclic/cyclicAMI excluded) -- the absolute-position Cf indexing used
+        // by the NVRTC coded-BC kernels (aligned to the DeviceBoundary refValue/faceCell order). Built once at setup.
+        {
+            std::vector<scalar> bx, by, bz;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    const vector& cf = g.Cf()[fvp[pi].start + i];
+                    bx.push_back(cf.x); by.push_back(cf.y); bz.push_back(cf.z);
+                }
+            }
+            bndCfX_.copyFrom(bx); bndCfY_.copyFrom(by); bndCfZ_.copyFrom(bz);
+        }
         // adjustPhi adjustable mask (patch order = phiBnd_ order): a face is adjustable iff its U patch does NOT
         // fix the flux (zeroGradient/inletOutlet/calculated) -> OF "!fixesValue || isA<inletOutlet>".
         {
@@ -212,6 +227,17 @@ namespace brae {
         zeroBndU_.copyFrom(std::vector<scalar>(dbU_.n, 0.0));
         ones_.copyFrom(std::vector<scalar>(nC_, 1.0));            // unit vector for the OF normFactor
         validateTurbulence();                                    // OF turbulenceModel ctor bound() + simpleFoam.C:92 validate()
+    }
+
+    void DeviceSimpleSolver::addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target)
+    {
+        SolverCodedBC cbc;
+        cbc.kernel = (target == 0) ? compileCodedVectorBc(name, code)    // U -> vec3 out
+                                   : compileCodedScalarBc(name, code);   // p/k/second -> scalar out
+        cbc.offset = offset;
+        cbc.count  = count;
+        cbc.target = target;
+        codedBCs_.push_back(std::move(cbc));
     }
 
     void DeviceSimpleSolver::validateTurbulence()
@@ -341,6 +367,22 @@ namespace brae {
             deviceBCValue(dbU_.comp[1], Uk_[1], uby);
             deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
             deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz);
+        }
+        // NVRTC device-coded BCs (codedFixedValue): run each compiled snippet over its patch faces, overwriting the
+        // target field's refValue on the device from position/time/adjacent-cell value. Same updateCoeffs point as the
+        // BCs above; the p/k/second boundaries set here persist into the pressure + turbulence phases of this corrector.
+        for (const SolverCodedBC& cbc : codedBCs_)
+        {
+            if (cbc.target == 0)         // U (vector)
+                launchCodedVectorBc(cbc.kernel, cbc.offset, cbc.count, time_,
+                                    bndCfX_, bndCfY_, bndCfZ_, Uk_[0], Uk_[1], Uk_[2], dbU_.comp[0].faceCell,
+                                    dbU_.comp[0].refValue, dbU_.comp[1].refValue, dbU_.comp[2].refValue);
+            else if (cbc.target == 1)    // p
+                launchCodedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, dp_, dbP_.faceCell, dbP_.refValue);
+            else if (cbc.target == 2)    // k (or nuTilda for SA)
+                launchCodedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, dk_, dbK_.faceCell, dbK_.refValue);
+            else if (cbc.target == 3)    // second turbulence scalar (omega / epsilon)
+                launchCodedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, de_, dbEps_.faceCell, dbEps_.refValue);
         }
 
         DeviceBuffer<scalar> nuEff;
