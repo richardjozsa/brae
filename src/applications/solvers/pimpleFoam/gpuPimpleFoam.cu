@@ -31,7 +31,9 @@
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
+#include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace brae;
@@ -69,6 +71,44 @@ DdtScheme parseDdtScheme(const std::string& fvSchemesPath)
     throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|steadyState).");
 }
 
+// Read a surfaceScalarField (phi) written by writeSurfaceField (or by OpenFOAM) back into a SurfaceScalarField shaped
+// exactly like fvc::flux: internal = the nInternalFaces flux list; boundary indexed [patch] with boundary[pi] sized
+// patches[pi].size. readField<scalar> parses the file transparently (it does not check the FoamFile class nor the list
+// length against nCells -- that check lives only in buildField, which we bypass). Values come from `calculated` patches;
+// zeros stand in for empty/cyclic/cyclicAMI/no-value patches (the ctor recomputes cyclic/AMI flux from U + skips them,
+// and an empty face flux is 0). Used only for a seamless restart (resume the exact written flux state).
+SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
+{
+    const FieldData<scalar> fd = readField<scalar>(path);
+    SurfaceScalarField ssf;
+    if (fd.internalUniform)
+        ssf.internal.assign(static_cast<std::size_t>(nInternalFaces), fd.internalUniformValue);
+    else if (static_cast<label>(fd.internalField.size()) != nInternalFaces)
+        throw std::runtime_error("readSurfaceField: " + path + " internalField has "
+            + std::to_string(fd.internalField.size()) + " faces, but the mesh has " + std::to_string(nInternalFaces)
+            + " internal faces (wrong mesh / decomposed phi).");
+    else
+        ssf.internal = fd.internalField;
+
+    ssf.boundary.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        std::vector<scalar> vals(static_cast<std::size_t>(patches[pi].size), scalar(0));
+        for (const auto& b : fd.boundary)   // pass-1 exact-name match (written phi lists exact mesh-patch names)
+        {
+            if (b.name != patches[pi].name) continue;
+            if (b.hasValue && patches[pi].type != "cyclic" && patches[pi].type != "cyclicAMI")
+            {
+                if (b.valueUniform) std::fill(vals.begin(), vals.end(), b.uniformValue);
+                else if (b.values.size() == vals.size()) vals = b.values;   // else keep zeros (defensive)
+            }
+            break;
+        }
+        ssf.boundary[pi] = std::move(vals);
+    }
+    return ssf;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -82,7 +122,7 @@ try
     const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
     const DdtScheme ddtScheme  = parseDdtScheme(caseDir + "/system/fvSchemes");
 
-    const scalar startTime     = controlDict.scalarOr("startTime", 0.0);
+    scalar       startTime     = controlDict.scalarOr("startTime", 0.0);   // resolved below for startFrom latestTime (restart)
     const scalar deltaT        = controlDict.scalarOr("deltaT", 1e-3);
     const scalar endTime       = controlDict.scalarOr("endTime", 1.0);
     const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
@@ -136,10 +176,39 @@ try
     FvGeometry g; g.build(m);
     const std::vector<FvPatch> fvp = buildPatches(m, g);
     const label nC = m.nCells();
-    const std::string fieldDir = caseDir + "/" + timeName(startTime);
+    // startFrom latestTime -> RESTART: resume from the newest numeric time dir that holds a U field (else startTime).
+    std::string startStr = timeName(startTime);
+    if (controlDict.wordOr("startFrom", "startTime") == "latestTime")
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec; scalar best = 0; std::string bestName; bool found = false;
+        for (const auto& e : fs::directory_iterator(caseDir, ec))
+        {
+            if (!e.is_directory()) continue;
+            const std::string nm = e.path().filename().string();
+            char* end = nullptr; const scalar t = std::strtod(nm.c_str(), &end);
+            if (end == nm.c_str() || *end != '\0') continue;             // not a pure number -> not a time dir
+            if (!fs::exists(e.path() / "U")) continue;
+            if (!found || t > best) { best = t; bestName = nm; found = true; }
+        }
+        if (found) { startTime = best; startStr = bestName;
+            std::printf("gpuPimpleFoam: startFrom latestTime -> resuming from time '%s'\n", bestName.c_str()); }
+    }
+    const std::string fieldDir = caseDir + "/" + startStr;
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
     GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC); p.evaluateBoundary();
-    SurfaceScalarField phi = fvc::flux(U, m, g, fvp);
+    // phi: on restart READ the previously-written conservative face flux (surfaceScalarField) so the resumed run
+    // continues the EXACT flux state (exact to writePrecision, default 16) -- no first-step continuity transient. Fresh
+    // start / no phi file -> recompute from U (fvc::flux is only continuity-consistent to the prior solver tolerance).
+    SurfaceScalarField phi;
+    const std::string phiPath = fieldDir + "/phi";
+    if (std::filesystem::exists(phiPath))
+    {
+        phi = readSurfaceField(phiPath, fvp, m.nInternalFaces());
+        std::printf("gpuPimpleFoam: read phi from %s (restart flux)\n", phiPath.c_str());
+    }
+    else
+        phi = fvc::flux(U, m, g, fvp);
 
     TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
 
@@ -177,6 +246,7 @@ try
                 std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
         writeVolField(fieldDir + "/U", outDir + "/U", solver.U(), fvp, precision);
         writeVolField(fieldDir + "/p", outDir + "/p", solver.p(), fvp, precision);
+        writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp, precision);   // face flux (OF writes phi)
         if (ctl.sa) {
             writeVolField(fieldDir + "/nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
             writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
