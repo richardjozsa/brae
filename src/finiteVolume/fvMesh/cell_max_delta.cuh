@@ -9,7 +9,9 @@
 // over the faces; no cell->point connectivity is needed.
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
+#include "fv_geometry.cuh"
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace brae {
@@ -45,6 +47,53 @@ inline std::vector<scalar> cellMaxDeltaXYZ(const PrimitiveMesh& m)
     for (label c = 0; c < nCells; ++c)
         hmax[c] = std::max(hi[c].x - lo[c].x, std::max(hi[c].y - lo[c].y, hi[c].z - lo[c].z));
     return hmax;
+}
+
+// Per-cell wall-normal grid spacing h_wn, the third term of the IDDES delta min(max(max(Cw*y, Cw*hmax), h_wn), hmax).
+// The wall-normal direction n = normalize(C - wallOrigin), where wallOrigin is the nearest wall-face centre propagated
+// by cellWallDist (exact wall-normal for near-wall cells, where h_wn matters). h_wn is the extent of the cell's vertex
+// bounding box projected onto n. Cells with no wall direction (wallOrigin == C, i.e. wave never reached / no walls)
+// fall back to hmax so h_wn never constrains the delta there. Static geometry -> computed ONCE at setup, uploaded.
+inline std::vector<scalar> cellWallNormalSpacing(
+    const PrimitiveMesh& m, const FvGeometry& g,
+    const std::vector<vector>& wallOrigin, const std::vector<scalar>& hmax)
+{
+    const label nCells = m.nCells();
+    const label nFaces = m.nFaces();
+    const label nIntF  = m.nInternalFaces();
+    const std::vector<vector>& pts = m.points();
+    const std::vector<vector>& C   = g.C();
+    const std::vector<label>&  own = m.owner();
+    const std::vector<label>&  nei = m.neighbour();
+
+    std::vector<vector> nhat(nCells);
+    std::vector<char>   ok(nCells, 0);
+    for (label c = 0; c < nCells; ++c)
+    {
+        const scalar dx = C[c].x - wallOrigin[c].x, dy = C[c].y - wallOrigin[c].y, dz = C[c].z - wallOrigin[c].z;
+        const scalar mg = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (mg > 1e-12) { nhat[c] = vector{dx/mg, dy/mg, dz/mg}; ok[c] = 1; }
+    }
+    constexpr scalar BIG = 1e300;
+    std::vector<scalar> plo(nCells, BIG), phi(nCells, -BIG);
+    auto accumulate = [&](label c, label f)
+    {
+        if (!ok[c]) return;
+        const label nv = m.faceSize(f);
+        for (label k = 0; k < nv; ++k)
+        {
+            const vector& p = pts[m.faceVert(f, k)];
+            const scalar proj = nhat[c].x*p.x + nhat[c].y*p.y + nhat[c].z*p.z;
+            plo[c] = std::min(plo[c], proj); phi[c] = std::max(phi[c], proj);
+        }
+    };
+    for (label f = 0; f < nFaces; ++f) accumulate(own[f], f);
+    for (label f = 0; f < nIntF;  ++f) accumulate(nei[f], f);
+
+    std::vector<scalar> hwn(nCells);
+    for (label c = 0; c < nCells; ++c)
+        hwn[c] = ok[c] ? (phi[c] - plo[c]) : hmax[c];   // no wall direction -> hmax (h_wn does not constrain the delta)
+    return hwn;
 }
 
 } // namespace brae

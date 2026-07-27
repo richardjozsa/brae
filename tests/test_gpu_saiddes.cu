@@ -15,7 +15,7 @@
 
 using namespace brae;
 
-static double hostIddes(const double g[9], double y, double hmax, double nt, double nu, const SpalartAllmarasCoeffs& co)
+static double hostIddes(const double g[9], double y, double hmax, double hwn, double nt, double nu, const SpalartAllmarasCoeffs& co)
 {
     double g2 = 0; for (int k = 0; k < 9; ++k) g2 += g[k]*g[k];
     const double magGradU = std::fmax(std::sqrt(g2), 1e-300);
@@ -35,7 +35,7 @@ static double hostIddes(const double g[9], double y, double hmax, double nt, dou
     const double fdTilde = std::fmax(1.0 - fdt, fB);
     const double fe1 = (alpha >= 0.0) ? 2.0*std::exp(-11.09*alpha*alpha) : 2.0*std::exp(-9.0*alpha*alpha);
     const double fe = std::fmax(fe1 - 1.0, 0.0)*fe2;
-    const double delta = std::fmin(std::fmax(co.Cw*y, co.Cw*hm), hm);
+    const double delta = std::fmin(std::fmax(std::fmax(co.Cw*y, co.Cw*hm), hwn), hm);
     return std::fmax(fdTilde*(1.0 + fe)*y + (1.0 - fdTilde)*co.CDES*delta, 1e-300);
 }
 
@@ -50,40 +50,45 @@ int main()
 
     SpalartAllmarasCoeffs co;   // CDES=0.65, Cdt1=20, Cl=5, Ct=1.87, Cw=0.15, kappa=0.41, Cv1=7.1
     const double nu = 1e-5;
-    const int nC = 4;
+    const int nC = 5;
     // [0]=deep near-wall (shielded RANS); [1]=far-field (LES); [2]=fe elevated-stress band (huge shear keeps rd_t moderate);
-    // [3]=generic cell (exactness).
+    // [3]=generic cell (exactness); [4]=hwn is the binding delta term (Cw*y,Cw*hmax < hwn < hmax) in a near-LES cell.
     double g[nC][9] = {
         {0,1000,0,  0,0,0,  0,0,0},
         {0,100,0,   0,0,0,  0,0,0},
         {0,495000,0,0,0,0,  0,0,0},
         {0.1,0.5,-0.2, 0.3,-0.1,0.4, 0.05,-0.3,0.15},
+        {0,1e5,0,   0,0,0,  0,0,0},
     };
-    double yc[nC]    = {1e-4, 1.0,  2e-4, 5e-3};
-    double hmaxc[nC] = {1e-3, 1e-3, 1e-3, 2e-3};
-    double ntc[nC]   = {1e-2, 1e-4, 1e-3, 1e-3};
+    double yc[nC]    = {1e-4, 1.0,  2e-4, 5e-3, 1e-3};
+    double hmaxc[nC] = {1e-3, 1e-3, 1e-3, 2e-3, 1e-3};
+    double hwnc[nC]  = {1e-3, 5e-4, 1e-3, 1e-3, 6e-4};   // cell4: 0.15*y=1.5e-4, 0.15*hmax=1.5e-4 < hwn=6e-4 < hmax=1e-3 -> delta=hwn
+    double ntc[nC]   = {1e-2, 1e-4, 1e-3, 1e-3, 1e-4};
 
-    std::vector<scalar> hgradU(9*nC), hy(nC), hhmax(nC), hnt(nC);
+    std::vector<scalar> hgradU(9*nC), hy(nC), hhmax(nC), hhwn(nC), hnt(nC);
     for (int c = 0; c < nC; ++c) {
-        hy[c]=yc[c]; hhmax[c]=hmaxc[c]; hnt[c]=ntc[c];
+        hy[c]=yc[c]; hhmax[c]=hmaxc[c]; hhwn[c]=hwnc[c]; hnt[c]=ntc[c];
         for (int k = 0; k < 9; ++k) hgradU[k*nC + c] = g[c][k];
     }
-    DeviceBuffer<scalar> y, hmax, gradU, nt, dT;
-    y.copyFrom(hy); hmax.copyFrom(hhmax); gradU.copyFrom(hgradU); nt.copyFrom(hnt);
-    deviceSAIDDESdTilda(nC, y, hmax, gradU, nt, nu, co, dT);
+    DeviceBuffer<scalar> y, hmax, hwn, gradU, nt, dT;
+    y.copyFrom(hy); hmax.copyFrom(hhmax); hwn.copyFrom(hhwn); gradU.copyFrom(hgradU); nt.copyFrom(hnt);
+    deviceSAIDDESdTilda(nC, y, hmax, hwn, gradU, nt, nu, co, dT);
     const auto d = dT.host();
 
     std::printf("device kernel vs host IDDES formula (exact):\n");
     for (int c = 0; c < nC; ++c) {
         char nm[32]; std::snprintf(nm, sizeof nm, "cell %d dTilda", c);
-        chk(nm, d[c], hostIddes(g[c], yc[c], hmaxc[c], ntc[c], nu, co), 1e-12);
+        chk(nm, d[c], hostIddes(g[c], yc[c], hmaxc[c], hwnc[c], ntc[c], nu, co), 1e-12);
     }
 
     std::printf("physical limits (by hand):\n");
     chk("deep near-wall (shielded) -> dTilda=y", d[0], yc[0], 1e-9);
     chk("far-field -> dTilda=CDES*hmax (LES)",   d[1], co.CDES*hmaxc[1], 1e-6);
     chk("elevated-stress band -> dTilda>y",      (d[2] > yc[2]) ? 1.0 : 0.0, 1.0, 0.0);
-    chk("all dTilda > 0", (d[0]>0&&d[1]>0&&d[2]>0&&d[3]>0)?1.0:0.0, 1.0, 0.0);
+    chk("hwn binds -> dTilda ~ CDES*hwn (LES)",  d[4], co.CDES*hwnc[4], 3e-2);
+    // hwn actually enters: cell4 differs from the hwn-omitted (hwn=0) length scale.
+    chk("hwn changes dTilda (vs hwn=0)", (std::fabs(d[4] - hostIddes(g[4], yc[4], hmaxc[4], 0.0, ntc[4], nu, co)) > 1e-6) ? 1.0 : 0.0, 1.0, 0.0);
+    chk("all dTilda > 0", (d[0]>0&&d[1]>0&&d[2]>0&&d[3]>0&&d[4]>0)?1.0:0.0, 1.0, 0.0);
 
     std::printf("\n%s: %d failure(s)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;

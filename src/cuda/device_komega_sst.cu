@@ -293,7 +293,7 @@ __global__
 void kOmegaSSTIDDESfactorKernel(
     int nC, const scalar* __restrict__ k, const scalar* __restrict__ om, const scalar* __restrict__ F1,
     const scalar* __restrict__ gradU, const scalar* __restrict__ nut, const scalar* __restrict__ y,
-    const scalar* __restrict__ hmax, scalar nu, KOmegaSSTCoeffs co, scalar* __restrict__ FDES)
+    const scalar* __restrict__ hmax, const scalar* __restrict__ hwn, scalar nu, KOmegaSSTCoeffs co, scalar* __restrict__ FDES)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -303,7 +303,7 @@ void kOmegaSSTIDDESfactorKernel(
     const scalar lRAS = sqrt(fmax(k[c], scalar(0))) / fmax(co.betaStar*om[c], scalar(1e-300));   // RANS length (Lt)
     const scalar CDES = F1[c]*co.CDES1 + (scalar(1) - F1[c])*co.CDES2;
     const scalar hm = fmax(hmax[c], scalar(1e-300));
-    const scalar delta = fmin(fmax(co.Cw*y[c], co.Cw*hm), hm);        // IDDES delta (hwn omitted)
+    const scalar delta = fmin(fmax(fmax(co.Cw*y[c], co.Cw*hm), hwn[c]), hm);   // IDDES delta = min(max(max(Cw*y,Cw*hmax),hwn), hmax)
     const scalar lLES = CDES*delta;
     const scalar kd2 = fmax(co.kappa*co.kappa*y[c]*y[c], scalar(1e-300));
     const scalar rdt = fmin(nut[c] / (magGradU*kd2), scalar(10));     // turbulent rd (SST nut)
@@ -574,12 +574,12 @@ void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const Devic
 // wall distance y and the maxDeltaxyz hmax; F1 blends CDES. (Unit-test/DES hook.)
 void deviceKOmegaSSTIDDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
     const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nut,
-    const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax, scalar nu,
+    const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax, const DeviceBuffer<scalar>& hwn, scalar nu,
     const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES)
 {
     FDES.resize(nC);
     kOmegaSSTIDDESfactorKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), F1.data(), gradU.data(),
-        nut.data(), y.data(), hmax.data(), nu, co, FDES.data());
+        nut.data(), y.data(), hmax.data(), hwn.data(), nu, co, FDES.data());
     cudaCheck(cudaGetLastError(), "kOmegaSSTIDDESfactor");
 }
 
@@ -661,7 +661,8 @@ void deviceKOmegaSSTCorrect(
     const ScalarDdt& sDdt,
     bool des,
     bool iddes,
-    const DeviceBuffer<scalar>* hmax)
+    const DeviceBuffer<scalar>* hmax,
+    const DeviceBuffer<scalar>* hwn)
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -705,8 +706,8 @@ void deviceKOmegaSSTCorrect(
     DeviceBuffer<scalar> FDES;
     if (des)
     {
-        if (iddes && hmax)   // kOmegaSST-IDDES: the improved (WMLES) length scale (needs the SST nut + hmax + gradU + y)
-            deviceKOmegaSSTIDDESfactor(nC, k, omega, F1, gradU, nut, y, *hmax, nu, co, FDES);
+        if (iddes && hmax && hwn)   // kOmegaSST-IDDES: the improved (WMLES) length scale (needs the SST nut + hmax + hwn + gradU + y)
+            deviceKOmegaSSTIDDESfactor(nC, k, omega, F1, gradU, nut, y, *hmax, *hwn, nu, co, FDES);
         else                 // kOmegaSST-DDES: the F2-shielded cubeRootVol DES factor
             deviceKOmegaSSTDESfactor(nC, k, omega, dm.V, F1, F2, co, FDES);
     }

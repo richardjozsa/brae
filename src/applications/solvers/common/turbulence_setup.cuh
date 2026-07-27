@@ -65,7 +65,7 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         ctl.saCoeffs.Cw   = dc->scalarOr("Cw",   ctl.saCoeffs.Cw);
                     }
                     if (saIddes)
-                        std::printf("  %s (SA-IDDES, delta=maxDeltaxyz; hwn omitted): CDES=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g kappa=%.4g Cv1=%.3g\n",
+                        std::printf("  %s (SA-IDDES, delta=IDDESDelta [maxDeltaxyz+hwn]): CDES=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g kappa=%.4g Cv1=%.3g\n",
                                     model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.Cdt1, ctl.saCoeffs.Cl, ctl.saCoeffs.Ct, ctl.saCoeffs.Cw, ctl.saCoeffs.kappa, ctl.saCoeffs.Cv1);
                     else
                         std::printf("  %s (SA-DES, delta=cubeRootVol): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
@@ -86,7 +86,7 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         ctl.ksstCoeffs.Cw   = dc->scalarOr("Cw",   ctl.ksstCoeffs.Cw);
                     }
                     if (sstIddes)
-                        std::printf("  %s (kOmegaSST-IDDES, delta=maxDeltaxyz; hwn omitted): CDES1=%.4g CDES2=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g betaStar=%.4g\n",
+                        std::printf("  %s (kOmegaSST-IDDES, delta=IDDESDelta [maxDeltaxyz+hwn]): CDES1=%.4g CDES2=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g betaStar=%.4g\n",
                                     model.c_str(), ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.Cdt1, ctl.ksstCoeffs.Cl, ctl.ksstCoeffs.Ct, ctl.ksstCoeffs.Cw, ctl.ksstCoeffs.betaStar);
                     else
                         std::printf("  %s (kOmegaSST-DES, delta=cubeRootVol): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
