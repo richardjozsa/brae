@@ -4,7 +4,7 @@
 // reads k/second/nut (or nuTilda/nut for SA, +ReThetat/gammaInt for LM), the nut wall function from the 0/nut BC,
 // guards wall-function-on-non-wall patches, and applies the turbulent-inlet BCs. Bodies extracted verbatim from
 // gpuSimpleFoam so both drivers stay identical. Call readTurbulenceModel BEFORE readTurbulenceFields (needs ctl.sst).
-#include "simple_controls.cuh"
+#include "solver_controls.cuh"
 #include "foam_dict.cuh"
 #include "foam_field_reader.cuh"
 #include "geometric_field.cuh"
@@ -30,17 +30,32 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             if (const FoamDict* les = turbProps.subDict("LES"))
             {
                 const std::string model = les->wordOr("LESModel", "");
-                if (model != "SpalartAllmarasDDES" && model != "SpalartAllmarasDES")
-                    throw std::runtime_error("brae: unsupported LESModel '" + model + "' (SpalartAllmarasDDES or SpalartAllmarasDES)");
-                ctl.sa = true;
+                const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES");
+                const bool sstDes = (model == "kOmegaSSTDDES" || model == "kOmegaSSTDES");
+                if (!saDes && !sstDes)
+                    throw std::runtime_error("brae: unsupported LESModel '" + model
+                        + "' (SpalartAllmarasDDES/DES or kOmegaSSTDDES/DES)");
                 ctl.des = true;
                 const std::string delta = les->wordOr("delta", "cubeRootVol");
                 if (delta != "cubeRootVol")
                     std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
-                if (const FoamDict* dc = les->subDict(model + "Coeffs"))
-                    ctl.saCoeffs.CDES = dc->scalarOr("CDES", ctl.saCoeffs.CDES);
-                std::printf("  %s (SA-DES, delta=cubeRootVol): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
-                            model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.kappa, ctl.saCoeffs.Cb1, ctl.saCoeffs.Cw1(), ctl.saCoeffs.Cv1);
+                const FoamDict* dc = les->subDict(model + "Coeffs");
+                if (saDes)   // SA-DDES: reuse the SA transport + the DES length-scale limiter
+                {
+                    ctl.sa = true;
+                    if (dc) ctl.saCoeffs.CDES = dc->scalarOr("CDES", ctl.saCoeffs.CDES);
+                    std::printf("  %s (SA-DES, delta=cubeRootVol): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
+                                model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.kappa, ctl.saCoeffs.Cb1, ctl.saCoeffs.Cw1(), ctl.saCoeffs.Cv1);
+                }
+                else         // kOmegaSST-DDES: reuse the kOmegaSST transport + the DES factor on the k destruction
+                {
+                    ctl.sst = true;
+                    readKOmegaSSTCoeffs(les, ctl.ksstCoeffs);   // honour an inline kOmegaSSTCoeffs under LES{} if present
+                    if (dc) { ctl.ksstCoeffs.CDES1 = dc->scalarOr("CDES1", ctl.ksstCoeffs.CDES1);
+                              ctl.ksstCoeffs.CDES2 = dc->scalarOr("CDES2", ctl.ksstCoeffs.CDES2); }
+                    std::printf("  %s (kOmegaSST-DES, delta=cubeRootVol): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
+                                model.c_str(), ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
+                }
                 return;
             }
             const FoamDict* ras = turbProps.subDict("RAS");
