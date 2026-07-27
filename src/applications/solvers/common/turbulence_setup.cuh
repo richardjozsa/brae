@@ -30,14 +30,15 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             if (const FoamDict* les = turbProps.subDict("LES"))
             {
                 const std::string model = les->wordOr("LESModel", "");
-                const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES");
+                const bool saIddes = (model == "SpalartAllmarasIDDES");
+                const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES" || saIddes);
                 const bool sstDes = (model == "kOmegaSSTDDES" || model == "kOmegaSSTDES");
                 const bool smag   = (model == "Smagorinsky");
                 if (!saDes && !sstDes && !smag)
                     throw std::runtime_error("brae: unsupported LESModel '" + model
-                        + "' (Smagorinsky, SpalartAllmarasDDES/DES or kOmegaSSTDDES/DES)");
+                        + "' (Smagorinsky, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES)");
                 const std::string delta = les->wordOr("delta", "cubeRootVol");
-                if (delta != "cubeRootVol")
+                if (!saIddes && delta != "cubeRootVol")   // IDDES computes its own (maxDeltaxyz-based) length scale internally
                     std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
                 const FoamDict* dc = les->subDict(model + "Coeffs");
                 if (smag)   // pure LES Smagorinsky: ALGEBRAIC sub-grid nut (no transport scalar, no DES length-scale limiter)
@@ -50,12 +51,24 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                     return;
                 }
                 ctl.des = true;
-                if (saDes)   // SA-DDES: reuse the SA transport + the DES length-scale limiter
+                if (saDes)   // SA-DDES/IDDES: reuse the SA transport + the DES length-scale limiter
                 {
                     ctl.sa = true;
+                    ctl.iddes = saIddes;   // IDDES -> the improved (WMLES) length scale (maxDeltaxyz + blending); else plain DDES
                     if (dc) ctl.saCoeffs.CDES = dc->scalarOr("CDES", ctl.saCoeffs.CDES);
-                    std::printf("  %s (SA-DES, delta=cubeRootVol): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
-                                model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.kappa, ctl.saCoeffs.Cb1, ctl.saCoeffs.Cw1(), ctl.saCoeffs.Cv1);
+                    if (saIddes && dc)   // IDDES blending-constant overrides (defaults = Shur/Spalart/Strelets/Travin 2008)
+                    {
+                        ctl.saCoeffs.Cdt1 = dc->scalarOr("Cdt1", ctl.saCoeffs.Cdt1);
+                        ctl.saCoeffs.Cl   = dc->scalarOr("Cl",   ctl.saCoeffs.Cl);
+                        ctl.saCoeffs.Ct   = dc->scalarOr("Ct",   ctl.saCoeffs.Ct);
+                        ctl.saCoeffs.Cw   = dc->scalarOr("Cw",   ctl.saCoeffs.Cw);
+                    }
+                    if (saIddes)
+                        std::printf("  %s (SA-IDDES, delta=maxDeltaxyz; hwn omitted): CDES=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g kappa=%.4g Cv1=%.3g\n",
+                                    model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.Cdt1, ctl.saCoeffs.Cl, ctl.saCoeffs.Ct, ctl.saCoeffs.Cw, ctl.saCoeffs.kappa, ctl.saCoeffs.Cv1);
+                    else
+                        std::printf("  %s (SA-DES, delta=cubeRootVol): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
+                                    model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.kappa, ctl.saCoeffs.Cb1, ctl.saCoeffs.Cw1(), ctl.saCoeffs.Cv1);
                 }
                 else         // kOmegaSST-DDES: reuse the kOmegaSST transport + the DES factor on the k destruction
                 {

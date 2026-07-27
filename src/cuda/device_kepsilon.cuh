@@ -233,12 +233,18 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   bool linearUpwind = false, bool nonOrth = false,
                                   bool gsK = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                                   const ScalarDdt& ntDdt = {},   // transient fvm::ddt(nuTilda)
-                                  bool des = false);   // SpalartAllmarasDDES: DES length-scale limiter on the SA destruction
+                                  bool des = false,   // SpalartAllmarasDDES: DES length-scale limiter on the SA destruction
+                                  bool iddes = false,   // SpalartAllmarasIDDES: use the improved (WMLES) length scale (needs hmax)
+                                  const DeviceBuffer<scalar>* hmax = nullptr);   // per-cell maxDeltaxyz (IDDES delta); null -> DDES cubeRootVol
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
 // SA-DDES length scale dTilda = y - fd*max(0, y - CDES*cubeRootVol(V)); fd = 1 - tanh((8 rd)^3). (Unit-test/DES hook.)
 void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& V,
+    const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda);
+// SA-IDDES length scale (Shur et al. 2008): dTilda = fdTilde*(1+fe)*y + (1-fdTilde)*CDES*Delta, Delta from hmax. (Unit-test/DES hook.)
+void deviceSAIDDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax,
     const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
     const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda);
 // Spalart-Allmaras source-prep, exported for the distributed SA correct. Cell-local (gradU + grad(nuTilda) supplied

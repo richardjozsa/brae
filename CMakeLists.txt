@@ -556,6 +556,11 @@ target_include_directories(test_gpu_smagorinsky PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_smagorinsky PRIVATE brae_core)
 add_test(NAME gpu_smagorinsky COMMAND test_gpu_smagorinsky)
 
+add_executable(test_gpu_saiddes tests/test_gpu_saiddes.cu)
+target_include_directories(test_gpu_saiddes PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_saiddes PRIVATE brae_core)
+add_test(NAME gpu_saiddes COMMAND test_gpu_saiddes)
+
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_forces PRIVATE brae_core)

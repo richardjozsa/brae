@@ -146,6 +146,44 @@ void saDdesDTildaKernel(
     const scalar fd = scalar(1) - tanh(t8*t8*t8);
     dTilda[c] = y[c] - fd * fmax(scalar(0), y[c] - co.CDES * delta);
 }
+
+// SA-IDDES (SpalartAllmarasIDDES, Shur/Spalart/Strelets/Travin 2008): the IMPROVED delayed-DES length scale, adding
+// wall-modelled-LES capability over DDES. dTilda = fdTilde*(1 + fe)*lRAS + (1 - fdTilde)*lLES, lRAS = y (wall dist),
+// lLES = CDES*Delta with the IDDES delta Delta = min(max(Cw*y, Cw*hmax), hmax) (hmax = maxDeltaxyz; the wall-normal
+// spacing hwn term is omitted -> hwn=0, a documented simplification). Blending: rd_t/rd_l from nut/nu, fdt/fl/ft the
+// shielding + elevated-stress functions, fB/fe1/fe the WMLES branch. des==false leaves this path untaken (RANS exact).
+__global__
+void saIddesDTildaKernel(
+    int nC, const scalar* __restrict__ y, const scalar* __restrict__ gradU,
+    const scalar* __restrict__ nt, scalar nu, const scalar* __restrict__ hmax,
+    SpalartAllmarasCoeffs co, scalar* __restrict__ dTilda)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    scalar g2 = 0;
+    for (int k = 0; k < 9; ++k) { const scalar gk = gradU[k*nC + c]; g2 += gk*gk; }
+    const scalar magGradU = fmax(sqrt(g2), scalar(1e-300));            // |gradU|
+    const scalar chi = nt[c]/nu, chi3 = chi*chi*chi, Cv13 = co.Cv1*co.Cv1*co.Cv1;
+    const scalar nutc = nt[c] * (chi3 / (chi3 + Cv13));                // nut = nuTilda*fv1
+    const scalar kd2 = fmax(co.kappa*co.kappa*y[c]*y[c], scalar(1e-300));
+    const scalar rdt = fmin(nutc / (magGradU * kd2), scalar(10));      // turbulent rd (nut)
+    const scalar rdl = fmin(nu   / (magGradU * kd2), scalar(10));      // laminar rd (nu)
+    const scalar adt = co.Cdt1 * rdt;   const scalar fdt = scalar(1) - tanh(adt*adt*adt);   // fdt = 1 - tanh((Cdt1 rd_t)^3)
+    const scalar al  = co.Cl*co.Cl*rdl; const scalar al2 = al*al, al4 = al2*al2, al8 = al4*al4;
+    const scalar fl  = tanh(al8*al2);                                  // fl = tanh((Cl^2 rd_l)^10)
+    const scalar at  = co.Ct*co.Ct*rdt; const scalar ft = tanh(at*at*at);                   // ft = tanh((Ct^2 rd_t)^3)
+    const scalar fe2 = scalar(1) - fmax(ft, fl);
+    const scalar hm  = fmax(hmax[c], scalar(1e-300));
+    const scalar alpha = scalar(0.25) - y[c]/hm;
+    const scalar fB  = fmin(scalar(2)*exp(scalar(-9)*alpha*alpha), scalar(1));
+    const scalar fdTilde = fmax(scalar(1) - fdt, fB);
+    const scalar fe1 = (alpha >= scalar(0)) ? scalar(2)*exp(scalar(-11.09)*alpha*alpha)
+                                            : scalar(2)*exp(scalar(-9.0)*alpha*alpha);
+    const scalar fe  = fmax(fe1 - scalar(1), scalar(0)) * fe2;
+    const scalar delta = fmin(fmax(co.Cw*y[c], co.Cw*hm), hm);         // IDDES delta (hwn omitted)
+    const scalar lLES  = co.CDES * delta;
+    dTilda[c] = fmax(fdTilde*(scalar(1) + fe)*y[c] + (scalar(1) - fdTilde)*lLES, scalar(1e-300));
+}
 } // namespace (SA kernels)
 
 void deviceSpalartAllmarasCorrect(
@@ -175,18 +213,24 @@ void deviceSpalartAllmarasCorrect(
     DeviceAMI* ami,
     DeviceCyclic* cyc,
     const ScalarDdt& ntDdt,
-    bool des)
+    bool des,
+    bool iddes,
+    const DeviceBuffer<scalar>* hmax)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);   // interface-aware grad(U) for vorticity/production
-    // SA-DDES: replace the wall distance y with the DES length scale dTilda in the SA length-scale terms (Stilda, fw,
-    // destruction). des==false (RANS) -> dScale aliases y, so the model is byte-for-byte the standard SA.
+    // SA-DDES/IDDES: replace the wall distance y with the DES length scale dTilda in the SA length-scale terms (Stilda,
+    // fw, destruction). des==false (RANS) -> dScale aliases y, so the model is byte-for-byte the standard SA. iddes uses
+    // the improved (WMLES) length scale (needs hmax = maxDeltaxyz); otherwise the plain DDES cubeRootVol limiter.
     DeviceBuffer<scalar> dTilda;
     if (des)
     {
         dTilda.resize(static_cast<std::size_t>(nC));
-        saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), dm.V.data(), gradU.data(), nuTilda.data(), nu, co, dTilda.data());
+        if (iddes && hmax)
+            saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax->data(), co, dTilda.data());
+        else
+            saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), dm.V.data(), gradU.data(), nuTilda.data(), nu, co, dTilda.data());
     }
     const DeviceBuffer<scalar>& dScale = des ? dTilda : y;
     DeviceBuffer<scalar> Stilda(static_cast<std::size_t>(nC));
@@ -262,6 +306,17 @@ void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffe
     dTilda.resize(nC);
     saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), V.data(), gradU.data(), nuTilda.data(), nu, co, dTilda.data());
     cudaCheck(cudaGetLastError(), "deviceSADDESdTilda");
+}
+
+// Exported SA-IDDES length-scale wrapper: the improved (WMLES) dTilda from y, hmax (maxDeltaxyz), |gradU|, nuTilda
+// (a unit-test hook + a future distributed entry). Uses hmax (not cubeRootVol) for the IDDES delta.
+void deviceSAIDDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax,
+    const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda)
+{
+    dTilda.resize(nC);
+    saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax.data(), co, dTilda.data());
+    cudaCheck(cudaGetLastError(), "deviceSAIDDESdTilda");
 }
 
 // ---- Exported SA (Spalart-Allmaras) source-prep wrappers for the DISTRIBUTED SA correct -----------------------
