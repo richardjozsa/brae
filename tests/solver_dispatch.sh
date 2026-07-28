@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Solver selection ctest: `brae` routes a case to the brae solver its controlDict `application` asks for, and
+# refuses the cases it has no solver for instead of running them with the wrong one (solver_dispatch.cuh).
+# Only the SELECTION is under test here -- it happens before any mesh read or CUDA init, so these minimal
+# fake cases (system/ dicts only, no polyMesh) never reach the solver and the test needs no GPU. The happy
+# path -- the transient case actually solving through `brae` -- is the pimple_dispatch ctest.
+set -u
+BIN="${1:?brae binary}"
+WORK="${2:?work dir}"
+
+fail=0
+mkcase()   # mkcase <dir> <application-line> <ddt-scheme>
+{
+    mkdir -p "$1/system"
+    printf 'FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }\n%s\nstartFrom startTime;\nstartTime 0;\nstopAt endTime;\nendTime 1;\ndeltaT 1;\n' "$2" > "$1/system/controlDict"
+    printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvSchemes; }\nddtSchemes { default %s; }\ngradSchemes { default Gauss linear; }\ndivSchemes { default none; div(phi,U) bounded Gauss upwind; }\nlaplacianSchemes { default Gauss linear corrected; }\n' "$3" > "$1/system/fvSchemes"
+}
+check()    # check <name> <case dir> <expected text in output>
+{
+    local log="$WORK/$1.log"
+    "$BIN" -case "$2" > "$log" 2>&1
+    if grep -qF -e "$3" "$log"; then
+        echo "ok:   $1"
+    else
+        echo "FAIL: $1 -- output does not contain '$3'"; sed -n '1,15p' "$log"; fail=1
+    fi
+}
+
+rm -rf "$WORK"; mkdir -p "$WORK"
+
+# 1. A solver brae does not implement: stop, name it, and list what brae does have. Never silently solve it
+#    with simpleFoam -- a wrong solver is a wrong answer that looks right.
+mkcase "$WORK/unsupported" "application     interFoam;" "Euler"
+check unsupported_application "$WORK/unsupported" "'interFoam' is not a solver brae implements yet"
+grep -qF "pimpleFoam" "$WORK/unsupported_application.log" || { echo "FAIL: error does not list brae's solvers"; fail=1; }
+
+# 2. controlDict and fvSchemes disagree (steady solver, transient ddt): a case error, so stop rather than
+#    guess which of the two the user meant.
+mkcase "$WORK/mismatch" "application     simpleFoam;" "Euler"
+check application_ddt_mismatch "$WORK/mismatch" "ddtSchemes.default is 'Euler'"
+
+# 3. Hand-written case with no `application`: fall back to the ddt scheme. Euler -> the transient solver, which
+#    is reached (the notice) and then fails on the absent mesh -- selection is what matters here.
+mkcase "$WORK/noapp" "" "Euler"
+check no_application_transient "$WORK/noapp" "-> pimpleFoam"
+
+# 4. Same, steadyState: stays in this executable (no hand-over notice), and gets as far as the missing case
+#    dictionary that the steady driver reads next.
+mkcase "$WORK/noapp_steady" "" "steadyState"
+"$BIN" -case "$WORK/noapp_steady" > "$WORK/no_application_steady.log" 2>&1
+if grep -qF -e "-> pimpleFoam" "$WORK/no_application_steady.log"; then
+    echo "FAIL: no_application_steady -- steady case was handed to the transient solver"; fail=1
+else
+    echo "ok:   no_application_steady"
+fi
+
+# 5. application pimpleFoam is handed over even though this binary is `brae`.
+mkcase "$WORK/pimple" "application     pimpleFoam;" "backward"
+check application_pimplefoam "$WORK/pimple" "controlDict application pimpleFoam -> pimpleFoam"
+
+[ "$fail" -eq 0 ] && echo "PASS: solver selection routes and refuses correctly"
+exit "$fail"

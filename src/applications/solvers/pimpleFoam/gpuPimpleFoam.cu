@@ -9,9 +9,11 @@
 // (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. BOTH the momentum ddt AND the
 // turbulence transport ddt (fvm::ddt(k/eps/omega/nuTilda)) are fully implicit + OF-exact -- the turbulence is transient
 // URANS/DES, not quasi-steady (see device_simple_foam.cu:294). fvSchemes div/laplacian schemes are parsed; phi output +
-// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs, fvOptions/MRF all wired. Follow-ups: adjustTimeStep
-// + maxCo (adaptive dt), runtime functionObjects (probes/forces/fieldAverage), distributed (multi-GPU) transient.
-// Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae.
+// restart, CrankNicolson ddt0 restart and coded (fixedValue/mixed) BCs are wired. NOT yet: MRF, fvOptions,
+// adjustTimeStep + maxCo (adaptive dt), runtime functionObjects (probes/forces/fieldAverage), distributed
+// (multi-GPU) transient. The first three are REFUSED at start-up rather than silently skipped (see main).
+// Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae; `brae` hands
+// over to it whenever a case's controlDict says `application pimpleFoam` (solvers/common/solver_dispatch.cuh).
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -19,6 +21,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
+#include "mrf_read.cuh"             // readMRFProperties: only to REFUSE an MRF case (not applied transient yet)
 #include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
@@ -124,12 +127,34 @@ SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<F
 
 // CodedBCSpec + parseCodedBCs + setupCodedBCs now live in coded_bc_setup.cuh (shared with gpuSimpleFoam).
 
+void printUsage()
+{
+    std::printf(
+"brae_pimpleFoam, the GPU-native transient incompressible solver (PIMPLE). Normally reached through `brae`,\n"
+"which hands over any case whose controlDict says `application pimpleFoam`.\n\n"
+"Usage:\n"
+"  brae_pimpleFoam [-case <dir>]  march an OpenFOAM case in time (default: the current directory)\n"
+"  brae_pimpleFoam <dir>          same, case directory as a positional argument\n"
+"  brae_pimpleFoam --help         show this message\n\n"
+"Needs ddtSchemes.default = Euler | backward | CrankNicolson and a PIMPLE dict in fvSolution. Writes standard\n"
+"OpenFOAM time directories (U, p, phi, turbulence) that restart seamlessly with startFrom latestTime.\n\n"
+"Docs: https://github.com/simd-ai/brae/blob/main/docs/solvers/pimplefoam.md\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
 try
 {
-    const std::string caseDir = argc > 1 ? argv[1] : ".";
+    // Same argument surface as the steady driver, so `brae -case <dir>` forwards here verbatim on dispatch.
+    std::string caseDir = ".";
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string a = argv[i];
+        if (a == "--help" || a == "-h")        { printUsage(); return 0; }
+        else if (a == "-case" && i + 1 < argc) caseDir = argv[++i];
+        else if (a[0] != '-')                  caseDir = a;
+    }
 
     // ---- case dictionaries ----
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
@@ -147,6 +172,26 @@ try
     const int    precision     = controlDict.intOr("writePrecision", 16);
     if (deltaT <= 0)          throw std::runtime_error("controlDict deltaT must be > 0.");
     if (endTime <= startTime) throw std::runtime_error("controlDict endTime must be > startTime.");
+
+    // Physics the STEADY driver applies and this one does not yet: refuse the case rather than march it with the
+    // source terms quietly missing (an MRF rotation or an fvOptions source dropped is wrong physics that still
+    // produces a plausible-looking field). Same rule the steady driver applies to unsupported fvOptions sources.
+    if (readMRFProperties(caseDir + "/constant").active)
+        throw std::runtime_error(
+            "constant/MRFProperties has an active zone, and brae's transient solver does not apply MRF yet "
+            "(the steady solver does). Marching this case would silently drop the rotation.");
+    for (const std::string& fvo : {caseDir + "/system/fvOptions", caseDir + "/constant/fvOptions"})
+        if (std::filesystem::exists(fvo))
+            throw std::runtime_error(
+                fvo + " is present, and brae's transient solver does not apply fvOptions yet (the steady solver "
+                "does). Marching this case would silently drop those sources.");
+
+    // adjustTimeStep needs the Courant-limited dt that brae does not compute yet; running the case at the fixed
+    // deltaT instead is a different simulation, so say so rather than quietly ignore the switch.
+    if (controlDict.wordOr("adjustTimeStep", "no") == "yes")
+        throw std::runtime_error(
+            "controlDict adjustTimeStep yes is not supported yet (no Courant-based dt). Set adjustTimeStep no and "
+            "a fixed deltaT; keep it under your target maxCo.");
 
     // ---- PIMPLE + solver controls (fvSolution) ----
     const FoamDict* pimple  = fvSolution.subDict("PIMPLE");

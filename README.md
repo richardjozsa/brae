@@ -134,8 +134,12 @@ run back to back. Override the detected GPU count with `BRAE_GPUS`.
 
 ## 🌊 Solvers
 
-Brae implements OpenFOAM's incompressible solvers one at a time, each fully device-resident and validated
-cell-by-cell. Today it runs [`simpleFoam`](docs/solvers/simplefoam.md) (steady incompressible); more to follow.
+Brae implements OpenFOAM's solvers one at a time, each fully device-resident and validated cell-by-cell:
+
+- [`simpleFoam`](docs/solvers/simplefoam.md) — steady incompressible
+- [`pimpleFoam`](docs/solvers/pimplefoam.md) — transient incompressible — **brae 4.5× faster than SPUMA**
+
+Coming soon: compressible solver.
 
 ---
 

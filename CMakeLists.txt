@@ -1211,6 +1211,24 @@ add_test(NAME pimple_run
                  ${CMAKE_CURRENT_BINARY_DIR}/pimple_run_work)
 set_tests_properties(pimple_run PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 
+# The same transient case run through `brae` itself: the case says `application pimpleFoam`, so the solver
+# registry (solvers/common/solver_dispatch.cuh) must hand it to brae_pimpleFoam and produce the identical
+# end-to-end result. Guards the single-command CLI: `brae` on a transient case must not fall through to SIMPLE.
+add_test(NAME pimple_dispatch
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_run.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/pimple_dispatch_work)
+set_tests_properties(pimple_dispatch PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
+
+# Solver selection itself: routes on controlDict `application`, refuses the solvers brae does not have, and
+# catches an application/ddtSchemes contradiction. Dict-only fake cases, no mesh and no GPU.
+add_test(NAME solver_dispatch
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_dispatch.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_BINARY_DIR}/solver_dispatch_work)
+set_tests_properties(solver_dispatch PROPERTIES TIMEOUT 120)
+
 # GPU offload #7: thread-block clusters + DSM, foundational cluster reduction vs the global reduction.
 add_executable(test_gpu_cluster tests/test_gpu_cluster.cu)
 target_include_directories(test_gpu_cluster PRIVATE ${BRAE_HEADER_DIRS})
