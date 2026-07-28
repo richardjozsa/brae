@@ -18,6 +18,7 @@
 #include "turbulent_inlet.cuh"
 #include "foam_dict.cuh"
 #include "scheme_parse.cuh"   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
+#include "solver_dispatch.cuh"   // dispatchSolver: route the case to the brae solver its controlDict asks for
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
 #include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
 #include "fvc.cuh"
@@ -44,8 +45,12 @@ using namespace brae;
 static void printUsage()
 {
     std::printf(
-"brae, a GPU-native, OpenFOAM-compatible CFD solver (steady incompressible, simpleFoam).\n"
-"The whole SIMPLE loop runs on one GPU; reads a standard OpenFOAM case and writes standard time dirs.\n\n"
+"brae, a GPU-native, OpenFOAM-compatible CFD solver. The whole solve runs on one GPU; reads a standard\n"
+"OpenFOAM case and writes standard time dirs.\n\n"
+"Solvers (picked from the case's controlDict `application`, so `brae` is the only command you type):\n"
+"  simpleFoam       steady incompressible, RAS/laminar\n"
+"  pimpleFoam       transient incompressible, URANS/DES/LES/laminar\n"
+"Any other application stops at start-up rather than run the case with the wrong solver.\n\n"
 "Usage:\n"
 "  brae [-case <dir>]             solve an OpenFOAM case (default: the current directory)\n"
 "  mpirun -np N brae -case <dir> -parallel\n"
@@ -105,6 +110,12 @@ int main(int argc, char** argv)
             else if (a[0] != '-')
                 caseDir = a;
         }
+        // The case names its solver (controlDict `application`), so `brae` is the only command a user types: this
+        // executable keeps the steady cases and hands the others to the brae solver that owns them, before any dict
+        // read or CUDA init. -partition is solver-agnostic prep (mesh + AMG cache) and always runs here.
+        // Registry + rules: solvers/common/solver_dispatch.cuh.
+        if (!partition) dispatchSolver(caseDir, argc, argv);
+
         // -partition is cf's analogue of OF decomposePar: do the one-time prep (parse mesh + build AMG hierarchy) and
         // persist it to constant/polyMesh/.brae_mesh|amgcache, so the actual run reloads it warm. Forces the cache write.
         if (partition) setenv("BRAE_MESH_CACHE", "1", 1);
