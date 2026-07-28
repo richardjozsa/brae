@@ -28,20 +28,24 @@
 #include "device_interface.cuh"   // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_kepsilon.cuh"
 #include "device_komega_sst.cuh"   // deviceS2/deviceF2/deviceNutSST for the startup validate() correctNut
+#include "device_smagorinsky.cuh"  // deviceSmagorinskyNut for the pure-LES (algebraic sub-grid nut) path
+#include "device_coded_bc.cuh"     // NVRTC device-resident coded (runtime-compiled) boundary conditions
 #include "cell_wall_dist.cuh"
+#include "cell_max_delta.cuh"      // cellMaxDeltaXYZ -> hmax_ (SA-IDDES filter width, maxDeltaxyz)
 #include "device_mrf.cuh"
 #include "device_divdevreff.cuh"
+#include "device_ddt.cuh"          // transient fvm::ddt(U) for the PIMPLE path (no-op in steady SIMPLE)
 #include "device_amg.cuh"
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
-#include "simple_controls.cuh"   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
+#include "solver_controls.cuh"   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
 #include <cstdlib>
 #include <vector>
 #include <cuda_runtime.h>
 
 namespace brae {
 
-// NutWall, DeviceSimpleControls, DeviceSimpleResidual now live in simple_controls.cuh (included above).
+// NutWall, DeviceSimpleControls, DeviceSimpleResidual now live in solver_controls.cuh (included above).
 
 class DeviceSimpleSolver
 {
@@ -82,6 +86,31 @@ public:
     void correctPressureVelocity(DeviceSimpleResidual& res);
 
     DeviceSimpleResidual step();
+
+    // --- Transient (PIMPLE) interface -- reuses the three composable phases above under an outer/inner-corrector loop,
+    // with the implicit fvm::ddt(U) folded into solveMomentumPredictor. setDdtScheme() switches this solver from steady
+    // (SIMPLE, the default) to transient; the steady step() path is completely unaffected (ddt stays a no-op).
+    void setDdtScheme(DdtScheme s, scalar ocCoeff = scalar(1))
+    {
+        ddtScheme_ = s;
+        ocCoeff_   = ocCoeff;
+        if (s == DdtScheme::CrankNicolson)   // allocate + zero each transported variable's stored old ddt (ddt0)
+        {
+            const std::vector<scalar> z(nC_, scalar(0));
+            for (int k = 0; k < 3; ++k) Uddt0_[k].copyFrom(z);
+            if (ctl_.turbulent && !ctl_.les)
+            {
+                kddt0_.copyFrom(z);
+                if (!ctl_.sa) e2ddt0_.copyFrom(z);
+                if (ctl_.lm) { ReThetatddt0_.copyFrom(z); gammaIntddt0_.copyFrom(z); }
+            }
+        }
+    }
+    // Advance one time level: store U.oldTime()[.oldTime()] + roll deltaT -> deltaT0 (OF runTime++ / GeometricField::oldTime).
+    void advanceTime(scalar deltaT);
+    // One PIMPLE time step: advanceTime, then nOuterCorrectors x { momentum predictor (ddt folded in); nCorrectors x
+    // pressure-velocity correction; turbulence }, then continuity errors. Returns the outer-loop residual signal.
+    DeviceSimpleResidual pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors);
 
     // Enable an MRF rotating zone: builds the device frame data + makes the resident flux RELATIVE (so the
     // momentum/pressure are solved in the rotating frame). Call once after construction, before stepping.
@@ -130,6 +159,42 @@ public:
     std::vector<scalar> phiInternal() const { return phiInt_.host(); }
     std::vector<scalar> phiBoundary() const { return phiBnd_.host(); }
 
+    // CrankNicolson ddt0 (stored old ddt) persistence -- get/set for seamless restart (the driver writes+reads these).
+    bool isCrankNicolson() const { return ddtScheme_ == DdtScheme::CrankNicolson; }
+    bool cnWarm() const { return cnWarm_; }
+    void setCnWarm(bool w) { cnWarm_ = w; }
+    // Prime the CrankNicolson time state on restart: deltaT_=deltaT0 makes the FIRST advanceTime set deltaT0_=deltaT0
+    // (so the first post-restart step is full CN, not the Euler bootstrap), and the ddt0 recurrence is already warm.
+    void setCnRestart(scalar deltaT0) { deltaT_ = deltaT0; cnWarm_ = true; }
+
+    // NVRTC device-coded BC (codedFixedValue on U): compile `code` once into a device kernel over the patch's boundary
+    // faces [offset, offset+count) in the flat boundary order. Applied each step in solveMomentumPredictor (writes the
+    // patch's dbU_ refValue on the device). setTime feeds the current time to the snippet's `t`.
+    // target: 0=U (vector), 1=p, 2=k/nuTilda, 3=second (omega/epsilon). mixed=true -> codedMixed (also writes valueFraction).
+    void addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target = 0, bool mixed = false);
+    void setTime(scalar t) { time_ = t; }
+    std::vector<vector> Uddt0() const
+    {
+        const auto x = Uddt0_[0].host(), y = Uddt0_[1].host(), z = Uddt0_[2].host();
+        std::vector<vector> r(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i) r[i] = vector{x[i], y[i], z[i]};
+        return r;
+    }
+    void setUddt0(const std::vector<vector>& v)
+    {
+        std::vector<scalar> x(v.size()), y(v.size()), z(v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) { x[i] = v[i].x; y[i] = v[i].y; z[i] = v[i].z; }
+        Uddt0_[0].copyFrom(x); Uddt0_[1].copyFrom(y); Uddt0_[2].copyFrom(z);
+    }
+    std::vector<scalar> kddt0()  const { return kddt0_.host(); }
+    void setKddt0(const std::vector<scalar>& v)  { kddt0_.copyFrom(v); }
+    std::vector<scalar> e2ddt0() const { return e2ddt0_.host(); }
+    void setE2ddt0(const std::vector<scalar>& v) { e2ddt0_.copyFrom(v); }
+    std::vector<scalar> reThetatddt0() const { return ReThetatddt0_.host(); }
+    void setReThetatddt0(const std::vector<scalar>& v) { ReThetatddt0_.copyFrom(v); }
+    std::vector<scalar> gammaIntddt0() const { return gammaIntddt0_.host(); }
+    void setGammaIntddt0(const std::vector<scalar>& v) { gammaIntddt0_.copyFrom(v); }
+
 private:
     const std::vector<FvPatch>& fvp_;
     DeviceSimpleControls ctl_;
@@ -166,6 +231,24 @@ private:
     DeviceBuffer<scalar> rotorFx_, rotorFy_, rotorFz_;
     AMGData amg_;
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_, dk_, de_, dnut_, y_;   // y_ = cell wall distance (SST/SA)
+    DeviceBuffer<scalar> hmax_;   // per-cell maxDeltaxyz (IDDES filter width); built only when ctl_.iddes
+    DeviceBuffer<scalar> hwn_;    // per-cell wall-normal grid spacing (IDDES delta 3rd term); built only when ctl_.iddes
+    // Transient (PIMPLE) state: ddt scheme + time steps + old-time velocity levels (U.oldTime()[.oldTime()]), rotated by
+    // advanceTime(). steadyState + empty old-time buffers in the default steady SIMPLE path, where ddt is a no-op.
+    DdtScheme ddtScheme_ = DdtScheme::steadyState;
+    scalar    deltaT_ = 0, deltaT0_ = 0;
+    scalar    ocCoeff_ = 1;         // CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>"); 0=Euler-like, 1=pure CN
+    bool      cnWarm_  = false;     // CrankNicolson: the ddt0 recurrence has done its first (Euler-startup) update
+    // NVRTC device-coded BCs (codedFixedValue). bndCf* = flat boundary face centres (patch order, cyclic excluded).
+    struct SolverCodedBC { CodedBcKernel kernel; int offset = 0, count = 0; int target = 0; bool mixed = false; };   // target: 0=U 1=p 2=k 3=second
+    std::vector<SolverCodedBC> codedBCs_;
+    DeviceBuffer<scalar> bndCfX_, bndCfY_, bndCfZ_;
+    scalar    time_ = 0;            // current time, fed to the coded-BC snippet's `t`
+    DeviceBuffer<scalar> Uold_[3], Uold2_[3];
+    // Turbulence old-time levels for the URANS fvm::ddt(k/eps/omega/nuTilda): dk_ (k or nuTilda) + de_ (epsilon or omega).
+    DeviceBuffer<scalar> kOld_, kOld2_, e2Old_, e2Old2_;
+    DeviceBuffer<scalar> ReThetatOld_, ReThetatOld2_, gammaIntOld_, gammaIntOld2_;   // kOmegaSSTLM transition old-time
+    DeviceBuffer<scalar> Uddt0_[3], kddt0_, e2ddt0_, ReThetatddt0_, gammaIntddt0_;   // CrankNicolson stored old ddt (per variable); allocated only for CN
     // Momentum-predictor outputs, shared with the pressure-velocity phase (PIMPLE foundation: solveMomentumPredictor()
     // fills them once per outer corrector; correctPressureVelocity() reads them). Members so both phases see them + to
     // avoid per-step reallocation. mDiagR/mUp/mLo = relaxed momentum matrix; iC/bCb = per-component boundary coeffs;

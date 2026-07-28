@@ -107,6 +107,21 @@ namespace brae {
             bndIsWall_.copyFrom(isW);
             bndY_.copyFrom(yv);
         }
+        // flat boundary face centres (patch order, cyclic/cyclicAMI excluded) -- the absolute-position Cf indexing used
+        // by the NVRTC coded-BC kernels (aligned to the DeviceBoundary refValue/faceCell order). Built once at setup.
+        {
+            std::vector<scalar> bx, by, bz;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    const vector& cf = g.Cf()[fvp[pi].start + i];
+                    bx.push_back(cf.x); by.push_back(cf.y); bz.push_back(cf.z);
+                }
+            }
+            bndCfX_.copyFrom(bx); bndCfY_.copyFrom(by); bndCfZ_.copyFrom(bz);
+        }
         // adjustPhi adjustable mask (patch order = phiBnd_ order): a face is adjustable iff its U patch does NOT
         // fix the flux (zeroGradient/inletOutlet/calculated) -> OF "!fixesValue || isA<inletOutlet>".
         {
@@ -175,22 +190,35 @@ namespace brae {
         std::vector<scalar> nv(nC_, 0.0);
         if (ctl_.turbulent)
         {
-            dbK_   = buildDeviceBoundary(*k, fvp, g);        // SA: the "k" slot holds nuTilda
-            dk_.copyFrom(k->internal);
-            if (!ctl_.sa)
+            nv = nut->internal;   // nut is the ONLY turbulence field for pure LES (Smagorinsky); read it for every model.
+            if (!ctl_.les)        // RAS/DES transport scalars: pure-LES Smagorinsky is ALGEBRAIC (no k/epsilon/omega/nuTilda, no wall distance).
             {
-                dbEps_ = buildDeviceBoundary(*eps, fvp, g);
-                de_.copyFrom(eps->internal);   // 2nd scalar (omega/eps); SA has none
-            }
-            nv = nut->internal;
-            if (ctl_.sst || ctl_.sa) y_.copyFrom(cellWallDist(m, g, fvp));   // wall distance (SST F1/F2/F3; SA dTilda)
-            if (ctl_.lm && ReThetat && gammaInt)   // kOmegaSSTLM transition fields
-            {
-                dbReThetat_ = buildDeviceBoundary(*ReThetat, fvp, g);
-                ReThetat_.copyFrom(ReThetat->internal);
-                dbGammaInt_ = buildDeviceBoundary(*gammaInt, fvp, g);
-                gammaInt_.copyFrom(gammaInt->internal);
-                gammaIntEff_.copyFrom(std::vector<scalar>(nC_, 0.0));   // OF kOmegaSSTLM ctor: gammaIntEff_ = Zero (no Pk on iter 1, before correctReThetatGammaInt updates it)
+                dbK_   = buildDeviceBoundary(*k, fvp, g);        // SA: the "k" slot holds nuTilda
+                dk_.copyFrom(k->internal);
+                if (!ctl_.sa)
+                {
+                    dbEps_ = buildDeviceBoundary(*eps, fvp, g);
+                    de_.copyFrom(eps->internal);   // 2nd scalar (omega/eps); SA has none
+                }
+                if (ctl_.sst || ctl_.sa)
+                {
+                    std::vector<vector> wallOrigin;                              // nearest wall-face centre (IDDES wall-normal source)
+                    y_.copyFrom(cellWallDist(m, g, fvp, ctl_.iddes ? &wallOrigin : nullptr));   // wall distance (SST F1/F2/F3; SA dTilda)
+                    if (ctl_.iddes)   // IDDES filter widths (maxDeltaxyz + wall-normal spacing), uploaded once at setup
+                    {
+                        const std::vector<scalar> hmax = cellMaxDeltaXYZ(m);
+                        hmax_.copyFrom(hmax);
+                        hwn_.copyFrom(cellWallNormalSpacing(m, g, wallOrigin, hmax));
+                    }
+                }
+                if (ctl_.lm && ReThetat && gammaInt)   // kOmegaSSTLM transition fields
+                {
+                    dbReThetat_ = buildDeviceBoundary(*ReThetat, fvp, g);
+                    ReThetat_.copyFrom(ReThetat->internal);
+                    dbGammaInt_ = buildDeviceBoundary(*gammaInt, fvp, g);
+                    gammaInt_.copyFrom(gammaInt->internal);
+                    gammaIntEff_.copyFrom(std::vector<scalar>(nC_, 0.0));   // OF kOmegaSSTLM ctor: gammaIntEff_ = Zero (no Pk on iter 1, before correctReThetatGammaInt updates it)
+                }
             }
         }
         dnut_.copyFrom(nv);
@@ -201,10 +229,30 @@ namespace brae {
         validateTurbulence();                                    // OF turbulenceModel ctor bound() + simpleFoam.C:92 validate()
     }
 
+    void DeviceSimpleSolver::addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target, bool mixed)
+    {
+        SolverCodedBC cbc;
+        const bool vec = (target == 0);   // U is vector; p/k/second are scalar
+        cbc.kernel = mixed ? (vec ? compileCodedMixedVectorBc(name, code) : compileCodedMixedScalarBc(name, code))
+                           : (vec ? compileCodedVectorBc(name, code)      : compileCodedScalarBc(name, code));
+        cbc.offset = offset;
+        cbc.count  = count;
+        cbc.target = target;
+        cbc.mixed  = mixed;
+        codedBCs_.push_back(std::move(cbc));
+    }
+
     void DeviceSimpleSolver::validateTurbulence()
     {
         if (!ctl_.turbulent) return;
         const DeviceMesh& dm = dm_;
+        if (ctl_.les)   // pure LES Smagorinsky: nut is algebraic (no bound(k)/bound(omega)); seed it from the initial U.
+        {
+            DeviceBuffer<scalar> gradU;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);   // nut = Ck*delta*sqrt(k_sgs)
+            return;
+        }
         deviceBoundField(dm, dk_, 1e-15);                              // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
         if (!ctl_.sa) deviceBoundField(dm, de_, 1e-15);               // bound(omega_|epsilon_, ...Min_)
         // validate() -> correctNut(): recompute internal nut from the bounded fields + the initial U.
@@ -234,13 +282,28 @@ namespace brae {
     {
         const DeviceMesh& dm = dm_;
         clearTurbulenceReport();   // OF-style report: collect this step's turbulence solves (Solving for k/omega/...)
+        if (ctl_.les)   // pure LES Smagorinsky: algebraic sub-grid nut = Ck*delta*sqrt(k_sgs) from the current U. No
+        {              // transport solve (report stays empty -> no "Solving for k/omega" lines), so no ddt(k/omega) either.
+            DeviceBuffer<scalar> gradU;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);
+            return;
+        }
         if (ctl_.turbulent)
         {
+            // transient URANS fvm::ddt(k/eps/omega/nuTilda): a per-scalar bundle (steady -> active==false -> no-op, so
+            // the steady SIMPLE turbulence stays byte-for-byte). dk_=k|nuTilda (kOld_), de_=epsilon|omega (e2Old_).
+            const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
+            const ScalarDdt kDdt{ ddtc, &kOld_,  kOld2_.size()  ? &kOld2_  : nullptr, ddtc.cn ? &kddt0_ : nullptr };
+            const ScalarDdt sDdt{ ddtc, &e2Old_, e2Old2_.size() ? &e2Old2_ : nullptr, ddtc.cn ? &e2ddt0_ : nullptr };
+            const ScalarDdt reDdt{ ddtc, &ReThetatOld_, ReThetatOld2_.size() ? &ReThetatOld2_ : nullptr, ddtc.cn ? &ReThetatddt0_ : nullptr };   // kOmegaSSTLM
+            const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr, ddtc.cn ? &gammaIntddt0_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
                                              ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
-                                             ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                                             ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
+                                             ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -249,12 +312,13 @@ namespace brae {
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
                                        static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
-                                       ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
+                                       ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
+                                       kDdt, sDdt, ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // ddt(k)/ddt(omega) + kOmegaSSTDDES/IDDES DES limiter (no-op for RANS)
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
                                              ctl_.tolKE, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
-                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, reDdt, giDdt);   // LM transition ddt
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
@@ -262,7 +326,8 @@ namespace brae {
                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
-                                      ctl_.atmZ0, ctl_.atmBoundNut);   // atmNutkWallFunction roughness for the near-wall G0
+                                      ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
+                                      kDdt, sDdt);   // transient fvm::ddt(k)/ddt(epsilon)  (sDdt = the 2nd-scalar bundle)
         }
     }
 
@@ -270,6 +335,10 @@ namespace brae {
     {
         const DeviceMesh& dm = dm_;
         const scalar tol = ctl_.tolU;
+        // Transient fvm::ddt(U): the ONE term steady SIMPLE lacks. steadyState (SIMPLE) -> ddtc.active==false -> the two
+        // deviceFvmDdt* calls below are exact no-ops (this method stays byte-for-byte SIMPLE). pimpleStep() sets the
+        // scheme + rotates the old-time fields, so the transient (PIMPLE) path folds ddt into the SAME predictor.
+        const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
         // nonOrthLimitP (the pressure non-orth limiter) is declared in step() -- it is read only by the pressure phase.
         const scalar nonOrthRelaxU = std::getenv("BRAE_NONORTH_RELAX_U") ? std::atof(std::getenv("BRAE_NONORTH_RELAX_U")) : 1.0;
 
@@ -277,7 +346,7 @@ namespace brae {
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);
         deviceUpdateInletOutlet(dbP_, phiBnd_);
-        if (ctl_.turbulent)
+        if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
         {
             deviceUpdateInletOutlet(dbK_, phiBnd_);
             deviceUpdateInletOutlet(dbEps_, phiBnd_);
@@ -301,6 +370,33 @@ namespace brae {
             deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
             deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz);
         }
+        // NVRTC device-coded BCs (codedFixedValue): run each compiled snippet over its patch faces, overwriting the
+        // target field's refValue on the device from position/time/adjacent-cell value. Same updateCoeffs point as the
+        // BCs above; the p/k/second boundaries set here persist into the pressure + turbulence phases of this corrector.
+        for (const SolverCodedBC& cbc : codedBCs_)
+        {
+            if (cbc.target == 0)         // U (vector)
+            {
+                if (cbc.mixed)
+                    launchCodedMixedVectorBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_,
+                                             Uk_[0], Uk_[1], Uk_[2], dbU_.comp[0].faceCell,
+                                             dbU_.comp[0].refValue, dbU_.comp[1].refValue, dbU_.comp[2].refValue,
+                                             dbU_.comp[0].valueFraction, dbU_.comp[1].valueFraction, dbU_.comp[2].valueFraction);
+                else
+                    launchCodedVectorBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_,
+                                        Uk_[0], Uk_[1], Uk_[2], dbU_.comp[0].faceCell,
+                                        dbU_.comp[0].refValue, dbU_.comp[1].refValue, dbU_.comp[2].refValue);
+            }
+            else                         // scalar: p (1), k/nuTilda (2), second omega|epsilon (3)
+            {
+                DeviceBoundary& db = (cbc.target == 1) ? dbP_ : (cbc.target == 2) ? dbK_ : dbEps_;
+                const DeviceBuffer<scalar>& fld = (cbc.target == 1) ? dp_ : (cbc.target == 2) ? dk_ : de_;
+                if (cbc.mixed)
+                    launchCodedMixedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, fld, db.faceCell, db.refValue, db.valueFraction);
+                else
+                    launchCodedScalarBc(cbc.kernel, cbc.offset, cbc.count, time_, bndCfX_, bndCfY_, bndCfZ_, fld, db.faceCell, db.refValue);
+            }
+        }
 
         DeviceBuffer<scalar> nuEff;
         deviceCopy(nuEff, dnut_);
@@ -310,7 +406,22 @@ namespace brae {
         // nuEff at boundary FACES: turbulent uses the TRUE wall nut (nutkWallFunction), not the cell value, so the
         // wall shear matches OpenFOAM; laminar/non-wall faces use the adjacent cell value.
         DeviceBuffer<scalar> nuEffBnd;
-        if (ctl_.turbulent)
+        if (ctl_.turbulent && ctl_.les)
+        {
+            // pure LES Smagorinsky: NO k-based wall function (there is no k field). Honour a velocity-based nut wall
+            // function (nutUSpaldingWallFunction) if the 0/nut BC selects it; otherwise extrapolate the cell nuEff
+            // (nu+nut) to the boundary (calculated/zeroGradient/fixedValue nut -> adjacent-cell sub-grid nut), exactly
+            // as the laminar path does.
+            if (ctl_.nutWall == NutWall::Spalding)
+            {
+                deviceCopy(nuEffBnd, nuBndConst_);
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
+                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
+            }
+            else
+                deviceBCValue(dbExtrap_, nuEff, nuEffBnd);
+        }
+        else if (ctl_.turbulent)
         {
             deviceCopy(nuEffBnd, nuBndConst_);
             // Wall nut chosen by the 0/nut BC TYPE (ctl_.nutWall), matching OpenFOAM, NOT the model.
@@ -407,6 +518,9 @@ namespace brae {
             deviceAxpy(-1.0,r2lIC,r2IC);
             deviceCmptMaxMag3(r0IC, r1IC, r2IC, iCmaxMag);   // OF fvMatrix::relax adds cmptMax(cmptMag(iC)) to the diagonal
         }
+        // + implicit fvm::ddt(U) DIAGONAL (rho=1 incompressible): coefft*rDeltaT*V, shared by all 3 components, added
+        // to the assembled diagonal BEFORE relax -- OF assembles fvm::ddt into UEqn, then UEqn.relax(). No-op for SIMPLE.
+        deviceFvmDdtDiag(dm.V, ddtc, 1.0, mDiag);
         DeviceBuffer<scalar> delta;   // mDiagR is now a member
         deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.relaxU, mDiagR, delta,
                         hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
@@ -487,6 +601,9 @@ namespace brae {
             bCb[kk]=std::move(dBC);
             deviceHadamard(relaxSrc[kk], delta, Uk_[kk]);
             deviceAxpy(1.0, *ddr[kk], relaxSrc[kk]);                                  // += explicit divDevReff stress
+            // + fvm::ddt(U) SOURCE for this component: rDeltaT*V*(coefft0*Uold - coefft00*Uold2). Into relaxSrc so it
+            // feeds BOTH the predictor solve AND H()/HbyA (OF's UEqn.H() includes the ddt source). No-op for SIMPLE.
+            deviceFvmDdtSource(dm.V, ddtc, 1.0, Uold_[kk], Uold2_[kk], relaxSrc[kk], ddtc.cn ? &Uddt0_[kk] : nullptr);   // CrankNicolson: + ocCoeff*ddt0
             if (mrf_.active) deviceMrfCoriolis(mrf_, dm.V, Uk_[0], Uk_[1], Uk_[2], kk, relaxSrc[kk]);   // MRF Coriolis: -V*(Omega x U)_kk on zone cells
             // Explicit momentum corrections (linearUpwind deferred + non-orth laplacian) go into relaxSrc so they
             // feed BOTH the predictor solve AND H()/HbyA, OF's UEqn.H() includes them. Adding them only to the
@@ -849,6 +966,87 @@ namespace brae {
         correctTurbulence();
         // OF continuityErrs.H: contErr = fvc::div(phi) on the CORRECTED flux; sum local = sum(V|contErr|)/sumV,
         // global = sum(V contErr)/sumV. deviceDiv gives Sum(phi)/V per cell, so R = V*div = the cell flux balance.
+        {
+            DeviceBuffer<scalar> divPhi;
+            deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            DeviceBuffer<scalar> R;
+            deviceHadamard(R, divPhi, dm.V);
+            const scalar sumV = deviceDot(dm.V, ones_) + 1e-300;
+            res.contLocal  = deviceSumMag(R) / sumV;
+            res.contGlobal = deviceDot(R, ones_) / sumV;
+        }
+        return res;
+    }
+
+    // Advance one time level: roll the old-time velocity fields (t-2 <- t-1 <- current) and the time steps
+    // (deltaT0 <- deltaT). Call ONCE at the top of each time step, before the outer-corrector loop -- OF does this at
+    // runTime++ (the registry ages every field's oldTime). First call: Uold2_ stays empty + deltaT0_=0, so ddtCoeffs()
+    // bootstraps to Euler exactly like pimpleFoam's first step (only one old level exists yet).
+    void DeviceSimpleSolver::advanceTime(scalar deltaT)
+    {
+        const bool cn  = (ddtScheme_ == DdtScheme::CrankNicolson);
+        const bool two = (ddtScheme_ == DdtScheme::backward) || cn;   // backward (coefft00 term) + CrankNicolson (ddt0 recurrence) both need the 2nd old level
+        for (int k = 0; k < 3; ++k)
+        {
+            if (two && Uold_[k].size()) deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (once t-1 exists)
+            deviceCopy(Uold_[k], Uk_[k]);                                  // t-1 <- current
+        }
+        if (ctl_.turbulent && !ctl_.les)   // turbulence old-time levels for fvm::ddt(k/eps): dk_ = k (or nuTilda), de_ = epsilon|omega. Pure LES nut is algebraic -> no ddt.
+        {
+            if (two && kOld_.size()) deviceCopy(kOld2_, kOld_);
+            deviceCopy(kOld_, dk_);
+            if (!ctl_.sa)   // SA is one-equation (no second scalar)
+            {
+                if (two && e2Old_.size()) deviceCopy(e2Old2_, e2Old_);
+                deviceCopy(e2Old_, de_);
+            }
+            if (ctl_.lm)   // kOmegaSSTLM transition fields (ReThetat, gammaInt)
+            {
+                if (two && ReThetatOld_.size()) deviceCopy(ReThetatOld2_, ReThetatOld_);
+                deviceCopy(ReThetatOld_, ReThetat_);
+                if (two && gammaIntOld_.size()) deviceCopy(gammaIntOld2_, gammaIntOld_);
+                deviceCopy(gammaIntOld_, gammaInt_);
+            }
+        }
+        if (cn)   // CrankNicolson: update each transported variable's stored old ddt (ddt0) from the just-rotated old levels.
+        {         // deltaT0 = the PREVIOUS deltaT (deltaT_ not yet overwritten); no-op on the first step (no oldTime.oldTime).
+            const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT, deltaT_, ocCoeff_, cnWarm_);
+            for (int k = 0; k < 3; ++k) deviceFvmDdtUpdateDdt0(ddtc, Uold_[k], Uold2_[k], Uddt0_[k]);
+            if (ctl_.turbulent && !ctl_.les)
+            {
+                deviceFvmDdtUpdateDdt0(ddtc, kOld_, kOld2_, kddt0_);
+                if (!ctl_.sa) deviceFvmDdtUpdateDdt0(ddtc, e2Old_, e2Old2_, e2ddt0_);
+                if (ctl_.lm)
+                {
+                    deviceFvmDdtUpdateDdt0(ddtc, ReThetatOld_, ReThetatOld2_, ReThetatddt0_);
+                    deviceFvmDdtUpdateDdt0(ddtc, gammaIntOld_, gammaIntOld2_, gammaIntddt0_);
+                }
+            }
+            if (ddtc.cn && Uold2_[0].size()) cnWarm_ = true;   // first (Euler-startup) ddt0 update done -> subsequent updates use 1+oc
+        }
+        deltaT0_ = deltaT_;
+        deltaT_  = deltaT;
+    }
+
+    // One PIMPLE time step -- the transient counterpart of step(): the SAME three composable phases re-orchestrated under
+    // outer (momentum<->pressure<->turbulence) + inner (pressure) corrector loops, with fvm::ddt(U) folded into the
+    // predictor (active once setDdtScheme() set ddtScheme_ != steadyState). The momentum matrix is re-assembled each
+    // outer corrector from the latest U/phi, exactly as OF's while(pimple.loop()) re-forms UEqn.
+    DeviceSimpleResidual DeviceSimpleSolver::pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors)
+    {
+        const DeviceMesh& dm = dm_;
+        advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
+        DeviceSimpleResidual res;
+        const int nOuter = nOuterCorrectors > 0 ? nOuterCorrectors : 1;
+        const int nCorr  = nCorrectors      > 0 ? nCorrectors      : 1;
+        for (int oc = 0; oc < nOuter; ++oc)
+        {
+            solveMomentumPredictor(res);                     // momentum incl. implicit ddt
+            for (int pc = 0; pc < nCorr; ++pc)               // PIMPLE pressure (inner) correctors
+                correctPressureVelocity(res);
+            correctTurbulence();
+        }
+        // continuity errors on the corrected flux (identical to step()).
         {
             DeviceBuffer<scalar> divPhi;
             deviceDiv(dm, phiInt_, phiBnd_, divPhi);

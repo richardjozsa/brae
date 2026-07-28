@@ -35,7 +35,8 @@ namespace brae {
 inline std::vector<scalar> cellWallDist(
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    std::vector<vector>* wallOrigin = nullptr)   // optional: nearest wall-face centre per cell (IDDES wall-normal source)
 {
     const std::vector<vector>& C   = g.C();
     const std::vector<vector>& Cf  = g.Cf();
@@ -46,6 +47,7 @@ inline std::vector<scalar> cellWallDist(
     const label nIntF  = m.nInternalFaces();
 
     std::vector<scalar> y(nCells, nwdGreat);                  // OF wallDist: y initialised to GREAT
+    if (wallOrigin) *wallOrigin = C;                          // default: cell centre (degenerate -> IDDES hwn falls back to hmax)
 
     // the wave seed: every wall-patch face (patchWave::setChangedFaces)
     std::vector<char> isWallFace(nFaces, 0);
@@ -211,6 +213,11 @@ inline std::vector<scalar> cellWallDist(
         if (wallY[c] < nwdGreat)      y[c] = wallY[c];               // face-corrected (priority)
         else if (ptY[c] < nwdGreat)   y[c] = ptY[c];                // point-corrected
     }
+    // the wave's nearest wall-face centre per reached cell -> the IDDES wall-normal direction (C - origin). Cells the
+    // wave never reached keep the default (C, degenerate). Does not alter y (the correctWalls override above is intact).
+    if (wallOrigin)
+        for (label c = 0; c < nCells; ++c)
+            if (cellSet[c]) (*wallOrigin)[c] = cellOrg[c];
     return y;
 }
 

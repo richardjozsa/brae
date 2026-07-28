@@ -39,6 +39,10 @@ if(OpenMP_CXX_FOUND)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp")
 endif()
 
+# CUDAToolkit: the NVRTC runtime compiler (CUDA::nvrtc) + the driver API (CUDA::cuda_driver) for the device-resident
+# runtime-compiled boundary conditions (device_coded_bc.cu: nvrtc -> PTX -> cuModuleLoadData -> cuLaunchKernel).
+find_package(CUDAToolkit REQUIRED)
+
 # SCOTCH, cell-graph partitioner (the decomposePar-equivalent), matching OpenFOAM.
 find_path(SCOTCH_INCLUDE_DIR NAMES scotch.h PATH_SUFFIXES scotch REQUIRED)
 find_library(SCOTCH_LIBRARY NAMES scotch REQUIRED)
@@ -88,9 +92,12 @@ add_library(brae_core STATIC
     src/cuda/device_boundary_assembly.cu
     src/cuda/device_boundary_flow.cu
     src/cuda/device_divdevreff.cu
+    src/cuda/device_ddt.cu
     src/cuda/device_kepsilon.cu
     src/cuda/device_spalart.cu
     src/cuda/device_komega_sst.cu
+    src/cuda/device_smagorinsky.cu
+    src/cuda/device_coded_bc.cu
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
@@ -109,7 +116,7 @@ add_library(brae_core STATIC
 target_include_directories(brae_core PUBLIC ${BRAE_HEADER_DIRS} ${MPI_CXX_INCLUDE_DIRS} ${SCOTCH_INCLUDE_DIR})
 # Link MPI libraries directly (not the imported target) so its CXX compile flags do not
 # reach nvcc, which would reject them.
-target_link_libraries(brae_core PUBLIC ${MPI_CXX_LIBRARIES} ${SCOTCH_LIBRARY} ${SCOTCH_ERR_LIBRARY} ZLIB::ZLIB)
+target_link_libraries(brae_core PUBLIC ${MPI_CXX_LIBRARIES} ${SCOTCH_LIBRARY} ${SCOTCH_ERR_LIBRARY} ZLIB::ZLIB CUDA::nvrtc CUDA::cuda_driver)
 # OpenMP runtime (libgomp) linked directly, like MPI above, the imported target's CXX compile flags would reach nvcc.
 if(OpenMP_CXX_FOUND)
     target_link_libraries(brae_core PUBLIC ${OpenMP_CXX_LIBRARIES})
@@ -531,6 +538,49 @@ target_link_libraries(test_gpu_komega_sst PRIVATE brae_core)
 add_test(NAME gpu_komega_sst
          COMMAND test_gpu_komega_sst ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282/komega_sst.dat)
 
+# Transient ddt (PIMPLE foundation): deviceFvmDdt reproduces OF EulerDdtScheme/backwardDdtScheme exactly.
+add_executable(test_gpu_ddt tests/test_gpu_ddt.cu)
+target_include_directories(test_gpu_ddt PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_ddt PRIVATE brae_core)
+add_test(NAME gpu_ddt COMMAND test_gpu_ddt)
+
+# SA-DDES length scale (DES/LES): deviceSADDESdTilda reproduces the OF SpalartAllmarasDDES delayed length scale.
+add_executable(test_gpu_saddes tests/test_gpu_saddes.cu)
+target_include_directories(test_gpu_saddes PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_saddes PRIVATE brae_core)
+add_test(NAME gpu_saddes COMMAND test_gpu_saddes)
+
+# kOmegaSST-DDES DES factor: deviceKOmegaSSTDESfactor reproduces the OF kOmegaSSTDDES k-destruction enhancement.
+add_executable(test_gpu_ksstddes tests/test_gpu_ksstddes.cu)
+target_include_directories(test_gpu_ksstddes PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_ksstddes PRIVATE brae_core)
+add_test(NAME gpu_ksstddes COMMAND test_gpu_ksstddes)
+
+add_executable(test_gpu_smagorinsky tests/test_gpu_smagorinsky.cu)
+target_include_directories(test_gpu_smagorinsky PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_smagorinsky PRIVATE brae_core)
+add_test(NAME gpu_smagorinsky COMMAND test_gpu_smagorinsky)
+
+add_executable(test_gpu_saiddes tests/test_gpu_saiddes.cu)
+target_include_directories(test_gpu_saiddes PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_saiddes PRIVATE brae_core)
+add_test(NAME gpu_saiddes COMMAND test_gpu_saiddes)
+
+add_executable(test_gpu_ksstiddes tests/test_gpu_ksstiddes.cu)
+target_include_directories(test_gpu_ksstiddes PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_ksstiddes PRIVATE brae_core)
+add_test(NAME gpu_ksstiddes COMMAND test_gpu_ksstiddes)
+
+add_executable(test_gpu_ddt_cn tests/test_gpu_ddt_cn.cu)
+target_include_directories(test_gpu_ddt_cn PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_ddt_cn PRIVATE brae_core)
+add_test(NAME gpu_ddt_cn COMMAND test_gpu_ddt_cn)
+
+add_executable(test_gpu_coded_bc tests/test_gpu_coded_bc.cu)
+target_include_directories(test_gpu_coded_bc PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_coded_bc PRIVATE brae_core)
+add_test(NAME gpu_coded_bc COMMAND test_gpu_coded_bc)
+
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_forces PRIVATE brae_core)
@@ -898,6 +948,12 @@ add_executable(brae src/applications/solvers/simpleFoam/gpuSimpleFoam.cu)
 target_include_directories(brae PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae PRIVATE brae_core)
 
+# The single-GPU device-resident TRANSIENT solver app (PIMPLE): brae_pimpleFoam <caseDir>. Reuses DeviceSimpleSolver's
+# three composable phases via pimpleStep, with implicit fvm::ddt(U). v1 laminar.
+add_executable(brae_pimpleFoam src/applications/solvers/pimpleFoam/gpuPimpleFoam.cu)
+target_include_directories(brae_pimpleFoam PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
+target_link_libraries(brae_pimpleFoam PRIVATE brae_core)
+
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
 # slow-labelled (~2 min); regenerate the oracle with validation/komegasstlm_wall_vs_openfoam.sh.
@@ -1136,6 +1192,42 @@ add_executable(test_gpu_driver tests/test_gpu_driver.cu)
 target_include_directories(test_gpu_driver PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
 target_link_libraries(test_gpu_driver PRIVATE brae_core)
 add_test(NAME gpu_driver COMMAND test_gpu_driver ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+
+# PIMPLE foundation: transient pimpleStep() steady-limit consistency vs step() + transient stability (skips if the
+# case fixture is absent, like ami_oracle -- validation/ is local-only on CI).
+add_executable(test_gpu_pimple tests/test_gpu_pimple.cu)
+target_include_directories(test_gpu_pimple PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
+target_link_libraries(test_gpu_pimple PRIVATE brae_core)
+add_test(NAME gpu_pimple COMMAND test_gpu_pimple ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(gpu_pimple PROPERTIES SKIP_RETURN_CODE 125)
+
+# Driver-level ctest: run the brae_pimpleFoam EXECUTABLE end-to-end on a transient variant of the committed pitzDaily
+# (kEpsilon URANS) -- exercises the controlDict/fvSchemes(ddt)/fvSolution(PIMPLE) parse + turbulence I/O + time loop +
+# OF writer. Fixture is committed, so this runs on CI (skips only if it is somehow absent).
+add_test(NAME pimple_run
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_run.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/pimple_run_work)
+set_tests_properties(pimple_run PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
+
+# The same transient case run through `brae` itself: the case says `application pimpleFoam`, so the solver
+# registry (solvers/common/solver_dispatch.cuh) must hand it to brae_pimpleFoam and produce the identical
+# end-to-end result. Guards the single-command CLI: `brae` on a transient case must not fall through to SIMPLE.
+add_test(NAME pimple_dispatch
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_run.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/pimple_dispatch_work)
+set_tests_properties(pimple_dispatch PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
+
+# Solver selection itself: routes on controlDict `application`, refuses the solvers brae does not have, and
+# catches an application/ddtSchemes contradiction. Dict-only fake cases, no mesh and no GPU.
+add_test(NAME solver_dispatch
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_dispatch.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_BINARY_DIR}/solver_dispatch_work)
+set_tests_properties(solver_dispatch PROPERTIES TIMEOUT 120)
 
 # GPU offload #7: thread-block clusters + DSM, foundational cluster reduction vs the global reduction.
 add_executable(test_gpu_cluster tests/test_gpu_cluster.cu)

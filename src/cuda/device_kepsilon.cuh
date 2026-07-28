@@ -6,6 +6,7 @@
 #include "cf_types.cuh"
 #include "kepsilon_coeffs.cuh"
 #include "device_buffer.cuh"
+#include "device_ddt.cuh"          // ScalarDdt (transient turbulence ddt bundle)
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "primitive_mesh.cuh"
@@ -184,7 +185,8 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                            bool linearUpwindK = false, bool linearUpwindEps = false, bool nonOrth = false,
                            bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                            int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
-                           scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough wall)
+                           scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough wall)
+                           const ScalarDdt& kDdt = {}, const ScalarDdt& eDdt = {});   // transient fvm::ddt(k)/ddt(eps)
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -202,7 +204,12 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                             const scalar* gammaIntEff = nullptr,   // kOmegaSSTLM transition: scales k Pk/epsilonByk
                             int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
-                            scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough wall)
+                            scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough wall)
+                            const ScalarDdt& kDdt = {}, const ScalarDdt& sDdt = {},   // transient fvm::ddt(k)/ddt(omega)
+                            bool des = false,   // kOmegaSSTDDES: DES limiter on the k destruction
+                            bool iddes = false,   // kOmegaSSTIDDES: the improved (WMLES) length scale (needs hmax+hwn)
+                            const DeviceBuffer<scalar>* hmax = nullptr,   // per-cell maxDeltaxyz (IDDES delta); null -> DDES cubeRootVol
+                            const DeviceBuffer<scalar>* hwn = nullptr);   // per-cell wall-normal spacing (IDDES delta 3rd term)
 
 // kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition) extra step: after the SST k/omega solve, transport ReThetat
 // and gammaInt and update gammaIntEff (fed back into the SST k equation next iteration). See PORTING_KOMEGASSTLM.md.
@@ -213,7 +220,8 @@ void deviceKOmegaSSTLMCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& 
                               DeviceBuffer<scalar>& ReThetat, DeviceBuffer<scalar>& gammaInt, DeviceBuffer<scalar>& gammaIntEff,
                               const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd, scalar nu,
                               scalar relax, scalar tol, scalar relTolKE, int keCheckEvery, bool bounded, bool nonOrth,
-                              bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
+                              bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
+                              const ScalarDdt& reDdt = {}, const ScalarDdt& giDdt = {});   // transient fvm::ddt(ReThetat)/ddt(gammaInt)
 
 // Spalart-Allmaras (one-equation): solve the nuTilda transport (div - laplacian(DnuTildaEff) + Sp(destruction) ==
 // production + Cb2 grad^2) via the shared scaffold, then nut = nuTilda*fv1. Mirrors SpalartAllmarasBase::correct()
@@ -226,10 +234,23 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   scalar nu, scalar relax, scalar tol, bool bounded = false, bool limited = false,
                                   scalar twoByk = 2.0, const SpalartAllmarasCoeffs& co = {}, scalar relTol = 0.0, int checkEvery = 1,
                                   bool linearUpwind = false, bool nonOrth = false,
-                                  bool gsK = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
+                                  bool gsK = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
+                                  const ScalarDdt& ntDdt = {},   // transient fvm::ddt(nuTilda)
+                                  bool des = false,   // SpalartAllmarasDDES: DES length-scale limiter on the SA destruction
+                                  bool iddes = false,   // SpalartAllmarasIDDES: use the improved (WMLES) length scale (needs hmax+hwn)
+                                  const DeviceBuffer<scalar>* hmax = nullptr,   // per-cell maxDeltaxyz (IDDES delta); null -> DDES cubeRootVol
+                                  const DeviceBuffer<scalar>* hwn = nullptr);   // per-cell wall-normal spacing (IDDES delta 3rd term)
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
+// SA-DDES length scale dTilda = y - fd*max(0, y - CDES*cubeRootVol(V)); fd = 1 - tanh((8 rd)^3). (Unit-test/DES hook.)
+void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& V,
+    const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda);
+// SA-IDDES length scale (Shur et al. 2008): dTilda = fdTilde*(1+fe)*y + (1-fdTilde)*CDES*Delta, Delta from hmax+hwn. (Unit-test/DES hook.)
+void deviceSAIDDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax,
+    const DeviceBuffer<scalar>& hwn, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda);
 // Spalart-Allmaras source-prep, exported for the distributed SA correct. Cell-local (gradU + grad(nuTilda) supplied
 // by the caller). Stilda/Fw/DEff/Reaction reuse the anon kernels; deviceSAReaction ACCUMULATES (+=) -> zero first.
 void deviceSAStilda(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda,
