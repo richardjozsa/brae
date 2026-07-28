@@ -17,9 +17,13 @@
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
 #include "foam_dict.cuh"
+#include "scheme_parse.cuh"   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
+#include "solver_dispatch.cuh"   // dispatchSolver: route the case to the brae solver its controlDict asks for
+#include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
 #include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
+#include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
 #include "parallel_device_foam.cuh"   // brae ... -parallel: the distributed DEVICE path (one rank per GPU)
 
 #include <algorithm>
@@ -41,8 +45,12 @@ using namespace brae;
 static void printUsage()
 {
     std::printf(
-"brae, a GPU-native, OpenFOAM-compatible CFD solver (steady incompressible, simpleFoam).\n"
-"The whole SIMPLE loop runs on one GPU; reads a standard OpenFOAM case and writes standard time dirs.\n\n"
+"brae, a GPU-native, OpenFOAM-compatible CFD solver. The whole solve runs on one GPU; reads a standard\n"
+"OpenFOAM case and writes standard time dirs.\n\n"
+"Solvers (picked from the case's controlDict `application`, so `brae` is the only command you type):\n"
+"  simpleFoam       steady incompressible, RAS/laminar\n"
+"  pimpleFoam       transient incompressible, URANS/DES/LES/laminar\n"
+"Any other application stops at start-up rather than run the case with the wrong solver.\n\n"
 "Usage:\n"
 "  brae [-case <dir>]             solve an OpenFOAM case (default: the current directory)\n"
 "  mpirun -np N brae -case <dir> -parallel\n"
@@ -102,6 +110,12 @@ int main(int argc, char** argv)
             else if (a[0] != '-')
                 caseDir = a;
         }
+        // The case names its solver (controlDict `application`), so `brae` is the only command a user types: this
+        // executable keeps the steady cases and hands the others to the brae solver that owns them, before any dict
+        // read or CUDA init. -partition is solver-agnostic prep (mesh + AMG cache) and always runs here.
+        // Registry + rules: solvers/common/solver_dispatch.cuh.
+        if (!partition) dispatchSolver(caseDir, argc, argv);
+
         // -partition is cf's analogue of OF decomposePar: do the one-time prep (parse mesh + build AMG hierarchy) and
         // persist it to constant/polyMesh/.brae_mesh|amgcache, so the actual run reloads it warm. Forces the cache write.
         if (partition) setenv("BRAE_MESH_CACHE", "1", 1);
@@ -184,209 +198,12 @@ int main(int argc, char** argv)
         }
         // read schemes: div(phi,U) "bounded" -> -Sp(div(phi),.); "linearUpwind" -> deferred gradient correction;
         // laplacian/snGrad "corrected" -> non-orthogonal correction (nonOrthDeltaCoeffs implicit + corrVec.grad explicit).
-        {
-            const std::string schemesText = readFileExpanded(caseDir + "/system/fvSchemes");   // $var expanded ($turbulence)
-            std::istringstream fsch(schemesText);
-            std::string ln;
-            bool foundDivU = false;   // require an EXPLICIT div(phi,U); brae does not resolve the divSchemes 'default'
-            bool warnedLeastSq = false, warnedCellMD = false;   // #14: warn-once on grad schemes brae approximates
-            auto hasWord = [](const std::string& s, const std::string& w)   // whole-word match (so "uncorrected" != "corrected")
-            {
-                for (std::size_t p = s.find(w); p != std::string::npos; p = s.find(w, p + 1))
-                {
-                    const bool lb = (p == 0 || !std::isalpha((unsigned char)s[p-1]));
-                    const bool rb = (p + w.size() >= s.size() || !std::isalpha((unsigned char)s[p+w.size()]));
-                    if (lb && rb) return true;
-                }
-                return false;
-            };
-            // "limitedLinear <k_>" on a div line -> twoByk = 2/max(k_,SMALL); returns 0 if the scheme is absent.
-            auto limitedTwoByk = [](const std::string& s) -> scalar
-            {
-                const std::size_t p = s.find("limitedLinear");
-                if (p == std::string::npos) return 0.0;
-                scalar kc = 1.0;
-                std::sscanf(s.c_str() + p + 13, "%lf", &kc);   // coefficient after "limitedLinear"
-                return 2.0 / std::max(kc, (scalar)1e-30);
-            };
-            // the interpolation-scheme word after "Gauss" on a div(phi,*) line (OF: "[bounded] Gauss <scheme> [args]").
-            auto divSchemeWord = [](const std::string& s) -> std::string
-            {
-                const std::size_t g = s.find("Gauss");
-                if (g == std::string::npos) return std::string();
-                const char* p = s.c_str() + g + 5;
-                while (*p && std::isspace((unsigned char)*p)) ++p;
-                std::string w;
-                while (*p && !std::isspace((unsigned char)*p) && *p != ';') { w += *p; ++p; }
-                return w;
-            };
-            // OF-faithful fail-fast (mirrors surfaceInterpolationScheme::New "Unknown discretisation scheme ... Valid
-            // schemes are : (...)" + exit(FatalIOError)): throw on a scheme cf models nothing close to; warn loudly on
-            // one cf only APPROXIMATES (so the route is detected, never silently covered). `ok` = exact; `approx` = warned.
-            auto checkDiv = [&](
-                const std::string& s,
-                const char* field,
-                std::initializer_list<const char*> ok,
-                std::initializer_list<const char*> approx)
-            {
-                const std::string w = divSchemeWord(s);
-                for (const char* o : ok)
-                    if (w == o) return;
-                for (const char* o : approx)
-                    if (w == o)
-                    {
-                        std::fprintf(stderr, "brae WARNING: div(phi,%s) 'Gauss %s' has no exact cf kernel -- run as a near-equivalent "
-                                     "(NOT OF-bit-identical). Set the scheme to an exact one to avoid this.\n", field, w.c_str());
-                        return;
-                    }
-                std::string valid;
-                for (const char* o : ok)     (valid += " ") += o;
-                for (const char* o : approx) (valid += " ") += o;
-                throw std::runtime_error(std::string("brae: unknown/unsupported div(phi,") + field +
-                    ") scheme 'Gauss " + w + "'; cf supports : (" + valid + " )");
-            };
-            while (std::getline(fsch, ln))
-            {
-                if (ln.find("div(phi,U)") != std::string::npos)
-                {
-                    foundDivU = true;
-                    checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST"}, {"limitedLinear", "limitedLinearV"});
-                    if (ln.find("bounded") != std::string::npos)      ctl.bounded = true;
-                    if (ln.find("linearUpwind") != std::string::npos) ctl.linearUpwind = true;   // linearUpwindV contains this -> upwind matrix + gradients
-                    if (ln.find("linearUpwindV") != std::string::npos) ctl.linearUpwindV = true; // + OF vector direction limiter
-                    if (ln.find("LUST") != std::string::npos)         ctl.lust = true;   // 0.75 linear + 0.25 linearUpwind
-                }
-                // grad(U) cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>): k is the first number after
-                // "cellLimited" (the basicScheme between has no digits). 0 = unlimited. cellMDLimited not yet handled.
-                if (ln.find("grad(U)") != std::string::npos && hasWord(ln, "cellLimited"))
-                {
-                    ctl.gradULimitK = 1.0;
-                    const char* s = ln.c_str() + ln.find("cellLimited") + 11;
-                    while (*s && !(std::isdigit((unsigned char)*s) || *s == '.')) ++s;
-                    scalar kc;
-                    if (std::sscanf(s, "%lf", &kc) == 1) ctl.gradULimitK = kc;
-                }
-                // #14: brae computes gradients via Gauss linear only. These are valid ALTERNATIVE discretisations
-                // (not wrong answers), so warn-once rather than fail -- the user should know brae is approximating.
-                if (!warnedLeastSq && ln.find("leastSquares") != std::string::npos)
-                { warnedLeastSq = true; std::fprintf(stderr, "brae WARNING: gradScheme 'leastSquares' is approximated as Gauss linear (differs on skewed meshes)\n"); }
-                if (!warnedCellMD && ln.find("cellMDLimited") != std::string::npos)
-                { warnedCellMD = true; std::fprintf(stderr, "brae WARNING: grad limiter 'cellMDLimited' is not applied (runs unlimited)\n"); }
-                if (std::getenv("BRAE_SCHEME_DEBUG") && ln.find("div(phi,") != std::string::npos) std::fprintf(stderr, "[scheme] %s\n", ln.c_str());
-                if (ln.find("div(phi,k)") != std::string::npos)
-                {
-                    checkDiv(ln, "k", {"upwind", "linearUpwind", "limitedLinear"}, {});
-                    const scalar t = limitedTwoByk(ln);
-                    if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
-                    if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
-                }
-                if (ln.find("div(phi,epsilon)") != std::string::npos || ln.find("div(phi,omega)") != std::string::npos)
-                {
-                    checkDiv(ln, "epsilon|omega", {"upwind", "linearUpwind", "limitedLinear"}, {});
-                    const scalar t = limitedTwoByk(ln);
-                    if (t > 0.0) { ctl.limitedEps = true; ctl.twoBykEps = t; }   // 2nd turb scalar (eps|omega)
-                    if (ln.find("linearUpwind") != std::string::npos) ctl.luEps = true;
-                }
-                if (ln.find("div(phi,nuTilda)") != std::string::npos)   // SA: nuTilda uses the k-slot scheme flags
-                {
-                    checkDiv(ln, "nuTilda", {"upwind", "linearUpwind", "limitedLinear"}, {});
-                    const scalar t = limitedTwoByk(ln);
-                    if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
-                    if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
-                }
-                if (ln.find("Gauss") != std::string::npos || ln.find("snGrad") != std::string::npos ||
-                    ln.find("laplacian") != std::string::npos || ln.find("default") != std::string::npos)
-                {
-                    if (hasWord(ln, "corrected")) ctl.nonOrth = true;     // unlimited non-orth correction (psi = 1)
-                    // OF fv::limitedSnGrad "limited [<correctedScheme>] <psi>" (psi in [0,1]): non-orth correction
-                    // capped per-face. hasWord avoids matching "unlimited" and "limitedLinear" (a div scheme); the coeff
-                    // is the next numeric token after "limited" (skip an optional scheme word like "corrected").
-                    if (hasWord(ln, "limited"))
-                    {
-                        ctl.nonOrth = true;
-                        scalar psi = 1.0;
-                        const char* s = ln.c_str() + ln.find("limited") + 7;
-                        while (*s && !(std::isdigit((unsigned char)*s) || *s == '.')) ++s;   // skip to the coefficient
-                        if (std::sscanf(s, "%lf", &psi) == 1) ctl.nonOrthLimit = psi;
-                    }
-                }
-            }
-            if (!schemesText.empty() && !foundDivU)
-                throw std::runtime_error("fvSchemes: no explicit div(phi,U) scheme. brae does not resolve the"
-                    " divSchemes 'default' for momentum convection (it would silently run first-order upwind)."
-                    " Add e.g. 'div(phi,U)  bounded Gauss linearUpwind grad(U);'.");
-        }
+        parseFvSchemesControls(caseDir, ctl);
         const std::string simType = turbProps.wordOr("simulationType", "laminar");
         ctl.turbulent = (simType == "RAS");
         if (simType != "RAS" && simType != "laminar")
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' (RAS or laminar)");
-        if (ctl.turbulent)
-        {
-            const FoamDict* ras = turbProps.subDict("RAS");
-            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            ctl.lm  = (model == "kOmegaSSTLM");                 // Langtry-Menter transition = kOmegaSST + gamma-ReThetat
-            ctl.sst = (model == "kOmegaSST") || ctl.lm;
-            ctl.sa  = (model == "SpalartAllmaras");
-            const bool rke = (model == "realizableKE");
-            if (model != "kEpsilon" && !rke && !ctl.sst && !ctl.sa)
-                throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
-            if (ctl.sa)
-            {
-                // Spalart-Allmaras: OF defaults (coeffs read from RAS.SpalartAllmarasCoeffs would override; not needed here).
-                const SpalartAllmarasCoeffs& c = ctl.saCoeffs;
-                std::printf("  SpalartAllmaras (OF defaults): sigmaNut=%.4g kappa=%.4g Cb1=%.4g Cb2=%.4g Cw1=%.4g Cw2=%.3g Cw3=%.3g Cv1=%.3g Cs=%.3g\n",
-                            c.sigmaNut, c.kappa, c.Cb1, c.Cb2, c.Cw1(), c.Cw2, c.Cw3, c.Cv1, c.Cs);
-            }
-            else if (ctl.sst)
-            {
-                // kOmegaSST coefficients: OF turbulenceProperties RAS.kOmegaSSTCoeffs (absent keys keep OF defaults).
-                readKOmegaSSTCoeffs(ras, ctl.ksstCoeffs);
-                const KOmegaSSTCoeffs& c = ctl.ksstCoeffs;
-                std::printf("  kOmegaSSTCoeffs: a1=%.4g betaStar=%.4g alphaK1=%.4g alphaOmega1=%.4g gamma1=%.4g beta1=%.4g\n",
-                            c.a1, c.betaStar, c.alphaK1, c.alphaOmega1, c.gamma1, c.beta1);
-            }
-            else
-            {
-                // k-eps coefficients: RAS.kEpsilonCoeffs (kappa/E wall-function coeffs accepted if present).
-                KEpsilonCoeffs& c = ctl.keCoeffs;
-                if (rke)   // realizableKE: variable Cmu + strain production; OF defaults A0=4, C2=1.9, sigmak=1, sigmaEps=1.2
-                {
-                    c.realizable = true;
-                    c.A0 = 4.0;
-                    c.C2 = 1.9;
-                    c.sigmaK = 1.0;
-                    c.sigmaEps = 1.2;
-                    if (const FoamDict* rkc = ras ? ras->subDict("realizableKECoeffs") : nullptr)
-                    {
-                        c.A0 = rkc->scalarOr("A0", c.A0);
-                        c.C2 = rkc->scalarOr("C2", c.C2);
-                        c.sigmaK = rkc->scalarOr("sigmak", c.sigmaK);
-                        c.sigmaEps = rkc->scalarOr("sigmaEps", c.sigmaEps);
-                        c.kappa = rkc->scalarOr("kappa", c.kappa);
-                        c.E = rkc->scalarOr("E", c.E);
-                    }
-                    std::printf("  realizableKECoeffs: A0=%.4g C2=%.4g sigmak=%.4g sigmaEps=%.4g kappa=%.4g E=%.4g (variable Cmu)\n",
-                                c.A0, c.C2, c.sigmaK, c.sigmaEps, c.kappa, c.E);
-                }
-                else
-                {
-                    const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr;
-                    if (kec)
-                    {
-                        c.Cmu = kec->scalarOr("Cmu", c.Cmu);
-                        c.C1 = kec->scalarOr("C1", c.C1);
-                        c.C2 = kec->scalarOr("C2", c.C2);
-                        c.C3 = kec->scalarOr("C3", c.C3);
-                        c.sigmaK = kec->scalarOr("sigmak", c.sigmaK);
-                        c.sigmaEps = kec->scalarOr("sigmaEps", c.sigmaEps);
-                        c.kappa = kec->scalarOr("kappa", c.kappa);
-                        c.E = kec->scalarOr("E", c.E);
-                    }
-                    std::printf("  kEpsilonCoeffs%s: Cmu=%.4g C1=%.4g C2=%.4g C3=%.4g sigmak=%.4g sigmaEps=%.4g kappa=%.4g E=%.4g\n",
-                                kec ? " (from dict)" : " (OF defaults)", c.Cmu, c.C1, c.C2, c.C3, c.sigmaK, c.sigmaEps, c.kappa, c.E);
-                }
-            }
-        }
+        readTurbulenceModel(turbProps, ctl);
 
         // Scalar linearUpwind (deferred correction) is implemented in the scalar scaffold but currently DEGRADES
         // turbulence accuracy (explicit lagged correction + loose under-relaxed turb solve + steep near-wall
@@ -553,95 +370,7 @@ int main(int argc, char** argv)
         SurfaceScalarField phi = fvc::flux(U, m, g, fvp);
 
         const std::string secondName = ctl.sst ? "omega" : "epsilon";   // the 2nd turbulence scalar
-        // Wall-function fidelity guard -- fail loud on a nut/epsilon/omega wall-function BC placed on a patch NOT typed
-        // 'wall': brae gates the near-wall model on the geometric patch type, so the wall function would be SILENTLY
-        // inert. Conservative on the patch match -- only errors when the BC patch resolves to a concrete non-'wall'
-        // patch (group/regex names are skipped). NOTE: nutUSpalding/nutUBlended on a non-SA model are NO LONGER an
-        // error -- brae now honours the velocity-based nut wall function on any RAS model (see setNutWall + the
-        // NutWall dispatch in device_simple_foam.cuh), matching OpenFOAM.
-        auto patchGeoType = [&](const std::string& nm) -> std::string {
-            for (const auto& q : fvp) if (q.name == nm) return q.type;
-            return "";
-        };
-        auto guardWallFn = [&](const FieldData<scalar>& fd, const std::string& field) {
-            auto isWF = [](const std::string& t) {
-                return t == "nutkWallFunction" || t == "nutUSpaldingWallFunction" || t == "nutLowReWallFunction"
-                    || t == "nutUBlendedWallFunction" || t == "atmNutkWallFunction" || t == "epsilonWallFunction" || t == "omegaWallFunction";
-            };
-            for (const auto& pb : fd.boundary)
-            {
-                if (!isWF(pb.type)) continue;
-                const std::string gt = patchGeoType(pb.name);
-                if (!gt.empty() && gt != "wall")
-                    throw std::runtime_error(field + " boundary '" + pb.name + "' uses " + pb.type + ", but the patch"
-                        " is type '" + gt + "' (not 'wall'). brae applies the near-wall model only on 'wall' patches, so"
-                        " it would be SILENTLY inert (no wall shear / near-wall constraint). Retype the patch as 'wall'"
-                        " in constant/polyMesh/boundary.");
-            }
-        };
-        // Pick the nut wall function from the 0/nut wall-patch BC TYPE (OpenFOAM does this per-BC, not by model):
-        // nutUSpalding -> Spalding, nutUBlended -> Blended, else nutk. Warn once on nutLowRe (mapped to nutk: identical
-        // only on a resolved y+<yPlusLam mesh). SA keeps its Spalding path regardless (ctl.sa short-circuits below).
-        auto setNutWall = [&](const FieldData<scalar>& fd) {
-            for (const auto& pb : fd.boundary)
-            {
-                const std::string gt = patchGeoType(pb.name);
-                if (!gt.empty() && gt != "wall") continue;                 // only wall patches drive the choice
-                if (pb.type == "nutUSpaldingWallFunction") { ctl.nutWall = NutWall::Spalding; }
-                else if (pb.type == "nutUBlendedWallFunction") { ctl.nutWall = NutWall::Blended; }
-                else if (pb.type == "atmNutkWallFunction")   // atmospheric rough-wall nut (k-based path + roughness z0)
-                {
-                    ctl.atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
-                    ctl.atmBoundNut = pb.atmBoundNut;  // clamp nut>=0 option
-                    printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s) on %s per the BC\n",
-                           (double)ctl.atmZ0, ctl.atmBoundNut ? "true" : "false", ctl.sst ? "kOmegaSST" : "kEpsilon");
-                }
-                else if (pb.type == "nutLowReWallFunction")
-                    fprintf(stderr, "brae WARNING: nut boundary '%s' uses nutLowReWallFunction; brae applies "
-                        "nutkWallFunction (log law). Identical only where y+<yPlusLam (resolved mesh).\n", pb.name.c_str());
-            }
-            if (!ctl.sa && ctl.nutWall != NutWall::Nutk)
-                printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
-                       ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction" : "nutUBlendedWallFunction",
-                       ctl.sst ? "kOmegaSST" : "kEpsilon");
-        };
-        GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
-        if (ctl.sa)   // Spalart-Allmaras (one-equation): nuTilda -> the "k" slot, nut. BCs (freestream + fixedValue-0 wall) need no inlet calc.
-        {
-            k   = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC);
-            k.evaluateBoundary();
-            const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
-            guardWallFn(nutFD, "nut");
-            nut = buildField<scalar>(nutFD, fvp, nC);
-            nut.evaluateBoundary();
-        }
-        else if (ctl.turbulent)
-        {
-            const FieldData<scalar> kFD = readField<scalar>(fieldDir + "/k");
-            const FieldData<scalar> sFD = readField<scalar>(fieldDir + "/" + secondName);
-            k   = buildField<scalar>(kFD, fvp, nC);
-            k.evaluateBoundary();
-            eps = buildField<scalar>(sFD, fvp, nC);
-            eps.evaluateBoundary();
-            const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
-            guardWallFn(nutFD, "nut");
-            guardWallFn(sFD, secondName);
-            setNutWall(nutFD);   // honour the BC-specified velocity-based nut wall function (nutUSpalding/nutUBlended)
-            nut = buildField<scalar>(nutFD, fvp, nC);
-            nut.evaluateBoundary();
-            if (ctl.lm)   // kOmegaSSTLM transition fields
-            {
-                ReThetat = buildField<scalar>(readField<scalar>(fieldDir + "/ReThetat"), fvp, nC);
-                ReThetat.evaluateBoundary();
-                gammaInt = buildField<scalar>(readField<scalar>(fieldDir + "/gammaInt"), fvp, nC);
-                gammaInt.evaluateBoundary();
-                std::printf("  kOmegaSSTLM (Langtry-Menter transition): + ReThetat + gammaInt transport\n");
-            }
-            // turbulent-inlet BCs: inflow value computed from U (k) then from k (epsilon/omega).
-            const scalar wCmu = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
-            applyTurbulentInletK(k, kFD, U, fvp);
-            applyTurbulentInletSecond(eps, sFD, k, wCmu, fvp);
-        }
+        TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
 
         // MRF rotating zone (constant/MRFProperties + polyMesh/cellZones), if present
         const MRFConfig mrfCfg = readMRFProperties(caseDir + "/constant");
@@ -686,8 +415,8 @@ int main(int argc, char** argv)
         // device-resident SIMPLE loop
         _tsLap("fields + patches");
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
-                                  ctl.turbulent ? &k : nullptr, (ctl.turbulent && !ctl.sa) ? &eps : nullptr, ctl.turbulent ? &nut : nullptr,
-                                  ctl.lm ? &ReThetat : nullptr, ctl.lm ? &gammaInt : nullptr);
+                                  ctl.turbulent ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa) ? &tf.eps : nullptr, ctl.turbulent ? &tf.nut : nullptr,
+                                  ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
         _tsLap("solver ctor (incl AMG)");
         if (partition)   // caches written by the mesh read + the AMG build above; done, like decomposePar finishing.
         {
@@ -696,6 +425,11 @@ int main(int argc, char** argv)
             return 0;
         }
         if (mrfCfg.active) solver.setMRF(mrfZone, m, g, mrfCfg.nonRotatingPatches);
+
+        // codedFixedValue / codedMixed on U / p / turbulence scalars -> NVRTC device kernel per coded patch (compiled
+        // once; applied each SIMPLE iteration in the momentum predictor). Steady: the coded `t` stays 0 (position-based
+        // profiles); a codedFixedValue set here overrides its seed `value`. Fully device-resident.
+        setupCodedBCs(solver, fieldDir, fvp, ctl, secondName, "gpuSimpleFoam");
 
         // fvOptions (system/fvOptions or constant/fvOptions), if present (else an empty no-op list)
         // Read cellZones only when an fvOptions file exists (avoids touching cellZones on cases that have none,

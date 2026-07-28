@@ -248,7 +248,8 @@ void kReactionSSTKernel(
     scalar c1betaStar,
     const scalar* __restrict__ gammaIntEff,
     scalar* __restrict__ diag,
-    scalar* __restrict__ source)
+    scalar* __restrict__ source,
+    const scalar* __restrict__ FDES)   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr -> 1 -> plain RANS)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -257,9 +258,69 @@ void kReactionSSTKernel(
     // kOmegaSSTLM transition: Pk *= gammaIntEff, epsilonByk (= betaStar*omega) *= clamp(gammaIntEff, 0.1, 1).
     // gammaIntEff == nullptr (plain kOmegaSST) -> geff = 1 -> bit-identical (clamp(1,0.1,1)=1).
     const scalar geff = gammaIntEff ? gammaIntEff[c] : 1.0;
+    // kOmegaSST-DDES: the DES limiter FDES>=1 enhances the k destruction (beta*k*omega -> beta*k*omega*FDES) so the
+    // modelled length scale collapses to the LES scale in detached regions. FDES==nullptr (RANS) -> factor 1 -> unchanged.
+    const scalar fdes = FDES ? FDES[c] : scalar(1);
     const scalar Pk = geff * fmin(G[c], c1betaStar * k[c] * om[c]);
-    diag[c]   += V[c] * (fmin(fmax(geff, 0.1), 1.0) * betaStar * om[c] + fmax(sp, 0.0));
+    diag[c]   += V[c] * (fdes * fmin(fmax(geff, 0.1), 1.0) * betaStar * om[c] + fmax(sp, 0.0));
     source[c] += V[c] * Pk - V[c] * fmin(sp, 0.0) * k[c];
+}
+
+// kOmegaSST-DDES DES factor: FDES = max( (Lt/(CDES*Delta))*(1 - F2), 1 ), Lt = sqrt(k)/(betaStar*omega) (RANS length),
+// Delta = cubeRootVol = V^(1/3), CDES = F1*CDES1 + (1-F1)*CDES2 (SST-blended), F2 = the DDES shielding (RANS in the
+// boundary layer where F2->1 -> FDES=1; LES in free shear where F2->0). Matches OF kOmegaSSTDDES.
+__global__
+void kOmegaSSTDESfactorKernel(
+    int nC, const scalar* __restrict__ k, const scalar* __restrict__ om, const scalar* __restrict__ V,
+    const scalar* __restrict__ F1, const scalar* __restrict__ F2, scalar betaStar, scalar CDES1, scalar CDES2,
+    scalar* __restrict__ FDES)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar delta = cbrt(V[c]);
+    const scalar Lt = sqrt(fmax(k[c], scalar(0))) / fmax(betaStar * om[c], 1e-300);
+    const scalar CDES = F1[c]*CDES1 + (scalar(1) - F1[c])*CDES2;
+    FDES[c] = fmax((Lt / fmax(CDES*delta, 1e-300)) * (scalar(1) - F2[c]), scalar(1));
+}
+
+// kOmegaSST-IDDES DES factor (Gritskevich/Garbaruk/Schuetze/Menter 2012): the improved (WMLES) length scale replaces the
+// k-dissipation scale. lRAS = sqrt(k)/(betaStar*omega); lLES = CDES*Delta, CDES = F1*CDES1 + (1-F1)*CDES2, Delta =
+// min(max(Cw*y, Cw*hmax), hmax) (hwn omitted). Blending: rd_t/rd_l from nut/nu, fdt/fl/ft/fB/fe as in SA-IDDES (the SST
+// rd denominator sqrt(0.5(S^2+Omega^2)) equals |gradU|). lIDDES = fdTilde*(1+fe)*lRAS + (1-fdTilde)*lLES, and the k
+// destruction beta*k*omega is scaled by FDES = lRAS/lIDDES (== k^(3/2)/lIDDES). NOT clamped to 1: the fe elevated-stress
+// branch makes lIDDES > lRAS -> FDES < 1 (less destruction), which is the intended IDDES behaviour.
+__global__
+void kOmegaSSTIDDESfactorKernel(
+    int nC, const scalar* __restrict__ k, const scalar* __restrict__ om, const scalar* __restrict__ F1,
+    const scalar* __restrict__ gradU, const scalar* __restrict__ nut, const scalar* __restrict__ y,
+    const scalar* __restrict__ hmax, const scalar* __restrict__ hwn, scalar nu, KOmegaSSTCoeffs co, scalar* __restrict__ FDES)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    scalar g2 = 0;
+    for (int q = 0; q < 9; ++q) { const scalar gk = gradU[q*nC + c]; g2 += gk*gk; }
+    const scalar magGradU = fmax(sqrt(g2), scalar(1e-300));           // |gradU| = sqrt(0.5(S^2+Omega^2))
+    const scalar lRAS = sqrt(fmax(k[c], scalar(0))) / fmax(co.betaStar*om[c], scalar(1e-300));   // RANS length (Lt)
+    const scalar CDES = F1[c]*co.CDES1 + (scalar(1) - F1[c])*co.CDES2;
+    const scalar hm = fmax(hmax[c], scalar(1e-300));
+    const scalar delta = fmin(fmax(fmax(co.Cw*y[c], co.Cw*hm), hwn[c]), hm);   // IDDES delta = min(max(max(Cw*y,Cw*hmax),hwn), hmax)
+    const scalar lLES = CDES*delta;
+    const scalar kd2 = fmax(co.kappa*co.kappa*y[c]*y[c], scalar(1e-300));
+    const scalar rdt = fmin(nut[c] / (magGradU*kd2), scalar(10));     // turbulent rd (SST nut)
+    const scalar rdl = fmin(nu     / (magGradU*kd2), scalar(10));     // laminar rd (nu)
+    const scalar adt = co.Cdt1*rdt;   const scalar fdt = scalar(1) - tanh(adt*adt*adt);
+    const scalar al  = co.Cl*co.Cl*rdl; const scalar al2 = al*al, al4 = al2*al2, al8 = al4*al4;
+    const scalar fl  = tanh(al8*al2);
+    const scalar at  = co.Ct*co.Ct*rdt; const scalar ft = tanh(at*at*at);
+    const scalar fe2 = scalar(1) - fmax(ft, fl);
+    const scalar alpha = scalar(0.25) - y[c]/hm;
+    const scalar fB  = fmin(scalar(2)*exp(scalar(-9)*alpha*alpha), scalar(1));
+    const scalar fdTilde = fmax(scalar(1) - fdt, fB);
+    const scalar fe1 = (alpha >= scalar(0)) ? scalar(2)*exp(scalar(-11.09)*alpha*alpha)
+                                            : scalar(2)*exp(scalar(-9.0)*alpha*alpha);
+    const scalar fe  = fmax(fe1 - scalar(1), scalar(0)) * fe2;
+    const scalar lIDDES = fmax(fdTilde*(scalar(1) + fe)*lRAS + (scalar(1) - fdTilde)*lLES, scalar(1e-300));
+    FDES[c] = lRAS / lIDDES;                                          // beta*k*omega scaling (== k^(3/2)/lIDDES)
 }
 
 
@@ -488,12 +549,38 @@ void deviceKReactionSST(
     const KOmegaSSTCoeffs& co,
     DeviceBuffer<scalar>& diag,
     DeviceBuffer<scalar>& source,
-    const scalar* gammaIntEff)
+    const scalar* gammaIntEff,
+    const DeviceBuffer<scalar>* FDES)   // kOmegaSST-DDES DES factor per cell; nullptr -> plain RANS (unchanged)
 {
     const int nC = static_cast<int>(V.size());
     kReactionSSTKernel<<<nBlocks(nC), TPB>>>(nC, V.data(), k.data(), omega.data(), G.data(), divU.data(),
-                                             co.betaStar, co.c1 * co.betaStar, gammaIntEff, diag.data(), source.data());
+                                             co.betaStar, co.c1 * co.betaStar, gammaIntEff, diag.data(), source.data(),
+                                             FDES ? FDES->data() : nullptr);
     cudaCheck(cudaGetLastError(), "kReactionSST");
+}
+
+// Exported kOmegaSST-DDES DES-factor wrapper (single-GPU + unit-test hook): FDES from k/omega, cubeRootVol(V), F1, F2.
+void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& F2,
+    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES)
+{
+    FDES.resize(nC);
+    kOmegaSSTDESfactorKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), V.data(), F1.data(), F2.data(),
+                                                   co.betaStar, co.CDES1, co.CDES2, FDES.data());
+    cudaCheck(cudaGetLastError(), "kOmegaSSTDESfactor");
+}
+
+// kOmegaSST-IDDES factor FDES = lRAS/lIDDES (Gritskevich et al. 2012). Needs gradU (|gradU| for rd), the SST nut, the
+// wall distance y and the maxDeltaxyz hmax; F1 blends CDES. (Unit-test/DES hook.)
+void deviceKOmegaSSTIDDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nut,
+    const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax, const DeviceBuffer<scalar>& hwn, scalar nu,
+    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES)
+{
+    FDES.resize(nC);
+    kOmegaSSTIDDESfactorKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), F1.data(), gradU.data(),
+        nut.data(), y.data(), hmax.data(), hwn.data(), nu, co, FDES.data());
+    cudaCheck(cudaGetLastError(), "kOmegaSSTIDDESfactor");
 }
 
 
@@ -569,7 +656,13 @@ void deviceKOmegaSSTCorrect(
     const scalar* gammaIntEff,
     int nutWall,
     scalar atmZ0,
-    bool atmBoundNut)
+    bool atmBoundNut,
+    const ScalarDdt& kDdt,
+    const ScalarDdt& sDdt,
+    bool des,
+    bool iddes,
+    const DeviceBuffer<scalar>* hmax,
+    const DeviceBuffer<scalar>* hwn)
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -608,6 +701,16 @@ void deviceKOmegaSSTCorrect(
     deviceF1(k, omega, y, CD, nu, co, F1, gammaIntEff != nullptr);   // LM: F1=max(F1,F3) near-wall override
     DeviceBuffer<scalar> F2;
     deviceF2(k, omega, y, nu, co, F2);
+    // kOmegaSST-DDES: the DES factor FDES>=1 (from the RANS length scale sqrt(k)/(betaStar*omega) vs C_DES*cubeRootVol,
+    // shielded by 1-F2) multiplies the k destruction below. des==false -> FDES stays empty -> plain kOmegaSST(-RANS).
+    DeviceBuffer<scalar> FDES;
+    if (des)
+    {
+        if (iddes && hmax && hwn)   // kOmegaSST-IDDES: the improved (WMLES) length scale (needs the SST nut + hmax + hwn + gradU + y)
+            deviceKOmegaSSTIDDESfactor(nC, k, omega, F1, gradU, nut, y, *hmax, *hwn, nu, co, FDES);
+        else                 // kOmegaSST-DDES: the F2-shielded cubeRootVol DES factor
+            deviceKOmegaSSTDESfactor(nC, k, omega, dm.V, F1, F2, co, FDES);
+    }
 
     // blends, limited production-by-nu, DomegaEff.
     DeviceBuffer<scalar> gamma;
@@ -623,7 +726,7 @@ void deviceKOmegaSSTCorrect(
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divU, bounded, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src); },
-                               &wall, &omega0, ami, cyc);
+                               &wall, &omega0, ami, cyc, sDdt);
     deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
@@ -631,8 +734,8 @@ void deviceKOmegaSSTCorrect(
     deviceDEff(F1, nut, co.alphaK1, co.alphaK2, nu, DkEff);
     deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divU, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
-                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff); },
-                               nullptr, nullptr, ami, cyc);
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr); },
+                               nullptr, nullptr, ami, cyc, kDdt);
     deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
@@ -902,7 +1005,9 @@ void deviceKOmegaSSTLMCorrect(
     bool nonOrth,
     bool gsEps,
     DeviceAMI* ami,
-    DeviceCyclic* cyc)
+    DeviceCyclic* cyc,
+    const ScalarDdt& reDdt,
+    const ScalarDdt& giDdt)
 {
     const int nC = dm.nCells;
     const LMCoeffs lm;
@@ -924,7 +1029,7 @@ void deviceKOmegaSSTLMCorrect(
     deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spR.data(), suR.data(), diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc);
+                               nullptr, nullptr, ami, cyc, reDdt);
     deviceBoundField(dm, ReThetat, 0.0);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
@@ -937,7 +1042,7 @@ void deviceKOmegaSSTLMCorrect(
     deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spG.data(), suG.data(), diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc);
+                               nullptr, nullptr, ami, cyc, giDdt);
     deviceBoundField(dm, gammaInt, 0.0);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),

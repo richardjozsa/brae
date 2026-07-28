@@ -78,6 +78,17 @@ void deviceWallOmegaG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, c
 void deviceKReactionSST(const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
                         const DeviceBuffer<scalar>& G, const DeviceBuffer<scalar>& divU,
                         const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source,
-                        const scalar* gammaIntEff = nullptr);
+                        const scalar* gammaIntEff = nullptr,
+                        const DeviceBuffer<scalar>* FDES = nullptr);   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr=RANS)
+
+// kOmegaSST-DDES DES factor FDES = max((sqrt(k)/(betaStar*omega))/(CDES*cubeRootVol(V))*(1-F2), 1), CDES=F1-blended.
+void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& F2,
+    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES);
+// kOmegaSST-IDDES factor FDES = lRAS/lIDDES (Gritskevich et al. 2012): the improved (WMLES) length scale. (Unit-test/DES hook.)
+void deviceKOmegaSSTIDDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nut,
+    const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& hmax, const DeviceBuffer<scalar>& hwn, scalar nu,
+    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES);
 
 } // namespace brae

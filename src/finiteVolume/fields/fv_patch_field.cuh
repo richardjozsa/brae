@@ -558,8 +558,13 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFieldData<T>& d)
 {
-    if (d.type == "fixedValue" || d.type == "uniformFixedValue")   // uniformFixedValue: steady constant uniformValue = fixedValue
+    if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue")
+        // uniformFixedValue: steady constant = fixedValue. codedFixedValue: seed with `value`; the NVRTC device kernel
+        // (device_coded_bc) OVERWRITES this patch's refValue each step from the compiled `code` snippet (the driver
+        // parses the code + wires the solver's coded-BC apply). Building it as fixedValue makes buildField/buildDeviceBoundary succeed.
         return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    if (d.type == "codedMixed")   // Robin: seeded as mixed (vf=0.5); the NVRTC device kernel overwrites refValue + valueFraction each step
+        return std::make_unique<MixedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values, false);
     if (d.type == "noSlip")          return std::make_unique<NoSlipPatchField<T>>(p);
     if (d.type == "zeroGradient")    return std::make_unique<ZeroGradientPatchField<T>>(p);
     // fixedFluxPressure = fixedGradient p whose gradient constrainPressure sets to (phiHbyA - Sf&U)/(magSf*rAU).
@@ -681,13 +686,7 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         }
         else throw std::runtime_error("brae: atmBoundaryLayerInlet{K,Epsilon,Omega} is a scalar BC");
     }
-    // codedFixedValue is runtime-compiled arbitrary C++ (OF codeStream/dlopen) -> structurally incompatible with cf's
-    // precompiled device kernels. Reject with a clear message rather than the generic unsupported-BC throw.
-    if (d.type == "codedFixedValue")
-        throw std::runtime_error("brae: codedFixedValue on patch '" + p.name + "' is unsupported by design -- it is a "
-            "runtime-compiled C++ snippet (OpenFOAM codeStream/dlopen), which cf's precompiled device kernels cannot "
-            "host. Replace it with an analytic BC that yields the same profile (atmBoundaryLayerInlet*, "
-            "uniformFixedValue, or timeVaryingMappedFixedValue).");
+    // codedFixedValue is handled above (seeded as fixedValue; the NVRTC device kernel overwrites its refValue per step).
     throw std::runtime_error("brae: unsupported BC type '" + d.type + "' on patch " + p.name);
 }
 
