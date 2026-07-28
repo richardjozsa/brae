@@ -4,11 +4,13 @@
 // (momentum predictor / pressure-velocity / turbulence), with the implicit fvm::ddt(U) folded into the predictor.
 // Writes standard OpenFOAM time directories.
 //
-// v1 scope: Euler/backward ddt, laminar OR RAS (kEpsilon/realizableKE/kOmegaSST/kOmegaSSTLM/SpalartAllmaras). Reuses the
-// steady driver's field I/O (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. NOTE: the
-// MOMENTUM ddt is fully implicit + OF-exact; the TURBULENCE transport currently runs quasi-steady per time step (no
-// fvm::ddt(k/eps/omega) yet -- that ddt wiring through the scalar-transport scaffold is the next step). Follow-ups: the
-// full fvSchemes div/laplacian-scheme parse (v1 uses brae defaults: upwind div), phi output + restart, fvOptions/MRF.
+// Scope: Euler/backward/CrankNicolson ddt; laminar, RAS (kEpsilon/realizableKE/kOmegaSST/kOmegaSSTLM/SpalartAllmaras),
+// or DES/LES (SA-DDES/IDDES, kOmegaSST-DDES/IDDES, Smagorinsky). Reuses the steady driver's field I/O
+// (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. BOTH the momentum ddt AND the
+// turbulence transport ddt (fvm::ddt(k/eps/omega/nuTilda)) are fully implicit + OF-exact -- the turbulence is transient
+// URANS/DES, not quasi-steady (see device_simple_foam.cu:294). fvSchemes div/laplacian schemes are parsed; phi output +
+// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs, fvOptions/MRF all wired. Follow-ups: adjustTimeStep
+// + maxCo (adaptive dt), runtime functionObjects (probes/forces/fieldAverage), distributed (multi-GPU) transient.
 // Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
