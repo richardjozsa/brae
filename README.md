@@ -10,7 +10,7 @@
   <img alt="C++17" src="https://img.shields.io/badge/C%2B%2B-17-00599C">
   <img alt="GPU Ampere to Blackwell" src="https://img.shields.io/badge/GPU-Ampere%20%7C%20Ada%20%7C%20Hopper%20%7C%20Blackwell-76B900">
   <img alt="OpenFOAM v2412" src="https://img.shields.io/badge/OpenFOAM-v2412-brightgreen">
-  <img alt="ctest 158/158" src="https://img.shields.io/badge/ctest-158%2F158-brightgreen">
+  <img alt="ctest 261/261" src="https://img.shields.io/badge/ctest-261%2F261-brightgreen">
 </p>
 
 Brae keeps the whole CFD solve on one GPU. The mesh, the fields, and every linear solve stay on the device from the
@@ -105,11 +105,11 @@ cmake --build build -j --target brae
 
 ## 🚀 Get started
 
-Run brae from inside any OpenFOAM `simpleFoam` case, exactly as you would run `simpleFoam` itself:
+Run brae from inside any OpenFOAM case, exactly as you would run `simpleFoam` or `pimpleFoam` itself:
 
 ```bash
 cd yourCase                       # your OpenFOAM case (0/  constant/  system/)
-brae                              # solve in the current directory
+brae                              # solve in the current directory (steady or transient)
 brae -case /path/to/yourCase      # or run it from anywhere
 brae -partition -case yourCase    # optional: cache the mesh + AMG once, then later runs start warm
 brae --help                       # all options
@@ -138,6 +138,10 @@ Brae implements OpenFOAM's solvers one at a time, each fully device-resident and
 
 - [`simpleFoam`](docs/solvers/simplefoam.md) — steady incompressible
 - [`pimpleFoam`](docs/solvers/pimplefoam.md) — transient incompressible — **brae 4.5× faster than SPUMA**
+
+You always type `brae`. It reads the `application` entry your case already has in `controlDict` and runs the
+matching solver, so a transient case needs no different command. A case asking for a solver brae does not have
+stops at start-up, named, rather than being solved with the wrong one.
 
 Coming soon: compressible solver.
 
