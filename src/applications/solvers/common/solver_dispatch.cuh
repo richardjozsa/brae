@@ -96,37 +96,50 @@ inline std::string braeSolverList()
     return s;
 }
 
-// Replace this process with the solver that owns the case, forwarding argv unchanged (both drivers take
-// `-case <dir>` and a positional case dir). Prefer the binary next to this one, so a build tree runs its own
-// solvers and an install runs the installed set; fall back to PATH. Never returns on success.
-[[noreturn]] inline void execSolver(const BraeSolver& s, int argc, char** argv, const std::string& why)
+// Replace this process with a sibling brae executable, forwarding `args` as its argv[1..]. Prefers the binary
+// next to this one, so a build tree runs its own components and an install runs the installed set; falls back to
+// PATH. Never returns on success. This is the ONE exec path in brae -- solver hand-over and the `brae node`
+// subcommand both come through here.
+[[noreturn]] inline void execSibling(const std::string& exe, const std::vector<std::string>& args,
+                                     const std::string& message, const std::string& target)
 {
-    // One hand-over per run. If the exec'd solver dispatches again we are in a loop (a renamed binary, or a
-    // registry row pointing at the wrong executable), so stop with something readable instead of forking forever.
+    // One hand-over per run. A second one means a renamed binary or a table pointing at the wrong executable, so
+    // stop with something readable instead of forking forever.
     if (const char* from = std::getenv("BRAE_DISPATCHED_FROM"))
         throw std::runtime_error(
-            std::string("solver dispatch loop: already handed over from '") + from + "' and now asked for '" +
-            s.exe + "'. Check that " + s.exe + " is the binary the registry names.");
-    setenv("BRAE_DISPATCHED_FROM", s.application, 1);
+            std::string("dispatch loop: already handed over to '") + from + "' and now asked for '" + exe +
+            "'. Check that " + exe + " is the binary that was meant.");
+    setenv("BRAE_DISPATCHED_FROM", exe.c_str(), 1);
 
-    std::string exe = s.exe;
+    std::string path = exe;
     std::error_code ec;
     const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
     if (!ec)
     {
-        const std::filesystem::path sibling = self.parent_path() / s.exe;
-        if (std::filesystem::exists(sibling, ec)) exe = sibling.string();
+        const std::filesystem::path sibling = self.parent_path() / exe;
+        if (std::filesystem::exists(sibling, ec)) path = sibling.string();
     }
-    std::fprintf(stderr, "brae: %s -> %s (%s)\n", why.c_str(), s.application, s.exe);
+    std::fprintf(stderr, "brae: %s\n", message.c_str());
     std::vector<char*> av;
-    av.push_back(const_cast<char*>(exe.c_str()));
-    for (int i = 1; i < argc; ++i) av.push_back(argv[i]);
+    av.push_back(const_cast<char*>(path.c_str()));
+    for (const std::string& a : args) av.push_back(const_cast<char*>(a.c_str()));
     av.push_back(nullptr);
-    execv(exe.c_str(), av.data());        // the sibling/installed path
-    execvp(s.exe, av.data());             // else whatever is on PATH
+    execv(path.c_str(), av.data());   // the sibling/installed path
+    execvp(exe.c_str(), av.data());   // else whatever is on PATH
     throw std::runtime_error(
-        std::string("cannot start '") + s.exe + "', the brae solver for " + s.application +
-        ". Build it with: cmake --build build --target " + s.exe);
+        "cannot start '" + exe + "', which brae needs for " + target +
+        ". Build it with: cmake --build build --target " + exe);
+}
+
+// Hand the case to the solver that owns it, forwarding argv unchanged (every driver takes `-case <dir>` and a
+// positional case dir).
+[[noreturn]] inline void execSolver(const BraeSolver& s, int argc, char** argv, const std::string& why)
+{
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+    execSibling(s.exe, args,
+                why + " -> " + s.application + " (" + s.exe + ")",
+                std::string("cases using ") + s.application);
 }
 
 // Route the case to its solver. Returns only when the running binary IS the chosen solver; otherwise it has

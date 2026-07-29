@@ -18,7 +18,8 @@
 #include "turbulent_inlet.cuh"
 #include "foam_dict.cuh"
 #include "scheme_parse.cuh"   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
-#include "solver_dispatch.cuh"   // dispatchSolver: route the case to the brae solver its controlDict asks for
+#include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
+#include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
 #include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
 #include "fvc.cuh"
@@ -51,6 +52,12 @@ static void printUsage()
 "  simpleFoam       steady incompressible, RAS/laminar\n"
 "  pimpleFoam       transient incompressible, URANS/DES/LES/laminar\n"
 "Any other application stops at start-up rather than run the case with the wrong solver.\n\n"
+"Subcommands (the only two reserved words; anything else leading is a case directory):\n"
+"  brae benchmark [sample]        run the standard workload, writes brae-benchmark.json\n"
+"  brae benchmark --list          the samples published at github.com/simd-ai/brae-bench\n"
+"  brae node register|status|unregister\n"
+"                                 join this machine to the Brae network (needs brae-agent)\n"
+"A case directory called 'node' or 'benchmark' is addressed as `brae -case node`.\n\n"
 "Usage:\n"
 "  brae [-case <dir>]             solve an OpenFOAM case (default: the current directory)\n"
 "  mpirun -np N brae -case <dir> -parallel\n"
@@ -73,6 +80,25 @@ int main(int argc, char** argv)
 {
     try
     {
+        // Subcommands. ONLY these two leading words are reserved -- everything else is a case directory, so
+        // `brae myCase` is untouched. A case actually named `node` or `benchmark` is reached with -case.
+        if (argc > 1 && argv[1][0] != '-')
+        {
+            const std::string word = argv[1];
+            if (word == "benchmark")
+            {
+                std::vector<std::string> rest(argv + 2, argv + argc);
+                std::error_code ec;
+                const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
+                return bench::runBenchmark(rest, ec ? std::string("brae") : self.string());
+            }
+            if (word == "node")
+            {
+                // The node service is a separate, CUDA-free binary; `brae` is only the front door to it.
+                std::vector<std::string> args(argv + 1, argv + argc);
+                execSibling("brae-agent", args, "node subcommand -> brae-agent", "`brae node` (the node service)");
+            }
+        }
         for (int i = 1; i < argc; ++i)
         {
             const std::string h = argv[i];
