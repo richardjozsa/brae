@@ -1,8 +1,11 @@
 # Roadmap
 
-Brae runs steady, incompressible, single-region flow on a single GPU today. Coming next:
+Brae runs steady and transient incompressible single-region flow on a single GPU today:
+[`simpleFoam`](solvers/simplefoam.md) and [`pimpleFoam`](solvers/pimplefoam.md). Coming next:
 
-- More steady single-phase solvers
+- Adaptive time stepping (`adjustTimeStep` / `maxCo`) and runtime function objects for the transient solver
+- MRF and `fvOptions` in the transient solver (the steady solver has them)
+- Compressible solvers
 - Multiphase solvers
 - Multi-region
 - Heat transfer
