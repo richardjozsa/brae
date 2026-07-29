@@ -28,7 +28,7 @@ Legend: ✓ supported & validated · ✗ not yet.
 | Pressure reference handling (closed domains, all-Neumann, `fixedFluxPressure`) | ✓ |
 | Under-relaxation, `residualControl` convergence | ✓ |
 | Non-orthogonal correction in the Laplacian (`corrected`) | ✓ |
-| `nNonOrthogonalCorrectors > 0` (extra pressure correctors) | ✗ |
+| `nNonOrthogonalCorrectors > 0` (extra pressure correctors) | ✓ (with a `corrected` laplacian scheme) |
 
 ## Turbulence (RAS), 5 models, all validated vs OpenFOAM v2412
 

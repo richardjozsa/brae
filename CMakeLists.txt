@@ -9,7 +9,7 @@ if(NOT DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
         CACHE STRING "CUDA architectures cf is built for" FORCE)
 endif()
 
-project(brae VERSION 0.1.0 LANGUAGES CXX CUDA)
+project(brae VERSION 0.3.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -953,6 +953,11 @@ target_link_libraries(brae PRIVATE brae_core)
 add_executable(brae_pimpleFoam src/applications/solvers/pimpleFoam/gpuPimpleFoam.cu)
 target_include_directories(brae_pimpleFoam PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
 target_link_libraries(brae_pimpleFoam PRIVATE brae_core)
+
+# `brae` hands transient cases to brae_pimpleFoam at run time, so building brae must build it too: one target to
+# build, one command to run, and no way to end up with a brae that cannot solve half the cases it is handed.
+# Every solver added to the registry (solvers/common/solver_dispatch.cuh) belongs in this list.
+add_dependencies(brae brae_pimpleFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.

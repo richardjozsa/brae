@@ -1,7 +1,7 @@
 # Getting started
 
-Brae runs an existing OpenFOAM steady-incompressible case on one GPU. If you can run it with `simpleFoam`, you can
-usually run it with `brae`.
+Brae runs an existing OpenFOAM incompressible case on one GPU. If you can run it with `simpleFoam` (steady) or
+`pimpleFoam` (transient), you can usually run it with `brae`.
 
 ## 1. Prerequisites
 
@@ -19,7 +19,8 @@ cmake -B build -DCMAKE_CUDA_ARCHITECTURES=<arch>   # 121=GB10, 120=RTX 50xx, 100
 cmake --build build -j --target brae
 ```
 
-The solver is `build/brae`. Add it to your `PATH` if you like:
+The command is `build/brae`, and it is the only one you run — steady or transient. Add it to your `PATH` if you
+like:
 
 ```bash
 export PATH="$PWD/build:$PATH"
@@ -36,11 +37,13 @@ brae -case /path/to/yourCase
 
 What happens:
 
-1. Brae reads your mesh, fields, schemes, and solver settings.
-2. It **auto-partitions** the mesh and builds its multigrid hierarchy for your GPU (the `decomposePar` analogue ,
+1. Brae reads your `controlDict` `application` entry and picks the matching solver (`simpleFoam` -> steady,
+   `pimpleFoam` -> transient). A solver it does not have yet stops the run instead of being substituted.
+2. It reads your mesh, fields, schemes, and solver settings.
+3. It **auto-partitions** the mesh and builds its multigrid hierarchy for your GPU (the `decomposePar` analogue ,
    done once, cached). You can pre-build this cache with `brae -case yourCase -partition`.
-3. It runs the SIMPLE loop fully on the GPU until `endTime` or `residualControl` convergence.
-4. It writes standard time directories (`100/U`, `100/p`, …) you open with `paraFoam` or `postProcess`.
+4. It runs the solver loop fully on the GPU until `endTime` (or, steady, `residualControl` convergence).
+5. It writes standard time directories (`100/U`, `100/p`, …) you open with `paraFoam` or `postProcess`.
 
 ## 4. The fast path (on by default)
 
