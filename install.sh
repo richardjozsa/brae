@@ -147,10 +147,14 @@ jobs=$(nproc 2>/dev/null || echo 4)
 say "building brae with $jobs jobs (this can take a few minutes)"
 cmake --build build -j "$jobs" --target brae || die "build failed"
 
-# ---- install the binary ----
+# ---- install the binaries ----
+# `brae` is the only command; the solvers it hands cases to (brae_pimpleFoam today) come along as build
+# dependencies and are looked up next to it, so they install side by side.
 mkdir -p "$BINDIR"
-install -m 0755 build/brae "$BINDIR/brae" 2>/dev/null || cp build/brae "$BINDIR/brae"
-say "installed  $BINDIR/brae"
+for b in brae brae_pimpleFoam; do
+    install -m 0755 "build/$b" "$BINDIR/$b" 2>/dev/null || cp "build/$b" "$BINDIR/$b"
+    say "installed  $BINDIR/$b"
+done
 
 # ---- PATH hint ----
 case ":$PATH:" in
@@ -159,6 +163,6 @@ case ":$PATH:" in
        printf '      echo '\''export PATH="%s:$PATH"'\'' >> ~/.profile && . ~/.profile\n' "$BINDIR" >&2 ;;
 esac
 
-printf '\n%s%sbrae is installed.%s  Run it inside any OpenFOAM case:\n\n' "$G" "$B" "$N"
+printf '\n%s%sbrae is installed.%s  Run it inside any OpenFOAM case, steady or transient:\n\n' "$G" "$B" "$N"
 printf '    cd yourCase && brae\n\n'
 printf '  docs: https://brae.sh   source: %s\n' "$DIR"
