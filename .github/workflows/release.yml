@@ -22,4 +22,12 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --title "brae $GITHUB_REF_NAME" --generate-notes
+        # Hand-written notes at docs/releases/<tag>.md win; without one, fall back to the commit list.
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [ -f "$notes" ]; then
+              gh release create "$GITHUB_REF_NAME" --title "brae $GITHUB_REF_NAME" --notes-file "$notes"
+          else
+              echo "no $notes, generating notes from commits"
+              gh release create "$GITHUB_REF_NAME" --title "brae $GITHUB_REF_NAME" --generate-notes
+          fi

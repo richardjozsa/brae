@@ -58,5 +58,16 @@ fi
 mkcase "$WORK/pimple" "application     pimpleFoam;" "backward"
 check application_pimplefoam "$WORK/pimple" "controlDict application pimpleFoam -> pimpleFoam"
 
+# 6. application simpleFoam: the registry names `brae` for it, which IS the running binary, so it must solve in
+#    this process -- no hand-over, and above all no exec loop (the guard would report one).
+mkcase "$WORK/simple" "application     simpleFoam;" "steadyState"
+"$BIN" -case "$WORK/simple" > "$WORK/application_simplefoam.log" 2>&1
+if grep -qE -e "-> simpleFoam|dispatch loop" "$WORK/application_simplefoam.log"; then
+    echo "FAIL: application_simplefoam -- brae handed the steady case to another process"
+    sed -n '1,10p' "$WORK/application_simplefoam.log"; fail=1
+else
+    echo "ok:   application_simplefoam"
+fi
+
 [ "$fail" -eq 0 ] && echo "PASS: solver selection routes and refuses correctly"
 exit "$fail"

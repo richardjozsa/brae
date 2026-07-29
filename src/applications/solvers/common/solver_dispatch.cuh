@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>   // getenv/setenv: the one-hand-over-per-run guard
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -32,19 +33,32 @@ namespace brae {
 struct BraeSolver
 {
     const char* application;   // OF controlDict `application` this row claims
-    const char* exe;           // brae executable that runs it; nullptr = the steady driver itself (in-process)
+    const char* exe;           // brae executable that runs it
     bool        transient;     // marches in time (ddtSchemes.default != steadyState)
     const char* what;          // one-line description, shown when a case asks for a solver brae lacks
 };
 
-// The registry. `brae` is the steady driver, so its row carries exe = nullptr and is run in-process.
+// The registry. Every row has the same shape, including the steady one: `brae` is the launcher AND the steady
+// solver's executable, which is a fact about today's build, not a rule the dispatcher should know. It finds out
+// by comparing the chosen row's executable with the binary that is actually running (selfExecutableName below)
+// -- so the steady case costs no extra process, and the day the steady solver moves into its own binary, only
+// this table changes.
 inline const std::vector<BraeSolver>& braeSolvers()
 {
     static const std::vector<BraeSolver> reg = {
-        {"simpleFoam", nullptr,           false, "steady incompressible, RAS/laminar"},
+        {"simpleFoam", "brae",            false, "steady incompressible, RAS/laminar"},
         {"pimpleFoam", "brae_pimpleFoam", true,  "transient incompressible, URANS/DES/LES/laminar"},
     };
     return reg;
+}
+
+// Filename of the running binary, "" if it cannot be determined (then nothing matches and the chosen solver is
+// exec'd, which is the safe direction -- the loop guard in execSolver catches a misconfiguration).
+inline std::string selfExecutableName()
+{
+    std::error_code ec;
+    const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
+    return ec ? std::string() : self.filename().string();
 }
 
 // ddtSchemes.default as written in system/fvSchemes, "" if the case has no readable ddtSchemes block.
@@ -87,6 +101,14 @@ inline std::string braeSolverList()
 // solvers and an install runs the installed set; fall back to PATH. Never returns on success.
 [[noreturn]] inline void execSolver(const BraeSolver& s, int argc, char** argv, const std::string& why)
 {
+    // One hand-over per run. If the exec'd solver dispatches again we are in a loop (a renamed binary, or a
+    // registry row pointing at the wrong executable), so stop with something readable instead of forking forever.
+    if (const char* from = std::getenv("BRAE_DISPATCHED_FROM"))
+        throw std::runtime_error(
+            std::string("solver dispatch loop: already handed over from '") + from + "' and now asked for '" +
+            s.exe + "'. Check that " + s.exe + " is the binary the registry names.");
+    setenv("BRAE_DISPATCHED_FROM", s.application, 1);
+
     std::string exe = s.exe;
     std::error_code ec;
     const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
@@ -107,8 +129,8 @@ inline std::string braeSolverList()
         ". Build it with: cmake --build build --target " + s.exe);
 }
 
-// Route the case to its solver. Returns only when THIS executable (the steady driver) owns the case; otherwise
-// it has already exec'd the right one, or thrown because brae does not have it.
+// Route the case to its solver. Returns only when the running binary IS the chosen solver; otherwise it has
+// already exec'd the right one, or thrown because brae does not have it.
 inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
@@ -150,8 +172,8 @@ inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
         why = "no controlDict application, ddtSchemes.default = " + (ddt.empty() ? std::string("(none)") : ddt);
     }
 
-    if (!chosen->exe) return;                  // this executable owns it: carry on with the steady solve
-    execSolver(*chosen, argc, argv, why);      // does not return
+    if (selfExecutableName() == chosen->exe) return;   // already the right binary: solve in this process
+    execSolver(*chosen, argc, argv, why);              // does not return
 }
 
 }  // namespace brae
