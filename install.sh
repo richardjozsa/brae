@@ -156,6 +156,16 @@ for b in brae brae_pimpleFoam; do
     say "installed  $BINDIR/$b"
 done
 
+# brae-agent is what `brae node ...` execs. It is built only when libcurl's headers are present, and its
+# absence must not fail an install of the solver -- someone building brae to run simulations does not need it.
+if [ -f build/brae-agent ]; then
+    install -m 0755 build/brae-agent "$BINDIR/brae-agent" 2>/dev/null || cp build/brae-agent "$BINDIR/brae-agent"
+    say "installed  $BINDIR/brae-agent"
+else
+    warn "brae-agent was not built (libcurl headers missing), so \`brae node\` will not work.
+      Install libcurl4-openssl-dev and rebuild if you want to join the Brae network."
+fi
+
 # ---- PATH hint ----
 case ":$PATH:" in
     *":$BINDIR:"*) ;;

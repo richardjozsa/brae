@@ -1226,6 +1226,124 @@ add_test(NAME pimple_dispatch
                  ${CMAKE_CURRENT_BINARY_DIR}/pimple_dispatch_work)
 set_tests_properties(pimple_dispatch PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 
+# The transient solver's refusals: MRF / fvOptions / adjustTimeStep are applied by the STEADY driver and not yet
+# by this one, so a case using them must stop rather than be marched with the physics quietly missing. Includes
+# the negative controls (an INACTIVE MRF zone, and a clean case) so the guards cannot creep. Dict-only, no GPU.
+add_test(NAME pimple_guards
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_guards.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${CMAKE_CURRENT_BINARY_DIR}/pimple_guards_work)
+set_tests_properties(pimple_guards PROPERTIES TIMEOUT 120)
+
+# The CLI's two reserved words (`benchmark`, `node`) route to their subcommands, and -- the half that protects
+# every existing user -- nothing else does: a case directory called `run`, `status` or `list` is still a case.
+add_test(NAME brae_subcommands
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_subcommands.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_BINARY_DIR}/brae_subcommands_work)
+set_tests_properties(brae_subcommands PROPERTIES TIMEOUT 300)
+
+# `brae benchmark <sample>` end to end against a LOCAL fixture template repo: fetch, cache, manifest, and the
+# security guard that refuses a sample carrying coded (NVRTC-compiled) boundary conditions. Solves the committed
+# pitzDaily cut to 5 iterations, so the happy path is a real run.
+add_test(NAME brae_benchmark
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_benchmark.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/brae_benchmark_work)
+set_tests_properties(brae_benchmark PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 600)
+
+# brae-agent unit tests (milestone 3): JSON, SHA-256, the identity file, sample-name validation, argv
+# construction and backoff. Deliberately a CXX-ONLY target that links neither brae_core nor CUDA -- the agent
+# must build and run on a machine whose solver build is broken, and so must its tests. No GPU, no network.
+add_executable(test_node_agent tests/test_node_agent.cpp
+               src/node/json.cpp src/node/jobs.cpp src/node/sha256.cpp src/node/identity.cpp)
+target_include_directories(test_node_agent PRIVATE src/node)
+set_target_properties(test_node_agent PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME node_agent COMMAND test_node_agent)
+set_tests_properties(node_agent PROPERTIES TIMEOUT 60)
+
+# The agent's protocol against a FAKE transport: every status code, a body that is not JSON, JSON of the wrong
+# shape, an assignment for a job type this agent does not know. Those are the cases a real orchestrator will not
+# produce on request, and they decide whether a node quietly stops working. No network.
+add_executable(test_node_api tests/test_node_api.cpp
+               src/node/api_client.cpp src/node/json.cpp src/node/jobs.cpp)
+target_include_directories(test_node_api PRIVATE src/node)
+set_target_properties(test_node_api PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME node_api COMMAND test_node_api)
+set_tests_properties(node_api PROPERTIES TIMEOUT 60)
+
+# Job execution and GPU detection. The runner is driven against fake `brae` binaries the test writes itself --
+# one that succeeds, one that fails, one that hangs, one that is missing -- because those four are what actually
+# happen on a contributor's machine. The GPU probe covers the no-driver path and, where there is a driver, the
+# real one. Needs dl for NVML; still no CUDA and no network.
+add_executable(test_node_runner tests/test_node_runner.cpp
+               src/node/runner.cpp src/node/gpu_probe.cpp src/node/jobs.cpp src/node/sha256.cpp)
+target_include_directories(test_node_runner PRIVATE src/node)
+target_link_libraries(test_node_runner PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(test_node_runner PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME node_runner COMMAND test_node_runner)
+set_tests_properties(node_runner PROPERTIES TIMEOUT 120)
+
+# ---------------------------------------------------------------------------------------------------------
+# brae-agent: the node service, and the implementation behind `brae node ...`.
+#
+# A CXX-ONLY target. It links neither CUDA nor brae_core, deliberately: a contributor's machine must keep
+# reporting even when the solver build on it is broken, and a solver bug must not be able to take the node's
+# reporting down with it. libcurl and dlopen are its entire dependency budget.
+# ---------------------------------------------------------------------------------------------------------
+set(BRAE_AGENT_SOURCES
+    src/node/agent_main.cpp src/node/agent.cpp src/node/cli.cpp src/node/service_systemd.cpp
+    src/node/api_client.cpp src/node/http_curl.cpp src/node/json.cpp src/node/jobs.cpp
+    src/node/identity.cpp src/node/gpu_probe.cpp src/node/runner.cpp src/node/sha256.cpp)
+
+find_package(Threads REQUIRED)          # the executor runs a job on a worker thread so heartbeats continue
+find_package(CURL QUIET)
+if(CURL_FOUND)
+    add_executable(brae-agent ${BRAE_AGENT_SOURCES})
+    target_include_directories(brae-agent PRIVATE src/node)
+    target_link_libraries(brae-agent PRIVATE CURL::libcurl Threads::Threads ${CMAKE_DL_LIBS})
+    set_target_properties(brae-agent PROPERTIES LINKER_LANGUAGE CXX)
+    # `brae node <verb>` execs brae-agent from beside its own binary, so the two must land together.
+    add_dependencies(brae brae-agent)
+else()
+    message(STATUS "brae: libcurl not found -- brae-agent is not built "
+                   "(install libcurl4-openssl-dev); the solver is unaffected")
+endif()
+
+# The loop itself, driven at exact instants with a fake transport, fake executor and fake clock: a job that
+# outlives several heartbeats, a result POST that fails repeatedly, a process restarted between finishing a job
+# and reporting it, a 401 after months of working. No threads, no sleeps, no network.
+add_executable(test_node_loop tests/test_node_loop.cpp
+               src/node/agent.cpp src/node/api_client.cpp src/node/json.cpp
+               src/node/jobs.cpp src/node/runner.cpp)
+target_include_directories(test_node_loop PRIVATE src/node)
+target_link_libraries(test_node_loop PRIVATE Threads::Threads)
+set_target_properties(test_node_loop PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME node_loop COMMAND test_node_loop)
+set_tests_properties(node_loop PROPERTIES TIMEOUT 120)
+
+# The real transport, against a deliberately awkward local server: a redirect that would leak the bearer token,
+# a body that never ends, a server that stalls, a proxy's HTML error page. Guarded on libcurl so a machine
+# without the headers still builds and tests everything else -- the agent's behaviour is covered above the
+# transport (node_api), and only these properties need a real socket.
+find_package(CURL QUIET)
+if(CURL_FOUND)
+    add_executable(test_node_http tests/test_node_http.cpp
+                   src/node/http_curl.cpp src/node/api_client.cpp src/node/json.cpp src/node/jobs.cpp)
+    target_include_directories(test_node_http PRIVATE src/node)
+    target_link_libraries(test_node_http PRIVATE CURL::libcurl)
+    set_target_properties(test_node_http PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME node_http
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/node_http_run.sh
+                     $<TARGET_FILE:test_node_http>
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/node_http_server.py)
+    set_tests_properties(node_http PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 180)
+else()
+    message(STATUS "brae: libcurl not found -- the agent transport test is skipped "
+                   "(install libcurl4-openssl-dev)")
+endif()
+
 # Solver selection itself: routes on controlDict `application`, refuses the solvers brae does not have, and
 # catches an application/ddtSchemes contradiction. Dict-only fake cases, no mesh and no GPU.
 add_test(NAME solver_dispatch
