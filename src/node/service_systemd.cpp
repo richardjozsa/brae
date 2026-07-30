@@ -13,12 +13,16 @@
 #include <sstream>
 
 #include <fcntl.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 namespace brae::node {
 namespace {
+
+// The unprivileged account the unit runs as. Declared in the unit, created by ensureUser().
+constexpr const char* kServiceUser = "brae";
 
 int runQuiet(const std::vector<std::string>& argv, std::string* captured = nullptr)
 {
@@ -62,6 +66,46 @@ class SystemdService : public ServiceManager
 public:
     SystemdService(std::string unitPath, std::string execPath)
         : unitPath_(std::move(unitPath)), execPath_(std::move(execPath)) {}
+
+    bool ensureUser(std::string& error) override
+    {
+        if (::getpwnam(kServiceUser) != nullptr) return true;      // already there; nothing to do
+
+        // A system account: no home, no login shell, no password. It exists to own a process and a state
+        // directory, nothing else. `video` and `render` are what NVML needs to see the GPU.
+        const int rc = runQuiet({"useradd", "--system", "--no-create-home",
+                                 "--shell", "/usr/sbin/nologin",
+                                 "--groups", "video,render",
+                                 "--comment", "Brae node agent", kServiceUser});
+        if (rc != 0 && ::getpwnam(kServiceUser) == nullptr)
+        {
+            error = std::string("cannot create the '") + kServiceUser + "' system user (useradd exited "
+                    + std::to_string(rc) + "); run with sudo";
+            return false;
+        }
+        return true;
+    }
+
+    bool takeOwnership(const std::string& path, std::string& error) override
+    {
+        const struct passwd* pw = ::getpwnam(kServiceUser);
+        if (pw == nullptr)
+        {
+            error = std::string("the '") + kServiceUser + "' user does not exist";
+            return false;
+        }
+        // The parent directory too: the agent has to traverse /etc/brae to reach the identity inside it.
+        const std::size_t slash = path.find_last_of('/');
+        if (slash != std::string::npos)
+            ::chown(path.substr(0, slash).c_str(), pw->pw_uid, pw->pw_gid);
+        if (::chown(path.c_str(), pw->pw_uid, pw->pw_gid) != 0)
+        {
+            error = "cannot give " + path + " to " + kServiceUser + ": " + std::strerror(errno);
+            return false;
+        }
+        ::chmod(path.c_str(), 0600);            // still readable only by its owner -- now the right owner
+        return true;
+    }
 
     bool install(std::string& error) override
     {
@@ -160,6 +204,10 @@ private:
 class NoopService : public ServiceManager
 {
 public:
+    // --no-service: a developer running the agent in the foreground as themselves. Creating a system account
+    // and reassigning their identity file would be a surprise, so both are no-ops here.
+    bool ensureUser(std::string&) override { return true; }
+    bool takeOwnership(const std::string&, std::string&) override { return true; }
     bool install(std::string&) override { return true; }
     bool start(std::string&) override { return true; }
     bool stopAndRemove(std::string&) override { return true; }
