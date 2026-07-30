@@ -29,7 +29,7 @@ namespace {
 
 using namespace brae::node;
 
-constexpr const char* kAgentVersion = "0.3.0";
+constexpr const char* kAgentVersion = "0.3.1";
 
 std::string nowIso8601()
 {
