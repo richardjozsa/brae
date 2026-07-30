@@ -80,12 +80,50 @@ fi
 grep -q "fetching sample" "$WORK/run.log" && say_ok "first_run_fetches" \
     || say_fail "first_run_fetches" "did not report fetching the sample"
 
+# The result carries evidence the run computed something, not just that it finished. Deliberately scalar
+# invariants rather than a hash: two GPUs sum in different orders, so a digest would differ between machines
+# that are both correct.
+if python3 -c "
+import json
+r = json.load(open('$WORK/brae-benchmark.json'))
+inv = r['invariants']
+assert inv['cells'] == 12225, inv
+assert inv['u_max'] > inv['u_mean'] > 0, inv
+assert inv['p_min'] < inv['p_max'], inv
+" 2>"$WORK/inv.err"; then
+    say_ok "result_carries_invariants"
+else
+    say_fail "result_carries_invariants" "$(head -3 "$WORK/inv.err")"
+fi
+
+cp "$WORK/brae-benchmark.json" "$WORK/first.json"
+
 # ---- 2. the cache: a second run must not re-clone ----------------------------------------------------------
 "$BIN" benchmark pimplefoam/pitz-tiny > "$WORK/run2.log" 2>&1
 if grep -q "fetching sample" "$WORK/run2.log"; then
     say_fail "second_run_uses_cache" "re-fetched an already-cached sample"
 else
     say_ok "second_run_uses_cache"
+fi
+
+# Same sample, same machine, same numbers -- to a tolerance, not exactly.
+#
+# The GPU reduces in whatever order the scheduler produces, so two identical runs differ in the last few digits:
+# measured here at ~4e-9 relative on u_max. That is why the result carries invariants rather than a hash, and
+# why whoever compares them across nodes must use a tolerance looser still. 1e-6 sits comfortably above the
+# observed floor while remaining far tighter than any real error.
+if python3 -c "
+import json
+a = json.load(open('$WORK/first.json'))['invariants']
+b = json.load(open('$WORK/brae-benchmark.json'))['invariants']
+for k in a:
+    lhs, rhs = float(a[k]), float(b[k])
+    scale = max(abs(lhs), abs(rhs), 1e-12)
+    assert abs(lhs - rhs) / scale < 1e-6, (k, lhs, rhs)
+" 2>"$WORK/repro.err"; then
+    say_ok "invariants_are_reproducible"
+else
+    say_fail "invariants_are_reproducible" "$(head -3 "$WORK/repro.err")"
 fi
 
 # ---- 3. SECURITY: a sample carrying coded BCs is refused, and never solved ---------------------------------

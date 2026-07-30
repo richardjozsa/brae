@@ -27,7 +27,9 @@
 // repo). It is deliberately not documented in --help: a contributor who can be talked into setting it can be
 // talked into running anything.
 #include "foam_dict.cuh"
+#include "foam_field_reader.cuh"   // readInvariants: evidence the run computed something
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -267,6 +269,82 @@ inline std::string commitOf(const std::filesystem::path& dir)
     return sha;
 }
 
+// Numbers that say the run computed the right thing, not merely that it finished.
+//
+// Deliberately NOT a hash. Two GPUs sum in different orders, so a digest of the field values differs between
+// machines that are both perfectly correct -- a checksum would flag the whole network. These are a handful of
+// scalar invariants instead, compared numerically against a tolerance by whoever collects them
+// (brae-cloud docs/08-benchmark-job.md).
+struct Invariants
+{
+    bool ok = false;
+    long long cells = 0;
+    double uMean = 0, uMax = 0;
+    double pMean = 0, pMin = 0, pMax = 0;
+};
+
+// The newest numeric time directory holding a p field: what the run finished with.
+inline std::string lastWrittenTimeDir(const std::filesystem::path& caseDir)
+{
+    std::error_code ec;
+    std::string best;
+    double bestValue = -1;
+    for (const auto& e : std::filesystem::directory_iterator(caseDir, ec))
+    {
+        if (!e.is_directory()) continue;
+        const std::string name = e.path().filename().string();
+        char* end = nullptr;
+        const double t = std::strtod(name.c_str(), &end);
+        if (end == name.c_str() || *end != '\0') continue;          // not a pure number
+        if (!std::filesystem::exists(e.path() / "p") && !std::filesystem::exists(e.path() / "p.gz")) continue;
+        if (t > bestValue) { bestValue = t; best = e.path().string(); }
+    }
+    return best;
+}
+
+inline Invariants readInvariants(const std::filesystem::path& caseDir)
+{
+    Invariants inv;
+    const std::string dir = lastWrittenTimeDir(caseDir);
+    if (dir.empty()) return inv;                                    // nothing written: not a usable result
+
+    try
+    {
+        const FieldData<scalar> p = readField<scalar>(dir + "/p");
+        const FieldData<vector> U = readField<vector>(dir + "/U");
+        if (p.internalUniform || U.internalUniform) return inv;      // a uniform field means it never solved
+        if (p.internalField.empty() || U.internalField.size() != p.internalField.size()) return inv;
+
+        inv.cells = static_cast<long long>(p.internalField.size());
+        double pSum = 0, uSum = 0;
+        inv.pMin = inv.pMax = static_cast<double>(p.internalField[0]);
+        for (const scalar v : p.internalField)
+        {
+            const double d = static_cast<double>(v);
+            pSum += d;
+            if (d < inv.pMin) inv.pMin = d;
+            if (d > inv.pMax) inv.pMax = d;
+        }
+        for (const vector& v : U.internalField)
+        {
+            const double m = std::sqrt(double(v.x) * double(v.x) + double(v.y) * double(v.y)
+                                       + double(v.z) * double(v.z));
+            uSum += m;
+            if (m > inv.uMax) inv.uMax = m;
+        }
+        inv.pMean = pSum / double(inv.cells);
+        inv.uMean = uSum / double(inv.cells);
+        inv.ok = true;
+    }
+    catch (const std::exception&)
+    {
+        // A field we cannot read is a missing invariant, not a failed benchmark: the run still happened, and
+        // the runtime is still worth reporting. The absence is visible in the result.
+        inv.ok = false;
+    }
+    return inv;
+}
+
 inline std::string jsonEscape(const std::string& s)
 {
     std::string o;
@@ -326,9 +404,13 @@ inline int runBenchmark(const std::vector<std::string>& args, const std::string&
     const int rc = run({braeExe, "-case", dir.string()});
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
+    // Read what the run produced, so the result carries evidence of correctness and not just a duration.
+    const Invariants inv = (rc == 0) ? readInvariants(dir) : Invariants{};
+
     const std::string outPath = "brae-benchmark.json";
     {
         std::ofstream j(outPath);
+        j.precision(12);
         j << "{\n"
           << "  \"sample\": \"" << jsonEscape(man.sample) << "\",\n"
           << "  \"sample_commit\": \"" << jsonEscape(commit) << "\",\n"
@@ -336,8 +418,16 @@ inline int runBenchmark(const std::vector<std::string>& args, const std::string&
           << "  \"solver\": \"" << jsonEscape(man.solver) << "\",\n"
           << "  \"runtime_s\": " << seconds << ",\n"
           << "  \"success\": " << (rc == 0 ? "true" : "false") << ",\n"
-          << "  \"exit_code\": " << rc << "\n"
-          << "}\n";
+          << "  \"exit_code\": " << rc;
+        if (inv.ok)
+            j << ",\n  \"invariants\": {"
+              << "\"cells\": " << inv.cells
+              << ", \"u_mean\": " << inv.uMean
+              << ", \"u_max\": " << inv.uMax
+              << ", \"p_mean\": " << inv.pMean
+              << ", \"p_min\": " << inv.pMin
+              << ", \"p_max\": " << inv.pMax << "}";
+        j << "\n}\n";
     }
     if (rc == 0) std::printf("\nbenchmark complete: %.2f s   ->  %s\n", seconds, outPath.c_str());
     else         std::fprintf(stderr, "\nbenchmark FAILED (brae exited %d) after %.2f s   ->  %s\n",
