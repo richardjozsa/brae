@@ -1,0 +1,28 @@
+FoamFile { version 2.0; format ascii; class dictionary; object snappyHexMeshDict; }
+castellatedMesh true; snap true; addLayers false;
+geometry
+{
+    f16.stl { type triSurfaceMesh; name f16; }
+    // Re-placed refinement box. The old one, min(-5 -6 -1) max(16 6 11), had two
+    // faults: it STARTED at x=-5 while the nose is at x=-7.14, so the forebody got
+    // no volume refinement at all; and it ran to z=+11, i.e. 9 m of level-5 cells
+    // above a 2.1 m-tall aircraft, nearly all of it empty. The aircraft occupies
+    // x[-7.14,7.50] y[+-4.50] z[+-2.12]. This box covers the nose, keeps 4.5 m of
+    // near wake, and is centred in z on the aircraft while leaving room above for
+    // the vortices to rise. 21x12x10 m vs the old 21x12x12 -> ~20% fewer cells.
+    vortexBox { type searchableBox; min (-9 -6 -4); max (12 6 6); }
+}
+castellatedMeshControls
+{
+    maxLocalCells 45000000; maxGlobalCells 45000000; minRefinementCells 10; maxLoadUnbalance 0.1;
+    nCellsBetweenLevels 3;
+    features ( { file "f16.eMesh"; level 5; } );
+    refinementSurfaces { f16 { level (4 6); patchInfo { type wall; } } }
+    resolveFeatureAngle 30;
+    refinementRegions { vortexBox { mode inside; levels ((1e15 5)); } }
+    locationInMesh (30 15 15); allowFreeStandingZoneFaces true;
+}
+snapControls { nSmoothPatch 3; tolerance 2.0; nSolveIter 30; nRelaxIter 5; nFeatureSnapIter 10; implicitFeatureSnap false; explicitFeatureSnap true; multiRegionFeatureSnap false; }
+addLayersControls { relativeSizes true; layers {} expansionRatio 1.0; finalLayerThickness 0.3; minThickness 0.1; nGrow 0; featureAngle 60; nRelaxIter 3; nSmoothSurfaceNormals 1; nSmoothNormals 3; nSmoothThickness 10; maxFaceThicknessRatio 0.5; maxThicknessToMedialRatio 0.3; minMedialAxisAngle 90; nBufferCellsNoExtrude 0; nLayerIter 50; }
+meshQualityControls { maxNonOrtho 65; maxBoundarySkewness 20; maxInternalSkewness 4; maxConcave 80; minVol 1e-13; minTetQuality 1e-15; minArea -1; minTwist 0.02; minDeterminant 0.001; minFaceWeight 0.02; minVolRatio 0.01; minTriangleTwist -1; nSmoothScale 4; errorReduction 0.75; }
+mergeTolerance 1e-6; debug 0;

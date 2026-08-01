@@ -1,0 +1,55 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+FoamFile
+{
+    version         2;
+    format          ascii;
+    class           dictionary;
+    object          controlDict;
+}
+
+application     pimpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+// Target: vortex system established = 5 convective passes over the 15 m airframe
+// at 50 m/s (15/50 = 0.3 s each) -> 1.5 s. The previous run stopped at 0.6 s,
+// which is a large part of why nothing was developed.
+endTime         1.5;
+
+// Left at the value that ran stably before. Max CFL on the real field is already
+// 1.48 at this dt, so there is little headroom -- and raising dt only pays while
+// nOuterCorrectors stays at 1, since a second outer corrector costs ~2x per step
+// to remove only 1.5x of the steps: a net loss.
+deltaT          0.0003;
+
+writeControl    timeStep;
+
+// 1.5/3e-4 = 5000 steps; /33 -> ~151 frames, the same frame count as before.
+writeInterval   33;
+
+purgeWrite      0;
+
+// binary, not ascii: the previous run wrote ~150 x 4 GB of ASCII (~600 GB).
+writeFormat     binary;
+
+writePrecision  8;
+
+writeCompression off;
+
+runTimeModifiable true;
+
+adjustTimeStep  no;
+
+
+// ************************************************************************* //
