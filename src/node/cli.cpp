@@ -90,21 +90,41 @@ int cmdRegister(const CliDeps& d, const std::string& enrollmentToken)
     // 4. NetBird enrolment belongs here (milestone 5). Until then the agent talks to the control plane
     //    directly, and `register` does not create a peer -- so there is nothing to roll back for it either.
 
-    // 5. Install and start the service.
+    // 5. The service account, and the identity it has to be able to read.
+    //
+    //    This command runs under sudo, so everything above was written by root, while the daemon runs as an
+    //    unprivileged user. Without both steps the unit installs cleanly and then dies on every start with
+    //    "no identity" -- which looks like a broken agent rather than a permissions mistake.
+    const auto rollback = [&](const std::string& what) {
+        std::string ignored;
+        if (d.service) d.service->stopAndRemove(ignored);
+        removeIdentity(d.identityPath, ignored);
+        d.api->unregisterNode(reg.nodeId, reg.nodeToken);
+        oops(what + ": " + error + "\n(the registration was rolled back)");
+    };
+
     if (d.service)
     {
+        if (!d.service->ensureUser(error))
+        {
+            rollback("could not create the service account");
+            return 1;
+        }
+        if (!d.service->takeOwnership(d.identityPath, error))
+        {
+            rollback("could not give the node identity to the service account");
+            return 1;
+        }
+
+        // 6. Install and start.
         if (!d.service->install(error) || !d.service->start(error))
         {
-            std::string ignored;
-            d.service->stopAndRemove(ignored);
-            removeIdentity(d.identityPath, ignored);
-            d.api->unregisterNode(reg.nodeId, reg.nodeToken);
-            oops("could not start the brae-agent service: " + error + "\n(the registration was rolled back)");
+            rollback("could not start the brae-agent service");
             return 1;
         }
     }
 
-    // 6. Verify. Registration is only real once the control plane has heard from the agent -- otherwise the
+    // 7. Verify. Registration is only real once the control plane has heard from the agent -- otherwise the
     //    contributor is told they joined and then never appears.
     bool verified = true;
     if (d.verifyOnce)
@@ -117,7 +137,7 @@ int cmdRegister(const CliDeps& d, const std::string& enrollmentToken)
         }
     }
 
-    // 7. Say what happened.
+    // 8. Say what happened.
     const GpuIdentity& g = probe.gpus.front();
     std::ostringstream o;
     o << "\nBrae Node\n\n"

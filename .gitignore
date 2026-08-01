@@ -34,4 +34,8 @@ Testing/
 __pycache__/
 *.pyc
 
-demo/
+# demo: track the scripts and READMEs, not the regenerated case data.
+# run_all.sh rebuilds case1024/case1M/out from scratch (~300 MB).
+demo/amgpcg/case1024/
+demo/amgpcg/case1M/
+demo/amgpcg/out/

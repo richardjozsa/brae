@@ -1323,6 +1323,19 @@ set_target_properties(test_node_loop PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME node_loop COMMAND test_node_loop)
 set_tests_properties(node_loop PROPERTIES TIMEOUT 120)
 
+# `brae node register | status | unregister`, against a fake API and a fake service manager. The criterion is
+# atomicity: each step of registration is made to fail in turn -- the GPU probe, the API, the identity write,
+# the service account, the ownership hand-over, the unit install, the start -- and each must leave no identity
+# file, no service and no registry row behind.
+add_executable(test_node_cli tests/test_node_cli.cpp
+               src/node/cli.cpp src/node/api_client.cpp src/node/json.cpp src/node/jobs.cpp
+               src/node/identity.cpp src/node/gpu_probe.cpp src/node/sha256.cpp)
+target_include_directories(test_node_cli PRIVATE src/node)
+target_link_libraries(test_node_cli PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(test_node_cli PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME node_cli COMMAND test_node_cli)
+set_tests_properties(node_cli PROPERTIES TIMEOUT 60)
+
 # The real transport, against a deliberately awkward local server: a redirect that would leak the bearer token,
 # a body that never ends, a server that stalls, a proxy's HTML error page. Guarded on libcurl so a machine
 # without the headers still builds and tests everything else -- the agent's behaviour is covered above the

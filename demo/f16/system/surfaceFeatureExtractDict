@@ -1,0 +1,2 @@
+FoamFile { version 2.0; format ascii; class dictionary; object surfaceFeatureExtractDict; }
+f16.stl { extractionMethod extractFromSurface; extractFromSurfaceCoeffs { includedAngle 150; } writeObj yes; }

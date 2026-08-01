@@ -1,0 +1,12 @@
+FoamFile { version 2.0; format ascii; class volScalarField; object p; }
+dimensions [0 2 -2 0 0 0 0]; internalField uniform 0;
+// freestreamPressure is the flux-opposite partner of freestreamVelocity:
+// fixedValue where flow LEAVES, zeroGradient where it enters. Pairing it with a
+// through-flow velocity BC is what makes the far boundary behave like open air
+// rather than a wall.
+boundaryField {
+  inlet { type zeroGradient; }
+  outlet { type fixedValue; value uniform 0; }
+  farfield { type freestreamPressure; freestreamValue uniform 0; value uniform 0; }
+  f16 { type zeroGradient; }
+}

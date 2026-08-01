@@ -25,6 +25,15 @@ class ServiceManager
 {
 public:
     virtual ~ServiceManager() = default;
+
+    // Create the unprivileged account the unit runs as, if it does not exist. The unit declares User=brae, so
+    // without this `systemctl start` fails on a clean machine -- on the very first command a contributor runs.
+    virtual bool ensureUser(std::string& error) = 0;
+
+    // Hand a file to that account. `register` runs under sudo, so anything it writes is owned by root, and the
+    // daemon -- which does not run as root -- then cannot read its own identity. The service starts and dies.
+    virtual bool takeOwnership(const std::string& path, std::string& error) = 0;
+
     virtual bool install(std::string& error) = 0;
     virtual bool start(std::string& error) = 0;
     virtual bool stopAndRemove(std::string& error) = 0;

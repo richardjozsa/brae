@@ -55,12 +55,29 @@ public:
 class FakeService : public ServiceManager
 {
 public:
+    bool failEnsureUser = false;
+    bool failTakeOwnership = false;
+    bool userCreated = false;
+    std::vector<std::string> owned;
     bool failInstall = false;
     bool failStart = false;
     bool installed = false;
     bool started = false;
     int removeCalls = 0;
 
+    bool ensureUser(std::string& error) override
+    {
+        if (failEnsureUser) { error = "useradd failed"; return false; }
+        userCreated = true;
+        return true;
+    }
+    bool takeOwnership(const std::string& path, std::string& error) override
+    {
+        if (failTakeOwnership) { error = "chown failed"; return false; }
+        if (!userCreated) { error = "ownership handed over before the user existed"; return false; }
+        owned.push_back(path);
+        return true;
+    }
     bool install(std::string& error) override
     {
         if (failInstall) { error = "cannot write the unit file"; return false; }
@@ -212,6 +229,42 @@ static void testApi500LeavesNothing()
     check(!h.service.installed, "atomic: no service after a 500");
 }
 
+static void testTheServiceAccountIsPreparedForTheDaemon()
+{
+    // The bug this covers: `register` runs under sudo, so the identity is written by root, while the daemon
+    // runs as an unprivileged user. Without creating that user and handing the file over, the unit installs
+    // cleanly and then dies on every start with "no identity" -- which reads as a broken agent.
+    Harness h;
+    h.http.reply(201, kGoodRegister);
+    check(cmdRegister(h.deps(), "brae_ent_x") == 0, "service account: registration succeeds");
+    check(h.service.userCreated, "service account: the account the unit runs as is created");
+    check(h.service.owned.size() == 1 && h.service.owned[0] == h.identityPath,
+          "service account: the node identity is handed to it, so the daemon can read its own token");
+}
+
+static void testServiceAccountFailureRollsBack()
+{
+    {
+        Harness h;
+        h.http.reply(201, kGoodRegister);
+        h.service.failEnsureUser = true;
+        check(cmdRegister(h.deps(), "brae_ent_x") != 0, "atomic: a service account that cannot be created fails");
+        check(!h.identityExists(), "atomic: identity removed after an account failure");
+        check(h.http.countTo("/unregister") == 1, "atomic: registration undone after an account failure");
+        check(!h.service.installed, "atomic: no unit installed when the account could not be made");
+    }
+    {
+        Harness h;
+        h.http.reply(201, kGoodRegister);
+        h.service.failTakeOwnership = true;
+        check(cmdRegister(h.deps(), "brae_ent_x") != 0, "atomic: an identity that cannot be handed over fails");
+        check(!h.identityExists(), "atomic: identity removed after an ownership failure");
+        check(h.http.countTo("/unregister") == 1, "atomic: registration undone after an ownership failure");
+        check(!h.service.installed,
+              "atomic: the unit is never installed pointing at an identity the daemon cannot read");
+    }
+}
+
 static void testServiceFailureRollsBack()
 {
     // The interesting one: registration SUCCEEDED server-side, then the service could not start. The node row
@@ -353,6 +406,8 @@ int main()
     testDriverButNoUsableGpu();
     testApiRefusalLeavesNothing();
     testApi500LeavesNothing();
+    testTheServiceAccountIsPreparedForTheDaemon();
+    testServiceAccountFailureRollsBack();
     testServiceFailureRollsBack();
     testInstallFailureRollsBack();
     testUnsavableIdentityRollsBack();
