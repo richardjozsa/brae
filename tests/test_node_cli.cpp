@@ -395,6 +395,35 @@ static void testUnregisterWhenNotRegistered()
     check(cmdUnregister(h.deps()) != 0, "unregister: refuses when there is nothing to remove");
 }
 
+
+// A unit whose ExecStart the service cannot reach never starts. `brae node register` installed exactly that:
+// ExecStart pointed into the build tree under $HOME, the unit sets ProtectHome=true, and systemd looped on
+// 203/EXEC over a thousand times while `node status` said "activating" and the registry said OFFLINE.
+static void testHomePathsAreNotServiceReachable()
+{
+    check(!isServiceReachablePath("/home/ghost/cudafoam/brae/build/brae-agent"),
+          "a build tree under /home is not reachable by the hardened unit");
+    check(!isServiceReachablePath("/root/brae/build/brae-agent"),
+          "/root is not reachable either -- ProtectHome hides it too");
+    check(!isServiceReachablePath("/tmp/brae-agent"),
+          "/tmp is not reachable: PrivateTmp gives the unit its own empty one");
+    check(!isServiceReachablePath("build/brae-agent"), "a relative path is refused");
+    check(!isServiceReachablePath(""), "an empty path is refused");
+}
+
+static void testSystemPathsAreServiceReachable()
+{
+    // The negative control. If this fails everything gets copied on every register, which would be wrong in
+    // the opposite direction -- silently overwriting an installed binary from whatever tree you happened to
+    // build in.
+    check(isServiceReachablePath("/usr/local/bin/brae-agent"), "/usr/local/bin is reachable");
+    check(isServiceReachablePath("/usr/bin/brae-agent"), "/usr/bin is reachable");
+    check(isServiceReachablePath("/opt/brae/brae-agent"), "/opt is reachable");
+    check(isServiceReachablePath("/var/lib/brae/brae-agent"), "the unit's own StateDirectory is reachable");
+    check(isServiceReachablePath(systemInstallDir() + "/brae-agent"),
+          "whatever we install into must itself be reachable");
+}
+
 int main()
 {
     char dir[] = "/tmp/brae-cli-testXXXXXX";
@@ -404,6 +433,8 @@ int main()
     testRegisterSucceeds();
     testNoGpuIsRefused();
     testDriverButNoUsableGpu();
+    testHomePathsAreNotServiceReachable();
+    testSystemPathsAreServiceReachable();
     testApiRefusalLeavesNothing();
     testApi500LeavesNothing();
     testTheServiceAccountIsPreparedForTheDaemon();

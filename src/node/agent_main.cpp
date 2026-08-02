@@ -18,7 +18,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -155,6 +157,62 @@ int runDaemon()
     return 0;
 }
 
+// ---- installing the binaries where the service can see them -------------------------------------------------
+
+namespace {
+
+bool copyExecutable(const std::string& from, const std::string& to, std::string& error)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(to).parent_path(), ec);
+    // copy_options::overwrite_existing, so re-registering after a rebuild picks up the new binary rather than
+    // silently keeping the old one -- a stale agent that still runs is harder to notice than one that does not.
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec)
+    {
+        error = "cannot copy " + from + " to " + to + ": " + ec.message();
+        return false;
+    }
+    std::filesystem::permissions(to, std::filesystem::perms::owner_all | std::filesystem::perms::group_read
+                                     | std::filesystem::perms::group_exec | std::filesystem::perms::others_read
+                                     | std::filesystem::perms::others_exec,
+                                 std::filesystem::perm_options::replace, ec);
+    if (ec)
+    {
+        error = "cannot make " + to + " executable: " + ec.message();
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+/// Copy the agent, and the solver beside it, into a directory the hardened unit can reach.
+///
+/// The solver comes too because the agent looks for `brae` as its own sibling (braeBinaryPath), so leaving it
+/// behind would produce a service that starts, reports in happily, and then fails every job it accepts.
+bool installForService(const std::string& selfPath, std::string& installedPath, std::string& error)
+{
+    const std::filesystem::path dir(systemInstallDir());
+    const std::filesystem::path self(selfPath);
+    installedPath = (dir / self.filename()).string();
+
+    if (!copyExecutable(selfPath, installedPath, error))
+    {
+        error += "\n(this needs root: run `sudo brae node register`)";
+        return false;
+    }
+
+    std::error_code ec;
+    const std::filesystem::path solver = self.parent_path() / "brae";
+    if (std::filesystem::exists(solver, ec))
+    {
+        std::string ignored;
+        copyExecutable(solver.string(), (dir / "brae").string(), ignored);   // best effort: jobs need it, snapshots do not
+    }
+    return true;
+}
+
 // ---- the CLI verbs -----------------------------------------------------------------------------------------
 
 int runNodeCommand(int argc, char** argv)
@@ -186,10 +244,25 @@ int runNodeCommand(int argc, char** argv)
     const std::string selfPath = n > 0 ? std::string(selfBuf, static_cast<std::size_t>(n))
                                        : std::string("/usr/local/bin/brae-agent");
 
+    // The unit runs as the `brae` user with ProtectHome=true, so a build tree under $HOME is invisible to it:
+    // pointing ExecStart there installs a service that loops on 203/EXEC forever while the node reads OFFLINE.
+    // Copy the binaries somewhere the service can actually see, unless they already live there.
+    std::string execPath = selfPath;
+    if (!noService && !isServiceReachablePath(selfPath))
+    {
+        std::string err;
+        if (!installForService(selfPath, execPath, err))
+        {
+            std::fprintf(stderr, "brae node: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "brae: installed the agent to %s so the service can reach it\n", execPath.c_str());
+    }
+
     std::unique_ptr<ServiceManager> service =
         noService ? makeNoopService()
                   : makeSystemdService(envOr("BRAE_UNIT_PATH", "/etc/systemd/system/brae-agent.service"),
-                                       selfPath);
+                                       execPath);
 
     CliDeps d;
     d.api = &api;

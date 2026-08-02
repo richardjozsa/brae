@@ -1329,7 +1329,9 @@ set_tests_properties(node_loop PROPERTIES TIMEOUT 120)
 # file, no service and no registry row behind.
 add_executable(test_node_cli tests/test_node_cli.cpp
                src/node/cli.cpp src/node/api_client.cpp src/node/json.cpp src/node/jobs.cpp
-               src/node/identity.cpp src/node/gpu_probe.cpp src/node/sha256.cpp)
+               src/node/identity.cpp src/node/gpu_probe.cpp src/node/sha256.cpp
+               # for isServiceReachablePath: the rule that decides whether the unit can start at all
+               src/node/service_systemd.cpp)
 target_include_directories(test_node_cli PRIVATE src/node)
 target_link_libraries(test_node_cli PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(test_node_cli PROPERTIES LINKER_LANGUAGE CXX)

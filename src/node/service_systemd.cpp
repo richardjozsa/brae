@@ -221,6 +221,31 @@ std::unique_ptr<ServiceManager> makeSystemdService(const std::string& unitPath, 
     return std::make_unique<SystemdService>(unitPath, execPath);
 }
 
+std::string systemInstallDir()
+{
+    return "/usr/local/bin";
+}
+
+bool isServiceReachablePath(const std::string& path)
+{
+    // A prefix test rather than an access() probe, because access() answers for whoever is asking -- and the
+    // caller is root, for whom everything is reachable. The question is whether the *service* can reach it
+    // after ProtectHome=true and ProtectSystem=strict, and that is decided by where the path is, not by us.
+    if (path.empty() || path.front() != '/') return false;
+
+    auto under = [&path](const char* prefix) {
+        const std::string p(prefix);
+        return path.size() > p.size() && path.compare(0, p.size(), p) == 0;
+    };
+
+    // ProtectHome=true hides these outright.
+    if (under("/home/") || under("/root/") || under("/Users/")) return false;
+
+    // Everything the service can still see and execute. /tmp is excluded on purpose: PrivateTmp=true gives the
+    // unit its own empty /tmp, so a binary there would vanish from under it.
+    return under("/usr/") || under("/opt/") || under("/srv/") || under("/var/lib/brae/");
+}
+
 std::unique_ptr<ServiceManager> makeNoopService()
 {
     return std::make_unique<NoopService>();
