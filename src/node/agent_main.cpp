@@ -13,6 +13,7 @@
 #include "http_curl.h"
 #include "identity.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -163,23 +164,42 @@ namespace {
 
 bool copyExecutable(const std::string& from, const std::string& to, std::string& error)
 {
+    // Write beside the target, then rename over it. Copying onto the destination directly fails with ETXTBSY
+    // ("Text file busy") whenever the service is running from it -- which is exactly the case when someone
+    // re-registers an already-installed node. rename(2) does not touch the running inode: the live process
+    // keeps the old file, and the name points at the new one for the next start. Same trick identity.cpp uses.
     std::error_code ec;
-    std::filesystem::create_directories(std::filesystem::path(to).parent_path(), ec);
-    // copy_options::overwrite_existing, so re-registering after a rebuild picks up the new binary rather than
-    // silently keeping the old one -- a stale agent that still runs is harder to notice than one that does not.
-    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    const std::filesystem::path dst(to);
+    std::filesystem::create_directories(dst.parent_path(), ec);
+
+    const std::filesystem::path tmp =
+        dst.parent_path() / ("." + dst.filename().string() + ".new." + std::to_string(::getpid()));
+
+    std::filesystem::copy_file(from, tmp, std::filesystem::copy_options::overwrite_existing, ec);
     if (ec)
     {
-        error = "cannot copy " + from + " to " + to + ": " + ec.message();
+        error = "cannot write " + tmp.string() + ": " + ec.message();
+        if (ec.value() == EACCES || ec.value() == EPERM) error += "\n(this needs root: use sudo)";
         return false;
     }
-    std::filesystem::permissions(to, std::filesystem::perms::owner_all | std::filesystem::perms::group_read
-                                     | std::filesystem::perms::group_exec | std::filesystem::perms::others_read
-                                     | std::filesystem::perms::others_exec,
-                                 std::filesystem::perm_options::replace, ec);
+
+    std::filesystem::permissions(tmp, std::filesystem::perms::owner_all | std::filesystem::perms::group_read
+                                      | std::filesystem::perms::group_exec | std::filesystem::perms::others_read
+                                      | std::filesystem::perms::others_exec,
+                                  std::filesystem::perm_options::replace, ec);
     if (ec)
     {
-        error = "cannot make " + to + " executable: " + ec.message();
+        error = "cannot make " + tmp.string() + " executable: " + ec.message();
+        std::filesystem::remove(tmp, ec);
+        return false;
+    }
+
+    std::filesystem::rename(tmp, dst, ec);
+    if (ec)
+    {
+        error = "cannot install " + dst.string() + ": " + ec.message();
+        std::error_code ignored;
+        std::filesystem::remove(tmp, ignored);      // never leave a stray .brae-agent.new.<pid> behind
         return false;
     }
     return true;
@@ -197,11 +217,7 @@ bool installForService(const std::string& selfPath, std::string& installedPath, 
     const std::filesystem::path self(selfPath);
     installedPath = (dir / self.filename()).string();
 
-    if (!copyExecutable(selfPath, installedPath, error))
-    {
-        error += "\n(this needs root: run `sudo brae node register`)";
-        return false;
-    }
+    if (!copyExecutable(selfPath, installedPath, error)) return false;
 
     std::error_code ec;
     const std::filesystem::path solver = self.parent_path() / "brae";
@@ -248,7 +264,7 @@ int runNodeCommand(int argc, char** argv)
     // pointing ExecStart there installs a service that loops on 203/EXEC forever while the node reads OFFLINE.
     // Copy the binaries somewhere the service can actually see, unless they already live there.
     std::string execPath = selfPath;
-    if (!noService && !isServiceReachablePath(selfPath))
+    if (verb == "register" && !noService && !isServiceReachablePath(selfPath))
     {
         std::string err;
         if (!installForService(selfPath, execPath, err))
