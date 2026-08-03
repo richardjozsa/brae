@@ -24,6 +24,10 @@ struct GpuIdentity
     std::string computeCapability;
     std::string driverVersion;
     std::string uuidHash;          // sha256 of the UUID; the raw value never leaves gpu_probe
+    // Both 0 when NVML does not report them, which is normal on older drivers and inside some containers. The
+    // wire format sends them only when they are real, so the server stores null rather than a fake zero.
+    int powerLimitW = 0;           // board power limit, watts
+    int cudaCores = 0;               // CUDA cores, not SMs: nvmlDeviceGetNumGpuCores returns cores
 };
 
 struct GpuState
@@ -39,6 +43,9 @@ struct RegisterRequest
 {
     std::string displayName, operatingSystem, architecture, agentVersion, braeVersion;
     std::vector<GpuIdentity> gpus;
+    // Mesh size is bound by host RAM as much as by VRAM: a 122 GB card behind 16 GB of system memory cannot
+    // load the cases it looks like it should. 0 when it could not be read.
+    int systemRamMb = 0;
 };
 
 struct RegisterResult

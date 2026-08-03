@@ -26,6 +26,8 @@ using FnUtil = nvmlReturn (*)(void*, unsigned*);                  // reads into 
 using FnTemp = nvmlReturn (*)(void*, int, unsigned*);
 using FnCudaCap = nvmlReturn (*)(void*, int*, int*);
 using FnDriver = nvmlReturn (*)(char*, unsigned);
+using FnPowerLimit = nvmlReturn (*)(void*, unsigned*);            // milliwatts
+using FnGpuCores = nvmlReturn (*)(void*, unsigned*);              // CUDA cores
 
 struct Nvml
 {
@@ -40,6 +42,8 @@ struct Nvml
     FnUtil util = nullptr;
     FnTemp temp = nullptr;
     FnCudaCap cudaCap = nullptr;
+    FnPowerLimit powerLimit = nullptr;
+    FnGpuCores gpuCores = nullptr;
     FnDriver driver = nullptr;
     std::string error;
 
@@ -83,6 +87,11 @@ bool openNvml(Nvml& n)
     n.util      = sym<FnUtil>(n.handle, "nvmlDeviceGetUtilizationRates");
     n.temp      = sym<FnTemp>(n.handle, "nvmlDeviceGetTemperature");
     n.cudaCap   = sym<FnCudaCap>(n.handle, "nvmlDeviceGetCudaComputeCapability");
+    // Optional: absent on older drivers, and dlsym simply returns null, which the call sites check.
+
+    n.powerLimit = sym<FnPowerLimit>(n.handle, "nvmlDeviceGetPowerManagementLimit");
+
+    n.gpuCores = sym<FnGpuCores>(n.handle, "nvmlDeviceGetNumGpuCores");
     n.driver    = sym<FnDriver>(n.handle, "nvmlSystemGetDriverVersion");
 
     if (!n.ok())
@@ -105,6 +114,8 @@ bool openNvml(Nvml& n)
 // failure to work around quietly -- on those machines the GPU genuinely shares the CPU's memory, so system RAM
 // IS the figure the scheduler needs when deciding whether a job fits. Dropping the card instead (which an
 // earlier version did) made a GB10 report zero GPUs and left it unable to register at all.
+}  // namespace
+
 int systemMemoryMb()
 {
     const long pages = ::sysconf(_SC_PHYS_PAGES);
@@ -112,6 +123,8 @@ int systemMemoryMb()
     if (pages <= 0 || pageSize <= 0) return 0;
     return static_cast<int>((static_cast<long long>(pages) * pageSize) / (1024 * 1024));
 }
+
+namespace {
 
 int systemMemoryUsedMb()
 {
@@ -168,6 +181,17 @@ GpuProbeResult probeGpus()
             if (n.memory(dev, mem) == NVML_SUCCESS) g.vramMb = static_cast<int>(mem[0] / (1024ull * 1024ull));
         }
         if (g.vramMb <= 0) g.vramMb = systemMemoryMb();   // unified memory: see systemMemoryMb
+        if (n.powerLimit)
+        {
+            unsigned milliwatts = 0;
+            if (n.powerLimit(dev, &milliwatts) == NVML_SUCCESS)
+                g.powerLimitW = static_cast<int>((milliwatts + 500u) / 1000u);   // round, do not truncate
+        }
+        if (n.gpuCores)
+        {
+            unsigned cores = 0;
+            if (n.gpuCores(dev, &cores) == NVML_SUCCESS) g.cudaCores = static_cast<int>(cores);
+        }
         if (n.cudaCap)
         {
             int major = 0, minor = 0;

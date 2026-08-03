@@ -31,6 +31,10 @@ GpuProbeResult probeGpus();
 // rather than failing the whole snapshot, because a partial report beats no report.
 std::vector<GpuState> probeGpuState();
 
+// Total physical RAM in MiB, 0 if it cannot be read. Reported at registration because mesh size is bound by
+// host memory as much as by VRAM -- and it is the same figure the GB10 unified-memory fallback already uses.
+int systemMemoryMb();
+
 // Which shared object to load. BRAE_NVML_LIB overrides it, which is how the "no driver" path gets tested.
 std::string nvmlLibraryName();
 

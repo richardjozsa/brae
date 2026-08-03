@@ -25,6 +25,9 @@ std::string buildRegisterBody(const RegisterRequest& r)
     j.set("architecture", Json::str(r.architecture));
     j.set("agent_version", Json::str(r.agentVersion));
     j.set("brae_version", Json::str(r.braeVersion));
+    // Omitted rather than sent as 0 when unknown: the server stores null, and "unknown" and "zero watts" are
+    // different facts. An older server that does not know the field ignores it either way.
+    if (r.systemRamMb > 0) j.set("system_ram_mb", Json::num(r.systemRamMb));
 
     Json gpus = Json::array();
     for (const GpuIdentity& g : r.gpus)
@@ -36,6 +39,8 @@ std::string buildRegisterBody(const RegisterRequest& r)
         e.set("compute_capability", Json::str(g.computeCapability));
         e.set("driver_version", Json::str(g.driverVersion));
         e.set("uuid_hash", Json::str(g.uuidHash));      // never the raw UUID; see gpu_probe
+        if (g.powerLimitW > 0) e.set("power_limit_w", Json::num(g.powerLimitW));
+        if (g.cudaCores > 0) e.set("cuda_cores", Json::num(g.cudaCores));
         gpus.push(std::move(e));
     }
     j.set("gpus", std::move(gpus));

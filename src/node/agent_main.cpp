@@ -286,6 +286,7 @@ int runNodeCommand(int argc, char** argv)
     d.probeGpus = [] { return probeGpus(); };
     d.probeGpuState = [] { return probeGpuState(); };
     d.nowIso8601 = nowIso8601;
+    d.systemRamMb = [] { return systemMemoryMb(); };
     d.out = [](const std::string& s) { std::fputs(s.c_str(), stdout); };
     d.err = [](const std::string& s) { std::fputs(s.c_str(), stderr); };
     d.identityPath = identityPath;
