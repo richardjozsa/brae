@@ -64,6 +64,7 @@ int cmdRegister(const CliDeps& d, const std::string& enrollmentToken)
     req.braeVersion = d.braeVersion;
     req.gpus = probe.gpus;
     req.systemRamMb = d.systemRamMb ? d.systemRamMb() : 0;
+    req.timezone = d.timezone ? d.timezone() : std::string();
 
     const RegisterResult reg = d.api->registerNode(req, enrollmentToken);
     if (!reg.ok)

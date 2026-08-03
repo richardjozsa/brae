@@ -28,6 +28,7 @@ std::string buildRegisterBody(const RegisterRequest& r)
     // Omitted rather than sent as 0 when unknown: the server stores null, and "unknown" and "zero watts" are
     // different facts. An older server that does not know the field ignores it either way.
     if (r.systemRamMb > 0) j.set("system_ram_mb", Json::num(r.systemRamMb));
+    if (!r.timezone.empty()) j.set("timezone", Json::str(r.timezone));
 
     Json gpus = Json::array();
     for (const GpuIdentity& g : r.gpus)

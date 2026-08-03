@@ -46,6 +46,8 @@ struct RegisterRequest
     // Mesh size is bound by host RAM as much as by VRAM: a 122 GB card behind 16 GB of system memory cannot
     // load the cases it looks like it should. 0 when it could not be read.
     int systemRamMb = 0;
+    // IANA zone, e.g. "Europe/Berlin". The server derives the country; we never send one ourselves.
+    std::string timezone;
 };
 
 struct RegisterResult

@@ -116,6 +116,23 @@ bool openNvml(Nvml& n)
 // earlier version did) made a GB10 report zero GPUs and left it unable to register at all.
 }  // namespace
 
+std::string systemTimezone()
+{
+    // /etc/localtime -> /usr/share/zoneinfo/Europe/Berlin
+    char buf[4096];
+    const ssize_t n = ::readlink("/etc/localtime", buf, sizeof buf - 1);
+    if (n <= 0) return {};
+    const std::string path(buf, static_cast<std::size_t>(n));
+    const std::string marker = "/zoneinfo/";
+    const std::size_t at = path.rfind(marker);
+    if (at == std::string::npos) return {};
+    std::string zone = path.substr(at + marker.size());
+    // Some distributions point at zoneinfo/posix/Europe/Berlin or .../right/Europe/Berlin.
+    for (const std::string prefix : {std::string("posix/"), std::string("right/")})
+        if (zone.rfind(prefix, 0) == 0) zone = zone.substr(prefix.size());
+    return zone;
+}
+
 int systemMemoryMb()
 {
     const long pages = ::sysconf(_SC_PHYS_PAGES);

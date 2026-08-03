@@ -35,6 +35,13 @@ std::vector<GpuState> probeGpuState();
 // host memory as much as by VRAM -- and it is the same figure the GB10 unified-memory fallback already uses.
 int systemMemoryMb();
 
+// The machine's IANA timezone, e.g. "Europe/Berlin", or "" if it cannot be determined.
+//
+// Read from the /etc/localtime symlink rather than /etc/timezone: the latter is a Debian file that goes stale
+// (this machine reports Europe/Berlin by symlink and Etc/UTC by file). The server maps it to a country, so a
+// bad mapping is fixed by a deploy rather than by asking every contributor to reinstall.
+std::string systemTimezone();
+
 // Which shared object to load. BRAE_NVML_LIB overrides it, which is how the "no driver" path gets tested.
 std::string nvmlLibraryName();
 

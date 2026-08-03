@@ -66,6 +66,7 @@ struct CliDeps
     std::function<std::vector<GpuState>()> probeGpuState;
     std::function<std::string()> nowIso8601;
     std::function<int()> systemRamMb;      // host RAM in MiB; injected so a test can pin it
+    std::function<std::string()> timezone; // IANA zone; injected so a test can pin it
     std::function<void(const std::string&)> out;   // stdout
     std::function<void(const std::string&)> err;   // stderr
 
