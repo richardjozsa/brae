@@ -20,6 +20,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -219,14 +220,174 @@ bool installForService(const std::string& selfPath, std::string& installedPath, 
 
     if (!copyExecutable(selfPath, installedPath, error)) return false;
 
+    // `brae` AND every solver beside it. `brae` is only a front door: it reads controlDict and hands a
+    // pimpleFoam case to `brae_pimpleFoam`, looked up as its own sibling. Copying the front door alone gives a
+    // node that registers, reports in happily, accepts a job and then dies with "cannot start
+    // brae_pimpleFoam" -- which is exactly what happened the first time a benchmark ran from /usr/local/bin.
     std::error_code ec;
-    const std::filesystem::path solver = self.parent_path() / "brae";
-    if (std::filesystem::exists(solver, ec))
+    for (const std::filesystem::directory_entry& e :
+         std::filesystem::directory_iterator(self.parent_path(), ec))
     {
+        const std::string name = e.path().filename().string();
+        if (name != "brae" && name.rfind("brae_", 0) != 0) continue;
+        if (!e.is_regular_file(ec)) continue;
         std::string ignored;
-        copyExecutable(solver.string(), (dir / "brae").string(), ignored);   // best effort: jobs need it, snapshots do not
+        // Best effort: a missing solver costs the jobs that need it, not the registration.
+        copyExecutable(e.path().string(), (dir / name).string(), ignored);
     }
     return true;
+}
+
+// ---- submitting work ---------------------------------------------------------------------------------------
+
+namespace {
+
+/// Where an operator's admin token lives.
+///
+/// ~/.config/brae, not /etc/brae. That one belongs to the daemon: a system account with no login shell, whose
+/// systemd unit sets ProtectHome so it cannot see a home directory at all. This is a person's credential on a
+/// person's laptop, and XDG is where those go.
+std::string adminTokenPath()
+{
+    if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg)
+        return std::string(xdg) + "/brae/token";
+    if (const char* home = std::getenv("HOME"); home && *home)
+        return std::string(home) + "/.config/brae/token";
+    return {};
+}
+
+std::string readAdminToken()
+{
+    // Environment first, so CI and a one-off shell never have to write a file.
+    if (const char* env = std::getenv("BRAE_ADMIN_TOKEN"); env && *env) return env;
+
+    const std::string path = adminTokenPath();
+    if (path.empty()) return {};
+    std::ifstream in(path);
+    if (!in) return {};
+    std::string token;
+    std::getline(in, token);
+    while (!token.empty() && (token.back() == '\n' || token.back() == '\r' || token.back() == ' '))
+        token.pop_back();
+    return token;
+}
+
+int jobUsage()
+{
+    std::fputs(
+        "brae job  ,  submit a simulation to the brae network\n"
+        "\n"
+        "  brae job run <sample> [--gpu <model>] [--no-wait]\n"
+        "  brae job status <job-id>\n"
+        "\n"
+        "Options:\n"
+        "  --gpu <model>   send it to a kind of card: gb10, h100, rtx3090. At least 3 characters.\n"
+        "                  Omit it and the first eligible machine to report in takes the job.\n"
+        "  --no-wait       print the job id and exit instead of following it.\n"
+        "  --api <url>     control plane (default $BRAE_API_URL, else https://api.brae.sh)\n"
+        "  --token <t>     admin token (default $BRAE_ADMIN_TOKEN, else ~/.config/brae/token)\n",
+        stderr);
+    return 2;
+}
+
+void printJob(const JobView& j)
+{
+    std::printf("\n%-10s %s\n", "Job", j.jobId.c_str());
+    std::printf("%-10s %s\n", "Sample", j.sample.c_str());
+    if (!j.requestedGpuModel.empty()) std::printf("%-10s %s\n", "GPU", j.requestedGpuModel.c_str());
+    std::printf("%-10s %s\n", "State", j.state.c_str());
+    if (!j.nodeId.empty()) std::printf("%-10s %s\n", "Node", j.nodeId.c_str());
+    if (!j.jobError.empty()) std::printf("%-10s %s\n", "Error", j.jobError.c_str());
+    std::printf("\n");
+}
+
+}  // namespace
+
+int runJobCommand(int argc, char** argv)
+{
+    // argv is: brae-agent job <verb> [...]
+    std::string verb, sample, gpu, jobId, token, apiUrl = envOr("BRAE_API_URL", "https://api.brae.sh");
+    bool noWait = false;
+
+    for (int i = 2; i < argc; ++i)
+    {
+        const std::string a = argv[i];
+        if (a == "--gpu" && i + 1 < argc) gpu = argv[++i];
+        else if (a == "--api" && i + 1 < argc) apiUrl = argv[++i];
+        else if (a == "--token" && i + 1 < argc) token = argv[++i];
+        else if (a == "--no-wait") noWait = true;
+        else if (a == "--help" || a == "-h") return jobUsage();
+        else if (a[0] == '-') { std::fprintf(stderr, "brae job: unknown option '%s'\n", a.c_str()); return 2; }
+        else if (verb.empty()) verb = a;
+        else if (verb == "status" && jobId.empty()) jobId = a;
+        else if (sample.empty()) sample = a;
+        else { std::fprintf(stderr, "brae job: unexpected argument '%s'\n", a.c_str()); return 2; }
+    }
+    if (verb.empty()) return jobUsage();
+
+    if (token.empty()) token = readAdminToken();
+    if (token.empty())
+    {
+        std::fprintf(stderr,
+                     "no admin token. Set BRAE_ADMIN_TOKEN, pass --token, or write it to %s\n",
+                     adminTokenPath().c_str());
+        return 1;
+    }
+
+    CurlHttp http;
+    http.setUserAgent(std::string("brae/") + kAgentVersion);
+    ApiClient api(http, apiUrl);
+
+    if (verb == "status")
+    {
+        if (jobId.empty()) return jobUsage();
+        const JobView j = api.getJob(jobId, token);
+        if (!j.ok) { std::fprintf(stderr, "%s\n", j.error.c_str()); return 1; }
+        printJob(j);
+        return j.state == "failed" || j.state == "abandoned" ? 1 : 0;
+    }
+
+    if (verb != "run" && verb != "submit") return jobUsage();
+    if (sample.empty()) { std::fprintf(stderr, "brae job: which sample?\n"); return jobUsage(); }
+
+    const JobView queued = api.queueJob(sample, gpu, token);
+    if (!queued.ok) { std::fprintf(stderr, "%s\n", queued.error.c_str()); return 1; }
+
+    if (noWait)
+    {
+        std::printf("%s\n", queued.jobId.c_str());
+        return 0;
+    }
+
+    std::fprintf(stderr, "queued %s%s\n", queued.jobId.c_str(),
+                 gpu.empty() ? "" : (" for " + gpu).c_str());
+
+    // Poll rather than stream: the control plane has no push channel to anything but a node, and a job runs
+    // for minutes, so a five-second poll costs nothing and needs no new protocol.
+    std::string last;
+    for (;;)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        const JobView j = api.getJob(queued.jobId, token);
+        if (!j.ok)
+        {
+            // A blip while a job runs for ten minutes should not end the watch; the job is unaffected either
+            // way, and Ctrl-C is always available.
+            std::fprintf(stderr, "  (%s)\n", j.error.c_str());
+            continue;
+        }
+        if (j.state != last)
+        {
+            std::fprintf(stderr, "  %s%s\n", j.state.c_str(),
+                         j.nodeId.empty() ? "" : (" on " + j.nodeId).c_str());
+            last = j.state;
+        }
+        if (j.terminal)
+        {
+            printJob(j);
+            return j.state == "completed" ? 0 : 1;
+        }
+    }
 }
 
 // ---- the CLI verbs -----------------------------------------------------------------------------------------
@@ -331,6 +492,7 @@ int main(int argc, char** argv)
     if (first == "--help" || first == "-h") return usage();
     if (first == "run") return runDaemon();
     if (first == "node") return runNodeCommand(argc, argv);
+    if (first == "job") return runJobCommand(argc, argv);
     std::fprintf(stderr, "brae-agent: unknown command '%s'\n", first.c_str());
     return 2;
 }

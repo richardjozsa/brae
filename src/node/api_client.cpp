@@ -217,6 +217,44 @@ SimpleResult parseSimpleResponse(const HttpResponse& res)
 
 // ---- calls --------------------------------------------------------------------------------------------------
 
+JobView parseJobView(const HttpResponse& res)
+{
+    JobView v;
+    if (!res.ok())
+    {
+        // The message, not the code: this one is read by a person at a terminal, and "'gb' is too short"
+        // helps where "invalid_request" does not. Falls back to the code, then to the status.
+        Json j;
+        std::string parseError;
+        if (!res.transportFailed() && Json::parse(res.body, j, parseError)
+            && j["error"].type() == Json::Type::Object)
+        {
+            const std::string message = j["error"]["message"].asString();
+            v.error = message.empty() ? transportOrStatus(res) : message;
+        }
+        else
+        {
+            v.error = transportOrStatus(res);
+        }
+        return v;
+    }
+
+    Json j;
+    std::string err;
+    if (!Json::parse(res.body, j, err)) { v.error = "unreadable job reply: " + err; return v; }
+
+    v.ok = true;
+    v.jobId = j["job_id"].asString();
+    v.state = j["state"].asString();
+    v.sample = j["sample"].asString();
+    v.nodeId = j["node_id"].asString();
+    v.requestedGpuModel = j["requested_gpu_model"].asString();
+    v.jobError = j["error"].asString();
+    v.terminal = v.state == "completed" || v.state == "failed" || v.state == "abandoned";
+    return v;
+}
+
+
 RegisterResult ApiClient::registerNode(const RegisterRequest& r, const std::string& enrollmentToken)
 {
     HttpRequest req;
@@ -238,6 +276,29 @@ SnapshotResult ApiClient::sendSnapshot(const std::string& nodeId, const std::str
     req.bearer = token;
     req.timeoutSeconds = 15;                      // must be well under the offline threshold
     return parseSnapshotResponse(http_.send(req));
+}
+
+JobView ApiClient::queueJob(const std::string& sample, const std::string& gpu, const std::string& adminToken)
+{
+    Json body = Json::object();
+    body.set("sample", Json::str(sample));
+    if (!gpu.empty()) body.set("gpu", Json::str(gpu));
+
+    HttpRequest req;
+    req.method = "POST";
+    req.url = urlJoin(base_, "/v1/jobs");
+    req.body = body.dump();
+    req.bearer = adminToken;
+    return parseJobView(http_.send(req));
+}
+
+JobView ApiClient::getJob(const std::string& jobId, const std::string& adminToken)
+{
+    HttpRequest req;
+    req.method = "GET";
+    req.url = urlJoin(base_, "/v1/jobs/" + jobId);
+    req.bearer = adminToken;
+    return parseJobView(http_.send(req));
 }
 
 SimpleResult ApiClient::acceptJob(const std::string& nodeId, const std::string& token, const std::string& jobId)

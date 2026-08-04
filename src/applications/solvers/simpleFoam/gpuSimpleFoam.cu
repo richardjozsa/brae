@@ -80,8 +80,8 @@ int main(int argc, char** argv)
 {
     try
     {
-        // Subcommands. ONLY these two leading words are reserved -- everything else is a case directory, so
-        // `brae myCase` is untouched. A case actually named `node` or `benchmark` is reached with -case.
+        // Subcommands. ONLY these three leading words are reserved -- everything else is a case directory, so
+        // `brae myCase` is untouched. A case actually named `node`, `benchmark` or `job` is reached with -case.
         if (argc > 1 && argv[1][0] != '-')
         {
             const std::string word = argv[1];
@@ -97,6 +97,15 @@ int main(int argc, char** argv)
                 // The node service is a separate, CUDA-free binary; `brae` is only the front door to it.
                 std::vector<std::string> args(argv + 1, argv + argc);
                 execSibling("brae-agent", args, "node subcommand -> brae-agent", "`brae node` (the node service)");
+            }
+            if (word == "job")
+            {
+                // `brae job run`, not `brae run`. A bare `run` was tried and tests/brae_subcommands.sh
+                // refused it, correctly: a case directory called `run` is commonplace, and the rule here is
+                // that only reserved words are subcommands and everything else is a case. Stealing `run`
+                // would have made `brae run` mean different things in different directories.
+                std::vector<std::string> args(argv + 1, argv + argc);
+                execSibling("brae-agent", args, "job subcommand -> brae-agent", "`brae job` (submitting work)");
             }
         }
         for (int i = 1; i < argc; ++i)

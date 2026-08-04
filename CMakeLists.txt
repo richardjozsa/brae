@@ -1336,6 +1336,12 @@ target_include_directories(test_node_cli PRIVATE src/node)
 target_link_libraries(test_node_cli PRIVATE ${CMAKE_DL_LIBS})
 set_target_properties(test_node_cli PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME node_cli COMMAND test_node_cli)
+
+# `brae run` against a stub control plane: argv, where the admin token comes from, what is actually sent, and
+# what a failure looks like to someone at a terminal.
+add_test(NAME brae_run
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_run.sh $<TARGET_FILE:brae> python3)
+set_tests_properties(brae_run PROPERTIES TIMEOUT 120)
 set_tests_properties(node_cli PROPERTIES TIMEOUT 60)
 
 # The real transport, against a deliberately awkward local server: a redirect that would leak the bearer token,
