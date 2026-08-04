@@ -23,6 +23,10 @@
 #include "device_pcg.cuh"
 #include "device_simple.cuh"
 #include "device_boundary.cuh"
+#include "thermo_types.cuh"
+#include "device_thermo.cuh"
+#include "device_energy.cuh"
+#include "rho_simple_controls.cuh"
 #include "device_cyclic.cuh"
 #include "device_ami.cuh"
 #include "device_interface.cuh"   // interface<Op>() overloads dispatching to the cyclic/AMI backends
@@ -112,6 +116,28 @@ public:
     // pressure-velocity correction; turbulence }, then continuity errors. Returns the outer-loop residual signal.
     DeviceSimpleResidual pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors);
 
+    // Steady COMPRESSIBLE step (rhoSimpleFoam). Composes the same three phases as simpleStep/pimpleStep
+    // with the energy equation and the thermo update inserted, in OF's rhoSimpleFoam.C order:
+    //
+    //     UEqn -> EEqn -> pEqn -> thermo.correct() -> rho.relax() -> turbulence
+    //
+    // EEqn sits between momentum and pressure because the pressure equation needs the density the NEW
+    // temperature implies, not the previous one. Requires setCompressible() first.
+    DeviceSimpleResidual rhoSimpleStep();
+
+    // The compressible state, so the driver can seed T/he before the loop and read T back after it.
+    // The solver owns the buffers (they are sized against its mesh); the driver owns what goes in them.
+    DeviceThermo& thermo() { return th_; }
+    const DeviceThermo& thermo() const { return th_; }
+
+    // Switch the solver into compressible mode. dbHe is the enthalpy boundary (built from the case's 0/T
+    // via deviceEnergyBoundaryFromT); th is allocated and seeded by the caller so the driver owns field
+    // construction, exactly as it already owns U/p.
+    void setCompressible(
+        const ThermoCoeffs& tc,
+        const RhoSimpleControls& rc,
+        DeviceBoundary dbHe);
+
     // Enable an MRF rotating zone: builds the device frame data + makes the resident flux RELATIVE (so the
     // momentum/pressure are solved in the rotating frame). Call once after construction, before stepping.
     void setMRF(
@@ -147,6 +173,8 @@ public:
         return u;
     }
     std::vector<scalar> p()   const { return dp_.host(); }
+    // Device-side p, for the compressible thermo update (which must not round-trip through the host).
+    const DeviceBuffer<scalar>& pDevice() const { return dp_; }
     std::vector<scalar> k()   const { return dk_.host(); }
     std::vector<scalar> eps() const { return de_.host(); }
     std::vector<scalar> ReThetat() const { return ReThetat_.host(); }   // kOmegaSSTLM
@@ -259,6 +287,14 @@ private:
     DeviceBuffer<scalar> ReThetat_, gammaInt_, gammaIntEff_;                   // kOmegaSSTLM transition fields
     DeviceBuffer<scalar> dnutBndWall_;                                          // persistent Spalding wall-nut (SA warm seed)
     DeviceBuffer<scalar> nuConst_, zeroSrc_, zeroBndU_, ones_;
+
+    // Compressible state (rhoSimpleFoam). compressible_ stays false for every incompressible case, so
+    // none of this is reachable from the existing solvers and the steady/PIMPLE paths are untouched.
+    bool compressible_ = false;
+    ThermoCoeffs tc_{};
+    RhoSimpleControls rc_{};
+    DeviceThermo th_{};
+    DeviceBoundary dbHe_{};
     DeviceBuffer<scalar> pD_, pU_, pL_, diagCp_, bp_;            // persistent pressure matrix (graph-stable addresses)
     DeviceBuffer<label>  bndIsWall_, adjustMask_;              // wall mask (true boundary nut); adjustPhi adjustable mask
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces

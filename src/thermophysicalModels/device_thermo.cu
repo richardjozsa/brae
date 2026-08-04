@@ -5,6 +5,7 @@
 #include "thermo_model.cuh"
 #include "transport_model.cuh"
 #include "device_buffer.cuh"
+#include "device_boundary.cuh"
 
 namespace brae {
 
@@ -135,6 +136,46 @@ void deviceRhoSeedPrev(DeviceThermo& th)
         th.rho.data(),
         th.rhoPrev.data());
     cudaCheck(cudaGetLastError(), "rhoSeedPrev");
+}
+
+// rho_b = p_b/(R*T_b), face by face. Same EOS as the cell update, so a boundary and its cell agree
+// whenever their p and T do.
+__global__
+void rhoBoundaryK(
+    int n,
+    ThermoCoeffs c,
+    const scalar* __restrict__ pBnd,
+    const scalar* __restrict__ heBnd,
+    scalar* __restrict__ rhoBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const scalar Tb = hConstHeToT(heBnd[i], c);
+    const scalar pb = fmax(pBnd[i], c.pMin);
+    rhoBnd[i] = fmin(fmax(pb / (c.R * Tb), c.rhoMin), c.rhoMax);
+}
+
+void deviceThermoRhoBoundary(
+    const DeviceBoundary& dbP,
+    const DeviceBuffer<scalar>& p,
+    const DeviceBoundary& dbHe,
+    const DeviceBuffer<scalar>& he,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& rhoBnd)
+{
+    if (dbP.n == 0) return;
+    DeviceBuffer<scalar> pBnd;
+    DeviceBuffer<scalar> heBnd;
+    deviceBCValue(dbP, p, pBnd);
+    deviceBCValue(dbHe, he, heBnd);
+    rhoBnd.resize(dbP.n);
+    rhoBoundaryK<<<nBlocks(dbP.n), TPB>>>(
+        dbP.n,
+        c,
+        pBnd.data(),
+        heBnd.data(),
+        rhoBnd.data());
+    cudaCheck(cudaGetLastError(), "rhoBoundary");
 }
 
 void deviceThermoHeFromT(

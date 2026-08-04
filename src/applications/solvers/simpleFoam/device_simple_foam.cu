@@ -801,6 +801,24 @@ namespace brae {
         if (hasSym_) deviceConstrainSymmetryHbyA(dbU_, Uk_[0], Uk_[1], Uk_[2], hxb, hyb, hzb);
         DeviceBuffer<scalar> phiHb;
         deviceBoundaryFlux(dm,hxb,hyb,hzb,phiHb);
+        if (compressible_)
+        {
+            // OF rhoSimpleFoam pEqn.H: phiHbyA = fvc::interpolate(rho)*fvc::flux(HbyA), i.e. a MASS flux.
+            // Both halves must be weighted: deviceInterpolate covers internal faces only, and the boundary
+            // rho comes from the boundary p and T rather than the adjacent cell -- see
+            // deviceThermoRhoBoundary for why extrapolating there is silently wrong at a fixed-T inlet.
+            DeviceBuffer<scalar> rhoF;
+            deviceInterpolate(dm, th_.rho, rhoF);
+            DeviceBuffer<scalar> tmp;
+            deviceHadamard(tmp, rhoF, phiHi);
+            deviceCopy(phiHi, tmp);
+
+            DeviceBuffer<scalar> rhoB;
+            deviceThermoRhoBoundary(dbP_, dp_, dbHe_, th_.he, tc_, rhoB);
+            DeviceBuffer<scalar> tmpB;
+            deviceHadamard(tmpB, rhoB, phiHb);
+            deviceCopy(phiHb, tmpB);
+        }
         if (mrf_.active) deviceMrfApplyFrameFlux(mrf_, +1.0, phiHi, phiHb);   // MRF.makeRelative(phiHbyA) before pressure
         // adjustPhi (OF order: after flux(HbyA), before the SIMPLEC correction): enforce global continuity by
         // scaling the adjustable outflow when there is no pressure reference (closed/all-velocity domains).
@@ -838,7 +856,19 @@ namespace brae {
             }
         }
         DeviceBuffer<scalar> rAUf;
-        deviceInterpolate(dm,rAtU,rAUf);
+        if (compressible_)
+        {
+            // OF rhoSimpleFoam pEqn.H: rhorAUf = fvc::interpolate(rho*rAU). The laplacian coefficient is
+            // the ONLY change the subsonic pressure equation needs -- there is no psi*p term outside the
+            // transonic branch, so the system stays symmetric and the AMG-PCG path is unchanged.
+            DeviceBuffer<scalar> rhoRAtU;
+            deviceHadamard(rhoRAtU, th_.rho, rAtU);
+            deviceInterpolate(dm, rhoRAtU, rAUf);
+        }
+        else
+        {
+            deviceInterpolate(dm,rAtU,rAUf);
+        }
         // pressure matrix buffers are PERSISTENT members: their addresses stay fixed across SIMPLE steps (only the
         // values change), so the V-cycle CUDA graph (keyed on diagCp_) is captured once and replayed every step.
         DeviceBuffer<scalar> pPrev;
@@ -1032,6 +1062,76 @@ namespace brae {
     // outer (momentum<->pressure<->turbulence) + inner (pressure) corrector loops, with fvm::ddt(U) folded into the
     // predictor (active once setDdtScheme() set ddtScheme_ != steadyState). The momentum matrix is re-assembled each
     // outer corrector from the latest U/phi, exactly as OF's while(pimple.loop()) re-forms UEqn.
+    void DeviceSimpleSolver::setCompressible(
+        const ThermoCoeffs& tc,
+        const RhoSimpleControls& rc,
+        DeviceBoundary dbHe)
+    {
+        tc_ = tc;
+        rc_ = rc;
+        dbHe_ = std::move(dbHe);
+        th_.allocate(dm_.nCells);
+        compressible_ = true;
+    }
+
+    // See the header for why the phases are ordered UEqn -> EEqn -> pEqn -> thermo -> turbulence.
+    DeviceSimpleResidual DeviceSimpleSolver::rhoSimpleStep()
+    {
+        const DeviceMesh& dm = dm_;
+        DeviceSimpleResidual res;
+
+        // muEff. The momentum assembly builds nuEff = dnut_ + nuConst_ and nuConst_ has exactly two uses
+        // (seeded from ctl_.nu at construction, added here), so handing it the DYNAMIC viscosity turns the
+        // same expression into muEff without touching the assembly. mu is T-dependent under Sutherland, so
+        // it must be refreshed every outer iteration, not seeded once. dnut_ is zero while the solve is
+        // laminar; phase 4 fills it with mut and this line keeps working unchanged.
+        deviceCopy(nuConst_, th_.mu);
+
+        solveMomentumPredictor(res);
+
+        // EEqn. alphat is still zero (phase 4 fills it), so this is the laminar enthalpy transport that
+        // gate 1 checked against OpenFOAM scalarTransportFoam.
+        deviceSolveEnergy(
+            dm,
+            dbHe_,
+            th_,
+            phiInt_,
+            phiBnd_,
+            zeroSrc_,
+            false,
+            false,
+            ctl_.nonOrth,
+            0.0,
+            rc_.relaxHe,
+            1e-10,
+            0.0,
+            1,
+            false);
+
+        correctPressureVelocity(res);
+
+        // thermo.correct() then rho.relax(): p and he have both moved, so every T-dependent property is
+        // stale until this runs, and the relaxation stops the outer loop oscillating on the raw update.
+        deviceThermoUpdate(th_, dp_, tc_);
+        deviceRhoRelax(th_, tc_);
+
+        correctTurbulence();
+
+        // Continuity. NOTE: with a mass flux this is a MASS residual, not a volumetric one -- the number
+        // means something different from the incompressible report even though the code is identical.
+        // Flagged in phi-audit.md as an INTERPRET site.
+        {
+            DeviceBuffer<scalar> divPhi;
+            deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            DeviceBuffer<scalar> R;
+            deviceHadamard(R, divPhi, dm.V);
+            const scalar sumV = deviceDot(dm.V, ones_) + 1e-300;
+            res.contLocal = deviceSumMag(R) / sumV;
+            res.contGlobal = deviceDot(R, ones_) / sumV;
+        }
+        return res;
+    }
+
     DeviceSimpleResidual DeviceSimpleSolver::pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors)
     {
         const DeviceMesh& dm = dm_;

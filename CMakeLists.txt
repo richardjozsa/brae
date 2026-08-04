@@ -1018,6 +1018,21 @@ target_include_directories(test_cyclic_fvc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_fvc PRIVATE brae_core)
 add_test(NAME cyclic_fvc COMMAND test_cyclic_fvc ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
 
+# brae_rhoSimpleFoam: steady compressible solver (subsonic, laminar)
+add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu)
+target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
+
+# rhoSimpleFoam phase 3 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam on a heated duct.
+# Needs an OF install; skipped (77) if absent.
+add_test(NAME rho_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/rho_vs_openfoam.sh)
+set_tests_properties(rho_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
 # rhoSimpleFoam phase 2: mass flux reduces exactly to the volumetric flux at constant density
 add_executable(test_rho_flux tests/test_rho_flux.cu)
 target_include_directories(test_rho_flux PRIVATE ${BRAE_HEADER_DIRS})

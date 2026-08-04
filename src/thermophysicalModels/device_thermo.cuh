@@ -11,6 +11,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "thermo_types.cuh"
+#include "device_boundary.cuh"
 
 namespace brae {
 
@@ -38,5 +39,20 @@ void deviceRhoRelax(
 
 // rhoPrev = rho. Call once after the first thermo update, before the outer loop starts relaxing.
 void deviceRhoSeedPrev(DeviceThermo& th);
+
+// Density AT BOUNDARY FACES, from the boundary values of p and he: rho_b = p_b/(R*T_b).
+//
+// Not the adjacent cell value. OF's rho is thermo.rho(), whose boundaryField is evaluated from the
+// boundary p and T, so at a fixed-temperature inlet rho_b differs from the cell behind it -- extrapolating
+// instead would put the wrong mass flux through every such patch and still converge, quietly.
+//
+// Needed because deviceInterpolate covers internal faces only, so phiHbyA's boundary half cannot reuse it.
+void deviceThermoRhoBoundary(
+    const DeviceBoundary& dbP,
+    const DeviceBuffer<scalar>& p,
+    const DeviceBoundary& dbHe,
+    const DeviceBuffer<scalar>& he,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& rhoBnd);
 
 } // namespace brae

@@ -48,6 +48,7 @@ inline const std::vector<BraeSolver>& braeSolvers()
     static const std::vector<BraeSolver> reg = {
         {"simpleFoam", "brae",            false, "steady incompressible, RAS/laminar"},
         {"pimpleFoam", "brae_pimpleFoam", true,  "transient incompressible, URANS/DES/LES/laminar"},
+        {"rhoSimpleFoam", "brae_rhoSimpleFoam", false, "steady compressible (subsonic, laminar, perfectGas+hConst)"},
     };
     return reg;
 }
