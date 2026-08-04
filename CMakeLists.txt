@@ -98,6 +98,7 @@ add_library(brae_core STATIC
     src/cuda/device_komega_sst.cu
     src/cuda/device_smagorinsky.cu
     src/cuda/device_coded_bc.cu
+    src/thermophysicalModels/device_thermo.cu
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
@@ -1015,6 +1016,12 @@ add_executable(test_cyclic_fvc tests/test_cyclic_fvc.cu)
 target_include_directories(test_cyclic_fvc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_fvc PRIVATE brae_core)
 add_test(NAME cyclic_fvc COMMAND test_cyclic_fvc ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+
+# rhoSimpleFoam phase 0 gate: thermophysical subsystem (perfectGas + hConst + Sutherland/const)
+add_executable(test_thermo_perfect_gas tests/test_thermo_perfect_gas.cu)
+target_include_directories(test_thermo_perfect_gas PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_thermo_perfect_gas PRIVATE brae_core)
+add_test(NAME thermo_perfect_gas COMMAND test_thermo_perfect_gas)
 
 # Cyclic increment C3b: cyclic coupling inside an iterative solver (periodic Poisson)
 add_executable(test_cyclic_poisson tests/test_cyclic_poisson.cu)
