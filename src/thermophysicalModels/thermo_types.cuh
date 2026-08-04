@@ -36,6 +36,9 @@ struct ThermoCoeffs
     scalar rhoMin = 1e-03;
     scalar rhoMax = 1e+03;
     scalar pMin = 1e+03;
+
+    // rho.relax() factor, fvSolution relaxationFactors.fields.rho. 1.0 = no relaxation.
+    scalar relaxRho = 1.0;
 };
 
 // Per-cell thermophysical fields, sized nCells. Internal field only -- boundary values live in the
@@ -55,6 +58,11 @@ struct DeviceThermo
     // equation already reads alphaEff = alpha + alphat so that phase does not touch the EEqn.
     DeviceBuffer<scalar> alphat;
 
+    // Density from the previous outer iteration, for rho.relax(). SIMPLE updates rho from a pressure
+    // field that is itself only partly converged, so feeding the raw update straight into the next
+    // momentum predictor makes the outer loop oscillate. OF relaxes rho for exactly this reason.
+    DeviceBuffer<scalar> rhoPrev;
+
     void allocate(int nCells)
     {
         n = nCells;
@@ -65,6 +73,7 @@ struct DeviceThermo
         mu.resize(n);
         alpha.resize(n);
         alphat.resize(n);
+        rhoPrev.resize(n);
     }
 };
 

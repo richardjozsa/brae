@@ -82,6 +82,61 @@ void deviceThermoUpdate(
     cudaCheck(cudaGetLastError(), "thermoUpdate");
 }
 
+// rho = rhoPrev + a*(rho - rhoPrev), then rhoPrev = rho. Bounds are re-applied because relaxing toward a
+// previous value cannot violate them, but relaxing AWAY from a clamped value can.
+__global__
+void rhoRelaxK(
+    int n,
+    scalar a,
+    scalar rhoMin,
+    scalar rhoMax,
+    scalar* __restrict__ rho,
+    scalar* __restrict__ rhoPrev)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const scalar blended = rhoPrev[i] + a * (rho[i] - rhoPrev[i]);
+    const scalar bounded = fmin(fmax(blended, rhoMin), rhoMax);
+    rho[i] = bounded;
+    rhoPrev[i] = bounded;
+}
+
+__global__
+void rhoSeedPrevK(
+    int n,
+    const scalar* __restrict__ rho,
+    scalar* __restrict__ rhoPrev)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    rhoPrev[i] = rho[i];
+}
+
+void deviceRhoRelax(
+    DeviceThermo& th,
+    const ThermoCoeffs& c)
+{
+    if (th.n == 0) return;
+    rhoRelaxK<<<nBlocks(th.n), TPB>>>(
+        th.n,
+        c.relaxRho,
+        c.rhoMin,
+        c.rhoMax,
+        th.rho.data(),
+        th.rhoPrev.data());
+    cudaCheck(cudaGetLastError(), "rhoRelax");
+}
+
+void deviceRhoSeedPrev(DeviceThermo& th)
+{
+    if (th.n == 0) return;
+    rhoSeedPrevK<<<nBlocks(th.n), TPB>>>(
+        th.n,
+        th.rho.data(),
+        th.rhoPrev.data());
+    cudaCheck(cudaGetLastError(), "rhoSeedPrev");
+}
+
 void deviceThermoHeFromT(
     DeviceThermo& th,
     const ThermoCoeffs& c)

@@ -126,6 +126,42 @@ int main()
         failures++;
     }
 
+    // rho.relax(): rho = rhoPrev + a*(rho - rhoPrev). Checked at a=1 (must be a no-op) and a=0.3
+    // (must land exactly on the blend), because a relaxation that silently does nothing still passes
+    // every convergence test -- it just converges slower, which looks like a physics problem.
+    {
+        c.sutherland = true;
+        c.rhoMax = 1e+06;
+        deviceThermoUpdate(th, p, c);
+        std::vector<scalar> rhoNew(n);
+        th.rho.copyTo(rhoNew);
+
+        // a = 1: relaxation must not move rho at all
+        deviceRhoSeedPrev(th);
+        c.relaxRho = 1.0;
+        deviceRhoRelax(th, c);
+        std::vector<scalar> got(n);
+        th.rho.copyTo(got);
+        for (int i = 0; i < n; ++i) check("relax a=1 is a no-op", got[i], rhoNew[i], tol);
+
+        // a = 0.3 against a known previous state: rho must land on rhoPrev + a*(rhoNew - rhoPrev)
+        const scalar prev = 0.9;
+        th.rhoPrev.copyFrom(std::vector<scalar>(n, prev));
+        th.rho.copyFrom(rhoNew);
+        c.relaxRho = 0.3;
+        deviceRhoRelax(th, c);
+        th.rho.copyTo(got);
+        for (int i = 0; i < n; ++i)
+        {
+            check("relax a=0.3 blend", got[i], prev + 0.3 * (rhoNew[i] - prev), tol);
+        }
+
+        // rhoPrev must have advanced to the blended value, or the next iteration relaxes against a stale state
+        std::vector<scalar> gotPrev(n);
+        th.rhoPrev.copyTo(gotPrev);
+        for (int i = 0; i < n; ++i) check("relax advances rhoPrev", gotPrev[i], got[i], tol);
+    }
+
     std::printf("thermo_perfect_gas: %d states, %d failures\n", n, failures);
     return failures == 0 ? 0 : 1;
 }

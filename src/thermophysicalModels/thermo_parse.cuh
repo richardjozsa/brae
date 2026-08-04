@@ -120,6 +120,14 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
         c.pMin = simple->scalarOr("pMin", c.pMin);
     }
 
+    // rho.relax() factor lives under relaxationFactors.fields.rho, as in OF.
+    const FoamDict* relax = fvSolution.subDict("relaxationFactors");
+    if (relax)
+    {
+        const FoamDict* fields = relax->subDict("fields");
+        if (fields) c.relaxRho = fields->scalarOr("rho", c.relaxRho);
+    }
+
     return c;
 }
 

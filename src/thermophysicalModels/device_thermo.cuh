@@ -26,4 +26,17 @@ void deviceThermoHeFromT(
     DeviceThermo& th,
     const ThermoCoeffs& c);
 
+// OF's rho.relax(): rho = rhoPrev + relaxRho*(rho - rhoPrev), then rhoPrev = rho.
+//
+// Called AFTER deviceThermoUpdate, once per outer iteration. SIMPLE derives rho from a pressure field
+// that is itself only partly converged, so handing the raw update to the next momentum predictor makes
+// the outer loop oscillate -- badly, once psi is large. Seed rhoPrev with the initial rho (see
+// deviceRhoSeedPrev) or the first relaxation blends against zeros.
+void deviceRhoRelax(
+    DeviceThermo& th,
+    const ThermoCoeffs& c);
+
+// rhoPrev = rho. Call once after the first thermo update, before the outer loop starts relaxing.
+void deviceRhoSeedPrev(DeviceThermo& th);
+
 } // namespace brae
