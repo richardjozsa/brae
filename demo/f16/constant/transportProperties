@@ -1,0 +1,2 @@
+FoamFile { version 2.0; format ascii; class dictionary; object transportProperties; }
+transportModel Newtonian; nu 1e-4;   // Re_MAC ~ 1.7e6 (wind-tunnel-like, wall-function DES)

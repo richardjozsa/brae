@@ -1,0 +1,14 @@
+FoamFile { version 2.0; format ascii; class volVectorField; object U; }
+dimensions [0 1 -1 0 0 0 0]; internalField uniform (42.40 0 26.50);
+// AoA is imposed by angling the freestream: 50 m/s at +32 deg. The farfield must
+// let that vertical component through. `slip` forces U.n=0 on the top/bottom
+// planes, which cancels the angle of attack -- the flow measured around the
+// aircraft came out at about -15 deg instead of +32. freestreamVelocity is a
+// Robin blend (fixedValue where flow enters, zeroGradient where it leaves), so
+// an angled stream passes through instead of being turned by the boundary.
+boundaryField {
+  inlet { type fixedValue; value uniform (42.40 0 26.50); }
+  outlet { type inletOutlet; inletValue uniform (0 0 0); value uniform (42.40 0 26.50); }
+  farfield { type freestreamVelocity; freestreamValue uniform (42.40 0 26.50); value uniform (42.40 0 26.50); }
+  f16 { type noSlip; }
+}

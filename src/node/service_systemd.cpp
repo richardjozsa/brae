@@ -13,12 +13,20 @@
 #include <sstream>
 
 #include <fcntl.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 namespace brae::node {
 namespace {
+
+// The unprivileged account the unit runs as. Declared in the unit, created by ensureUser().
+constexpr const char* kServiceUser = "brae";
+
+// The one directory the service may write to. It is HOME, StateDirectory and ReadWritePaths all at once --
+// deliberately the same path, so there is nowhere the agent can write that is not this.
+constexpr const char* kStateDir = "/var/lib/brae";
 
 int runQuiet(const std::vector<std::string>& argv, std::string* captured = nullptr)
 {
@@ -62,6 +70,46 @@ class SystemdService : public ServiceManager
 public:
     SystemdService(std::string unitPath, std::string execPath)
         : unitPath_(std::move(unitPath)), execPath_(std::move(execPath)) {}
+
+    bool ensureUser(std::string& error) override
+    {
+        if (::getpwnam(kServiceUser) != nullptr) return true;      // already there; nothing to do
+
+        // A system account: no home, no login shell, no password. It exists to own a process and a state
+        // directory, nothing else. `video` and `render` are what NVML needs to see the GPU.
+        const int rc = runQuiet({"useradd", "--system", "--no-create-home",
+                                 "--shell", "/usr/sbin/nologin",
+                                 "--groups", "video,render",
+                                 "--comment", "Brae node agent", kServiceUser});
+        if (rc != 0 && ::getpwnam(kServiceUser) == nullptr)
+        {
+            error = std::string("cannot create the '") + kServiceUser + "' system user (useradd exited "
+                    + std::to_string(rc) + "); run with sudo";
+            return false;
+        }
+        return true;
+    }
+
+    bool takeOwnership(const std::string& path, std::string& error) override
+    {
+        const struct passwd* pw = ::getpwnam(kServiceUser);
+        if (pw == nullptr)
+        {
+            error = std::string("the '") + kServiceUser + "' user does not exist";
+            return false;
+        }
+        // The parent directory too: the agent has to traverse /etc/brae to reach the identity inside it.
+        const std::size_t slash = path.find_last_of('/');
+        if (slash != std::string::npos)
+            ::chown(path.substr(0, slash).c_str(), pw->pw_uid, pw->pw_gid);
+        if (::chown(path.c_str(), pw->pw_uid, pw->pw_gid) != 0)
+        {
+            error = "cannot give " + path + " to " + kServiceUser + ": " + std::strerror(errno);
+            return false;
+        }
+        ::chmod(path.c_str(), 0600);            // still readable only by its owner -- now the right owner
+        return true;
+    }
 
     bool install(std::string& error) override
     {
@@ -131,6 +179,11 @@ private:
              "User=brae\n"
              "Group=brae\n"
              "ExecStart=" << execPath_ << " run\n"
+             // HOME, explicitly. Without it systemd uses the account's passwd home -- /home/brae -- which
+             // ProtectHome=true then makes invisible to the very service that needs it. The solver caches
+             // benchmark samples under $HOME/.cache/brae, so every job failed with solver_exit_1 while the
+             // same command run by hand succeeded. Point it at the StateDirectory, which is already writable.
+             "Environment=HOME=" << kStateDir << "\n"
              "Restart=always\n"
              "RestartSec=5\n"
              "\n"
@@ -144,7 +197,7 @@ private:
              "RestrictSUIDSGID=true\n"
              "LockPersonality=true\n"
              "MemoryDenyWriteExecute=false\n"   // NVRTC compiles device code at run time
-             "ReadWritePaths=/var/lib/brae\n"
+             "ReadWritePaths=" << kStateDir << "\n"
              "StateDirectory=brae\n"
              "SupplementaryGroups=video render\n"
              "\n"
@@ -160,6 +213,10 @@ private:
 class NoopService : public ServiceManager
 {
 public:
+    // --no-service: a developer running the agent in the foreground as themselves. Creating a system account
+    // and reassigning their identity file would be a surprise, so both are no-ops here.
+    bool ensureUser(std::string&) override { return true; }
+    bool takeOwnership(const std::string&, std::string&) override { return true; }
     bool install(std::string&) override { return true; }
     bool start(std::string&) override { return true; }
     bool stopAndRemove(std::string&) override { return true; }
@@ -171,6 +228,31 @@ public:
 std::unique_ptr<ServiceManager> makeSystemdService(const std::string& unitPath, const std::string& execPath)
 {
     return std::make_unique<SystemdService>(unitPath, execPath);
+}
+
+std::string systemInstallDir()
+{
+    return "/usr/local/bin";
+}
+
+bool isServiceReachablePath(const std::string& path)
+{
+    // A prefix test rather than an access() probe, because access() answers for whoever is asking -- and the
+    // caller is root, for whom everything is reachable. The question is whether the *service* can reach it
+    // after ProtectHome=true and ProtectSystem=strict, and that is decided by where the path is, not by us.
+    if (path.empty() || path.front() != '/') return false;
+
+    auto under = [&path](const char* prefix) {
+        const std::string p(prefix);
+        return path.size() > p.size() && path.compare(0, p.size(), p) == 0;
+    };
+
+    // ProtectHome=true hides these outright.
+    if (under("/home/") || under("/root/") || under("/Users/")) return false;
+
+    // Everything the service can still see and execute. /tmp is excluded on purpose: PrivateTmp=true gives the
+    // unit its own empty /tmp, so a binary there would vanish from under it.
+    return under("/usr/") || under("/opt/") || under("/srv/") || under("/var/lib/brae/");
 }
 
 std::unique_ptr<ServiceManager> makeNoopService()

@@ -34,14 +34,17 @@ Testing/
 __pycache__/
 *.pyc
 
-# demo: case DATA is regenerated (meshes, time dirs, renders) and stays untracked. The delta demo is
-# dictionaries + README only -- no STL (licence) and no mesh, so it is small enough to track.
-demo/*
-!demo/delta/
+# demo: track the scripts and READMEs, not the regenerated case data.
+# run_all.sh rebuilds case1024/case1M/out from scratch (~300 MB).
+demo/amgpcg/case1024/
+demo/amgpcg/case1M/
+demo/amgpcg/out/
+
+# delta: dictionaries + README only. The mesh, the time directories and the STL (licence unknown, see
+# the case README) are all regenerated or user-supplied, so none of them are tracked.
 demo/delta/[0-9]*/
 !demo/delta/0.orig/
 demo/delta/constant/polyMesh/
 demo/delta/constant/extendedFeatureEdgeMesh/
 demo/delta/constant/triSurface/*
 !demo/delta/constant/triSurface/README
-demo/delta/0/

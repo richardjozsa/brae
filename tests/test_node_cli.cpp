@@ -55,12 +55,29 @@ public:
 class FakeService : public ServiceManager
 {
 public:
+    bool failEnsureUser = false;
+    bool failTakeOwnership = false;
+    bool userCreated = false;
+    std::vector<std::string> owned;
     bool failInstall = false;
     bool failStart = false;
     bool installed = false;
     bool started = false;
     int removeCalls = 0;
 
+    bool ensureUser(std::string& error) override
+    {
+        if (failEnsureUser) { error = "useradd failed"; return false; }
+        userCreated = true;
+        return true;
+    }
+    bool takeOwnership(const std::string& path, std::string& error) override
+    {
+        if (failTakeOwnership) { error = "chown failed"; return false; }
+        if (!userCreated) { error = "ownership handed over before the user existed"; return false; }
+        owned.push_back(path);
+        return true;
+    }
     bool install(std::string& error) override
     {
         if (failInstall) { error = "cannot write the unit file"; return false; }
@@ -212,6 +229,42 @@ static void testApi500LeavesNothing()
     check(!h.service.installed, "atomic: no service after a 500");
 }
 
+static void testTheServiceAccountIsPreparedForTheDaemon()
+{
+    // The bug this covers: `register` runs under sudo, so the identity is written by root, while the daemon
+    // runs as an unprivileged user. Without creating that user and handing the file over, the unit installs
+    // cleanly and then dies on every start with "no identity" -- which reads as a broken agent.
+    Harness h;
+    h.http.reply(201, kGoodRegister);
+    check(cmdRegister(h.deps(), "brae_ent_x") == 0, "service account: registration succeeds");
+    check(h.service.userCreated, "service account: the account the unit runs as is created");
+    check(h.service.owned.size() == 1 && h.service.owned[0] == h.identityPath,
+          "service account: the node identity is handed to it, so the daemon can read its own token");
+}
+
+static void testServiceAccountFailureRollsBack()
+{
+    {
+        Harness h;
+        h.http.reply(201, kGoodRegister);
+        h.service.failEnsureUser = true;
+        check(cmdRegister(h.deps(), "brae_ent_x") != 0, "atomic: a service account that cannot be created fails");
+        check(!h.identityExists(), "atomic: identity removed after an account failure");
+        check(h.http.countTo("/unregister") == 1, "atomic: registration undone after an account failure");
+        check(!h.service.installed, "atomic: no unit installed when the account could not be made");
+    }
+    {
+        Harness h;
+        h.http.reply(201, kGoodRegister);
+        h.service.failTakeOwnership = true;
+        check(cmdRegister(h.deps(), "brae_ent_x") != 0, "atomic: an identity that cannot be handed over fails");
+        check(!h.identityExists(), "atomic: identity removed after an ownership failure");
+        check(h.http.countTo("/unregister") == 1, "atomic: registration undone after an ownership failure");
+        check(!h.service.installed,
+              "atomic: the unit is never installed pointing at an identity the daemon cannot read");
+    }
+}
+
 static void testServiceFailureRollsBack()
 {
     // The interesting one: registration SUCCEEDED server-side, then the service could not start. The node row
@@ -342,6 +395,35 @@ static void testUnregisterWhenNotRegistered()
     check(cmdUnregister(h.deps()) != 0, "unregister: refuses when there is nothing to remove");
 }
 
+
+// A unit whose ExecStart the service cannot reach never starts. `brae node register` installed exactly that:
+// ExecStart pointed into the build tree under $HOME, the unit sets ProtectHome=true, and systemd looped on
+// 203/EXEC over a thousand times while `node status` said "activating" and the registry said OFFLINE.
+static void testHomePathsAreNotServiceReachable()
+{
+    check(!isServiceReachablePath("/home/ghost/cudafoam/brae/build/brae-agent"),
+          "a build tree under /home is not reachable by the hardened unit");
+    check(!isServiceReachablePath("/root/brae/build/brae-agent"),
+          "/root is not reachable either -- ProtectHome hides it too");
+    check(!isServiceReachablePath("/tmp/brae-agent"),
+          "/tmp is not reachable: PrivateTmp gives the unit its own empty one");
+    check(!isServiceReachablePath("build/brae-agent"), "a relative path is refused");
+    check(!isServiceReachablePath(""), "an empty path is refused");
+}
+
+static void testSystemPathsAreServiceReachable()
+{
+    // The negative control. If this fails everything gets copied on every register, which would be wrong in
+    // the opposite direction -- silently overwriting an installed binary from whatever tree you happened to
+    // build in.
+    check(isServiceReachablePath("/usr/local/bin/brae-agent"), "/usr/local/bin is reachable");
+    check(isServiceReachablePath("/usr/bin/brae-agent"), "/usr/bin is reachable");
+    check(isServiceReachablePath("/opt/brae/brae-agent"), "/opt is reachable");
+    check(isServiceReachablePath("/var/lib/brae/brae-agent"), "the unit's own StateDirectory is reachable");
+    check(isServiceReachablePath(systemInstallDir() + "/brae-agent"),
+          "whatever we install into must itself be reachable");
+}
+
 int main()
 {
     char dir[] = "/tmp/brae-cli-testXXXXXX";
@@ -351,8 +433,12 @@ int main()
     testRegisterSucceeds();
     testNoGpuIsRefused();
     testDriverButNoUsableGpu();
+    testHomePathsAreNotServiceReachable();
+    testSystemPathsAreServiceReachable();
     testApiRefusalLeavesNothing();
     testApi500LeavesNothing();
+    testTheServiceAccountIsPreparedForTheDaemon();
+    testServiceAccountFailureRollsBack();
     testServiceFailureRollsBack();
     testInstallFailureRollsBack();
     testUnsavableIdentityRollsBack();

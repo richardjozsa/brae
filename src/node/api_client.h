@@ -24,6 +24,10 @@ struct GpuIdentity
     std::string computeCapability;
     std::string driverVersion;
     std::string uuidHash;          // sha256 of the UUID; the raw value never leaves gpu_probe
+    // Both 0 when NVML does not report them, which is normal on older drivers and inside some containers. The
+    // wire format sends them only when they are real, so the server stores null rather than a fake zero.
+    int powerLimitW = 0;           // board power limit, watts
+    int cudaCores = 0;               // CUDA cores, not SMs: nvmlDeviceGetNumGpuCores returns cores
 };
 
 struct GpuState
@@ -39,6 +43,11 @@ struct RegisterRequest
 {
     std::string displayName, operatingSystem, architecture, agentVersion, braeVersion;
     std::vector<GpuIdentity> gpus;
+    // Mesh size is bound by host RAM as much as by VRAM: a 122 GB card behind 16 GB of system memory cannot
+    // load the cases it looks like it should. 0 when it could not be read.
+    int systemRamMb = 0;
+    // IANA zone, e.g. "Europe/Berlin". The server derives the country; we never send one ourselves.
+    std::string timezone;
 };
 
 struct RegisterResult
@@ -84,6 +93,21 @@ struct SnapshotResult
     Assignment assignment;
 };
 
+/// A job as the operator sees it. Enough to say what happened, not enough to be a second copy of the schema.
+struct JobView
+{
+    bool ok = false;
+    std::string error;
+    std::string jobId;
+    std::string state;             // queued | assigned | running | completed | failed | abandoned
+    std::string sample;
+    std::string nodeId;            // empty until a machine takes it
+    std::string requestedGpuModel;
+    std::string jobError;          // the failure the node reported, if any
+    bool terminal = false;         // completed, failed or abandoned: nothing more will change
+};
+
+
 struct SimpleResult
 {
     bool ok = false;
@@ -108,6 +132,7 @@ std::string buildResultBody(const JobOutcome& o, const std::string& startedAt, c
 
 // Parsers take the raw response and never throw.
 RegisterResult parseRegisterResponse(const HttpResponse& res);
+JobView parseJobView(const HttpResponse& res);
 SnapshotResult parseSnapshotResponse(const HttpResponse& res);
 SimpleResult parseSimpleResponse(const HttpResponse& res);
 
@@ -118,6 +143,8 @@ public:
 
     RegisterResult registerNode(const RegisterRequest& r, const std::string& enrollmentToken);
     SnapshotResult sendSnapshot(const std::string& nodeId, const std::string& token, const SnapshotRequest& s);
+    JobView queueJob(const std::string& sample, const std::string& gpu, const std::string& adminToken);
+    JobView getJob(const std::string& jobId, const std::string& adminToken);
     SimpleResult acceptJob(const std::string& nodeId, const std::string& token, const std::string& jobId);
     SimpleResult reportResult(const std::string& nodeId, const std::string& token, const JobOutcome& o,
                               const std::string& startedAt, const std::string& finishedAt);

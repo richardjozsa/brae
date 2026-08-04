@@ -1,0 +1,40 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version         2;
+    format          ascii;
+    class           dictionary;
+    object          fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+solvers
+{
+    // GAMG exactly as OpenFOAM ships it: standalone multigrid, V(0,2) Gauss-Seidel,
+    // faceAreaPair agglomeration. nCellsInCoarsestLevel 4 so a 20-cell mesh still
+    // builds a real hierarchy (20 -> 10 -> 5 -> ...) instead of stopping immediately.
+    T
+    {
+        solver              GAMG;
+        tolerance           1e-10;
+        relTol              0;
+        smoother            GaussSeidel;
+        agglomerator        faceAreaPair;
+        nCellsInCoarsestLevel 4;
+        mergeLevels         1;
+        cacheAgglomeration  true;
+        directSolveCoarsest true;
+        nPreSweeps          0;
+        nPostSweeps         2;
+        nFinestSweeps       2;
+        maxIter             1000;
+    }
+}
+
+// ************************************************************************* //

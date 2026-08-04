@@ -25,6 +25,10 @@ std::string buildRegisterBody(const RegisterRequest& r)
     j.set("architecture", Json::str(r.architecture));
     j.set("agent_version", Json::str(r.agentVersion));
     j.set("brae_version", Json::str(r.braeVersion));
+    // Omitted rather than sent as 0 when unknown: the server stores null, and "unknown" and "zero watts" are
+    // different facts. An older server that does not know the field ignores it either way.
+    if (r.systemRamMb > 0) j.set("system_ram_mb", Json::num(r.systemRamMb));
+    if (!r.timezone.empty()) j.set("timezone", Json::str(r.timezone));
 
     Json gpus = Json::array();
     for (const GpuIdentity& g : r.gpus)
@@ -36,6 +40,8 @@ std::string buildRegisterBody(const RegisterRequest& r)
         e.set("compute_capability", Json::str(g.computeCapability));
         e.set("driver_version", Json::str(g.driverVersion));
         e.set("uuid_hash", Json::str(g.uuidHash));      // never the raw UUID; see gpu_probe
+        if (g.powerLimitW > 0) e.set("power_limit_w", Json::num(g.powerLimitW));
+        if (g.cudaCores > 0) e.set("cuda_cores", Json::num(g.cudaCores));
         gpus.push(std::move(e));
     }
     j.set("gpus", std::move(gpus));
@@ -211,6 +217,44 @@ SimpleResult parseSimpleResponse(const HttpResponse& res)
 
 // ---- calls --------------------------------------------------------------------------------------------------
 
+JobView parseJobView(const HttpResponse& res)
+{
+    JobView v;
+    if (!res.ok())
+    {
+        // The message, not the code: this one is read by a person at a terminal, and "'gb' is too short"
+        // helps where "invalid_request" does not. Falls back to the code, then to the status.
+        Json j;
+        std::string parseError;
+        if (!res.transportFailed() && Json::parse(res.body, j, parseError)
+            && j["error"].type() == Json::Type::Object)
+        {
+            const std::string message = j["error"]["message"].asString();
+            v.error = message.empty() ? transportOrStatus(res) : message;
+        }
+        else
+        {
+            v.error = transportOrStatus(res);
+        }
+        return v;
+    }
+
+    Json j;
+    std::string err;
+    if (!Json::parse(res.body, j, err)) { v.error = "unreadable job reply: " + err; return v; }
+
+    v.ok = true;
+    v.jobId = j["job_id"].asString();
+    v.state = j["state"].asString();
+    v.sample = j["sample"].asString();
+    v.nodeId = j["node_id"].asString();
+    v.requestedGpuModel = j["requested_gpu_model"].asString();
+    v.jobError = j["error"].asString();
+    v.terminal = v.state == "completed" || v.state == "failed" || v.state == "abandoned";
+    return v;
+}
+
+
 RegisterResult ApiClient::registerNode(const RegisterRequest& r, const std::string& enrollmentToken)
 {
     HttpRequest req;
@@ -232,6 +276,29 @@ SnapshotResult ApiClient::sendSnapshot(const std::string& nodeId, const std::str
     req.bearer = token;
     req.timeoutSeconds = 15;                      // must be well under the offline threshold
     return parseSnapshotResponse(http_.send(req));
+}
+
+JobView ApiClient::queueJob(const std::string& sample, const std::string& gpu, const std::string& adminToken)
+{
+    Json body = Json::object();
+    body.set("sample", Json::str(sample));
+    if (!gpu.empty()) body.set("gpu", Json::str(gpu));
+
+    HttpRequest req;
+    req.method = "POST";
+    req.url = urlJoin(base_, "/v1/jobs");
+    req.body = body.dump();
+    req.bearer = adminToken;
+    return parseJobView(http_.send(req));
+}
+
+JobView ApiClient::getJob(const std::string& jobId, const std::string& adminToken)
+{
+    HttpRequest req;
+    req.method = "GET";
+    req.url = urlJoin(base_, "/v1/jobs/" + jobId);
+    req.bearer = adminToken;
+    return parseJobView(http_.send(req));
 }
 
 SimpleResult ApiClient::acceptJob(const std::string& nodeId, const std::string& token, const std::string& jobId)

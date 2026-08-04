@@ -1,0 +1,89 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version         2;
+    format          ascii;
+    class           dictionary;
+    object          blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// The demo mesh: 4 cells in x, 5 in y, 1 in z = 20 cells, 2D (front/back empty).
+// Small enough that the 20x20 matrix, the agglomeration, and every smoothing sweep
+// fit on one video frame; large enough to build a 3-level hierarchy (20 -> 10 -> 5).
+
+scale   1;
+
+vertices
+(
+    (0 0 0)
+    (4 0 0)
+    (4 5 0)
+    (0 5 0)
+    (0 0 1)
+    (4 0 1)
+    (4 5 1)
+    (0 5 1)
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) (4 5 1) simpleGrading (1 1 1)
+);
+
+edges
+(
+);
+
+boundary
+(
+    left
+    {
+        type            patch;
+        faces
+        (
+            (0 4 7 3)
+        );
+    }
+    right
+    {
+        type            patch;
+        faces
+        (
+            (1 2 6 5)
+        );
+    }
+    bottom
+    {
+        type            patch;
+        faces
+        (
+            (0 1 5 4)
+        );
+    }
+    top
+    {
+        type            patch;
+        faces
+        (
+            (3 7 6 2)
+        );
+    }
+    frontAndBack
+    {
+        type            empty;
+        faces
+        (
+            (0 3 2 1)
+            (4 5 6 7)
+        );
+    }
+);
+
+// ************************************************************************* //

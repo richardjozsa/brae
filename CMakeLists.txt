@@ -1370,6 +1370,27 @@ set_target_properties(test_node_loop PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME node_loop COMMAND test_node_loop)
 set_tests_properties(node_loop PROPERTIES TIMEOUT 120)
 
+# `brae node register | status | unregister`, against a fake API and a fake service manager. The criterion is
+# atomicity: each step of registration is made to fail in turn -- the GPU probe, the API, the identity write,
+# the service account, the ownership hand-over, the unit install, the start -- and each must leave no identity
+# file, no service and no registry row behind.
+add_executable(test_node_cli tests/test_node_cli.cpp
+               src/node/cli.cpp src/node/api_client.cpp src/node/json.cpp src/node/jobs.cpp
+               src/node/identity.cpp src/node/gpu_probe.cpp src/node/sha256.cpp
+               # for isServiceReachablePath: the rule that decides whether the unit can start at all
+               src/node/service_systemd.cpp)
+target_include_directories(test_node_cli PRIVATE src/node)
+target_link_libraries(test_node_cli PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(test_node_cli PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME node_cli COMMAND test_node_cli)
+
+# `brae run` against a stub control plane: argv, where the admin token comes from, what is actually sent, and
+# what a failure looks like to someone at a terminal.
+add_test(NAME brae_run
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_run.sh $<TARGET_FILE:brae> python3)
+set_tests_properties(brae_run PROPERTIES TIMEOUT 120)
+set_tests_properties(node_cli PROPERTIES TIMEOUT 60)
+
 # The real transport, against a deliberately awkward local server: a redirect that would leak the bearer token,
 # a body that never ends, a server that stalls, a proxy's HTML error page. Guarded on libcurl so a machine
 # without the headers still builds and tests everything else -- the agent's behaviour is covered above the
@@ -1463,3 +1484,26 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo/amgpcg/trace_brae.cu")
     target_include_directories(trace_brae PRIVATE ${BRAE_HEADER_DIRS})
     target_link_libraries(trace_brae PRIVATE brae_core)
 endif()
+
+# ---- install ---------------------------------------------------------------------------------------------------
+#
+#   sudo cmake --install build
+#
+# All of them, together. Installing by hand cost three separate outages in one week: an agent without the
+# telemetry it was supposed to send, a `brae` that could not find `brae_pimpleFoam` beside it, and a `brae` that
+# had never heard of the `job` subcommand. Every one of them looked like a server bug from the outside, because
+# the binary that ran was older than the code that was tested.
+#
+# They travel as a set on purpose: `brae` dispatches a case to `brae_<solver>` as its own sibling, and
+# `brae-agent` execs `brae` the same way, so a mixed-version bin directory fails at the moment work arrives
+# rather than at install time.
+# Keep the library search path on the way out. CMake strips the build RPATH at install time and replaces it
+# with INSTALL_RPATH, which is empty by default -- so the first `cmake --install` produced binaries that could
+# not find libnvshmem_host.so.3 and failed for every user, not only under sudo. USE_LINK_PATH carries the
+# directories of the libraries actually linked (NVSHMEM, OpenMPI) into the installed binary.
+foreach(exe IN ITEMS brae brae-agent brae_simpleFoam brae_pimpleFoam)
+    if(TARGET ${exe})
+        set_target_properties(${exe} PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
+        install(TARGETS ${exe} RUNTIME DESTINATION bin)
+    endif()
+endforeach()
