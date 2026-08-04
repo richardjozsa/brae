@@ -1437,3 +1437,26 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo/amgpcg/trace_brae.cu")
     target_include_directories(trace_brae PRIVATE ${BRAE_HEADER_DIRS})
     target_link_libraries(trace_brae PRIVATE brae_core)
 endif()
+
+# ---- install ---------------------------------------------------------------------------------------------------
+#
+#   sudo cmake --install build
+#
+# All of them, together. Installing by hand cost three separate outages in one week: an agent without the
+# telemetry it was supposed to send, a `brae` that could not find `brae_pimpleFoam` beside it, and a `brae` that
+# had never heard of the `job` subcommand. Every one of them looked like a server bug from the outside, because
+# the binary that ran was older than the code that was tested.
+#
+# They travel as a set on purpose: `brae` dispatches a case to `brae_<solver>` as its own sibling, and
+# `brae-agent` execs `brae` the same way, so a mixed-version bin directory fails at the moment work arrives
+# rather than at install time.
+# Keep the library search path on the way out. CMake strips the build RPATH at install time and replaces it
+# with INSTALL_RPATH, which is empty by default -- so the first `cmake --install` produced binaries that could
+# not find libnvshmem_host.so.3 and failed for every user, not only under sudo. USE_LINK_PATH carries the
+# directories of the libraries actually linked (NVSHMEM, OpenMPI) into the installed binary.
+foreach(exe IN ITEMS brae brae-agent brae_simpleFoam brae_pimpleFoam)
+    if(TARGET ${exe})
+        set_target_properties(${exe} PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
+        install(TARGETS ${exe} RUNTIME DESTINATION bin)
+    endif()
+endforeach()

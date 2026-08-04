@@ -24,6 +24,10 @@ namespace {
 // The unprivileged account the unit runs as. Declared in the unit, created by ensureUser().
 constexpr const char* kServiceUser = "brae";
 
+// The one directory the service may write to. It is HOME, StateDirectory and ReadWritePaths all at once --
+// deliberately the same path, so there is nowhere the agent can write that is not this.
+constexpr const char* kStateDir = "/var/lib/brae";
+
 int runQuiet(const std::vector<std::string>& argv, std::string* captured = nullptr)
 {
     int pipefd[2] = {-1, -1};
@@ -175,6 +179,11 @@ private:
              "User=brae\n"
              "Group=brae\n"
              "ExecStart=" << execPath_ << " run\n"
+             // HOME, explicitly. Without it systemd uses the account's passwd home -- /home/brae -- which
+             // ProtectHome=true then makes invisible to the very service that needs it. The solver caches
+             // benchmark samples under $HOME/.cache/brae, so every job failed with solver_exit_1 while the
+             // same command run by hand succeeded. Point it at the StateDirectory, which is already writable.
+             "Environment=HOME=" << kStateDir << "\n"
              "Restart=always\n"
              "RestartSec=5\n"
              "\n"
@@ -188,7 +197,7 @@ private:
              "RestrictSUIDSGID=true\n"
              "LockPersonality=true\n"
              "MemoryDenyWriteExecute=false\n"   // NVRTC compiles device code at run time
-             "ReadWritePaths=/var/lib/brae\n"
+             "ReadWritePaths=" << kStateDir << "\n"
              "StateDirectory=brae\n"
              "SupplementaryGroups=video render\n"
              "\n"
