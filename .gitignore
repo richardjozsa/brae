@@ -34,4 +34,14 @@ Testing/
 __pycache__/
 *.pyc
 
-demo/
+# demo: case DATA is regenerated (meshes, time dirs, renders) and stays untracked. The delta demo is
+# dictionaries + README only -- no STL (licence) and no mesh, so it is small enough to track.
+demo/*
+!demo/delta/
+demo/delta/[0-9]*/
+!demo/delta/0.orig/
+demo/delta/constant/polyMesh/
+demo/delta/constant/extendedFeatureEdgeMesh/
+demo/delta/constant/triSurface/*
+!demo/delta/constant/triSurface/README
+demo/delta/0/

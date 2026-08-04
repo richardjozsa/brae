@@ -66,6 +66,20 @@ void deviceSolveEnergy(
     int checkEvery,
     bool useGS,
     DeviceAMI* ami = nullptr,
-    DeviceCyclic* cyc = nullptr);
+    DeviceCyclic* cyc = nullptr,
+    const DeviceBuffer<scalar>* kineticSrc = nullptr);   // V*div(phi,K); see deviceEnergyKineticSource
+
+// V*div(phi, K) with K = 0.5|U|^2, upwind-interpolated and "bounded" exactly as OF's
+// div(phi,K) bounded Gauss upwind is. OF's rhoSimpleFoam EEqn.H carries this term next to div(phi,he);
+// omitting it is only harmless when the flow is slow enough that K << he.
+void deviceEnergyKineticSource(
+    const DeviceMesh& dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& phiBnd,
+    DeviceBuffer<scalar>& src);
 
 } // namespace brae

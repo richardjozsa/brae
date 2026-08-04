@@ -210,6 +210,84 @@ void deviceThermoRhoBoundary(
     cudaCheck(cudaGetLastError(), "rhoBoundary");
 }
 
+// mu_b = Sutherland(T_b), face by face -- OF's transport_.mu(patchi).
+//
+// Needed because the compressible momentum boundary wants muEff_b = mu_b + rho_b*nut_b, and the wall
+// functions want the KINEMATIC nu_b = mu_b/rho_b. Both are per-face: a single scalar viscosity is only
+// right for a constant-property incompressible case.
+__global__
+void muBoundaryK(
+    int n,
+    ThermoCoeffs c,
+    const scalar* __restrict__ heBnd,
+    scalar* __restrict__ muBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    muBnd[i] = transportMu(hConstHeToT(heBnd[i], c), c);
+}
+
+void deviceThermoMuBoundary(
+    const DeviceBoundary& dbHe,
+    const DeviceBuffer<scalar>& he,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& muBnd)
+{
+    if (dbHe.n == 0) return;
+    DeviceBuffer<scalar> heBnd;
+    deviceBCValue(dbHe, he, heBnd);
+    muBnd.resize(dbHe.n);
+    muBoundaryK<<<nBlocks(dbHe.n), TPB>>>(
+        dbHe.n,
+        c,
+        heBnd.data(),
+        muBnd.data());
+    cudaCheck(cudaGetLastError(), "muBoundary");
+}
+
+// nu_b = mu_b/rho_b, face by face -- OF turbulenceModel::nu(patchi), which is literally
+// transport_.mu(patchi)/rho_.boundaryField()[patchi]. Every OF wall function reads this, so brae's wall
+// functions need it too: in compressible flow it is a field, not the single number a constant-property
+// incompressible case can get away with.
+__global__
+void nuBoundaryK(
+    int n,
+    ThermoCoeffs c,
+    const scalar* __restrict__ pBnd,
+    const scalar* __restrict__ heBnd,
+    scalar* __restrict__ nuBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const scalar Tb = hConstHeToT(heBnd[i], c);
+    const scalar pb = fmax(pBnd[i], c.pMin);
+    const scalar rb = fmin(fmax(pb / (c.R * Tb), c.rhoMin), c.rhoMax);
+    nuBnd[i] = transportMu(Tb, c) / rb;
+}
+
+void deviceThermoNuBoundary(
+    const DeviceBoundary& dbP,
+    const DeviceBuffer<scalar>& p,
+    const DeviceBoundary& dbHe,
+    const DeviceBuffer<scalar>& he,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& nuBnd)
+{
+    if (dbP.n == 0) return;
+    DeviceBuffer<scalar> pBnd;
+    DeviceBuffer<scalar> heBnd;
+    deviceBCValue(dbP, p, pBnd);
+    deviceBCValue(dbHe, he, heBnd);
+    nuBnd.resize(dbP.n);
+    nuBoundaryK<<<nBlocks(dbP.n), TPB>>>(
+        dbP.n,
+        c,
+        pBnd.data(),
+        heBnd.data(),
+        nuBnd.data());
+    cudaCheck(cudaGetLastError(), "nuBoundary");
+}
+
 void deviceThermoHeFromT(
     DeviceThermo& th,
     const ThermoCoeffs& c)

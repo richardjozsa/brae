@@ -168,7 +168,8 @@ void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, c
 // true wall eddy viscosity for the momentum boundary nuEff (vs the cell-value approximation).
 void deviceBoundaryNut(const DeviceBoundary& db, const DeviceBuffer<label>& isWall, const DeviceBuffer<scalar>& y,
                        const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& nut, scalar nu, DeviceBuffer<scalar>& nutBnd,
-                       const KEpsilonCoeffs& co = {}, scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction
+                       const KEpsilonCoeffs& co = {}, scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction
+                       const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 // The full device kEpsilon::correct(): production -> wall functions/override -> eps eqn (with the wall
 // setValues constraint) -> k eqn -> correctNut. Updates k/eps/nut in place. Mirrors the CPU correct().
@@ -208,8 +209,16 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const ScalarDdt& kDdt = {}, const ScalarDdt& sDdt = {},   // transient fvm::ddt(k)/ddt(omega)
                             bool des = false,   // kOmegaSSTDDES: DES limiter on the k destruction
                             bool iddes = false,   // kOmegaSSTIDDES: the improved (WMLES) length scale (needs hmax+hwn)
-                            const DeviceBuffer<scalar>* hmax = nullptr,   // per-cell maxDeltaxyz (IDDES delta); null -> DDES cubeRootVol
-                            const DeviceBuffer<scalar>* hwn = nullptr);   // per-cell wall-normal spacing (IDDES delta 3rd term)
+                            const DeviceBuffer<scalar>* hmax = nullptr,   // per-cell maxDeltaxyz (IDDES delta,
+                                                                          // null -> DDES cubeRootVol
+                            const DeviceBuffer<scalar>* hwn = nullptr,   // per-cell wall-normal spacing (IDDES delta 3rd term)
+                            const DeviceBuffer<scalar>* rho = nullptr,   // compressible: rho-weight reactions + diffusivity
+                            const DeviceBuffer<scalar>* muLam = nullptr,   // compressible: laminar DYNAMIC viscosity mu [Pa s]
+                            const DeviceBuffer<scalar>* nuWallFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+
+// nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
+void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
+                        DeviceBuffer<scalar>& nuWall);
 
 // kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition) extra step: after the SST k/omega solve, transport ReThetat
 // and gammaInt and update gammaIntEff (fed back into the SST k equation next iteration). See PORTING_KOMEGASSTLM.md.
@@ -271,13 +280,15 @@ void deviceBoundaryNutSpalding(const DeviceVectorBoundary& dbU, const DeviceBuff
                                const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
                                const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                const DeviceBuffer<scalar>& nutCell, scalar nu, const SpalartAllmarasCoeffs& co,
-                               DeviceBuffer<scalar>& nutBnd);
+                               DeviceBuffer<scalar>& nutBnd,
+                               const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 // nutUBlendedWallFunction wall nut (velocity-based binomial n=4 blend); kappa/E explicit (any RAS model).
 void deviceBoundaryNutBlended(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
                               const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
                               const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                               const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
-                              DeviceBuffer<scalar>& nutBnd);
+                              DeviceBuffer<scalar>& nutBnd,
+                              const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 } // namespace brae

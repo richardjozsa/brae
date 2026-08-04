@@ -128,6 +128,26 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
         if (fields) c.relaxRho = fields->scalarOr("rho", c.relaxRho);
     }
 
+    // Prt, exactly where OF looks for it: the turbulence model's own coeffs dict
+    // (EddyDiffusivity::correctNut -> Prt_.readIfPresent(this->coeffDict())). Absent, OF's 1.0 stands.
+    // OF names the dict after the model, e.g. RAS { RASModel kOmegaSST; kOmegaSSTCoeffs { Prt 0.85; } }.
+    try
+    {
+        const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
+        for (const char* sub : {"RAS", "LES"})
+        {
+            const FoamDict* d = turbProps.subDict(sub);
+            if (!d) continue;
+            const std::string model = d->wordOr(std::string(sub) + "Model", "");
+            const FoamDict* coeffs = model.empty() ? nullptr : d->subDict(model + "Coeffs");
+            if (coeffs) c.Prt = coeffs->scalarOr("Prt", c.Prt);
+        }
+    }
+    catch (const std::exception&)
+    {
+        // No turbulenceProperties (a laminar case may omit it): alphat is zero anyway, so Prt is unused.
+    }
+
     return c;
 }
 

@@ -36,6 +36,20 @@ namespace brae {
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
         dbP_  = buildDeviceBoundary(p, fvp, g);
         wall_ = buildDeviceWallData(m, g, fvp, U);
+        {
+            // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping type=="wall" patches;
+            // DeviceBoundary walks the same fvp skipping cyclic/cyclicAMI (a wall is neither), so the wall
+            // faces are a subsequence of the boundary faces and this map is just the running count.
+            std::vector<label> wfb;
+            label bi = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                for (label i = 0; i < fvp[pi].size; ++i, ++bi)
+                    if (fvp[pi].type == "wall") wfb.push_back(bi);
+            }
+            if (!wfb.empty()) wfBndIdx_.copyFrom(wfb);
+        }
         // all-extrapolated boundary -> gathers a cell field to boundary faces (nuEff_bnd = adjacent cell value)
         {
             std::vector<label> ty, fc;
@@ -313,7 +327,10 @@ namespace brae {
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
                                        static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
                                        ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
-                                       kDdt, sDdt, ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // ddt(k)/ddt(omega) + kOmegaSSTDDES/IDDES DES limiter (no-op for RANS)
+                                       kDdt, sDdt, ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr,   // ddt(k)/ddt(omega) + kOmegaSSTDDES/IDDES DES limiter (no-op for RANS)
+                                       compressible_ ? &th_.rho : nullptr,   // rho-weight every k/omega term, as OF's alpha*rho* does
+                                       compressible_ ? &th_.mu : nullptr,   // laminar dynamic mu; F1/F2 get nu = mu/rho from it
+                                       (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr);   // nu at WALL faces for omegaWallFunction/G0
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
@@ -399,12 +416,36 @@ namespace brae {
         }
 
         DeviceBuffer<scalar> nuEff;
-        deviceCopy(nuEff, dnut_);
-        deviceAxpy(1.0, nuConst_, nuEff);   // nuEff = nu + nut
+        if (compressible_)
+            // muEff = mu + rho*nut. OF assembles the stress as rho*nuEff() (linearViscousStress.C), and for a
+            // compressible model nuEff() = nut() + mu/rho, so rho*nuEff() = rho*nut + mu = mut + mu
+            // (CompressibleTurbulenceModel::muEff). dnut_ stays KINEMATIC -- the SST solves for it, every wall
+            // function compares it against nu, and alphat = rho*nut/Prt reads it -- so the rho belongs here.
+            deviceHadamard(nuEff, th_.rho, dnut_);
+        else
+            deviceCopy(nuEff, dnut_);
+        deviceAxpy(1.0, nuConst_, nuEff);   // + nu (incompressible) / + mu (compressible, nuConst_ = th_.mu)
         DeviceBuffer<scalar> nuEff_f;
         deviceInterpolate(dm, nuEff, nuEff_f);
         // nuEff at boundary FACES: turbulent uses the TRUE wall nut (nutkWallFunction), not the cell value, so the
         // wall shear matches OpenFOAM; laminar/non-wall faces use the adjacent cell value.
+        // Boundary turbulent viscosity into muEff_b. OF: mut(patchi) = rho.boundaryField()[patchi]*nut(patchi),
+        // so the wall nut -- which every wall function returns KINEMATIC -- is rho_b-weighted here, exactly as
+        // the cell value is above. Incompressible keeps the plain sum.
+        auto addWallNutToMuEff =
+            [&](const DeviceBuffer<scalar>& nutB,
+                DeviceBuffer<scalar>& muEffB)
+            {
+                if (!compressible_)
+                {
+                    deviceAxpy(1.0, nutB, muEffB);
+                    return;
+                }
+                DeviceBuffer<scalar> mutB;
+                deviceHadamard(mutB, rhoBnd_, nutB);
+                deviceAxpy(1.0, mutB, muEffB);
+            };
+
         DeviceBuffer<scalar> nuEffBnd;
         if (ctl_.turbulent && ctl_.les)
         {
@@ -415,7 +456,8 @@ namespace brae {
             if (ctl_.nutWall == NutWall::Spalding)
             {
                 deviceCopy(nuEffBnd, nuBndConst_);
-                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
+                                          compressible_ ? &nuWallBnd_ : nullptr);
                 deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
             }
             else
@@ -428,20 +470,24 @@ namespace brae {
             if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA always, or the BC on any model
             {
                 deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
-                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else if (ctl_.nutWall == NutWall::Blended)   // nutUBlendedWallFunction (velocity-based binomial n=4 blend) on kEps/kOmegaSST
             {
-                deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_);
-                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
+                deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
+                                         compressible_ ? &nuWallBnd_ : nullptr);
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else   // k-based wall nut: nutkWallFunction (smooth), or atmNutkWallFunction (rough) when ctl_.atmZ0>0
             {
                 DeviceBuffer<scalar> nutBnd;
-                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs, ctl_.atmZ0, ctl_.atmBoundNut);
-                deviceAxpy(1.0, nutBnd, nuEffBnd);
+                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs, ctl_.atmZ0, ctl_.atmBoundNut,
+                                  compressible_ ? &nuWallBnd_ : nullptr);
+                addWallNutToMuEff(nutBnd, nuEffBnd);
             }
         }
+        else if (compressible_)
+            deviceCopy(nuEffBnd, muBnd_);   // laminar compressible: mu_b = Sutherland(T_b), OF transport_.mu(patchi)
         else
             deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
         // explicit divDevReff stress (uses the incoming U; coupled across the 3 components)
@@ -1087,10 +1133,22 @@ namespace brae {
         // laminar; phase 4 fills it with mut and this line keeps working unchanged.
         deviceCopy(nuConst_, th_.mu);
 
+        // Boundary rho and mu for this iteration. Both are T-dependent, so they move with the solution and
+        // must be refreshed here rather than seeded once. nuBndConst_ becomes mu_b, which turns the boundary
+        // expression nuEffBnd = nuBndConst_ + nut_b into muEff_b = mu_b + rho_b*nut_b once the wall nut is
+        // rho_b-weighted (see addWallNutToMuEff).
+        deviceThermoRhoBoundary(dbP_, dp_, dbHe_, th_.he, tc_, rhoBnd_);
+        deviceThermoMuBoundary(dbHe_, th_.he, tc_, muBnd_);
+        deviceThermoNuBoundary(dbP_, dp_, dbHe_, th_.he, tc_, nuWallBnd_);   // OF nu(patchi), for the wall functions
+        deviceGatherWallNu(wfBndIdx_, nuWallBnd_, wfNu_);   // same nu, in the wall-face ordering omega/G0 uses
+        deviceCopy(nuBndConst_, muBnd_);
+
         solveMomentumPredictor(res);
 
-        // EEqn. alphat is still zero (phase 4 fills it), so this is the laminar enthalpy transport that
-        // gate 1 checked against OpenFOAM scalarTransportFoam.
+        // EEqn, with OF's kinetic-energy term: EEqn.H is div(phi,he) + div(phi,K) - laplacian(alphaEff,he).
+        // K is built from the velocity the momentum predictor just produced, matching OF's ordering.
+        DeviceBuffer<scalar> kineticSrc;
+        deviceEnergyKineticSource(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], phiInt_, phiBnd_, kineticSrc);
         deviceSolveEnergy(
             dm,
             dbHe_,
@@ -1106,7 +1164,10 @@ namespace brae {
             1e-10,
             0.0,
             1,
-            false);
+            false,
+            nullptr,
+            nullptr,
+            &kineticSrc);
 
         correctPressureVelocity(res);
 

@@ -298,6 +298,12 @@ private:
     DeviceBuffer<scalar> pD_, pU_, pL_, diagCp_, bp_;            // persistent pressure matrix (graph-stable addresses)
     DeviceBuffer<label>  bndIsWall_, adjustMask_;              // wall mask (true boundary nut); adjustPhi adjustable mask
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces
+    // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
+    // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed
+    // muEff_b = mu_b + rho_b*nut_b and the kinematic nu_b = mu_b/rho_b the wall functions ask for.
+    DeviceBuffer<scalar> rhoBnd_, muBnd_, nuWallBnd_;
+    DeviceBuffer<label>  wfBndIdx_;   // wall-face -> boundary-face index (built once)
+    DeviceBuffer<scalar> wfNu_;       // nu = mu_b/rho_b gathered onto wall faces, for omegaWallFunction/G0
     bool   hasMixed_ = false;                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)

@@ -22,6 +22,30 @@ void deviceThermoUpdate(
     const DeviceBuffer<scalar>& p,
     const ThermoCoeffs& c);
 
+// Laminar DYNAMIC viscosity AT BOUNDARY FACES, mu_b = Sutherland(T_b) -- OF transport_.mu(patchi).
+//
+// The compressible momentum boundary needs mu_b for muEff_b = mu_b + rho_b*nut_b, and every OF nut wall
+// function needs nu_b = mu_b/rho_b (turbulenceModel::nu(patchi)). A constant scalar viscosity is only
+// correct for constant-property incompressible flow.
+void deviceThermoMuBoundary(
+    const DeviceBoundary& dbHe,
+    const DeviceBuffer<scalar>& he,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& muBnd);
+
+// Laminar KINEMATIC viscosity AT BOUNDARY FACES, nu_b = mu_b/rho_b -- OF turbulenceModel::nu(patchi).
+//
+// This is what every OF wall function reads (nutk/nutUSpalding/nutUBlended/omega/epsilon/kLowRe). Passing a
+// single scalar instead is correct only for constant-property incompressible flow; under Sutherland with a
+// varying rho it is wrong at every wall face, and wrong in a way that still converges.
+void deviceThermoNuBoundary(
+    const DeviceBoundary& dbP,
+    const DeviceBuffer<scalar>& p,
+    const DeviceBoundary& dbHe,
+    const DeviceBuffer<scalar>& he,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& nuBnd);
+
 // T -> he, for initialising the enthalpy field from the T that the case actually ships.
 void deviceThermoHeFromT(
     DeviceThermo& th,

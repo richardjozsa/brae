@@ -26,11 +26,13 @@ void deviceCDkOmega(const DeviceBuffer<scalar>& gKx, const DeviceBuffer<scalar>&
 
 // F1 = tanh(arg1^4) (CD = raw CDkOmega; the max(.,1e-10) is applied inside).
 void deviceF1(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
-              const DeviceBuffer<scalar>& CD, scalar nu, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& F1, bool lm = false);
+              const DeviceBuffer<scalar>& CD, scalar nu, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& F1, bool lm = false,
+    const DeviceBuffer<scalar>* nuCell = nullptr);
 
 // F2 = tanh(arg2^2).
 void deviceF2(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
-              scalar nu, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& F2);
+              scalar nu, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& F2,
+    const DeviceBuffer<scalar>* nuCell = nullptr);
 
 // out = F1*(psi1-psi2)+psi2 (gamma/beta/alphaK/alphaOmega blends).
 void deviceBlend(const DeviceBuffer<scalar>& F1, scalar psi1, scalar psi2, DeviceBuffer<scalar>& out);
@@ -68,7 +70,8 @@ void deviceOmegaReaction(const DeviceBuffer<scalar>& V, const DeviceBuffer<scala
 void deviceWallOmegaG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& Ux,
                        const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                        DeviceBuffer<scalar>& omega0, DeviceBuffer<scalar>& G0, const KOmegaSSTCoeffs& co, int nutWall = 0,
-                       scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
+                       scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
+                       const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
 
 // C6 k equation
 // k reaction (adds to diag + source). Mirrors the k block of kOmegaSSTBase::correct() (incompressible):

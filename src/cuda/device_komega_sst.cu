@@ -74,15 +74,21 @@ void f1Kernel(
     scalar betaStar,
     scalar alphaOmega2,
     int lm,
-    scalar* __restrict__ F1)
+    scalar* __restrict__ F1,
+    const scalar* __restrict__ nuCell)   // compressible: per-cell nu = mu/rho (nullptr -> the scalar nu)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // The SST blending needs the LAMINAR kinematic viscosity. Incompressible cases have one value for the
+    // whole field, so it arrives as a scalar; compressible mu is T-dependent, so nu = mu/rho varies per
+    // cell and must arrive as a buffer. nullptr -> the scalar -> bit-identical incompressible behaviour.
+    const scalar nuc = nuCell ? nuCell[c] : nu;
+
     const scalar kk = k[c], w = om[c], yy = y[c];
     const scalar CDplus = fmax(CD[c], (scalar)1.0e-10);
     const scalar a  = (1.0 / betaStar) * sqrt(kk) / (w * yy);
-    const scalar b  = 500.0 * nu / (yy * yy * w);
+    const scalar b  = 500.0 * nuc / (yy * yy * w);
     const scalar cc = (4.0 * alphaOmega2) * kk / (CDplus * yy * yy);
     const scalar arg1 = fmin(fmin(fmax(a, b), cc), (scalar)10.0);
     const scalar a2 = arg1 * arg1;   // pow4(arg1) = (arg1^2)^2
@@ -92,7 +98,7 @@ void f1Kernel(
     // the (F1-1)*CDkOmega cross-diffusion source there. Only for the LM path (base kOmegaSST has no F3).
     if (lm)
     {
-        const scalar Ry = yy * sqrt(kk) / nu;
+        const scalar Ry = yy * sqrt(kk) / nuc;
         const scalar r = Ry / 120.0;
         const scalar r2 = r * r, r4 = r2 * r2;
         f1 = fmax(f1, exp(-(r4 * r4)));
@@ -109,14 +115,16 @@ void f2Kernel(
     const scalar* __restrict__ y,
     scalar nu,
     scalar betaStar,
-    scalar* __restrict__ F2)
+    scalar* __restrict__ F2,
+    const scalar* __restrict__ nuCell)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
+    const scalar nuc = nuCell ? nuCell[c] : nu;
 
     const scalar kk = k[c], w = om[c], yy = y[c];
     const scalar a = (2.0 / betaStar) * sqrt(kk) / (w * yy);
-    const scalar b = 500.0 * nu / (yy * yy * w);
+    const scalar b = 500.0 * nuc / (yy * yy * w);
     const scalar arg2 = fmin(fmax(a, b), (scalar)100.0);
     F2[c] = tanh(arg2 * arg2);   // sqr(arg2)
 }
@@ -361,15 +369,20 @@ void wallOmegaG0Kernel(
     scalar beta1,
     int nutWall,
     scalar* __restrict__ omega0,
-    scalar* __restrict__ G0)
+    scalar* __restrict__ G0,
+    const scalar* __restrict__ nuFace)   // compressible: per-wall-face nu, null -> the scalar nu
 {
     const int wf = blockIdx.x * blockDim.x + threadIdx.x;
     if (wf >= nWF) return;
 
     const int c = wfCell[wf];
     const scalar y = wfY[wf], dc = wfDc[wf], kc = k[c];
-    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nu, yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall, G0);
-    const scalar omegaVis = 6.0 * nu / (beta1 * y * y);
+    // OF omegaWallFunction and the near-wall G0 both read turbulenceModel::nu(patchi). Under Sutherland with
+    // a hot wall that is several times the freestream value, so the scalar fallback is only for the
+    // constant-property incompressible case.
+    const scalar nuw = nuFace ? nuFace[wf] : nu;
+    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nuw, yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall, G0);
+    const scalar omegaVis = 6.0 * nuw / (beta1 * y * y);
     const scalar omegaLog = sqrt(kc) / (Cmu25 * kappa * y);
     atomicAdd(&omega0[c], invNw[c] * sqrt(omegaVis*omegaVis + omegaLog*omegaLog));   // BINOMIAL n=2 (distinct omega wall value)
 }
@@ -411,11 +424,13 @@ void deviceF1(
     scalar nu,
     const KOmegaSSTCoeffs& co,
     DeviceBuffer<scalar>& F1,
-    bool lm)
+    bool lm,
+    const DeviceBuffer<scalar>* nuCell)   // compressible per-cell nu = mu/rho; nullptr -> the scalar nu
 {
     const int nC = static_cast<int>(k.size());
     F1.resize(nC);
-    f1Kernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), y.data(), CD.data(), nu, co.betaStar, co.alphaOmega2, lm ? 1 : 0, F1.data());
+    f1Kernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), y.data(), CD.data(), nu, co.betaStar, co.alphaOmega2, lm ? 1 : 0, F1.data(),
+                                   nuCell ? nuCell->data() : nullptr);
     cudaCheck(cudaGetLastError(), "F1");
 }
 
@@ -426,11 +441,13 @@ void deviceF2(
     const DeviceBuffer<scalar>& y,
     scalar nu,
     const KOmegaSSTCoeffs& co,
-    DeviceBuffer<scalar>& F2)
+    DeviceBuffer<scalar>& F2,
+    const DeviceBuffer<scalar>* nuCell)   // compressible per-cell nu = mu/rho; nullptr -> the scalar nu
 {
     const int nC = static_cast<int>(k.size());
     F2.resize(nC);
-    f2Kernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), y.data(), nu, co.betaStar, F2.data());
+    f2Kernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), y.data(), nu, co.betaStar, F2.data(),
+                                   nuCell ? nuCell->data() : nullptr);
     cudaCheck(cudaGetLastError(), "F2");
 }
 
@@ -525,6 +542,32 @@ void deviceOmegaReaction(
 }
 
 
+// nuWall[i] = nuBnd[wfBndIdx[i]] -- the same OF nu(patchi) the nut wall functions read, re-indexed into the
+// wall-face ordering that DeviceWallData (and therefore omegaWallFunction and the near-wall G0) uses.
+__global__
+void gatherWallNuK(
+    int n,
+    const label* __restrict__ idx,
+    const scalar* __restrict__ nuBnd,
+    scalar* __restrict__ nuWall)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    nuWall[i] = nuBnd[idx[i]];
+}
+
+void deviceGatherWallNu(
+    const DeviceBuffer<label>& wfBndIdx,
+    const DeviceBuffer<scalar>& nuBnd,
+    DeviceBuffer<scalar>& nuWall)
+{
+    const int n = static_cast<int>(wfBndIdx.size());
+    if (n == 0 || nuBnd.size() == 0) return;
+    nuWall.resize(n);
+    gatherWallNuK<<<nBlocks(n), TPB>>>(n, wfBndIdx.data(), nuBnd.data(), nuWall.data());
+    cudaCheck(cudaGetLastError(), "gatherWallNu");
+}
+
 void deviceWallOmegaG0(
     const DeviceWallData& w,
     const DeviceBuffer<scalar>& k,
@@ -537,7 +580,8 @@ void deviceWallOmegaG0(
     const KOmegaSSTCoeffs& co,
     int nutWall,
     scalar atmZ0,
-    bool   atmBoundNut)
+    bool   atmBoundNut,
+    const DeviceBuffer<scalar>* nuFace)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
 {
     const int nC = static_cast<int>(k.size());
     omega0.resize(nC); G0.resize(nC);
@@ -548,7 +592,8 @@ void deviceWallOmegaG0(
         wallOmegaG0Kernel<<<nBlocks(w.nWF), TPB>>>(w.nWF, w.wfCell.data(), w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
                                                    w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(),
                                                    Uy.data(), Uz.data(), nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, co.beta1,
-                                                   nutWall, omega0.data(), G0.data());
+                                                   nutWall, omega0.data(), G0.data(),
+                                                   (nuFace && nuFace->size()) ? nuFace->data() : nullptr);
     cudaCheck(cudaGetLastError(), "wallOmegaG0");
 }
 
@@ -633,6 +678,41 @@ void deviceCellLimitGradU(
 }
 
 
+
+
+// nu = mu/rho, cell by cell. Local to this file: the SST is the only consumer, and keeping it here means
+// the kinematic/dynamic distinction is resolved in one place instead of at every call site.
+__global__
+void nuFromMuRhoK(
+    int n,
+    const scalar* __restrict__ mu,
+    const scalar* __restrict__ rho,
+    scalar* __restrict__ nuOut)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    nuOut[i] = mu[i] / rho[i];
+}
+
+// Compressible diffusivity for the k/omega equations.
+//
+// OF wants alpha*rho*DEff(F1) where DEff = alphaBlend*nut + nu (kinematic). Rather than re-derive that,
+// deviceDEff is called with nu = 0 to get alphaBlend*nut, then scaled by rho and offset by the laminar
+// DYNAMIC viscosity: rho*alphaBlend*nut + mu = alphaBlend*mut + mu, which is the same expression. Doing
+// it this way means the SST blending itself is untouched and cannot drift from the incompressible path.
+static void scaleDEffCompressible(
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& muLam,
+    DeviceBuffer<scalar>& D)
+{
+    const int nC = static_cast<int>(D.size());
+    DeviceBuffer<scalar> t;
+    deviceHadamard(t, rho, D);
+    deviceCopy(D, t);
+    deviceAxpy(1.0, muLam, D);
+    (void)nC;
+}
+
 void deviceKOmegaSSTCorrect(
     const DeviceMesh& dm,
     const DeviceWallData& wall,
@@ -677,7 +757,10 @@ void deviceKOmegaSSTCorrect(
     bool des,
     bool iddes,
     const DeviceBuffer<scalar>* hmax,
-    const DeviceBuffer<scalar>* hwn)
+    const DeviceBuffer<scalar>* hwn,
+    const DeviceBuffer<scalar>* rho,     // compressible: rho-weight the reactions and the diffusivity
+    const DeviceBuffer<scalar>* muLam,   // compressible: laminar DYNAMIC viscosity mu [Pa s]
+    const DeviceBuffer<scalar>* nuWallFace)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -698,7 +781,7 @@ void deviceKOmegaSSTCorrect(
     // omega wall function FIRST (OF updateCoeffs before CDkOmega): omega0/G0, override omega & G at wall cells, so
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
-    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut);
+    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data());
 
     // CDkOmega from grad(k), grad(omega); F1, F2.
@@ -713,9 +796,21 @@ void deviceKOmegaSSTCorrect(
     DeviceBuffer<scalar> CD;
     deviceCDkOmega(kgx, kgy, kgz, ogx, ogy, ogz, omega, co.alphaOmega2, CD);
     DeviceBuffer<scalar> F1;
-    deviceF1(k, omega, y, CD, nu, co, F1, gammaIntEff != nullptr);   // LM: F1=max(F1,F3) near-wall override
+    // F1/F2 blend on the KINEMATIC laminar viscosity, the diffusivity wants the DYNAMIC one. Only mu is
+    // passed in; nu = mu/rho is derived here so the two can never drift apart at the call site.
+    DeviceBuffer<scalar> nuCellBuf;
+    const DeviceBuffer<scalar>* nuCell = nullptr;
+    if (rho && muLam)
+    {
+        const int nCk = static_cast<int>(muLam->size());
+        nuCellBuf.resize(nCk);
+        nuFromMuRhoK<<<nBlocks(nCk), TPB>>>(nCk, muLam->data(), rho->data(), nuCellBuf.data());
+        cudaCheck(cudaGetLastError(), "nuFromMuRho");
+        nuCell = &nuCellBuf;
+    }
+    deviceF1(k, omega, y, CD, nu, co, F1, gammaIntEff != nullptr, nuCell);   // LM: F1=max(F1,F3) near-wall override
     DeviceBuffer<scalar> F2;
-    deviceF2(k, omega, y, nu, co, F2);
+    deviceF2(k, omega, y, nu, co, F2, nuCell);
     // kOmegaSST-DDES: the DES factor FDES>=1 (from the RANS length scale sqrt(k)/(betaStar*omega) vs C_DES*cubeRootVol,
     // shielded by 1-F2) multiplies the k destruction below. des==false -> FDES stays empty -> plain kOmegaSST(-RANS).
     DeviceBuffer<scalar> FDES;
@@ -735,21 +830,23 @@ void deviceKOmegaSSTCorrect(
     DeviceBuffer<scalar> GbyNu0lim;
     deviceGbyNuLimit(GbyNu0, omega, F2, S2, co, GbyNu0lim);
     DeviceBuffer<scalar> DomegaEff;
-    deviceDEff(F1, nut, co.alphaOmega1, co.alphaOmega2, nu, DomegaEff);
+    deviceDEff(F1, nut, co.alphaOmega1, co.alphaOmega2, rho ? scalar(0) : nu, DomegaEff);
+    if (rho && muLam) scaleDEffCompressible(*rho, *muLam, DomegaEff);
 
     // omega equation (loose solve) with the near-wall setValues constraint (omega0)
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divU, bounded, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
-                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src); },
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
                                &wall, &omega0, ami, cyc, sDdt);
     deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
     DeviceBuffer<scalar> DkEff;
-    deviceDEff(F1, nut, co.alphaK1, co.alphaK2, nu, DkEff);
+    deviceDEff(F1, nut, co.alphaK1, co.alphaK2, rho ? scalar(0) : nu, DkEff);
+    if (rho && muLam) scaleDEffCompressible(*rho, *muLam, DkEff);
     deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divU, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
-                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr); },
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr, rho); },
                                nullptr, nullptr, ami, cyc, kDdt);
     deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
 

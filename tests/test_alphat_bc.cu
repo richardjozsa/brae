@@ -1,7 +1,8 @@
 // Phase 4.3: the alphat wall conditions load, and the one brae does not implement is refused.
 //
 // Every OpenFOAM rhoSimpleFoam tutorial with turbulence ships a 0/alphat, so without the
-// alphatWallFunction row brae rejects real compressible cases at load with "unsupported BC type".
+// compressible::alphatWallFunction row brae rejects real compressible cases at load with
+// "unsupported BC type". That IS the OF name -- unqualified "alphatWallFunction" is not a valid OF type.
 //
 // The second half is the point of the test. alphatJayatillekeWallFunction is NOT the same condition --
 // it adds a thermal-sublayer P-function and gives a different wall heat flux. Accepting it as the simple
@@ -66,25 +67,25 @@ int main(int argc, char** argv)
     g.build(m);
     const std::vector<FvPatch> fvp = buildPatches(m, g);
 
-    if (!loads(fvp, m.nCells(), "alphatWallFunction"))
+    if (!loads(fvp, m.nCells(), "compressible::alphatWallFunction"))
     {
-        std::printf("  FAIL alphatWallFunction was rejected -- real OF compressible cases will not load\n");
+        std::printf("  FAIL compressible::alphatWallFunction was rejected -- real OF compressible cases will not load\n");
         failures++;
     }
     else
     {
-        std::printf("  OK   alphatWallFunction loads\n");
+        std::printf("  OK   compressible::alphatWallFunction loads\n");
     }
 
-    if (loads(fvp, m.nCells(), "alphatJayatillekeWallFunction"))
+    if (loads(fvp, m.nCells(), "compressible::alphatJayatillekeWallFunction"))
     {
-        std::printf("  FAIL alphatJayatillekeWallFunction was ACCEPTED -- it is a different condition "
+        std::printf("  FAIL compressible::alphatJayatillekeWallFunction was ACCEPTED -- it is a different condition "
                     "(thermal-sublayer P-function) and would give the wrong wall heat flux\n");
         failures++;
     }
     else
     {
-        std::printf("  OK   alphatJayatillekeWallFunction refused by name\n");
+        std::printf("  OK   compressible::alphatJayatillekeWallFunction refused by name\n");
     }
 
     std::printf("alphat_bc: %d failures\n", failures);

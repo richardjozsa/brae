@@ -40,9 +40,13 @@ struct ThermoCoeffs
     // rho.relax() factor, fvSolution relaxationFactors.fields.rho. 1.0 = no relaxation.
     scalar relaxRho = 1.0;
 
-    // Turbulent Prandtl number, for alphat = mut/Prt. OF's compressible turbulence models default to
-    // 0.85 and read it from the turbulence dict; laminar cases never touch it (nut = 0 -> alphat = 0).
-    scalar Prt = 0.85;
+    // Turbulent Prandtl number, for alphat = rho*nut/Prt. OF's default is 1.0, NOT the 0.85 that is
+    // conventional in the literature: EddyDiffusivity.C sets Prt_("Prt", dimless, 1.0, coeffDict()) and
+    // only overrides it if the RAS/LES coeffs dict names it. Using 0.85 against an OF case that says
+    // nothing gives a ~15% wall heat flux difference that still converges. Laminar cases never touch it
+    // (nut = 0 -> alphat = 0). NOTE: the Prt inside a 0/alphat wall-function entry is the WALL
+    // function's own, applied at walls only -- it is not this one.
+    scalar Prt = 1.0;
 };
 
 // Per-cell thermophysical fields, sized nCells. Internal field only -- boundary values live in the

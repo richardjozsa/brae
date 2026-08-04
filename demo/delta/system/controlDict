@@ -1,0 +1,18 @@
+FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }
+application     pimpleFoam;
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+// chord 1.287 m at 50 m/s -> one chord pass = 0.0257 s. 0.20 s is ~7.8 passes,
+// enough for the LE vortex system to settle. The old run stopped at 0.12 s.
+endTime         0.20;
+deltaT          1e-4;
+writeControl    timeStep;
+// 2000 steps / 13 -> ~154 frames
+writeInterval   13;
+purgeWrite      0;
+writeFormat     binary;
+writePrecision  8;
+writeCompression off;
+runTimeModifiable true;
+adjustTimeStep  no;

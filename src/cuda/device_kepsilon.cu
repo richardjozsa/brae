@@ -197,15 +197,17 @@ void boundaryNutKernel(
     scalar E,
     scalar atmZ0,        // >0 -> atmNutkWallFunction (rough); 0 -> nutkWallFunction (smooth)
     bool   atmBoundNut,
-    scalar* __restrict__ nutBnd)
+    scalar* __restrict__ nutBnd,
+    const scalar* __restrict__ nuFace)   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     const int c = fc[i];
+    const scalar nuw = nuFace ? nuFace[i] : nu;
     if (isWall[i])
     {
-        nutBnd[i] = kBasedWallNut(yPlusWall(Cmu25, y[i], k[c], nu), y[i], atmZ0, atmBoundNut, nu, yplLam, kappa, E);
+        nutBnd[i] = kBasedWallNut(yPlusWall(Cmu25, y[i], k[c], nuw), y[i], atmZ0, atmBoundNut, nuw, yplLam, kappa, E);
     }
     else
     {
@@ -514,12 +516,17 @@ void deviceBoundaryNut(
     DeviceBuffer<scalar>& nutBnd,
     const KEpsilonCoeffs& co,
     scalar atmZ0,
-    bool   atmBoundNut)
+    bool   atmBoundNut,
+    const DeviceBuffer<scalar>* nuFace)
 {
+    // OF turbulenceModel::nu(patchi) = mu(patchi)/rho.boundaryField()[patchi] -- a per-FACE kinematic
+    // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
+    // argument exists; compressible flow does not, so nuFace overrides it when supplied.
     nutBnd.resize(db.n);
     const scalar Cmu25 = std::pow(co.Cmu, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
     boundaryNutKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), isWall.data(), y.data(), k.data(), nut.data(),
-                                              nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, nutBnd.data());
+                                              nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, nutBnd.data(),
+                                              nuFace ? nuFace->data() : nullptr);
     cudaCheck(cudaGetLastError(), "boundaryNut");
 }
 
@@ -631,7 +638,8 @@ void spaldingNutKernel(
     scalar nu,
     scalar kappa,
     scalar E,
-    scalar* __restrict__ nutBnd)
+    scalar* __restrict__ nutBnd,
+    const scalar* __restrict__ nuFace)   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -640,7 +648,8 @@ void spaldingNutKernel(
     if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
     const scalar magGradU = magUp * dc[i];
-    nutBnd[i] = spaldingNutValue(magUp, magGradU, y[i], nu, kappa, E, nutBnd[i]);   // shared with G0 (nut_wall_function.cuh)
+    const scalar nuw = nuFace ? nuFace[i] : nu;
+    nutBnd[i] = spaldingNutValue(magUp, magGradU, y[i], nuw, kappa, E, nutBnd[i]);   // shared with G0 (nut_wall_function.cuh)
 }
 
 
@@ -663,7 +672,8 @@ void blendedNutKernel(
     scalar nu,
     scalar kappa,
     scalar E,
-    scalar* __restrict__ nutBnd)
+    scalar* __restrict__ nutBnd,
+    const scalar* __restrict__ nuFace)   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -672,7 +682,8 @@ void blendedNutKernel(
     if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
     const scalar magGradU = magUp * dc[i];
-    nutBnd[i] = blendedNutValue(magUp, magGradU, y[i], nu, kappa, E, nutBnd[i]);   // shared with G0 (nut_wall_function.cuh)
+    const scalar nuw = nuFace ? nuFace[i] : nu;
+    nutBnd[i] = blendedNutValue(magUp, magGradU, y[i], nuw, kappa, E, nutBnd[i]);   // shared with G0 (nut_wall_function.cuh)
 }
 } // namespace
 
@@ -687,8 +698,13 @@ void deviceBoundaryNutSpalding(
     const DeviceBuffer<scalar>& nutCell,
     scalar nu,
     const SpalartAllmarasCoeffs& co,
-    DeviceBuffer<scalar>& nutBnd)
+    DeviceBuffer<scalar>& nutBnd,
+    const DeviceBuffer<scalar>* nuFace)
 {
+    // OF turbulenceModel::nu(patchi) = mu(patchi)/rho.boundaryField()[patchi] -- a per-FACE kinematic
+    // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
+    // argument exists; compressible flow does not, so nuFace overrides it when supplied.
+
     const int n = dbU.comp[0].n;
     if (static_cast<int>(nutBnd.size()) != n)   // first call: zero seed (warm-starts thereafter)
     {
@@ -697,7 +713,8 @@ void deviceBoundaryNutSpalding(
     }
     spaldingNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                            dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
-                                           nutCell.data(), nu, co.kappa, co.E, nutBnd.data());
+                                           nutCell.data(), nu, co.kappa, co.E, nutBnd.data(),
+                                           nuFace ? nuFace->data() : nullptr);
     cudaCheck(cudaGetLastError(), "spaldingNut");
 }
 
@@ -715,8 +732,13 @@ void deviceBoundaryNutBlended(
     scalar nu,
     scalar kappa,
     scalar E,
-    DeviceBuffer<scalar>& nutBnd)
+    DeviceBuffer<scalar>& nutBnd,
+    const DeviceBuffer<scalar>* nuFace)
 {
+    // OF turbulenceModel::nu(patchi) = mu(patchi)/rho.boundaryField()[patchi] -- a per-FACE kinematic
+    // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
+    // argument exists; compressible flow does not, so nuFace overrides it when supplied.
+
     const int n = dbU.comp[0].n;
     if (static_cast<int>(nutBnd.size()) != n)   // first call: zero seed (warm-starts thereafter)
     {
@@ -725,7 +747,8 @@ void deviceBoundaryNutBlended(
     }
     blendedNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                           dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
-                                          nutCell.data(), nu, kappa, E, nutBnd.data());
+                                          nutCell.data(), nu, kappa, E, nutBnd.data(),
+                                          nuFace ? nuFace->data() : nullptr);
     cudaCheck(cudaGetLastError(), "blendedNut");
 }
 

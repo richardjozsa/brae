@@ -621,16 +621,21 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // cells. Nothing is prescribed at the patch, so it is `calculated` exactly like the nut wall functions
     // -- the model writes the value. Without this row a real OF compressible case is refused at load,
     // because every rhoSimpleFoam tutorial with turbulence ships a 0/alphat.
-    if (d.type == "alphatWallFunction")   return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    // OF v2412 registers this as "compressible::alphatWallFunction"; the unqualified spelling is NOT a
+    // valid OF type (OF errors out on it). Both are accepted here so a hand-written case is not rejected
+    // for a spelling OF would have caught anyway, but the qualified form is the one real cases use.
+    if (d.type == "compressible::alphatWallFunction"
+     || d.type == "alphatWallFunction")   return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // alphatJayatillekeWallFunction is NOT the same condition: it adds a thermal-sublayer resistance
     // (the P-function) and gives a different wall heat flux. Accepting it as the simple form would run
     // and converge with the wrong wall heat transfer, so it is refused by name instead.
-    if (d.type == "alphatJayatillekeWallFunction")
+    if (d.type == "compressible::alphatJayatillekeWallFunction"
+     || d.type == "alphatJayatillekeWallFunction")
     {
         throw std::runtime_error(
             "brae: alphatJayatillekeWallFunction is not implemented (patch " + p.name
             + "). It applies a thermal-sublayer P-function that brae does not have, so treating it as "
-              "alphatWallFunction would give the wrong wall heat flux. Use alphatWallFunction, or wait "
+              "compressible::alphatWallFunction would give the wrong wall heat flux. Use that instead, or wait "
               "for the Jayatilleke port.");
     }
     if (d.type == "atmNutkWallFunction")  return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values); // atmospheric rough-wall nut (z0); device wall nut from deviceBoundaryNut with atmZ0>0

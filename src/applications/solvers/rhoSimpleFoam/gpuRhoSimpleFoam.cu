@@ -27,11 +27,14 @@
 #include "device_simple_foam.cuh"
 #include "thermo_parse.cuh"
 #include "rho_simple_controls.cuh"
+#include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with simpleFoam/pimpleFoam)
+#include "scheme_parse.cuh"        // parseFvSchemesControls
 #include <cstdio>
 #include <string>
 #include <vector>
 #include <stdexcept>
 #include <filesystem>
+#include <cmath>
 
 using namespace brae;
 
@@ -83,10 +86,50 @@ int main(int argc, char** argv)
 
         DeviceSimpleControls ctl;
         ctl.nu = tc.mu0;                       // replaced every iteration by th_.mu; only the seed matters
-        ctl.turbulent = false;                 // laminar until phase 4
+        parseFvSchemesControls(caseDir, ctl);
+
+        // Turbulence, through the SAME readers simpleFoam and pimpleFoam use, so a compressible case gets
+        // exactly the model selection, coefficient set and wall-function guards an incompressible one does.
+        const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
+        const std::string simType = turbProps.wordOr("simulationType", "laminar");
+        if (simType != "RAS" && simType != "laminar")
+            throw std::runtime_error("brae: unsupported simulationType '" + simType + "' for rhoSimpleFoam (RAS or laminar)");
+        ctl.turbulent = (simType == "RAS");
+        readTurbulenceModel(turbProps, ctl);
+        if (ctl.turbulent && !ctl.sst)
+            throw std::runtime_error(
+                "brae: rhoSimpleFoam supports kOmegaSST only so far. The other RAS models are not yet "
+                "rho-weighted, and running one down the incompressible path gives a converged wrong answer.");
+
+        const FoamDict* rf = fvSolution.subDict("relaxationFactors");
+        const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
+        const FoamDict* fld = rf ? rf->subDict("fields") : nullptr;
+        const FoamDict* eqSrc = eqs ? eqs : rf;
+        const FoamDict* fldSrc = fld ? fld : rf;
+        ctl.relaxU = eqSrc ? eqSrc->scalarOr("U", 1.0) : 1.0;
+        ctl.relaxK = eqSrc ? eqSrc->scalarOr("k", 1.0) : 1.0;
+        ctl.relaxEps = eqSrc ? eqSrc->scalarOr("omega", 1.0) : 1.0;
+        ctl.relaxP = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
+
+        const FoamDict* solvers = fvSolution.subDict("solvers");
+        auto solverTol = [&](const std::string& f, scalar def)
+        {
+            const FoamDict* sd = solvers ? solvers->subDict(f) : nullptr;
+            return sd ? sd->scalarOr("tolerance", def) : def;
+        };
+        ctl.tolP = solverTol("p", 1e-6);
+        ctl.tolU = solverTol("U", 1e-8);
+        ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol("omega", 1e-8));
+
+        TurbulenceFields tf;
+        if (ctl.turbulent) tf = readTurbulenceFields(t0, fvp, nC, ctl, "omega", U);
+
         const int endTime = static_cast<int>(controlDict.scalarOr("endTime", 1000));
 
-        DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl);
+        DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
+                                  ctl.turbulent ? &tf.k : nullptr,
+                                  ctl.turbulent ? &tf.eps : nullptr,
+                                  ctl.turbulent ? &tf.nut : nullptr);
 
         // he boundary: built from the case's 0/T, then converted. brae never reads a 0/he, exactly as OF
         // never asks a user to write one.
@@ -103,8 +146,8 @@ int main(int argc, char** argv)
         deviceThermoUpdate(th, solver.pDevice(), tc);
         deviceRhoSeedPrev(th);
 
-        std::printf("brae_rhoSimpleFoam: %ld cells, subsonic laminar, R=%.3f Cp=%.1f\n",
-                    (long)nC, tc.R, tc.Cp);
+        std::printf("brae_rhoSimpleFoam: %ld cells, subsonic %s, R=%.3f Cp=%.1f\n",
+                    (long)nC, ctl.turbulent ? "kOmegaSST" : "laminar", tc.R, tc.Cp);
 
         for (int iter = 1; iter <= endTime; ++iter)
         {
@@ -125,6 +168,18 @@ int main(int argc, char** argv)
             std::vector<scalar> Tout(nC);
             th.T.copyTo(Tout);
             writeVolField(wsrc + "T", outDir + "/T", Tout, fvp, 12);
+        }
+        {
+            // rho, so the gate can compare the EOS result directly rather than inferring it from p and T.
+            std::vector<scalar> rhoOut(nC);
+            th.rho.copyTo(rhoOut);
+            writeVolField(wsrc + "T", outDir + "/rho", rhoOut, fvp, 12);
+        }
+        if (ctl.turbulent)
+        {
+            writeVolField(t0 + "/k",     outDir + "/k",     solver.k(),   fvp, 12);
+            writeVolField(t0 + "/omega", outDir + "/omega", solver.eps(), fvp, 12);   // de_ slot holds omega on SST
+            writeVolField(t0 + "/nut",   outDir + "/nut",   solver.nut(), fvp, 12);
         }
         std::printf("brae_rhoSimpleFoam: wrote %s\n", outDir.c_str());
         return 0;
