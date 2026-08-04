@@ -1,0 +1,4 @@
+SOURCE = \
+dumpAmgTrace.C \
+
+# sources
