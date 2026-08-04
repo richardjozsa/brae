@@ -1023,6 +1023,12 @@ add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoS
 target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 
+# rhoSimpleFoam phase 4.3: alphat wall conditions load, Jayatilleke refused by name
+add_executable(test_alphat_bc tests/test_alphat_bc.cu)
+target_include_directories(test_alphat_bc PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_alphat_bc PRIVATE brae_core)
+add_test(NAME alphat_bc COMMAND test_alphat_bc ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox)
+
 # rhoSimpleFoam phase 3 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam on a heated duct.
 # Needs an OF install; skipped (77) if absent.
 add_test(NAME rho_vs_openfoam

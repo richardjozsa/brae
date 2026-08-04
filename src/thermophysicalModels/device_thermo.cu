@@ -138,6 +138,38 @@ void deviceRhoSeedPrev(DeviceThermo& th)
     cudaCheck(cudaGetLastError(), "rhoSeedPrev");
 }
 
+// alphat = rho*nut/Prt. Kept in its own kernel rather than folded into thermoUpdateK because nut is
+// owned by the turbulence model and is only valid after correctTurbulence(), which runs at the END of the
+// outer iteration -- whereas thermoUpdateK runs in the middle of it.
+__global__
+void alphatK(
+    int n,
+    scalar Prt,
+    const scalar* __restrict__ rho,
+    const scalar* __restrict__ nut,
+    scalar* __restrict__ alphat)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    alphat[i] = rho[i] * nut[i] / Prt;
+}
+
+void deviceAlphat(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& nut,
+    const ThermoCoeffs& c)
+{
+    if (th.n == 0) return;
+    if (static_cast<int>(nut.size()) != th.n) return;   // laminar: no nut field, alphat stays zero
+    alphatK<<<nBlocks(th.n), TPB>>>(
+        th.n,
+        c.Prt,
+        th.rho.data(),
+        nut.data(),
+        th.alphat.data());
+    cudaCheck(cudaGetLastError(), "alphat");
+}
+
 // rho_b = p_b/(R*T_b), face by face. Same EOS as the cell update, so a boundary and its cell agree
 // whenever their p and T do.
 __global__

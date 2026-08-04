@@ -162,6 +162,33 @@ int main()
         for (int i = 0; i < n; ++i) check("relax advances rhoPrev", gotPrev[i], got[i], tol);
     }
 
+    // alphat = rho*nut/Prt. Also checks the laminar guard: with no nut field alphat must stay zero,
+    // because the energy equation reads alphaEff = alpha + alphat unconditionally and a stray alphat
+    // would quietly add turbulent diffusion to a laminar solve.
+    {
+        c.Prt = 0.85;
+        c.rhoMax = 1e+06;
+        deviceThermoUpdate(th, p, c);
+        std::vector<scalar> rhoNow(n);
+        th.rho.copyTo(rhoNow);
+
+        DeviceBuffer<scalar> nut(std::vector<scalar>(n, 1.5e-03));
+        deviceAlphat(th, nut, c);
+        std::vector<scalar> gotAt(n);
+        th.alphat.copyTo(gotAt);
+        for (int i = 0; i < n; ++i)
+        {
+            check("alphat = rho*nut/Prt", gotAt[i], rhoNow[i] * 1.5e-03 / 0.85, tol);
+        }
+
+        // laminar: an empty nut must leave alphat untouched at zero
+        th.alphat.copyFrom(std::vector<scalar>(n, 0.0));
+        DeviceBuffer<scalar> noNut;
+        deviceAlphat(th, noNut, c);
+        th.alphat.copyTo(gotAt);
+        for (int i = 0; i < n; ++i) check("alphat stays 0 when laminar", gotAt[i], 0.0, tol);
+    }
+
     std::printf("thermo_perfect_gas: %d states, %d failures\n", n, failures);
     return failures == 0 ? 0 : 1;
 }

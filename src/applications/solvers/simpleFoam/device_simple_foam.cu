@@ -1117,6 +1117,11 @@ namespace brae {
 
         correctTurbulence();
 
+        // alphat = mut/Prt, for the NEXT iteration's energy equation. Must follow correctTurbulence(),
+        // which is what makes nut valid. No-op while laminar (nut empty -> alphat stays zero), so the
+        // energy equation is unaffected until phase 4.1 gives the SST a compressible nut.
+        deviceAlphat(th_, dnut_, tc_);
+
         // Continuity. NOTE: with a mass flux this is a MASS residual, not a volumetric one -- the number
         // means something different from the incompressible report even though the code is identical.
         // Flagged in phi-audit.md as an INTERPRET site.

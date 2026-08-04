@@ -617,6 +617,22 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     if (d.type == "epsilonWallFunction")  return std::make_unique<ZeroGradientPatchField<T>>(p); // boundary face = cell value; near-wall constraint applied separately
     if (d.type == "omegaWallFunction")    return std::make_unique<ZeroGradientPatchField<T>>(p); // kOmegaSST: same as epsilon, wall value set by deviceWallOmegaG0 + setValues
     if (d.type == "nutkWallFunction")     return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    // alphatWallFunction: alphat_w = rho_w*nut_w/Prt, i.e. the SAME expression deviceAlphat applies in the
+    // cells. Nothing is prescribed at the patch, so it is `calculated` exactly like the nut wall functions
+    // -- the model writes the value. Without this row a real OF compressible case is refused at load,
+    // because every rhoSimpleFoam tutorial with turbulence ships a 0/alphat.
+    if (d.type == "alphatWallFunction")   return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    // alphatJayatillekeWallFunction is NOT the same condition: it adds a thermal-sublayer resistance
+    // (the P-function) and gives a different wall heat flux. Accepting it as the simple form would run
+    // and converge with the wrong wall heat transfer, so it is refused by name instead.
+    if (d.type == "alphatJayatillekeWallFunction")
+    {
+        throw std::runtime_error(
+            "brae: alphatJayatillekeWallFunction is not implemented (patch " + p.name
+            + "). It applies a thermal-sublayer P-function that brae does not have, so treating it as "
+              "alphatWallFunction would give the wrong wall heat flux. Use alphatWallFunction, or wait "
+              "for the Jayatilleke port.");
+    }
     if (d.type == "atmNutkWallFunction")  return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values); // atmospheric rough-wall nut (z0); device wall nut from deviceBoundaryNut with atmZ0>0
     if (d.type == "nutUSpaldingWallFunction") return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values); // SA wall nut (value set by deviceBoundaryNutSpalding)
     // nutLowReWallFunction: OF calcNut()=0 (resolved viscous sublayer). cf's nutkWallFunction already yields nut=0 for

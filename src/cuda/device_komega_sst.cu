@@ -222,15 +222,20 @@ void omegaReactionKernel(
     const scalar* __restrict__ om,
     const scalar* __restrict__ divU,
     scalar* __restrict__ diag,
-    scalar* __restrict__ source)
+    scalar* __restrict__ source,
+    const scalar* __restrict__ rho)   // compressible: every term rho-weighted (nullptr -> incompressible)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // OF kOmegaSSTBase.C omega equation: the production, both SuSp terms and the beta*omega Sp are all
+    // alpha*rho*(...). Same treatment as the k sink -- the flux already carries rho and the diffusivity is
+    // scaled by the caller, so only the reaction pair is left. nullptr -> 1.0 -> bit-identical.
+    const scalar rw = rho ? rho[c] : scalar(1);
     const scalar sp1 = (2.0/3.0) * gamma[c] * divU[c];
     const scalar sp2 = (F1[c] - 1.0) * CD[c] / om[c];
-    diag[c]   += V[c] * (fmax(sp1, 0.0) + beta[c]*om[c] + fmax(sp2, 0.0));
-    source[c] += V[c] * gamma[c]*GbyNu0[c] - V[c]*fmin(sp1, 0.0)*om[c] - V[c]*fmin(sp2, 0.0)*om[c];
+    diag[c]   += rw * V[c] * (fmax(sp1, 0.0) + beta[c]*om[c] + fmax(sp2, 0.0));
+    source[c] += rw * (V[c] * gamma[c]*GbyNu0[c] - V[c]*fmin(sp1, 0.0)*om[c] - V[c]*fmin(sp2, 0.0)*om[c]);
 }
 
 
@@ -249,11 +254,17 @@ void kReactionSSTKernel(
     const scalar* __restrict__ gammaIntEff,
     scalar* __restrict__ diag,
     scalar* __restrict__ source,
-    const scalar* __restrict__ FDES)   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr -> 1 -> plain RANS)
+    const scalar* __restrict__ FDES,   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr -> 1 -> plain RANS)
+    const scalar* __restrict__ rho)    // compressible: every term is rho-weighted (nullptr -> 1 -> incompressible)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // OF's compressible k equation is the incompressible one with rho on every term:
+    //   fvm::div(alphaRhoPhi,k) - fvm::laplacian(alpha*rho*DkEff,k) == alpha*rho*Pk - fvm::Sp(alpha*rho*epsilonByk,k)
+    // The flux already carries rho (phase 2) and the diffusivity is scaled by the caller, so all that is
+    // left here is the production/sink pair. nullptr -> 1.0 -> bit-identical incompressible behaviour.
+    const scalar rw = rho ? rho[c] : scalar(1);
     const scalar sp = (2.0/3.0) * divU[c];
     // kOmegaSSTLM transition: Pk *= gammaIntEff, epsilonByk (= betaStar*omega) *= clamp(gammaIntEff, 0.1, 1).
     // gammaIntEff == nullptr (plain kOmegaSST) -> geff = 1 -> bit-identical (clamp(1,0.1,1)=1).
@@ -262,8 +273,8 @@ void kReactionSSTKernel(
     // modelled length scale collapses to the LES scale in detached regions. FDES==nullptr (RANS) -> factor 1 -> unchanged.
     const scalar fdes = FDES ? FDES[c] : scalar(1);
     const scalar Pk = geff * fmin(G[c], c1betaStar * k[c] * om[c]);
-    diag[c]   += V[c] * (fdes * fmin(fmax(geff, 0.1), 1.0) * betaStar * om[c] + fmax(sp, 0.0));
-    source[c] += V[c] * Pk - V[c] * fmin(sp, 0.0) * k[c];
+    diag[c]   += rw * V[c] * (fdes * fmin(fmax(geff, 0.1), 1.0) * betaStar * om[c] + fmax(sp, 0.0));
+    source[c] += rw * (V[c] * Pk - V[c] * fmin(sp, 0.0) * k[c]);
 }
 
 // kOmegaSST-DDES DES factor: FDES = max( (Lt/(CDES*Delta))*(1 - F2), 1 ), Lt = sqrt(k)/(betaStar*omega) (RANS length),
@@ -503,11 +514,13 @@ void deviceOmegaReaction(
     const DeviceBuffer<scalar>& omega,
     const DeviceBuffer<scalar>& divU,
     DeviceBuffer<scalar>& diag,
-    DeviceBuffer<scalar>& source)
+    DeviceBuffer<scalar>& source,
+    const DeviceBuffer<scalar>* rho)   // compressible rho weighting; nullptr -> incompressible (unchanged)
 {
     const int nC = static_cast<int>(V.size());
     omegaReactionKernel<<<nBlocks(nC), TPB>>>(nC, V.data(), gamma.data(), beta.data(), GbyNu0lim.data(), F1.data(),
-                                              CD.data(), omega.data(), divU.data(), diag.data(), source.data());
+                                              CD.data(), omega.data(), divU.data(), diag.data(), source.data(),
+                                              rho ? rho->data() : nullptr);
     cudaCheck(cudaGetLastError(), "omegaReaction");
 }
 
@@ -550,12 +563,14 @@ void deviceKReactionSST(
     DeviceBuffer<scalar>& diag,
     DeviceBuffer<scalar>& source,
     const scalar* gammaIntEff,
-    const DeviceBuffer<scalar>* FDES)   // kOmegaSST-DDES DES factor per cell; nullptr -> plain RANS (unchanged)
+    const DeviceBuffer<scalar>* FDES,   // kOmegaSST-DDES DES factor per cell; nullptr -> plain RANS (unchanged)
+    const DeviceBuffer<scalar>* rho)    // compressible rho weighting; nullptr -> incompressible (unchanged)
 {
     const int nC = static_cast<int>(V.size());
     kReactionSSTKernel<<<nBlocks(nC), TPB>>>(nC, V.data(), k.data(), omega.data(), G.data(), divU.data(),
                                              co.betaStar, co.c1 * co.betaStar, gammaIntEff, diag.data(), source.data(),
-                                             FDES ? FDES->data() : nullptr);
+                                             FDES ? FDES->data() : nullptr,
+                                             rho ? rho->data() : nullptr);
     cudaCheck(cudaGetLastError(), "kReactionSST");
 }
 

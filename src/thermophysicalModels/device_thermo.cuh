@@ -40,6 +40,16 @@ void deviceRhoRelax(
 // rhoPrev = rho. Call once after the first thermo update, before the outer loop starts relaxing.
 void deviceRhoSeedPrev(DeviceThermo& th);
 
+// alphat = mut/Prt = rho*nut/Prt, the turbulent thermal diffusivity [kg/(m s)].
+//
+// Written into th.alphat, which deviceAlphaEff already sums with alpha -- so the energy equation picks
+// this up with no change to it at all. Call AFTER the turbulence model has corrected nut; laminar cases
+// leave nut = 0 and this is a no-op that keeps alphat at zero.
+void deviceAlphat(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& nut,
+    const ThermoCoeffs& c);
+
 // Density AT BOUNDARY FACES, from the boundary values of p and he: rho_b = p_b/(R*T_b).
 //
 // Not the adjacent cell value. OF's rho is thermo.rho(), whose boundaryField is evaluated from the

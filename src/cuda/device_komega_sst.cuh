@@ -60,7 +60,8 @@ void deviceDEff(const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& nut,
 void deviceOmegaReaction(const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& beta,
                          const DeviceBuffer<scalar>& GbyNu0lim, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& CD,
                          const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& divU,
-                         DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
+                         DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source,
+    const DeviceBuffer<scalar>* rho = nullptr);
 
 // omega wall function (BINOMIAL n=2): omega0 = sqrt(omegaVis^2 + omegaLog^2) scattered to wall cells (cornerWeight
 // invNw), G0 identical to the epsilon wall function. Zeroes omega0/G0 then scatters. (Validated end-to-end at C7.)
@@ -79,7 +80,8 @@ void deviceKReactionSST(const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar
                         const DeviceBuffer<scalar>& G, const DeviceBuffer<scalar>& divU,
                         const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source,
                         const scalar* gammaIntEff = nullptr,
-                        const DeviceBuffer<scalar>* FDES = nullptr);   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr=RANS)
+                        const DeviceBuffer<scalar>* FDES = nullptr,
+    const DeviceBuffer<scalar>* rho = nullptr);   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr=RANS)
 
 // kOmegaSST-DDES DES factor FDES = max((sqrt(k)/(betaStar*omega))/(CDES*cubeRootVol(V))*(1-F2), 1), CDES=F1-blended.
 void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,

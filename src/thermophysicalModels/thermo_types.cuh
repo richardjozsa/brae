@@ -39,6 +39,10 @@ struct ThermoCoeffs
 
     // rho.relax() factor, fvSolution relaxationFactors.fields.rho. 1.0 = no relaxation.
     scalar relaxRho = 1.0;
+
+    // Turbulent Prandtl number, for alphat = mut/Prt. OF's compressible turbulence models default to
+    // 0.85 and read it from the turbulence dict; laminar cases never touch it (nut = 0 -> alphat = 0).
+    scalar Prt = 0.85;
 };
 
 // Per-cell thermophysical fields, sized nCells. Internal field only -- boundary values live in the
