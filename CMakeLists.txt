@@ -98,6 +98,7 @@ add_library(brae_core STATIC
     src/cuda/device_komega_sst.cu
     src/cuda/device_smagorinsky.cu
     src/cuda/device_coded_bc.cu
+    src/cuda/device_energy.cu
     src/thermophysicalModels/device_thermo.cu
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
@@ -1016,6 +1017,24 @@ add_executable(test_cyclic_fvc tests/test_cyclic_fvc.cu)
 target_include_directories(test_cyclic_fvc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_fvc PRIVATE brae_core)
 add_test(NAME cyclic_fvc COMMAND test_cyclic_fvc ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+
+# rhoSimpleFoam phase 2: mass flux reduces exactly to the volumetric flux at constant density
+add_executable(test_rho_flux tests/test_rho_flux.cu)
+target_include_directories(test_rho_flux PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_flux PRIVATE brae_core)
+add_test(NAME rho_flux COMMAND test_rho_flux)
+
+# rhoSimpleFoam phase 1 gate: sensible-enthalpy equation on a frozen velocity field
+add_executable(test_energy_frozen tests/test_energy_frozen.cu)
+target_include_directories(test_energy_frozen PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_energy_frozen PRIVATE brae_core)
+add_test(NAME energy_frozen COMMAND test_energy_frozen)
+# Gate 1 proper: same case, brae vs OpenFOAM scalarTransportFoam. Needs an OF install; skipped if absent.
+add_test(NAME energy_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/energy_vs_openfoam.sh)
+set_tests_properties(energy_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77)
 
 # rhoSimpleFoam phase 0 gate: thermophysical subsystem (perfectGas + hConst + Sutherland/const)
 add_executable(test_thermo_perfect_gas tests/test_thermo_perfect_gas.cu)

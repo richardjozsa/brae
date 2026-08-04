@@ -105,6 +105,34 @@ SurfaceScalarField flux(
     return phi;
 }
 
+SurfaceScalarField rhoFlux(
+    const std::vector<scalar>& rho,
+    const GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    const SurfaceScalarField phiV = flux(U, m, g, patches);
+    const SurfaceScalarField rhoF = interpolate(rho, m, g, patches);
+
+    SurfaceScalarField phi;
+    phi.internal.resize(phiV.internal.size());
+    for (std::size_t f = 0; f < phiV.internal.size(); ++f)
+    {
+        phi.internal[f] = rhoF.internal[f] * phiV.internal[f];
+    }
+    phi.boundary.resize(phiV.boundary.size());
+    for (std::size_t pi = 0; pi < phiV.boundary.size(); ++pi)
+    {
+        phi.boundary[pi].resize(phiV.boundary[pi].size());
+        for (std::size_t i = 0; i < phiV.boundary[pi].size(); ++i)
+        {
+            phi.boundary[pi][i] = rhoF.boundary[pi][i] * phiV.boundary[pi][i];
+        }
+    }
+    return phi;
+}
+
 SurfaceScalarField interpolate(
     const std::vector<scalar>& vol,
     const PrimitiveMesh& m,

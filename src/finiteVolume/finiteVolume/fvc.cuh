@@ -37,6 +37,18 @@ SurfaceScalarField flux(const GeometricField<vector>& U,
                         const PrimitiveMesh& m, const FvGeometry& g,
                         const std::vector<FvPatch>& patches);
 
+// rhoFlux(rho, U) = interpolate(rho) * flux(U)  -- the MASS flux, kg/s, for the compressible solvers.
+//
+// Deliberately composed from interpolate() and flux() rather than fused into one loop. Both already
+// reproduce OpenFOAM's linear face weights, and OF builds its compressible flux the same way
+// (linearInterpolate(rho)*(linearInterpolate(U) & Sf)). Fusing would mean re-deriving those weights here,
+// and any disagreement would surface much later as a fourth-digit mismatch in the pressure equation that
+// looks like a p-equation bug rather than an interpolation one.
+SurfaceScalarField rhoFlux(const std::vector<scalar>& rho,
+                           const GeometricField<vector>& U,
+                           const PrimitiveMesh& m, const FvGeometry& g,
+                           const std::vector<FvPatch>& patches);
+
 // interpolate a volScalarField (cell array) to faces: linear internal; boundary = cell value
 // (zeroGradient/extrapolated, as for rAU = 1/A()).
 SurfaceScalarField interpolate(const std::vector<scalar>& vol,
