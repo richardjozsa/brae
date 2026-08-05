@@ -40,7 +40,20 @@ OFLAST=$(ls -d [0-9]* | grep -vx 0 | sort -g | tail -1)
 rm -rf "$WORK.brae"; cp -r "$SRC" "$WORK.brae"
 cp -r "$WORK/constant/polyMesh" "$WORK.brae/constant/"
 mkdir -p "$WORK.brae/0" && cp "$WORK.brae"/0.orig/* "$WORK.brae/0/"
-"$BUILD/brae_rhoSimpleFoam" -case "$WORK.brae" > "$WORK.brae/log.brae" 2>&1
+BRAE_SCHEME_DEBUG=1 "$BUILD/brae_rhoSimpleFoam" -case "$WORK.brae" > "$WORK.brae/log.brae" 2>&1
+
+# INPUT ASSERTION, before comparing any field. The case asks for limitedLinear on the energy equation and
+# upwind on momentum; assert brae RESOLVED exactly that. Without this the field comparison is ambiguous --
+# a disagreement could mean the physics is wrong OR that brae read the case differently than OF did, and
+# that ambiguity is precisely what sent an earlier linearUpwind measurement (7.1e-2) the wrong way.
+RESOLVED=$(grep -m1 "RESOLVED" "$WORK.brae/log.brae" || true)
+echo "  parsed: ${RESOLVED#*RESOLVED  }"
+case "$RESOLVED" in
+  *"div(phi,U)=upwind"*"div(phi,h|e)=limitedLinear"*) ;;
+  *) echo "  FAIL brae did not resolve the case's schemes (expected div(phi,U)=upwind, div(phi,h|e)=limitedLinear)"
+     echo "       -> the field comparison below would be meaningless; fix the parse, not the tolerance"
+     exit 1 ;;
+esac
 BRLAST=$(ls -d "$WORK.brae"/[0-9]* | grep -v '/0$' | sort -g | tail -1)
 
 python3 - "$WORK/$OFLAST" "$BRLAST" "$TOL" <<'PY'

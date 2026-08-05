@@ -19,7 +19,13 @@ namespace brae {
 // Fill ctl's convection/laplacian/grad scheme flags from caseDir/system/fvSchemes.
 inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleControls& ctl)
 {
-            const std::string schemesText = readFileExpanded(caseDir + "/system/fvSchemes");   // $var expanded ($turbulence)
+            std::string schemesText = readFileExpanded(caseDir + "/system/fvSchemes");   // $var expanded ($turbulence)
+            // Split on ';' rather than on newlines. fvSchemes entries are ';'-terminated STATEMENTS, and
+            // OF does not care how they are laid out -- "div(phi,U) upwind; div(phi,e) linearUpwind;" on a
+            // single line is legal and means two different schemes. Matching per LINE let the flags of one
+            // entry leak into another (a one-line divSchemes gave div(phi,U) the energy equation's scheme),
+            // which is a silent scheme substitution, not a parse error.
+            for (char& c : schemesText) if (c == ';') c = '\n';
             std::istringstream fsch(schemesText);
             std::string ln;
             bool foundDivU = false;   // require an EXPLICIT div(phi,U); brae does not resolve the divSchemes 'default'
@@ -159,6 +165,22 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 throw std::runtime_error("fvSchemes: no explicit div(phi,U) scheme. brae does not resolve the"
                     " divSchemes 'default' for momentum convection (it would silently run first-order upwind)."
                     " Add e.g. 'div(phi,U)  bounded Gauss linearUpwind grad(U);'.");
+
+            // What brae CONCLUDED, not what the file said. BRAE_SCHEME_DEBUG used to echo the raw input
+            // line -- which is exactly the thing that was ambiguous: a one-line divSchemes looked correct
+            // in that echo while the flags leaked between entries, and div(phi,U) silently picked up the
+            // energy scheme. A measurement that never states which group its input landed in cannot tell
+            // "hypothesis wrong" from "input misread", and I read one as the other.
+            if (std::getenv("BRAE_SCHEME_DEBUG"))
+            {
+                auto sname = [](bool lu, bool lim) { return lu ? "linearUpwind" : (lim ? "limitedLinear" : "upwind"); };
+                std::fprintf(stderr,
+                    "[scheme] RESOLVED  div(phi,U)=%s%s  div(phi,k|omega)=%s  div(phi,h|e)=%s  "
+                    "nonOrth=%d gradULimitK=%g\n",
+                    ctl.linearUpwind ? "linearUpwind" : "upwind", ctl.linearUpwindV ? "V" : "",
+                    sname(ctl.luK, ctl.limitedK), sname(ctl.luHe, ctl.limitedHe),
+                    (int)ctl.nonOrth, ctl.gradULimitK);
+            }
 }
 
 }  // namespace brae

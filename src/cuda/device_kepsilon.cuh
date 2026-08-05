@@ -121,15 +121,18 @@ inline DeviceWallData buildDeviceWallData(
 void deviceWallEpsG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& Ux,
                      const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                      DeviceBuffer<scalar>& eps0, DeviceBuffer<scalar>& G0, const KEpsilonCoeffs& co = {}, int nutWall = 0,
-                     scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
+                     scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
+                     const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
 
 // add the eps / k reaction (Sp/Su) + SuSp(divU) terms to a matrix's diag/source (in place).
 void deviceEpsReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,
                        const DeviceBuffer<scalar>& gByNu, const DeviceBuffer<scalar>& divU,
-                       DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source, const KEpsilonCoeffs& co = {});
+                       DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source, const KEpsilonCoeffs& co = {},
+                       const DeviceBuffer<scalar>* rho = nullptr);   // compressible: alpha*rho on every RHS term
 void deviceKReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps,
                      const DeviceBuffer<scalar>& G, const DeviceBuffer<scalar>& divU,
-                     DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
+                     DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source,
+                     const DeviceBuffer<scalar>* rho = nullptr);   // compressible: alpha*rho on every RHS term
 // realizableKE (OF RAS/realizableKE): variable Cmu (rCmu) + strain magnitude magS from the gradU tensor; nut =
 // rCmu*k^2/eps; eps reaction = strain production C1*magS*eps - destruction C2*eps^2/(k+sqrt(nu*eps)). Cell-local
 // (no halo), so the distributed kEps correct reuses them on its already-halo-consistent gradU tensor.
@@ -187,7 +190,11 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                            bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                            int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
                            scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough wall)
-                           const ScalarDdt& kDdt = {}, const ScalarDdt& eDdt = {});   // transient fvm::ddt(k)/ddt(eps)
+                           const ScalarDdt& kDdt = {}, const ScalarDdt& eDdt = {},
+                            const DeviceBuffer<scalar>* rho = nullptr,          // compressible: alpha*rho weighting
+                            const DeviceBuffer<scalar>* muLam = nullptr,        // compressible: laminar dynamic mu
+                            const DeviceBuffer<scalar>* rhoBnd = nullptr,       // compressible: rho at boundary faces
+                            const DeviceBuffer<scalar>* nuWallFace = nullptr);  // compressible: nu = mu_b/rho_b per wall face   // transient fvm::ddt(k)/ddt(eps)
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw

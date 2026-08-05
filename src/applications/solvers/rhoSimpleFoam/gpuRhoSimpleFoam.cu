@@ -135,24 +135,23 @@ int main(int argc, char** argv)
                 "brae: rhoSimpleFoam supports kOmegaSST only so far. The other RAS models are not yet "
                 "rho-weighted, and running one down the incompressible path gives a converged wrong answer.");
 
-        // Scalar linearUpwind: brae's deferred correction does NOT reproduce OF's linearUpwind. Measured on
-        // the heated duct with div(phi,e) linearUpwind, brae vs OF: honouring it gives T 7.1e-2, running
-        // upwind instead gives 4.8e-2 -- so applying it is WORSE than not. The implicit limitedLinear IS
-        // faithful (8.3e-6) and is honoured. Same policy and same env-var opt-out gpuSimpleFoam already
-        // applies to the turbulence scalars; the point is that the downgrade is announced, never silent.
+        // div(phi,h|e) linearUpwind is HONOURED: measured against OF on the heated duct it agrees to
+        // 8.2e-7, i.e. as well as upwind does. An earlier measurement said otherwise (7.1e-2) and was
+        // wrong -- it used a one-line fvSchemes, which the old line-based parser let leak the energy
+        // scheme onto div(phi,U). The parser now splits on statements, so layout cannot do that.
+        //
+        // The turbulence scalars keep gpuSimpleFoam's opt-out: that gate predates this work and its
+        // claim (linearUpwind degrades k/omega vs OF) has not been re-measured here, so it is left as
+        // found rather than flipped on an untested assumption.
         if (!std::getenv("BRAE_SCALAR_LINEARUPWIND"))
         {
-            if (ctl.luHe || ctl.luK || ctl.luEps)
+            if (ctl.luK || ctl.luEps)
             {
                 std::fprintf(stderr,
-                    "brae WARNING: fvSchemes requests 'linearUpwind' on div(phi,%s%s%s) but brae is running "
-                    "UPWIND there (its deferred linearUpwind does not match OpenFOAM's). Set "
-                    "BRAE_SCALAR_LINEARUPWIND=1 to honour the requested scheme. 'limitedLinear' is "
-                    "reproduced faithfully and is honoured.\n",
-                    ctl.luHe ? "h|e" : "", (ctl.luHe && (ctl.luK || ctl.luEps)) ? "," : "",
-                    (ctl.luK || ctl.luEps) ? "k|omega" : "");
+                    "brae WARNING: fvSchemes requests 'linearUpwind' on div(phi,k|omega) but brae is "
+                    "running UPWIND there. Set BRAE_SCALAR_LINEARUPWIND=1 to honour it. The energy "
+                    "equation honours linearUpwind unconditionally (validated against OpenFOAM).\n");
             }
-            ctl.luHe = false;
             ctl.luK = false;
             ctl.luEps = false;
         }
