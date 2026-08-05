@@ -856,6 +856,18 @@ namespace brae {
             deviceSimplecRAtU(dm, rowSum, diagA, rAtU);
             deviceCopy(drAtU, rAtU);
             deviceAxpy(-1.0, rAU, drAtU);
+            // OF rhoSimpleFoam/pcEqn.H weights the SIMPLEC flux correction by density:
+            //     phiHbyA += fvc::interpolate(rho*(rAtU - rAU))*fvc::snGrad(p)*magSf
+            // (incompressible simpleFoam/pEqn.H has no rho and is the expression below without this).
+            // The HbyA correction on the other hand is NOT weighted in either: HbyA -= (rAU - rAtU)*grad(p),
+            // so only drAtU used for the FLUX is scaled -- keep an unscaled copy for that.
+            if (compressible_)
+            {
+                DeviceBuffer<scalar> t;
+                deviceHadamard(t, th_.rho, drAtU);
+                deviceCopy(drAtUFlux_, t);
+            }
+            else deviceCopy(drAtUFlux_, drAtU);
         }
         else
             deviceCopy(rAtU, rAU);
@@ -956,7 +968,7 @@ namespace brae {
         {
             // phiHbyA += interpolate(rAtU-rAU)*snGrad(p)*magSf = laplacian(interp(drAtU), p).flux()  (NOT via HbyA flux)
             DeviceBuffer<scalar> drAtUf;
-            deviceInterpolate(dm, drAtU, drAtUf);
+            deviceInterpolate(dm, drAtUFlux_, drAtUf);   // rho*(rAtU-rAU) when compressible
             DeviceBuffer<scalar> ld, lu, ll;
             deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
             DeviceBuffer<scalar> fInt;
@@ -972,7 +984,7 @@ namespace brae {
                 deviceAxpy(1.0, ffcS, phiHi);
             }
             DeviceBuffer<scalar> dIC, dBC;
-            deviceBCLaplacianCoeffs(dbP_, drAtU, dIC, dBC);
+            deviceBCLaplacianCoeffs(dbP_, drAtUFlux_, dIC, dBC);
             DeviceBuffer<scalar> fBnd;
             deviceMatrixFluxBoundary(dbP_, dIC, dBC, dp_, fBnd);
             deviceAxpy(1.0, fBnd, phiHb);
@@ -1296,6 +1308,13 @@ namespace brae {
             nullptr,
             &kineticSrc,
             alphaEffBnd.size() ? &alphaEffBnd : nullptr);
+
+        // OF's EEqn.H ends with thermo.correct(), so its PRESSURE equation sees psi/rho/mu updated from the
+        // just-solved he. brae updated thermo only after the pressure step, leaving the pEqn on the previous
+        // iteration's psi and rho. T/psi/mu/alpha depend on he alone (not p), so doing it here is exactly
+        // OF's ordering; rho still gets refreshed with the NEW p and relaxed below, as OF does at the end
+        // of pEqn.H/pcEqn.H.
+        deviceThermoUpdate(th_, dp_, tc_);
 
         correctPressureVelocity(res);
 

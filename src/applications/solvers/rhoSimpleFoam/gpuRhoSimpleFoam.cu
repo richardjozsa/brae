@@ -184,17 +184,9 @@ int main(int argc, char** argv)
             ctl.luEps = false;
         }
 
-        const FoamDict* rf = fvSolution.subDict("relaxationFactors");
-        const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
-        const FoamDict* fld = rf ? rf->subDict("fields") : nullptr;
-        const FoamDict* eqSrc = eqs ? eqs : rf;
-        const FoamDict* fldSrc = fld ? fld : rf;
-        ctl.relaxU = eqSrc ? eqSrc->scalarOr("U", 1.0) : 1.0;
-        ctl.relaxK = eqSrc ? eqSrc->scalarOr("k", 1.0) : 1.0;
         // OF looks these up by FIELD NAME: "omega" on kOmegaSST, "epsilon" on kEpsilon.
         const std::string second = ctl.sst ? "omega" : "epsilon";
-        ctl.relaxEps = eqSrc ? eqSrc->scalarOr(second, 1.0) : 1.0;
-        ctl.relaxP = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
+        readRelaxationFactors(fvSolution, ctl);   // shared; adds the alpha<=0 guard this copy lacked
 
         // fvSolution -> ctl, through the SHARED reader. This driver previously read only tolP/tolU/tolKE
         // by hand and silently dropped relTol{P,U,KE}, consistent (SIMPLEC), nNonOrthogonalCorrectors,

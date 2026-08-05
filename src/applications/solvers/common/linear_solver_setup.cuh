@@ -21,6 +21,7 @@
 #include "foam_dict.cuh"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -33,10 +34,18 @@ namespace brae {
 // secondName is the 2nd turbulence scalar's FIELD name: "omega" on kOmegaSST, "epsilon" on kEpsilon,
 // unused when ctl.sa (SA solves nuTilda only). Pass it explicitly -- deriving it here would re-hardcode
 // the thing that already went wrong once.
+//
+// algorithmDict is the fvSolution sub-dict holding the algorithm controls: "SIMPLE" for the steady
+// solvers, "PIMPLE" for the transient one. OF parameterises this the same way -- solutionControl reads
+// consistent/nNonOrthogonalCorrectors from subOrEmptyDict(algorithmName_) (solutionControl.C:46,51,302)
+// and the name is a constructor argument defaulting to "SIMPLE" in simpleControl.H:100 and "PIMPLE" in
+// pimpleControl.H:135. Hardcoding "SIMPLE" here would read nNonOrthogonalCorrectors as 0 on every
+// transient case, so this is required, not cosmetic.
 inline void readLinearSolverControls(
     const FoamDict& fvSolution,
     const std::string& secondName,
-    DeviceSimpleControls& ctl)
+    DeviceSimpleControls& ctl,
+    const std::string& algorithmDict = "SIMPLE")
 {
     const FoamDict* solvers = fvSolution.subDict("solvers");
 
@@ -86,14 +95,14 @@ inline void readLinearSolverControls(
         }
     }
 
-    const FoamDict* simple = fvSolution.subDict("SIMPLE");
+    const FoamDict* algo = fvSolution.subDict(algorithmDict);
     {
-        const std::string cons = simple ? simple->wordOr("consistent", "no") : "no";
+        const std::string cons = algo ? algo->wordOr("consistent", "no") : "no";
         ctl.consistent = (cons == "yes" || cons == "true" || cons == "on" || cons == "1");   // SIMPLEC
     }
-    ctl.nNonOrth = simple ? simple->intOr("nNonOrthogonalCorrectors", 0) : 0;
+    ctl.nNonOrth = algo ? algo->intOr("nNonOrthogonalCorrectors", 0) : 0;
     {
-        const std::vector<scalar> bf = simple ? simple->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
+        const std::vector<scalar> bf = algo ? algo->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
         if (bf.size() >= 3) ctl.bodyForce = vector{bf[0], bf[1], bf[2]};   // constant momentum source
     }
 
@@ -112,6 +121,48 @@ inline void readLinearSolverControls(
     }
     if (const char* cs = std::getenv("BRAE_CORR_SCALING")) ctl.corrScaling = (std::atoi(cs) != 0);
     if (const char* ug = std::getenv("BRAE_USE_GRAPH")) ctl.useGraph = (std::atoi(ug) != 0);
+}
+
+// relaxationFactors -> ctl.relax{U,P,K,Eps}. Third copy of this in the tree when it was written, each a
+// different subset -- the steady driver had all of it, the compressible one had no alpha<=0 guard, and the
+// transient one had neither the guard, nor the legacy form, nor the right key for the second scalar (it
+// reused k's factor for epsilon/omega, so `omega 0.4` was ignored and omega ran at k's factor).
+//
+// Call AFTER the turbulence model is read: it branches on ctl.sa/ctl.sst to pick the field names.
+inline void readRelaxationFactors(const FoamDict& fvSolution, DeviceSimpleControls& ctl)
+{
+    const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
+    const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
+    const FoamDict* fld = rf ? rf->subDict("fields") : nullptr;
+    // OF accepts BOTH the modern nested {equations{} fields{}} and the legacy FLAT {p ..; U ..;} form. Fall
+    // back to the flat keys when a sub-dict is absent, so a legacy case isn't silently left un-relaxed
+    // (all factors 1.0 -> the steady SIMPLE loop typically diverges).
+    const FoamDict* eqSrc  = eqs ? eqs : rf;
+    const FoamDict* fldSrc = fld ? fld : rf;
+
+    const char* kName    = ctl.sa ? "nuTilda" : "k";              // SA: relaxK carries the nuTilda relax
+    const std::string sName = ctl.sst ? "omega" : "epsilon";
+
+    ctl.relaxU   = eqSrc  ? eqSrc->scalarOr("U", 1.0) : 1.0;
+    ctl.relaxK   = eqSrc  ? eqSrc->scalarOr(kName, 1.0) : 1.0;
+    ctl.relaxEps = eqSrc  ? eqSrc->scalarOr(sName, 1.0) : 1.0;
+    ctl.relaxP   = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
+
+    // A relaxation factor <= 0 divides by zero in the diagonal-relaxation kernel (Inf diag -> NaN). OF's
+    // fvMatrix::relax skips relaxation for alpha <= 0; match that (treat as 1.0 = no under-relaxation) + warn.
+    auto fixRelax = [](scalar& a, const char* nm)
+    {
+        if (a <= 0.0)
+        {
+            std::fprintf(stderr,
+                "brae WARNING: relaxationFactors %s = %g <= 0; using 1.0 (no under-relaxation)\n", nm, (double)a);
+            a = 1.0;
+        }
+    };
+    fixRelax(ctl.relaxU, "U");
+    fixRelax(ctl.relaxK, kName);
+    fixRelax(ctl.relaxEps, sName.c_str());
+    fixRelax(ctl.relaxP, "p");
 }
 
 // The energy equation's linear solver, which OF names "h" for sensibleEnthalpy and "e" for

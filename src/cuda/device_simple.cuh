@@ -17,7 +17,11 @@ void deviceMatrixH(const DeviceLduView& A, const DeviceMesh& dm, const DeviceBuf
 
 // rAU = V/diagC  (A = diagC/V, rAU = 1/A). diagC already folded (= diag + internalCoeffs cmptAv).
 void deviceReciprocalV(const DeviceMesh& dm, const DeviceBuffer<scalar>& diagC, DeviceBuffer<scalar>& rAU);
-// SIMPLEC consistent rAtU = V/max(rowSum, 0.1*diagA); rowSum = A*ones (= 1/rAU - H1).
+// SIMPLEC consistent rAtU = V/rowSum, rowSum = A*ones. This is OF's 1/(1/rAU - UEqn.H1()) exactly:
+// H1 = (-sum(offdiag) + sum(coupled boundaryCoeffs))/V and A = D/V, so V*(A - H1) = D + sum(offdiag)
+// - sum(coupled bCoeffs) = rowSum on a mesh with no coupled patches. diagA is unused (kept for ABI).
+// NOTE: there is NO max(rowSum, 0.1*diagA) clamp -- an earlier version of this comment claimed one and
+// OF has none; the code never had it either (diagA is (void)-cast).
 void deviceSimplecRAtU(const DeviceMesh& dm, const DeviceBuffer<scalar>& rowSum, const DeviceBuffer<scalar>& diagA,
                        DeviceBuffer<scalar>& rAtU);
 // linearUpwind deferred correction for div(phi,U_i): corrSource[c] = Sum(+/-) phi_f*(grad(U_i)_upwind . (Cf-C_up)).

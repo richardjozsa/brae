@@ -17,7 +17,8 @@
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
 #include "foam_dict.cuh"
-#include "scheme_parse.cuh"   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
+#include "scheme_parse.cuh"
+#include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
@@ -257,99 +258,19 @@ int main(int argc, char** argv)
             ctl.luEps = false;
         }
 
-        const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
-        const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
-        const FoamDict* fld = rf ? rf->subDict("fields") : nullptr;
-        // OF accepts BOTH the modern nested {equations{} fields{}} and the legacy FLAT {p ..; U ..;} form. Fall back
-        // to the flat keys (read from rf itself) when a sub-dict is absent, so a legacy case isn't silently left
-        // un-relaxed (all factors 1.0 -> the steady SIMPLE loop typically diverges).
-        const FoamDict* eqSrc  = eqs ? eqs : rf;
-        const FoamDict* fldSrc = fld ? fld : rf;
-        ctl.relaxU   = eqSrc  ? eqSrc->scalarOr("U", 1.0) : 1.0;
-        ctl.relaxK   = eqSrc  ? eqSrc->scalarOr(ctl.sa ? "nuTilda" : "k", 1.0) : 1.0;   // SA: relaxK carries the nuTilda relax
-        ctl.relaxEps = eqSrc  ? eqSrc->scalarOr(ctl.sst ? "omega" : "epsilon", 1.0) : 1.0;
-        ctl.relaxP   = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
-        // A relaxation factor <= 0 divides by zero in the diagonal-relaxation kernel (Inf diag -> NaN). OF's
-        // fvMatrix::relax skips relaxation for alpha <= 0; match that (treat as 1.0 = no under-relaxation) + warn.
-        auto fixRelax = [](scalar& a, const char* nm) {
-            if (a <= 0.0) { std::fprintf(stderr, "brae WARNING: relaxationFactors %s = %g <= 0; using 1.0 (no under-relaxation)\n", nm, a); a = 1.0; }
-        };
-        fixRelax(ctl.relaxU, "U");
-        fixRelax(ctl.relaxK, ctl.sa ? "nuTilda" : "k");
-        fixRelax(ctl.relaxEps, ctl.sst ? "omega" : "epsilon");
-        fixRelax(ctl.relaxP, "p");
+        readRelaxationFactors(fvSolution, ctl);   // shared: solvers/common/linear_solver_setup.cuh
 
-        const FoamDict* solvers = fvSolution.subDict("solvers");
-        auto solverTol = [&](const std::string& f, scalar def)
-        {
-            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-            return s ? s->scalarOr("tolerance", def) : def;
-        };
-        auto solverRelTol = [&](const std::string& f)   // SIMPLE only needs a loose per-step solve
-        {
-            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-            return s ? s->scalarOr("relTol", 0.0) : 0.0;
-        };
-        ctl.tolP = solverTol("p", 1e-6);
-        ctl.tolU = solverTol("U", 1e-8);
+        // fvSolution -> ctl, through the SHARED reader in solvers/common/linear_solver_setup.cuh.
+        // This used to be an inline copy here; the compressible driver was ported from it and silently
+        // dropped fifteen of these controls. One reader means a new driver gets the whole set or none.
         const std::string second = ctl.sst ? "omega" : "epsilon";
-        ctl.tolKE = ctl.sa ? solverTol("nuTilda", 1e-8) : std::fmin(solverTol("k", 1e-8), solverTol(second, 1e-8));
-        ctl.relTolP = solverRelTol("p");
-        ctl.relTolU = solverRelTol("U");
-        ctl.relTolKE = ctl.sa ? solverRelTol("nuTilda")                     // SA: single nuTilda solve
-                              : std::fmin(solverRelTol("k"), solverRelTol(second));   // OF solves k/(eps|omega) loosely per SIMPLE step
-        // Per-field scalar linear solver from fvSolution, EXACTLY as OF selects it: solver smoothSolver +
-        // smoother symGaussSeidel -> cf's deviceSymGaussSeidel. Any other (PBiCG[Stab]/GAMG/...) keeps BiCGStab.
-        // OF smoothSolver with a GaussSeidel-family smoother (GaussSeidel = forward sweep, symGaussSeidel = fwd+bwd);
-        // cf maps BOTH to its symmetric multicolor deviceSymGaussSeidel (a superset of forward GaussSeidel). Other
-        // solvers (PBiCG[Stab]/GAMG/...) keep BiCGStab. motorBike uses "GaussSeidel" for U/k/omega; pitzDaily "symGaussSeidel".
-        auto useSymGS = [&](const std::string& f)
-        {
-            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-            if (!s || s->wordOr("solver", "") != "smoothSolver") return false;
-            const std::string sm = s->wordOr("smoother", "");
-            return sm == "symGaussSeidel" || sm == "GaussSeidel";
-        };
-        ctl.gsK   = useSymGS(ctl.sa ? "nuTilda" : "k");
-        ctl.gsEps = ctl.sa ? false : useSymGS(second);
-        // Momentum solver READ FROM fvSolution exactly like OF (fvVectorMatrix::solveSegregated solves each U component
-        // with the U solver) and like cf already does for the scalars above. OF uses smoothSolver+symGaussSeidel for U
-        // on most tutorials; cf's default Jacobi-preconditioned BiCGStab STALLS on the ill-conditioned high-aspect-ratio
-        // viscous momentum matrix (backwardFacingStep2D AR~7600: the iter-1 predictor came out ~half of OF's, seeding the
-        // divergence, divDevReff and rAU are OF-exact, the gap was purely the linear solve), whereas GS is robust like
-        // OF's smoothSolver. BRAE_GS_U=0 forces BiCGStab (perf escape: GS is slower over the 3 components).
-        const char* gsuEnv = std::getenv("BRAE_GS_U");
-        ctl.gsU   = gsuEnv ? (std::atoi(gsuEnv) != 0 && useSymGS("U")) : useSymGS("U");
-        // BiCGStab batched convergence DEFAULT OFF: measured net-NEGATIVE once relTol makes the solves few-iter
-        // (overshoot to the K-boundary costs more than the saved syncs). Kept behind the env for tight-tol cases
-        // (many inner iters), where it would help like the pressure pcgCheckEvery does.
-        if (const char* be = std::getenv("BRAE_BICG_CHECK_EVERY"))
-        {
-            const int k = std::atoi(be);
-            if (k >= 1) ctl.bicgCheckEvery = k;
-        }
-        ctl.pcgCheckEvery = 4;   // application default: batched PCG residual read (1.30x; OF-validated identical to K=1).
-        if (const char* ce = std::getenv("BRAE_PCG_CHECK_EVERY"))
-        {
-            const int k = std::atoi(ce);
-            if (k >= 1) ctl.pcgCheckEvery = k;   // override (1 = exact)
-        }
-        if (const char* cs = std::getenv("BRAE_CORR_SCALING")) ctl.corrScaling = (std::atoi(cs) != 0);   // AMG corr-scaling + flexible CG
-        if (const char* ug = std::getenv("BRAE_USE_GRAPH")) ctl.useGraph = (std::atoi(ug) != 0);          // V-cycle graph replay toggle (debug)
+        readLinearSolverControls(fvSolution, second, ctl);
 
         const FoamDict* simple = fvSolution.subDict("SIMPLE");
         const FoamDict* resCtl = simple ? simple->subDict("residualControl") : nullptr;
         const bool hasRC = (resCtl != nullptr);
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1, rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
-        {
-            const std::string cons = simple ? simple->wordOr("consistent", "no") : "no";
-            ctl.consistent = (cons == "yes" || cons == "true" || cons == "on" || cons == "1");   // SIMPLEC
-        }
-        ctl.nNonOrth = simple ? simple->intOr("nNonOrthogonalCorrectors", 0) : 0;   // extra pressure passes on non-orthogonal meshes
-        {
-            const std::vector<scalar> bf = simple ? simple->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
-            if (bf.size() >= 3) ctl.bodyForce = vector{bf[0], bf[1], bf[2]};   // constant momentum source (drives cyclic/periodic channels)
-        }
+        // consistent / nNonOrthogonalCorrectors / bodyForce are read by readLinearSolverControls above.
 
         std::printf("brae (device-resident) | case=%s | %s%s | nu=%.3g\n", caseDir.c_str(),
                     simType.c_str(), ctl.turbulent ? (ctl.sst ? " (kOmegaSST)" : " (kEpsilon)") : "", ctl.nu);

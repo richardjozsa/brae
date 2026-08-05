@@ -1177,6 +1177,11 @@ target_include_directories(test_thermo_type_equiv PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_thermo_type_equiv PRIVATE brae_core)
 add_test(NAME thermo_type_equiv COMMAND test_thermo_type_equiv)
 
+add_executable(test_linear_solver_setup tests/test_linear_solver_setup.cu)
+target_include_directories(test_linear_solver_setup PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_linear_solver_setup PRIVATE brae_core)
+add_test(NAME linear_solver_setup COMMAND test_linear_solver_setup)
+
 # Cyclic increment C3b: cyclic coupling inside an iterative solver (periodic Poisson)
 add_executable(test_cyclic_poisson tests/test_cyclic_poisson.cu)
 target_include_directories(test_cyclic_poisson PRIVATE ${BRAE_HEADER_DIRS})

@@ -311,6 +311,9 @@ private:
     // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
     // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed
     // muEff_b = mu_b + rho_b*nut_b and the kinematic nu_b = mu_b/rho_b the wall functions ask for.
+    // SIMPLEC: (rAtU - rAU) for the HbyA correction, rho*(rAtU - rAU) for the FLUX correction on the
+    // compressible path (OF pcEqn.H). Identical buffers when incompressible.
+    DeviceBuffer<scalar> drAtUFlux_;
     scalar eTol_ = 1e-10, eRelTol_ = 0.0;
     bool   eUseGS_ = false;
     DeviceBuffer<scalar> rhoBnd_, muBnd_, nuWallBnd_;

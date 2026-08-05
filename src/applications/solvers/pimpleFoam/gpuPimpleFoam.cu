@@ -22,6 +22,7 @@
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
 #include "mrf_read.cuh"             // readMRFProperties: only to REFUSE an MRF case (not applied transient yet)
+#include "linear_solver_setup.cuh"   // readLinearSolverControls: shared with gpuSimpleFoam/gpuRhoSimpleFoam
 #include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
@@ -198,22 +199,17 @@ try
     const int nOuter   = pimple ? std::max(1, pimple->intOr("nOuterCorrectors", 1)) : 1;
     const int nCorr    = pimple ? std::max(1, pimple->intOr("nCorrectors", 1)) : 1;
     const int nNonOrth = pimple ? pimple->intOr("nNonOrthogonalCorrectors", 0) : 0;
-    const FoamDict* rf   = fvSolution.subDict("relaxationFactors");
-    const FoamDict* rfEq = rf ? rf->subDict("equations") : nullptr;
-    const FoamDict* rfFl = rf ? rf->subDict("fields") : nullptr;
-    const scalar relaxU  = rfEq ? rfEq->scalarOr("U", 1.0) : 1.0;   // transient default: no relaxation
-    const scalar relaxP  = rfFl ? rfFl->scalarOr("p", 1.0) : 1.0;
-    const scalar relaxK  = rfEq ? rfEq->scalarOr("k", 1.0) : 1.0;
-    const FoamDict* solvers = fvSolution.subDict("solvers");
-    auto solveTol = [&](const char* f, scalar dflt) {
-        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-        return s ? s->scalarOr("tolerance", dflt) : dflt;
-    };
     const scalar nu = transport.scalarOr("nu", 1e-5);
 
     DeviceSimpleControls ctl;
-    ctl.nu = nu; ctl.relaxU = relaxU; ctl.relaxP = relaxP; ctl.relaxK = relaxK; ctl.relaxEps = relaxK;
-    ctl.tolU = solveTol("U", 1e-7); ctl.tolP = solveTol("p", 1e-7); ctl.tolKE = solveTol("k", 1e-8);
+    ctl.nu = nu;
+    // relaxationFactors come from readRelaxationFactors BELOW (with the turbulence model known). Read here
+    // it took epsilon/omega's factor from "k" -- `omega 0.4` was ignored -- skipped the legacy flat form,
+    // and had no alpha<=0 guard, where OF's fvMatrix::relax skips relaxation for alpha <= 0.
+    // tolerances / relTol / smoothSolver selection come from readLinearSolverControls BELOW, once the
+    // turbulence model is known (it picks k+omega vs k+epsilon vs nuTilda). Reading them here read only
+    // "k" -- a case with a tighter omega tolerance got the loose one -- and never read relTol or
+    // smoothSolver at all, so every transient solve was absolute-tolerance BiCGStab whatever fvSolution said.
     ctl.nNonOrth = nNonOrth;
     ctl.caseDir = caseDir;                                          // AMG-hierarchy cache lives in <caseDir>/constant/polyMesh
     ctl.writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;     // BRAE_MESH_CACHE=1 -> build the AMG hierarchy ONCE, cache it, reload next run
@@ -235,6 +231,13 @@ try
         readTurbulenceModel(turbProps, ctl);
         secondName = ctl.sst ? "omega" : "epsilon";
     }
+
+    // fvSolution -> ctl, through the SHARED reader. Must come AFTER the turbulence model is read: it
+    // branches on ctl.turbulent/sa/sst to pick which scalar solver dicts to look at. "PIMPLE" is the
+    // algorithm dict -- OF's solutionControl reads consistent/nNonOrthogonalCorrectors from the dict
+    // named by algorithmName_, "PIMPLE" here (pimpleControl.H:135), not "SIMPLE".
+    readLinearSolverControls(fvSolution, secondName, ctl, "PIMPLE");
+    readRelaxationFactors(fvSolution, ctl);
 
     // ---- mesh + start fields ----
     PrimitiveMesh m; m.read(caseDir + "/constant/polyMesh");

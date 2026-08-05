@@ -25,13 +25,16 @@ WORK=${WORK:-/tmp/brae_ctl_vs_of}
 # Those were all silently dropped by the compressible driver until readLinearSolverControls existed;
 # relTol unset meant every equation was solved to ABSOLUTE tolerance every outer iteration.
 #
-# 2e-4, not the 2e-5 the plain SST gate uses, and the reason is measured. Bisected:
-#   nNonOrth 2 + corrected laplacian alone  -> U 2.6e-6, k 1.9e-6   (exact)
-#   consistent yes (SIMPLEC)                -> U 7.9e-5, k 1.2e-4   (the floor)
-# So the floor is brae's SIMPLEC fidelity against OF, which is PRE-EXISTING incompressible-path code --
-# this gate only made it visible by being the first compressible case to switch SIMPLEC on. It is an
-# open item, deliberately recorded here rather than absorbed silently into a round tolerance.
-TOL=${TOL:-2e-4}
+# 5e-5, not the 2e-5 the plain SST gate uses. Bisected, and the floor moved once already:
+#   nNonOrth 2 + corrected laplacian alone  -> U 2.6e-6            (exact)
+#   consistent yes, SIMPLEC flux unweighted -> U 7.9e-5, k 1.2e-4  (was the floor)
+#   consistent yes, SIMPLEC flux rho-weighted -> U 1.2e-5, k 8.5e-6
+# The fix: OF rhoSimpleFoam/pcEqn.H weights the SIMPLEC flux correction by density,
+#     phiHbyA += fvc::interpolate(rho*(rAtU - rAU))*fvc::snGrad(p)*magSf
+# where incompressible simpleFoam/pEqn.H has no rho. brae used the unweighted form on both paths.
+# The residual ~1.2e-5 (vs 2.6e-6 without SIMPLEC) is not yet explained and is left visible here rather
+# than rounded away.
+TOL=${TOL:-5e-5}
 
 if [ ! -f "$OFBASHRC" ]; then echo "OpenFOAM not found at $OFBASHRC -- skipping"; exit 77; fi
 source "$OFBASHRC" 2>/dev/null || true
