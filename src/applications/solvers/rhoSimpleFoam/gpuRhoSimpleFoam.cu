@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <filesystem>
 #include <cmath>
+#include <algorithm>
 
 using namespace brae;
 
@@ -53,7 +54,7 @@ int main(int argc, char** argv)
         const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");
 
         const ThermoCoeffs tc = readThermoCoeffs(caseDir);
-        const RhoSimpleControls rc = readRhoSimpleControls(fvSolution);
+        const RhoSimpleControls rc = readRhoSimpleControls(fvSolution, tc.internalEnergy);
         if (rc.transonic)
         {
             throw std::runtime_error(
@@ -84,6 +85,39 @@ int main(int argc, char** argv)
         for (label i = 0; i < nC; ++i) rho0[i] = p.internal[i] / (tc.R * T.internal[i]);
         const SurfaceScalarField phi = fvc::rhoFlux(rho0, U, m, g, fvp);
 
+        // Resolve pMaxFactor/pMinFactor into absolute limits the way OF does: the reference is taken from
+        // the p BOUNDARY values (pressureControl.C scans p.boundaryField() over patches that fix a value).
+        // Without a fixed-pressure patch OF errors out and tells the user to give pMax/pMin directly, so
+        // brae does the same rather than inventing a reference from the internal field.
+        {
+            RhoSimpleControls& rcm = const_cast<RhoSimpleControls&>(rc);
+            if (rcm.pMaxFactor > 0.0 || rcm.pMinFactor > 0.0)
+            {
+                scalar pRefMax = -1e300;
+                scalar pRefMin = 1e300;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    const std::vector<scalar>& bv = p.boundary[pi]->value();
+                    for (scalar v : bv)
+                    {
+                        pRefMax = std::max(pRefMax, v);
+                        pRefMin = std::min(pRefMin, v);
+                    }
+                }
+                if (pRefMax <= -1e299)
+                {
+                    throw std::runtime_error(
+                        "brae: SIMPLE/pMaxFactor or pMinFactor given, but no boundary pressure to scale "
+                        "them against. Specify absolute pMax/pMin instead (OF refuses the same case).");
+                }
+                if (rcm.pMaxFactor > 0.0) { rcm.pMaxLimit = pRefMax * rcm.pMaxFactor; rcm.limitMaxP = true; }
+                if (rcm.pMinFactor > 0.0) { rcm.pMinLimit = pRefMin * rcm.pMinFactor; rcm.limitMinP = true; }
+                std::printf("brae_rhoSimpleFoam: pressureControl limits p to [%g, %g] Pa\n",
+                            rcm.limitMinP ? rcm.pMinLimit : -1e300,
+                            rcm.limitMaxP ? rcm.pMaxLimit : 1e300);
+            }
+        }
+
         DeviceSimpleControls ctl;
         ctl.nu = tc.mu0;                       // replaced every iteration by th_.mu; only the seed matters
         parseFvSchemesControls(caseDir, ctl);
@@ -100,6 +134,28 @@ int main(int argc, char** argv)
             throw std::runtime_error(
                 "brae: rhoSimpleFoam supports kOmegaSST only so far. The other RAS models are not yet "
                 "rho-weighted, and running one down the incompressible path gives a converged wrong answer.");
+
+        // Scalar linearUpwind: brae's deferred correction does NOT reproduce OF's linearUpwind. Measured on
+        // the heated duct with div(phi,e) linearUpwind, brae vs OF: honouring it gives T 7.1e-2, running
+        // upwind instead gives 4.8e-2 -- so applying it is WORSE than not. The implicit limitedLinear IS
+        // faithful (8.3e-6) and is honoured. Same policy and same env-var opt-out gpuSimpleFoam already
+        // applies to the turbulence scalars; the point is that the downgrade is announced, never silent.
+        if (!std::getenv("BRAE_SCALAR_LINEARUPWIND"))
+        {
+            if (ctl.luHe || ctl.luK || ctl.luEps)
+            {
+                std::fprintf(stderr,
+                    "brae WARNING: fvSchemes requests 'linearUpwind' on div(phi,%s%s%s) but brae is running "
+                    "UPWIND there (its deferred linearUpwind does not match OpenFOAM's). Set "
+                    "BRAE_SCALAR_LINEARUPWIND=1 to honour the requested scheme. 'limitedLinear' is "
+                    "reproduced faithfully and is honoured.\n",
+                    ctl.luHe ? "h|e" : "", (ctl.luHe && (ctl.luK || ctl.luEps)) ? "," : "",
+                    (ctl.luK || ctl.luEps) ? "k|omega" : "");
+            }
+            ctl.luHe = false;
+            ctl.luK = false;
+            ctl.luEps = false;
+        }
 
         const FoamDict* rf = fvSolution.subDict("relaxationFactors");
         const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
@@ -124,6 +180,30 @@ int main(int argc, char** argv)
         TurbulenceFields tf;
         if (ctl.turbulent) tf = readTurbulenceFields(t0, fvp, nC, ctl, "omega", U);
 
+        // Per-boundary-face Prt from 0/alphat. OF keeps two DIFFERENT turbulent Prandtl numbers in one
+        // case: alphatWallFunction reads its own from the patch (default 0.85) while the turbulence model
+        // uses the one from its coeffs dict (default 1.0). Using either one everywhere is wrong somewhere.
+        std::vector<scalar> prtFace;
+        if (ctl.turbulent)
+        {
+            FieldData<scalar> alphatFd;
+            bool haveAlphat = true;
+            try { alphatFd = readField<scalar>(t0 + "/alphat"); }
+            catch (const std::exception&) { haveAlphat = false; }
+
+            for (const FvPatch& q : fvp)
+            {
+                if (q.type == "cyclic" || q.type == "cyclicAMI") continue;   // DeviceBoundary skips these
+                scalar prt = tc.Prt;   // the MODEL's Prt away from an alphat wall function
+                if (haveAlphat)
+                    for (const PatchFieldData<scalar>& pb : alphatFd.boundary)
+                        if (pb.name == q.name
+                         && (pb.type == "compressible::alphatWallFunction" || pb.type == "alphatWallFunction"))
+                            prt = pb.Prt;
+                prtFace.insert(prtFace.end(), static_cast<std::size_t>(q.size), prt);
+            }
+        }
+
         const int endTime = static_cast<int>(controlDict.scalarOr("endTime", 1000));
 
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
@@ -137,6 +217,7 @@ int main(int argc, char** argv)
         DeviceBoundary dbHe = buildDeviceBoundary(T, fvp, g);
         deviceEnergyBoundaryFromT(dbT, tc, dbHe);
         solver.setCompressible(tc, rc, std::move(dbHe));
+        solver.setAlphatPrt(prtFace);
 
         // Seed the thermo: T from the case, he from T, then one thermo.correct() so rho/psi/mu/alpha are
         // consistent before the first momentum predictor, and rhoPrev so the first relax has a partner.

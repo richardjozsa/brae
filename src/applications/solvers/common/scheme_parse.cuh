@@ -121,6 +121,16 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (t > 0.0) { ctl.limitedEps = true; ctl.twoBykEps = t; }   // 2nd turb scalar (eps|omega)
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luEps = true;
                 }
+                // Energy: OF names the field "h" for sensibleEnthalpy and "e" for sensibleInternalEnergy,
+                // and the kinetic term "K" or "Ekp" to match. Any of them sets the same flags.
+                if (ln.find("div(phi,h)") != std::string::npos || ln.find("div(phi,e)") != std::string::npos
+                 || ln.find("div(phi,K)") != std::string::npos || ln.find("div(phi,Ekp)") != std::string::npos)
+                {
+                    checkDiv(ln, "h|e|K|Ekp", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    const scalar t = limitedTwoByk(ln);
+                    if (t > 0.0) { ctl.limitedHe = true; ctl.twoBykHe = t; }
+                    if (ln.find("linearUpwind") != std::string::npos) ctl.luHe = true;
+                }
                 if (ln.find("div(phi,nuTilda)") != std::string::npos)   // SA: nuTilda uses the k-slot scheme flags
                 {
                     checkDiv(ln, "nuTilda", {"upwind", "linearUpwind", "limitedLinear"}, {});

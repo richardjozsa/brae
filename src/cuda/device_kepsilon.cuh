@@ -214,7 +214,8 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<scalar>* hwn = nullptr,   // per-cell wall-normal spacing (IDDES delta 3rd term)
                             const DeviceBuffer<scalar>* rho = nullptr,   // compressible: rho-weight reactions + diffusivity
                             const DeviceBuffer<scalar>* muLam = nullptr,   // compressible: laminar DYNAMIC viscosity mu [Pa s]
-                            const DeviceBuffer<scalar>* nuWallFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+                            const DeviceBuffer<scalar>* nuWallFace = nullptr,   // compressible: nu = mu_b/rho_b per WALL face
+                            const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at boundary faces (volumetric flux for divU)
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,

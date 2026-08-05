@@ -37,6 +37,8 @@ public:
     // internal cell, valueIC=1, gradIC=0); 1 = fixedValue (fixedValue/noSlip: value=ref, valueIC=0,
     // gradIC=-deltaCoeffs); 2 = calculated (value=ref but extrapolated coeffs).
     virtual int bcCategory() const { return 0; }
+    // flowRateInletVelocity: the dict flow rate, so the solver can recompute avgU against the live rho.
+    virtual scalar flowRateValue() const { return 0.0; }
 
     // symmetryPlane/symmetry needs PER-COMPONENT device categories for vectors (the wall-normal component
     // is reflected = fixedValue 0, the tangential components are zeroGradient). The device builder keys on
@@ -160,6 +162,55 @@ private:
         std::vector<vector> v(p.size);
         for (label i = 0; i < p.size; ++i)
             v[i] = (uniform ? uval : (i < (label)vals.size() ? vals[i] : scalar(0))) * p.nf[i];
+        return v;
+    }
+};
+
+// flowRateInletVelocity (OF flowRateInletVelocityFvPatchVectorField). The default (extrapolateProfile
+// false) branch is, verbatim from updateValues():
+//
+//     avgU = -flowRate / gSum(rho*patch().magSf());   operator==(avgU*n)      n = patch().nf() (OUTWARD)
+//
+// so a POSITIVE flow rate gives inflow, because n points out of the domain. Two branches, selected by
+// which key the dict carries (updateCoeffs()):
+//   volumetricFlowRate -> rho == 1, the sum is pure area and the value is GEOMETRIC (never changes);
+//   massFlowRate       -> rho is the registered rho patch field, so the value moves with the solution
+//                         and must be recomputed every outer iteration (bcCategory 9 does that).
+// rhoInlet is NOT an override: OF uses it only when no rho field is registered. rhoSimpleFoam registers
+// one, so it is the seed here and the live rho takes over on the first update.
+class FlowRateInletVelocityPatchField : public FixedValuePatchField<vector>
+{
+public:
+    FlowRateInletVelocityPatchField(
+        const FvPatch& p,
+        scalar flowRate,
+        bool isMass,
+        scalar rhoInlet)
+        : FixedValuePatchField<vector>(p, false, vector{}, build(p, flowRate, isMass, rhoInlet)),
+          isMass_(isMass), flowRate_(flowRate)
+    {}
+    // 9 = flowRateInletVelocity: refValue recomputed per step from the live boundary rho (mass form only).
+    int bcCategory() const override { return isMass_ ? 9 : 1; }
+    scalar flowRateValue() const override { return flowRate_; }
+
+private:
+    bool   isMass_;
+    scalar flowRate_ = 0.0;
+
+    static std::vector<vector> build(
+        const FvPatch& p,
+        scalar flowRate,
+        bool isMass,
+        scalar rhoInlet)
+    {
+        // gSum(rho*magSf). Volumetric -> rho = 1. Mass -> the seed rho (rhoInlet if the case gave one,
+        // else 1); the per-step update replaces it with the real patch rho before it matters.
+        const scalar rhoSeed = (!isMass) ? scalar(1) : (rhoInlet > 0.0 ? rhoInlet : scalar(1));
+        scalar sumRhoA = 0.0;
+        for (label i = 0; i < p.size; ++i) sumRhoA += rhoSeed * p.magSf[i];
+        const scalar avgU = (sumRhoA > 0.0) ? -flowRate / sumRhoA : scalar(0);
+        std::vector<vector> v(p.size);
+        for (label i = 0; i < p.size; ++i) v[i] = avgU * p.nf[i];
         return v;
     }
 };
@@ -574,8 +625,34 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     if (d.type == "fixedFluxPressure") return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "totalPressure")   // p0 read into the inletValue slot (foam_field_reader); fall back to value
     {
+        // OF has three branches. brae implements the two that share one expression (kinematic, and the
+        // compressible low-speed form with rho). The isentropic branch a named psi selects is different
+        // physics, so it is refused rather than approximated -- it would converge and be wrong at the inlet.
+        if (d.psiName != "none")
+        {
+            throw std::runtime_error(
+                "brae: totalPressure with psi '" + d.psiName + "' on patch " + p.name +
+                " selects OpenFOAM's isentropic high-speed branch (p0/(1+0.5*psi*gM1ByG*|U|^2)^(1/gM1ByG)), "
+                "which is not implemented. Remove the psi entry to use the low-speed form, which brae "
+                "reproduces exactly.");
+        }
         const auto v = inletOrValue(d);
         return std::make_unique<TotalPressurePatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+    }
+    if (d.type == "flowRateInletVelocity")
+    {
+        if constexpr (std::is_same_v<T, vector>)
+        {
+            if (!d.hasFlowRate)
+                throw std::runtime_error("brae: flowRateInletVelocity on patch " + p.name +
+                    " has neither 'volumetricFlowRate' nor 'massFlowRate' (OF fails the same way).");
+            if (d.extrapolateProfile)
+                throw std::runtime_error("brae: flowRateInletVelocity 'extrapolateProfile true' on patch " +
+                    p.name + " is not implemented (it rescales the extrapolated internal profile rather "
+                    "than applying a uniform normal velocity). Remove it to use the uniform form.");
+            return std::make_unique<FlowRateInletVelocityPatchField>(p, d.flowRate, d.flowRateIsMass, d.rhoInlet);
+        }
+        else throw std::runtime_error("brae: flowRateInletVelocity is a velocity (vector) BC");
     }
     if (d.type == "surfaceNormalFixedValue" || d.type == "uniformNormalFixedValue")   // U_b = refValue(scalar) * n
     {

@@ -140,6 +140,7 @@ std::vector<scalar> solveT(
             dm,
             dbHe,
             th,
+            c,
             phiInt,
             phiBnd,
             divU,
@@ -274,7 +275,7 @@ int compareAgainstOpenFoam(const std::string& caseDir, const std::string& ofTime
     for (int it = 0; it < 600; ++it)
     {
         deviceSolveEnergy(
-            dm, dbHe, th, phiInt, phiBnd, divU,
+            dm, dbHe, th, c, phiInt, phiBnd, divU,
             false, true, false, 0.0, 1.0, 1e-14, 0.0, 1, false);
     }
 

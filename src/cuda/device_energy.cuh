@@ -29,6 +29,7 @@ namespace brae {
 // turbulence models land, so this is a laminar solve today and needs no change when they do.
 void deviceAlphaEff(
     const DeviceThermo& th,
+    const ThermoCoeffs& c,   // alphaEff = CpByCpv*(alpha+alphat); CpByCpv depends on the energy form
     DeviceBuffer<scalar>& alphaEff);
 
 // he boundary values from the T boundary. OpenFOAM's fixedEnergy/gradientEnergy/mixedEnergy are not
@@ -53,6 +54,7 @@ void deviceSolveEnergy(
     const DeviceMesh& dm,
     const DeviceBoundary& dbHe,
     DeviceThermo& th,
+    const ThermoCoeffs& c,   // energy form: sets CpByCpv on alphaEff
     const DeviceBuffer<scalar>& phiInt,
     const DeviceBuffer<scalar>& phiBnd,
     const DeviceBuffer<scalar>& divU,
@@ -67,7 +69,8 @@ void deviceSolveEnergy(
     bool useGS,
     DeviceAMI* ami = nullptr,
     DeviceCyclic* cyc = nullptr,
-    const DeviceBuffer<scalar>* kineticSrc = nullptr);   // V*div(phi,K); see deviceEnergyKineticSource
+    const DeviceBuffer<scalar>* kineticSrc = nullptr,   // V*div(phi,K); see deviceEnergyKineticSource
+    const DeviceBuffer<scalar>* alphaEffBnd = nullptr);   // alphaEff at boundary FACES (OF alphaEff(patchi))
 
 // V*div(phi, K) with K = 0.5|U|^2, upwind-interpolated and "bounded" exactly as OF's
 // div(phi,K) bounded Gauss upwind is. OF's rhoSimpleFoam EEqn.H carries this term next to div(phi,he);
@@ -80,6 +83,13 @@ void deviceEnergyKineticSource(
     const DeviceBuffer<scalar>& Uz,
     const DeviceBuffer<scalar>& phiInt,
     const DeviceBuffer<scalar>& phiBnd,
-    DeviceBuffer<scalar>& src);
+    DeviceBuffer<scalar>& src,
+    const DeviceBuffer<scalar>* p = nullptr,          // sensibleInternalEnergy -> Ekp = K + p/rho
+    const DeviceBuffer<scalar>* rho = nullptr,
+    const DeviceBuffer<scalar>* pBnd = nullptr,
+    const DeviceBuffer<scalar>* rhoBnd = nullptr,
+    const DeviceBoundary* dbHe = nullptr,   // grad(K) boundary, for the limitedLinear face value
+    bool limited = false,                   // div(phi,K|Ekp) limitedLinear (else upwind)
+    scalar twoByk = 2.0);
 
 } // namespace brae

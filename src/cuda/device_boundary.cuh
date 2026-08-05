@@ -52,7 +52,10 @@ inline DeviceBoundary buildDeviceBoundary(
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         for (label i = 0; i < fvp[pi].size; ++i)
         {
-            ty.push_back((cat == 3 || cat == 4 || cat == 7) ? 1 : cat);   // io/oio/totalPressure init fixedValue (resolved per-step); 5 stays mixed
+            // Categories whose VALUE is resolved per-step but whose TYPE is a plain fixedValue: inletOutlet,
+            // outletInlet, totalPressure and flowRateInletVelocity(mass). They must map to 1 here -- pushing
+            // the category through as a device bcType leaves an unknown type that no evaluator handles.
+            ty.push_back((cat == 3 || cat == 4 || cat == 7 || cat == 9) ? 1 : cat);   // 5 stays mixed
             io.push_back(cat == 3 ? 1 : 0);
             oio.push_back(cat == 4 ? 1 : 0);
             mx.push_back(cat == 5 ? 1 : 0);
@@ -155,8 +158,15 @@ void deviceUpdateSymmetry(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>&
 // totalPressure updateCoeffs (OF totalPressureFvPatchScalarField, incompressible rho=none/psi=none): per face
 // refValue = p0 - 0.5*neg(phi_b)*magSqr(U_b)  (inflow phi<0 -> p0 - dynamic head; outflow -> p0). bcType stays
 // fixedValue(1). Call each step AFTER the U-boundary updates, with the boundary U (deviceBCValue of current U) + flux.
+// flowRateInletVelocity (massFlowRate): set U_b = avgU*n on the masked patch faces. See the .cu.
+void deviceUpdateFlowRateInlet(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& maskMagSf, scalar avgU,
+                               const DeviceBuffer<scalar>& nx, const DeviceBuffer<scalar>& ny,
+                               const DeviceBuffer<scalar>& nz);
+
 void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& Uxb,
-                               const DeviceBuffer<scalar>& Uyb, const DeviceBuffer<scalar>& Uzb);
+                               const DeviceBuffer<scalar>& Uyb, const DeviceBuffer<scalar>& Uzb,
+                               const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at the face
+                                                                                // (p in Pa -> 0.5*rho*|U|^2)
 
 inline DeviceVectorBoundary buildDeviceVectorBoundary(
     const GeometricField<vector>& f,
@@ -210,7 +220,11 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
             {
                 for (int k = 0; k < 3; ++k)
                 {
-                    ty[k].push_back((cat == 3 || cat == 4) ? 1 : (cat == 6 ? 0 : cat));   // io/oio fixedValue init; piov zeroGradient init (device sets per-step)
+                    // io/oio/flowRateInlet init fixedValue (the device rewrites refValue per step); piov
+                    // zeroGradient init. Anything whose VALUE is resolved per-step but whose TYPE is a
+                    // plain fixedValue MUST map to 1 -- pushing the category through leaves an unknown
+                    // device bcType that no evaluator handles, and the patch then behaves arbitrarily.
+                    ty[k].push_back((cat == 3 || cat == 4 || cat == 9) ? 1 : (cat == 6 ? 0 : cat));
                     vf[k].push_back(seedVf);
                     ref[k].push_back(rv[k]);
                 }

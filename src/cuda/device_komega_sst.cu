@@ -680,8 +680,8 @@ void deviceCellLimitGradU(
 
 
 
-// nu = mu/rho, cell by cell. Local to this file: the SST is the only consumer, and keeping it here means
-// the kinematic/dynamic distinction is resolved in one place instead of at every call site.
+// Elementwise a/b. Used for nu = mu/rho (cells) and for phi/interpolate(rho) (faces), which are the two
+// places the SST has to undo a rho weighting that the rest of the compressible solver applies.
 __global__
 void nuFromMuRhoK(
     int n,
@@ -760,7 +760,8 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* hwn,
     const DeviceBuffer<scalar>* rho,     // compressible: rho-weight the reactions and the diffusivity
     const DeviceBuffer<scalar>* muLam,   // compressible: laminar DYNAMIC viscosity mu [Pa s]
-    const DeviceBuffer<scalar>* nuWallFace)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
+    const DeviceBuffer<scalar>* nuWallFace,   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
+    const DeviceBuffer<scalar>* rhoBnd)   // compressible: rho at boundary faces, for the volumetric flux
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -771,10 +772,45 @@ void deviceKOmegaSSTCorrect(
     deviceGByNuFromGradU(gradU, nC, GbyNu0);
     DeviceBuffer<scalar> G;
     deviceHadamard(G, nut, GbyNu0);
+    // TWO divergences, because OF uses two different fluxes here and they only coincide at constant rho:
+    //
+    //   divPhi -- div of the flux the convection term carries (the MASS flux when compressible). This is
+    //             what "bounded" subtracts: boundedConvectionScheme::fvmDiv is
+    //             scheme.fvmDiv(faceFlux,vf) - fvm::Sp(fvc::surfaceIntegrate(faceFlux), vf).
+    //   divU   -- div of the VOLUMETRIC flux, phi/interpolate(rho). This is the dilatation in the k and
+    //             omega reactions: kOmegaSSTBase.C builds it from compressibleTurbulenceModel::phi(),
+    //             which is phi_/fvc::interpolate(rho_) whenever phi_ is not already volumetric.
+    //
+    // Feeding the mass-flux divergence to the reactions makes the (2/3)divU term wrong by a factor of rho
+    // wherever density varies -- invisible in an isothermal case, ~1% in k at a hot wall.
+    DeviceBuffer<scalar> divPhi;
+    deviceDiv(dm, phiInt, phiBnd, divPhi);
+    if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divPhi);
+    if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divPhi);
+
     DeviceBuffer<scalar> divU;
-    deviceDiv(dm, phiInt, phiBnd, divU);
-    if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
-    if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
+    if (rho && rhoBnd && rhoBnd->size())
+    {
+        DeviceBuffer<scalar> rhoF;
+        deviceInterpolate(dm, *rho, rhoF);
+        const int nIf = dm.nInternalFaces;
+        DeviceBuffer<scalar> phiVolInt;
+        phiVolInt.resize(nIf);
+        nuFromMuRhoK<<<nBlocks(nIf), TPB>>>(nIf, phiInt.data(), rhoF.data(), phiVolInt.data());
+        cudaCheck(cudaGetLastError(), "phiVolInt");
+        const int nB = static_cast<int>(phiBnd.size());
+        DeviceBuffer<scalar> phiVolBnd;
+        phiVolBnd.resize(nB);
+        nuFromMuRhoK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), phiVolBnd.data());
+        cudaCheck(cudaGetLastError(), "phiVolBnd");
+        deviceDiv(dm, phiVolInt, phiVolBnd, divU);
+        if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
+        if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
+    }
+    else
+    {
+        deviceCopy(divU, divPhi);   // incompressible: the two fluxes are the same field, bit-identical
+    }
     DeviceBuffer<scalar> S2;
     deviceS2(gradU, nC, S2);
 
@@ -834,7 +870,7 @@ void deviceKOmegaSSTCorrect(
     if (rho && muLam) scaleDEffCompressible(*rho, *muLam, DomegaEff);
 
     // omega equation (loose solve) with the near-wall setValues constraint (omega0)
-    deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divU, bounded, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
+    deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, bounded, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
                                &wall, &omega0, ami, cyc, sDdt);
@@ -844,7 +880,7 @@ void deviceKOmegaSSTCorrect(
     DeviceBuffer<scalar> DkEff;
     deviceDEff(F1, nut, co.alphaK1, co.alphaK2, rho ? scalar(0) : nu, DkEff);
     if (rho && muLam) scaleDEffCompressible(*rho, *muLam, DkEff);
-    deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divU, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
+    deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr, rho); },
                                nullptr, nullptr, ami, cyc, kDdt);

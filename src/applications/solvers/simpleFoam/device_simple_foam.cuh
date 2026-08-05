@@ -133,6 +133,9 @@ public:
     // Switch the solver into compressible mode. dbHe is the enthalpy boundary (built from the case's 0/T
     // via deviceEnergyBoundaryFromT); th is allocated and seeded by the caller so the driver owns field
     // construction, exactly as it already owns U/p.
+    // Per-boundary-face Prt from 0/alphat: alphatWallFunction patches carry their own (OF default 0.85),
+    // every other face uses the turbulence model's (OF default 1.0). Optional -- absent, the model's is used.
+    void setAlphatPrt(const std::vector<scalar>& prtFace);
     void setCompressible(
         const ThermoCoeffs& tc,
         const RhoSimpleControls& rc,
@@ -302,8 +305,18 @@ private:
     // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed
     // muEff_b = mu_b + rho_b*nut_b and the kinematic nu_b = mu_b/rho_b the wall functions ask for.
     DeviceBuffer<scalar> rhoBnd_, muBnd_, nuWallBnd_;
+    // flowRateInletVelocity, massFlowRate form: OF recomputes avgU = -mdot/gSum(rho*magSf) every call, so
+    // it moves with the solution. frMagSf_ is magSf masked to the flowRate patches (0 elsewhere), making
+    // the patch sum a single dot product against the live boundary rho; frN_ holds the outward normals.
+    struct FlowRatePatch { scalar mdot; };
+    std::vector<FlowRatePatch> frPatches_;
+    std::vector<DeviceBuffer<scalar>> frMagSf_;
+    DeviceBuffer<scalar> frNx_, frNy_, frNz_;
+    bool hasFlowRate_ = false;
     DeviceBuffer<label>  wfBndIdx_;   // wall-face -> boundary-face index (built once)
     DeviceBuffer<scalar> wfNu_;       // nu = mu_b/rho_b gathered onto wall faces, for omegaWallFunction/G0
+    DeviceBuffer<scalar> nutBndAll_;  // nut at boundary faces (wall-function value on walls), for alphat_b
+    DeviceBuffer<scalar> prtBnd_;     // per-face Prt: the alphatWallFunction's on its patches, the model's elsewhere
     bool   hasMixed_ = false;                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)

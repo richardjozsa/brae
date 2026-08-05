@@ -50,6 +50,24 @@ struct PatchFieldData
     std::vector<T> inletValues;
     // turbulent-inlet BCs: k = 1.5*(intensity*|U|)^2; eps = Cmu^0.75 k^1.5/mixingLength; omega = sqrt(k)/(Cmu^0.25 mixingLength).
     scalar         intensity    = 0;
+    // compressible::alphatWallFunction: alphat_w = rho_w*nut_w/Prt. OF's default here is 0.85
+    // (alphatWallFunctionFvPatchScalarField.C: dict.getOrDefault<scalar>("Prt", 0.85)) and is NOT the
+    // turbulence model's own Prt, whose default is 1.0. Two different numbers in the same case.
+    scalar         Prt          = 0.85;
+    // totalPressure: OF picks its formula from these. psi "none" (the default) -> the low-speed form
+    // p0 - 0.5*rho*neg(phi)*|U|^2; a NAMED psi -> the isentropic high-speed form with gamma, which brae
+    // does not implement. Recorded so it can be refused by name instead of silently running low-speed.
+    std::string    psiName      = "none";
+    scalar         gammaTP      = 1.0;
+    // flowRateInletVelocity (OF flowRateInletVelocityFvPatchVectorField). OF selects the branch by which
+    // key is present: "volumetricFlowRate" -> volumetric_ = true; otherwise "massFlowRate" (default
+    // rhoName "rho"). rhoInlet is only the FALLBACK used when the rho field is not registered -- in
+    // rhoSimpleFoam it is, so the real patch rho is used and rhoInlet is ignored, exactly as OF does.
+    bool           hasFlowRate  = false;
+    bool           flowRateIsMass = false;
+    scalar         flowRate     = 0.0;
+    scalar         rhoInlet     = -1.0;   // OF default -VGREAT ("not given")
+    bool           extrapolateProfile = false;
     scalar         mixingLength = 0;
     // surfaceNormalFixedValue / uniformNormalFixedValue: SCALAR refValue; the BC builds U_b = refValue * face_normal.
     bool                hasNormalRef     = false;
@@ -328,6 +346,47 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "intensity")   // turbulentIntensityKineticEnergyInlet
                     {
                         p.intensity = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    // OF takes a Function1 here; "constant <v>" and a bare "<v>" are the steady forms.
+                    // Anything else (table/polynomial/...) is refused by name rather than approximated.
+                    else if (key == "volumetricFlowRate" || key == "massFlowRate")
+                    {
+                        p.hasFlowRate = true;
+                        p.flowRateIsMass = (key == "massFlowRate");
+                        std::string w = ts.next();
+                        if (w == "constant") w = ts.next();
+                        else if (w == "{")
+                            throw std::runtime_error(
+                                "brae: flowRateInletVelocity '" + key + "' given as a Function1 dictionary on patch "
+                                + p.name + "; only 'constant <value>' (or a bare value) is supported.");
+                        p.flowRate = std::stod(w);
+                        ts.expect(";");
+                    }
+                    else if (key == "rhoInlet")
+                    {
+                        p.rhoInlet = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "extrapolateProfile")
+                    {
+                        const std::string w = ts.next();
+                        p.extrapolateProfile = (w == "true" || w == "yes" || w == "on" || w == "1");
+                        ts.expect(";");
+                    }
+                    else if (key == "psi")    // totalPressure: selects OF's isentropic branch when != none
+                    {
+                        p.psiName = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (key == "gamma")   // totalPressure isentropic exponent
+                    {
+                        p.gammaTP = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "Prt")   // compressible::alphatWallFunction turbulent Prandtl number
+                    {
+                        p.Prt = ts.nextScalar();
                         ts.expect(";");
                     }
                     else if (key == "mixingLength")   // turbulentMixingLength*Inlet

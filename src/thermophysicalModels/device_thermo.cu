@@ -288,6 +288,88 @@ void deviceThermoNuBoundary(
     cudaCheck(cudaGetLastError(), "nuBoundary");
 }
 
+// alphaEff AT BOUNDARY FACES = alpha_b + alphat_b, which is what OF's laplacian(alphaEff, he) uses on a
+// patch (heThermo::alphaEff(patchi); CpByCpv = 1 for sensibleEnthalpy).
+//
+//   alphat_b = rho_b * nut_b / Prt_b       -- OF alphatWallFunction::updateCoeffs is operator==(rhow*tnutw/Prt_)
+//   alpha_b  = mu_b / Pr
+//
+// Prt_b is PER FACE because the two Prt in a compressible case are different numbers: the wall function's
+// own (default 0.85) on its patches, and the turbulence model's (default 1.0) everywhere else. nut_b is
+// the wall-function nut on a wall face and the extrapolated cell nut elsewhere, matching what the momentum
+// boundary already uses -- so momentum and energy see one consistent wall eddy viscosity.
+__global__
+void alphaEffBoundaryK(
+    int n,
+    ThermoCoeffs c,
+    const scalar* __restrict__ muBnd,
+    const scalar* __restrict__ rhoBnd,
+    const scalar* __restrict__ nutBnd,
+    const scalar* __restrict__ prtBnd,
+    scalar* __restrict__ alphaEffBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    // transportAlpha, not mu/Pr: under sutherland OF uses the Eucken kappa/Cp and there is no Pr at all.
+    const scalar alphaLam = transportAlpha(muBnd[i], c);
+    const scalar alphaTur = (nutBnd && prtBnd) ? rhoBnd[i] * nutBnd[i] / prtBnd[i] : scalar(0);
+    // CpByCpv, as on the cell path (heThermo::alphaEff) -- gamma for sensibleInternalEnergy, 1 for h.
+    alphaEffBnd[i] = thermoCpByCpv(c) * (alphaLam + alphaTur);
+}
+
+void deviceAlphaEffBoundary(
+    const DeviceBuffer<scalar>& muBnd,
+    const DeviceBuffer<scalar>& rhoBnd,
+    const DeviceBuffer<scalar>* nutBnd,
+    const DeviceBuffer<scalar>* prtBnd,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& alphaEffBnd)
+{
+    const int n = static_cast<int>(muBnd.size());
+    if (n == 0) return;
+    alphaEffBnd.resize(n);
+    alphaEffBoundaryK<<<nBlocks(n), TPB>>>(
+        n,
+        c,
+        muBnd.data(),
+        rhoBnd.data(),
+        (nutBnd && nutBnd->size() == muBnd.size()) ? nutBnd->data() : nullptr,
+        (prtBnd && prtBnd->size() == muBnd.size()) ? prtBnd->data() : nullptr,
+        alphaEffBnd.data());
+    cudaCheck(cudaGetLastError(), "alphaEffBoundary");
+}
+
+// OF pressureControl::limit(p): clamp p into [pMin, pMax] after the pressure solve, before rho is
+// recomputed from it (rhoSimpleFoam/pEqn.H:90).
+//
+// Not a cosmetic safety net. On the stock aerofoilNACA0012 tutorial (Mach 0.72) OF's own log reports
+//   pressureControl: p max 2332401     (23x ambient)
+//   pressureControl: p min -241053.81  (NEGATIVE)
+// during start-up. A negative p gives a negative rho through the perfect-gas EOS, and the next momentum
+// solve is NaN -- which is exactly what brae did on that case before this existed.
+__global__
+void clampPressureK(
+    int n,
+    scalar pMin,
+    scalar pMax,
+    scalar* __restrict__ p)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    p[i] = fmin(fmax(p[i], pMin), pMax);
+}
+
+void deviceLimitPressure(
+    DeviceBuffer<scalar>& p,
+    scalar pMin,
+    scalar pMax)
+{
+    const int n = static_cast<int>(p.size());
+    if (n == 0) return;
+    clampPressureK<<<nBlocks(n), TPB>>>(n, pMin, pMax, p.data());
+    cudaCheck(cudaGetLastError(), "limitPressure");
+}
+
 void deviceThermoHeFromT(
     DeviceThermo& th,
     const ThermoCoeffs& c)

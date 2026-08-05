@@ -18,6 +18,7 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
         p.faceCells.resize(pi.size);
         p.deltaCoeffs.resize(pi.size);
         p.nf.resize(pi.size);
+        p.magSf.resize(pi.size);
         p.Cf.resize(pi.size);
         for (label i = 0; i < pi.size; ++i)
         {
@@ -27,6 +28,7 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
             // OF fvPatch::delta() is the normal-projected delta; deltaCoeffs = 1/(n.(Cf-C)).
             const vector nHat = g.Sf()[f] / g.magSf()[f];
             p.nf[i] = nHat;
+            p.magSf[i] = g.magSf()[f];
             p.Cf[i] = g.Cf()[f];
             p.deltaCoeffs[i] = 1.0 / dot(g.Cf()[f] - g.C()[c], nHat);
         }

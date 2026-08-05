@@ -125,7 +125,8 @@ void deviceSolveScalarTransport(
     const DeviceBuffer<scalar>* eps0 = nullptr,
     DeviceAMI* ami = nullptr,
     DeviceCyclic* cyc = nullptr,
-    const ScalarDdt& ddt = ScalarDdt{})   // transient fvm::ddt(f); default (steady) -> no-op
+    const ScalarDdt& ddt = ScalarDdt{},   // transient fvm::ddt(f); default (steady) -> no-op
+    const DeviceBuffer<scalar>* DBnd = nullptr)   // per-FACE boundary diffusivity; null -> adjacent-cell value
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -149,7 +150,12 @@ void deviceSolveScalarTransport(
     reaction(aD, src);                                            // model reaction: adds to diag + source
     if (luCorr.size())  deviceAxpy(-1.0, luCorr, src);           // linearUpwind deferred correction (explicit RHS)
     if (lapCorr.size()) deviceAxpy(-1.0, lapCorr, src);          // non-orth laplacian correction (explicit RHS, mirrors momentum)
-    DeviceBuffer<scalar> aIC, aBC, lIC, lBC; deviceBCDivCoeffs(db, phiBnd, aIC, aBC); deviceBCLaplacianCoeffs(db, D, lIC, lBC);
+    DeviceBuffer<scalar> aIC, aBC, lIC, lBC; deviceBCDivCoeffs(db, phiBnd, aIC, aBC);
+    // OF evaluates the laplacian coefficient with the PATCH diffusivity (gamma.boundaryField()), not the
+    // adjacent cell's. They coincide for a zeroGradient wall (no flux anyway) but not at a fixedValue one,
+    // which is where a wall function puts its whole effect -- so the energy equation supplies DBnd.
+    if (DBnd && DBnd->size()) deviceBCLaplacianCoeffsFace(db, *DBnd, lIC, lBC);
+    else                      deviceBCLaplacianCoeffs(db, D, lIC, lBC);
     deviceAxpy(-1.0, lIC, aIC); deviceAxpy(-1.0, lBC, aBC);
     // interface (cyclic/cyclicAMI) coupling: fold div(phi,f) - laplacian(D,f) at the interface into the diagonal and
     // set the off-diagonal ifCoeff. A scalar is invariant under the cyclic transform (no rotation of the value), so the

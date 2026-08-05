@@ -1039,6 +1039,85 @@ set_tests_properties(rho_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 600)
 
+# rhoSimpleFoam BC gate: flowRateInletVelocity. OF sets U_b = avgU*n with
+#   avgU = -flowRate/gSum(rho*magSf)   (flowRateInletVelocityFvPatchVectorField::updateValues)
+# using the OUTWARD normal, so a positive rate is inflow. The gate runs the massFlowRate form, whose sum
+# is rho-weighted and therefore recomputed every outer iteration -- the volumetric form (validation/
+# rhoFRvol) is the easy half, since its sum is pure area and never changes.
+#
+# It also pins the bug that took the longest to find: buildDeviceVectorBoundary mapped bcCategory 9 to
+# device bcType 9, an UNKNOWN type, because only the scalar buildDeviceBoundary had been taught about it.
+# U is a vector field, so the inlet ran with an undefined BC and the profile bowed at the wall corners
+# (row 0 5.041 vs OF 5.163) while mid-channel looked right. Reverting that one line gives T 7.7e-4.
+add_test(NAME fr_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/fr_vs_openfoam.sh)
+set_tests_properties(fr_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam BC gate: a totalPressure inlet on a COMPRESSIBLE case. OF's totalPressure branches on
+# the dimensions of p -- kinematic gives p0 - 0.5*neg(phi)|U|^2, absolute gives p0 - 0.5*RHO*neg(phi)|U|^2.
+# brae implemented only the kinematic form, so every compressible totalPressure inlet was missing the
+# density on its dynamic head. No other gate uses totalPressure, so none of them could see it.
+add_test(NAME tp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tp_vs_openfoam.sh)
+set_tests_properties(tp_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam scheme gate: div(phi,h|e) and div(phi,K|Ekp) limitedLinear rather than upwind.
+# brae used to HARDCODE upwind for the energy equation and ignore fvSchemes entirely -- a silent
+# first-order downgrade. Every other compressible gate specifies upwind, so none of them can see it.
+# Covers BOTH halves: the implicit div(phi,he) and the explicit div(phi,K|Ekp), which are separate code
+# paths and were separately wrong.
+add_test(NAME lu_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/lu_vs_openfoam.sh)
+set_tests_properties(lu_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam transport gate: the same heated duct with transport sutherland instead of const.
+# The two models compute the laminar thermal diffusivity DIFFERENTLY (const: mu/Pr; sutherland: the
+# Eucken kappa/Cp, with no Pr in the dict at all), and sutherland makes mu vary strongly with T -- which
+# is what exposes whether the energy laplacian uses the PATCH diffusivity or the adjacent cell's. With
+# transport const those are numerically identical, so the const gates cannot see either error.
+add_test(NAME suth_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/suth_vs_openfoam.sh)
+set_tests_properties(suth_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam energy-form gate: the same heated duct with energy sensibleInternalEnergy (OF "e").
+# Every stock OF rhoSimpleFoam tutorial uses e rather than sensibleEnthalpy, and the two forms must give
+# the SAME temperature field -- OF's own h and e runs agree to 3e-11. They only do so if Cv, the gamma on
+# alphaEff and the p/rho in Ekp are all right, so this gate pins three things the h gate cannot see.
+add_test(NAME rhoE_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoE_vs_openfoam.sh)
+set_tests_properties(rhoE_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam phase 4 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam, kOmegaSST heated duct.
+# Compares seven fields (T p U k omega nut rho) -- the compressible turbulence coupling is the kind that
+# converges cleanly while being wrong, so residuals prove nothing here. Skipped (77) without an OF install.
+add_test(NAME sst_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/sst_vs_openfoam.sh)
+set_tests_properties(sst_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
 # rhoSimpleFoam phase 2: mass flux reduces exactly to the volumetric flux at constant density
 add_executable(test_rho_flux tests/test_rho_flux.cu)
 target_include_directories(test_rho_flux PRIVATE ${BRAE_HEADER_DIRS})

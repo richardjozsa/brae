@@ -100,18 +100,40 @@ int main()
         check("psi", gPsi[i], wantPsi, tol);
         check("rho", gRho[i], wantRho, tol);
         check("mu (Sutherland)", gMu[i], wantMu, tol);
-        check("alpha = mu/Pr", gAlpha[i], wantMu / c.Pr, tol);
+        // OF sutherlandTransport::alphah = kappa/Cp with the modified Eucken kappa -- NOT mu/Pr, and
+        // with no Prandtl number involved at all (a sutherland dict carries only As and Ts). This
+        // assertion previously read mu/Pr, which is the constTransport formula; it encoded the bug
+        // rather than catching it, and every validation case used transport const so nothing else saw it.
+        const scalar wantKappa = wantMu * thermoCv(c) * (1.32 + 1.77 * c.R / thermoCv(c));
+        check("alpha (sutherland: Eucken kappa/Cp)", gAlpha[i], wantKappa / c.Cp, tol);
         check("rho == psi*p", gRho[i], gPsi[i] * P, tol);
     }
 
-    // const-viscosity branch: mu must ignore T entirely
+    // const-viscosity branch: mu must ignore T entirely, AND alpha must switch formula with it.
+    // Both branches are asserted because the two models genuinely differ: getting one right says
+    // nothing about the other, which is exactly how the sutherland error survived.
     c.sutherland = false;
     c.mu0 = 1.8e-05;
     deviceThermoUpdate(th, p, c);
     th.mu.copyTo(gMu);
+    th.alpha.copyTo(gAlpha);
     for (int i = 0; i < n; ++i)
     {
         check("mu (const branch)", gMu[i], c.mu0, tol);
+        check("alpha (const: mu/Pr)", gAlpha[i], c.mu0 / c.Pr, tol);
+    }
+
+    // Negative control: the two formulas must actually DISAGREE on this data, or the two checks above
+    // could both pass against a single hardcoded expression and prove nothing.
+    {
+        const scalar aConst = c.mu0 / c.Pr;
+        const scalar aSuth  = c.mu0 * thermoCv(c) * (1.32 + 1.77 * c.R / thermoCv(c)) / c.Cp;
+        if (std::fabs(aConst - aSuth) / aConst < 1e-3)
+        {
+            std::printf("  FAIL const and sutherland alpha agree to <0.1%% -- this test cannot "
+                        "distinguish them, so it is not testing the branch\n");
+            failures++;
+        }
     }
 
     // rho bounding must clamp, not merely warn

@@ -40,6 +40,13 @@ struct DeviceSimpleControls
     bool   gsK = false, gsEps = false;             // scalar linear solver = smoothSolver+symGaussSeidel (read from fvSolution solvers.{k|nuTilda} / {epsilon|omega}).
     bool   gsU = false;                            // momentum linear solver = smoothSolver+(sym)GaussSeidel (read from fvSolution solvers.U).
     scalar twoBykK = 2.0, twoBykEps = 2.0;         // 2/max(k_,SMALL) from the limitedLinear coefficient (k_=1 -> 2).
+    // div(phi,h|e) and div(phi,K|Ekp) -- the ENERGY equation's convection scheme (rhoSimpleFoam). Read from
+    // fvSchemes like every other div scheme; brae used to hardcode upwind here and silently ignore what the
+    // case asked for, which is a first-order downgrade that still converges. The K/Ekp term takes the same
+    // scheme because OF's tutorials point div(phi,K) at the same entry ($energy) as div(phi,e).
+    bool   limitedHe = false;                      // div(phi,h|e) "limitedLinear"
+    bool   luHe = false;                           // div(phi,h|e) "linearUpwind"
+    scalar twoBykHe = 2.0;
     KEpsilonCoeffs keCoeffs;                       // k-eps model coeffs (default = OF); read from turbulenceProperties RAS.kEpsilonCoeffs.
     bool   sst = false;                            // RASModel kOmegaSST (the "second turbulence scalar" eps slot holds omega).
     bool   lm = false;                             // RASModel kOmegaSSTLM (sst + Langtry-Menter gamma-ReThetat transition).

@@ -26,6 +26,23 @@ validation/*
 !validation/pitzDaily282/
 !validation/pitzDailyTurb/
 !validation/pitzDailyTurbBig/
+!validation/rhoBox/
+!validation/rhoBoxE/
+!validation/rhoSuth/
+!validation/rhoLU/
+!validation/rhoTP/
+!validation/rhoFR/
+!validation/rhoFRvol/
+!validation/rhoSST/
+!validation/energyBox/
+!validation/rho_vs_openfoam.sh
+!validation/rhoE_vs_openfoam.sh
+!validation/suth_vs_openfoam.sh
+!validation/lu_vs_openfoam.sh
+!validation/tp_vs_openfoam.sh
+!validation/fr_vs_openfoam.sh
+!validation/sst_vs_openfoam.sh
+!validation/energy_vs_openfoam.sh
 
 # CTest-generated output (regenerated on every ctest run)
 Testing/

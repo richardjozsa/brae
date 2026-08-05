@@ -20,6 +20,7 @@ struct FvPatch {
     std::vector<label>  faceCells;    // owner cell of each boundary face
     std::vector<scalar> deltaCoeffs;  // 1/|Cf - C[faceCell]|
     std::vector<vector> nf;           // unit face normal Sf/|Sf| (for slip/symmetry projection)
+    std::vector<scalar> magSf;        // |Sf| face area (flowRateInletVelocity: gSum(rho*magSf))
     std::vector<vector> Cf;           // face centre (timeVaryingMapped boundaryData -> face mapping)
 };
 

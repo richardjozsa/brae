@@ -193,7 +193,15 @@ void selectMixedKernel(
 }
 
 
-// totalPressure: refValue = p0 - 0.5*neg(phi_b)*magSqr(U_b)  (OF totalPressureFvPatchScalarField, incompressible).
+// totalPressure (OF totalPressureFvPatchScalarField::updateCoeffs). OF branches on the DIMENSIONS of p:
+//
+//   kinematic p (incompressible):  p = p0 - 0.5*neg(phi)*magSqr(U)
+//   absolute p, psi "none":        p = p0 - 0.5*RHO*neg(phi)*magSqr(U)      <- rhoBnd supplies the rho
+//
+// The rho factor is not optional on a compressible case: it is the difference between a dynamic head in
+// m2/s2 and one in Pa. Passing rhoBnd = null gives the incompressible form, bit-identical to before.
+// (OF's third branch, the high-speed isentropic form with a named psi and gamma, is NOT implemented --
+// readThermoCoeffs-style refusal happens at load rather than silently running the low-speed form.)
 __global__
 void tpUpdateKernel(
     int n,
@@ -203,16 +211,60 @@ void tpUpdateKernel(
     const scalar* __restrict__ Uxb,
     const scalar* __restrict__ Uyb,
     const scalar* __restrict__ Uzb,
+    const scalar* __restrict__ rhoBnd,   // compressible: rho at the face; null -> kinematic (incompressible)
     scalar* __restrict__ refValue)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n || !tpMask[i]) return;
 
     const scalar u2 = Uxb[i]*Uxb[i] + Uyb[i]*Uyb[i] + Uzb[i]*Uzb[i];
-    refValue[i] = p0[i] - 0.5 * (phiB[i] < 0.0 ? 1.0 : 0.0) * u2;       // neg(phi)=inflow -> static = total - dynamic head
+    const scalar rw = rhoBnd ? rhoBnd[i] : scalar(1);
+    refValue[i] = p0[i] - 0.5 * rw * (phiB[i] < 0.0 ? 1.0 : 0.0) * u2;   // neg(phi)=inflow -> static = total - dynamic head
 }
 } // namespace
 
+
+// flowRateInletVelocity, massFlowRate form (OF flowRateInletVelocityFvPatchVectorField::updateValues,
+// extrapolateProfile false):  avgU = -flowRate/gSum(rho*magSf);  U_b = avgU*n.
+//
+// avgU is a single patch-wide scalar, computed by the caller as -mdot/dot(rhoBnd, maskedMagSf) -- the
+// mask makes that dot product exactly OF's gSum over this patch. Faces outside the patch have mask 0
+// and are left untouched.
+__global__
+void frUpdateKernel(
+    int n,
+    const scalar* __restrict__ mask,
+    scalar avgU,
+    const scalar* __restrict__ nx,
+    const scalar* __restrict__ ny,
+    const scalar* __restrict__ nz,
+    scalar* __restrict__ refX,
+    scalar* __restrict__ refY,
+    scalar* __restrict__ refZ)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || mask[i] <= scalar(0)) return;
+    refX[i] = avgU * nx[i];
+    refY[i] = avgU * ny[i];
+    refZ[i] = avgU * nz[i];
+}
+
+void deviceUpdateFlowRateInlet(
+    DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& maskMagSf,
+    scalar avgU,
+    const DeviceBuffer<scalar>& nx,
+    const DeviceBuffer<scalar>& ny,
+    const DeviceBuffer<scalar>& nz)
+{
+    const int n = dbU.comp[0].n;
+    if (n == 0) return;
+    frUpdateKernel<<<nBlocks(n), TPB>>>(n, maskMagSf.data(), avgU, nx.data(), ny.data(), nz.data(),
+                                        dbU.comp[0].refValue.data(),
+                                        dbU.comp[1].refValue.data(),
+                                        dbU.comp[2].refValue.data());
+    cudaCheck(cudaGetLastError(), "frUpdate");
+}
 
 void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phiBnd)
 {
@@ -317,11 +369,14 @@ void deviceUpdateTotalPressure(
     const DeviceBuffer<scalar>& phiB,
     const DeviceBuffer<scalar>& Uxb,
     const DeviceBuffer<scalar>& Uyb,
-    const DeviceBuffer<scalar>& Uzb)
+    const DeviceBuffer<scalar>& Uzb,
+    const DeviceBuffer<scalar>* rhoBnd)
 {
     if (db.n == 0) return;
     tpUpdateKernel<<<nBlocks(db.n), TPB>>>(db.n, db.tpMask.data(), db.p0.data(), phiB.data(), Uxb.data(),
-                                           Uyb.data(), Uzb.data(), db.refValue.data());
+                                           Uyb.data(), Uzb.data(),
+                                           (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(db.n)) ? rhoBnd->data() : nullptr,
+                                           db.refValue.data());
     cudaCheck(cudaGetLastError(), "tpUpdate");
 }
 

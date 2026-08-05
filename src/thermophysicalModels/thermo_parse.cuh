@@ -9,6 +9,7 @@
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "thermo_types.cuh"
+#include "thermo_model.cuh"   // thermoCv
 #include <stdexcept>
 #include <string>
 
@@ -55,7 +56,12 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
     thermoRequire(mixture == "pureMixture", "mixture", mixture, "pureMixture");
     thermoRequire(thermo == "hConst", "thermo", thermo, "hConst");
     thermoRequire(eos == "perfectGas", "equationOfState", eos, "perfectGas");
-    thermoRequire(energy == "sensibleEnthalpy", "energy", energy, "sensibleEnthalpy");
+    thermoRequire(
+        energy == "sensibleEnthalpy" || energy == "sensibleInternalEnergy",
+        "energy",
+        energy,
+        "sensibleEnthalpy, sensibleInternalEnergy");
+    c.internalEnergy = (energy == "sensibleInternalEnergy");
     thermoRequire(
         transport == "sutherland" || transport == "const",
         "transport",
@@ -107,6 +113,16 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
     if (c.Cp <= 0.0 || c.Pr <= 0.0)
     {
         throw std::runtime_error("brae: mixture Cp and Pr must be positive.");
+    }
+
+    // Cv = Cp - CpMCv, and perfectGas::CpMCv = R (OF HtoEthermo.H + perfectGasI.H). Guarded because a
+    // molWeight/Cp pair giving Cp <= R is not a gas -- it would make gamma negative and the energy
+    // equation quietly nonsense rather than obviously broken.
+    if (thermoCv(c) <= 0.0)
+    {
+        throw std::runtime_error(
+            "brae: Cv = Cp - R must be positive, but the given Cp and molWeight make it <= 0. "
+            "That is not a gas: it would make gamma negative and the sutherland kappa nonsense.");
     }
 
     // Bounds are a solver control, not a thermo property, so they come from fvSolution when present.

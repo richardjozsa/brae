@@ -22,6 +22,21 @@ struct ThermoCoeffs
     scalar R = 287.058;      // specific gas constant, R_universal/molWeight  [J/(kg K)]
     scalar Cp = 1005.0;      // heat capacity at constant pressure (hConst)   [J/(kg K)]
     scalar Hf = 0.0;         // heat of formation; sensibleEnthalpy sets he = Cp*T + Hf
+
+    // energy sensibleInternalEnergy (OF "e") instead of sensibleEnthalpy ("h"). Every stock OF
+    // rhoSimpleFoam tutorial uses e, so this is not an exotic option. It changes FOUR things, not one:
+    //
+    //   he      = Es = Hs - p/rho = Cv*T          (OF HtoEthermo.H; perfectGas p/rho = R*T)
+    //   Cv      = Cp - CpMCv = Cp - R             (OF HtoEthermo.H + perfectGas::CpMCv)
+    //   CpByCpv = gamma = Cp/Cv                   (OF sensibleInternalEnergy::CpByCpv)
+    //   alphaEff= CpByCpv*(alpha + alphat)        (OF heThermo::alphaEff) -> scaled by gamma, NOT 1
+    //   EEqn    += fvc::div(phi, 0.5|U|^2 + p/rho) rather than div(phi, 0.5|U|^2)  (OF EEqn.H)
+    //
+    // Missing the gamma on alphaEff would converge cleanly with a ~40% wrong thermal diffusivity.
+    bool   internalEnergy = false;
+    // NOTE: Cv is NOT stored. It is Cp - R by definition (perfectGas::CpMCv = R) and is derived on
+    // demand by thermoCv(). A stored copy only has to be filled by one code path to be wrong in every
+    // other -- a test or a future caller constructing ThermoCoeffs directly would keep a stale default.
     scalar Pr = 0.7;         // laminar Prandtl number, sets alpha = mu/Pr
 
     // transport: sutherland uses (As, Ts), const uses mu0 and ignores both

@@ -46,6 +46,24 @@ void deviceThermoNuBoundary(
     const ThermoCoeffs& c,
     DeviceBuffer<scalar>& nuBnd);
 
+// alphaEff at boundary FACES = mu_b/Pr + rho_b*nut_b/Prt_b -- OF's alphaEff(patchi), the diffusivity its
+// laplacian actually uses on a patch. brae previously fell back to the adjacent CELL value there, which
+// silently drops the whole alphatWallFunction effect at a fixed-temperature wall.
+void deviceAlphaEffBoundary(
+    const DeviceBuffer<scalar>& muBnd,
+    const DeviceBuffer<scalar>& rhoBnd,
+    const DeviceBuffer<scalar>* nutBnd,
+    const DeviceBuffer<scalar>* prtBnd,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& alphaEffBnd);
+
+// OF pressureControl::limit(p): clamp p into [pMin, pMax] after the pressure solve. See the .cu for why
+// this is load-bearing rather than defensive -- OF itself reports negative p on a stock tutorial.
+void deviceLimitPressure(
+    DeviceBuffer<scalar>& p,
+    scalar pMin,
+    scalar pMax);
+
 // T -> he, for initialising the enthalpy field from the T that the case actually ships.
 void deviceThermoHeFromT(
     DeviceThermo& th,

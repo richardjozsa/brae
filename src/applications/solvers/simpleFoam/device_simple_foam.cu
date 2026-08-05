@@ -96,6 +96,40 @@ namespace brae {
                 hasSym_ = true;
                 break;
             }
+        // flowRateInletVelocity (massFlowRate): one masked-magSf buffer per such patch, plus the outward
+        // normals over all boundary faces. Both are geometric and built once.
+        {
+            std::vector<scalar> nx, ny, nz;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    nx.push_back(fvp[pi].nf[i].x);
+                    ny.push_back(fvp[pi].nf[i].y);
+                    nz.push_back(fvp[pi].nf[i].z);
+                }
+            }
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (U.boundary[pi]->bcCategory() != 9) continue;
+                hasFlowRate_ = true;
+                std::vector<scalar> mask(nx.size(), 0.0);
+                label bi = 0;
+                for (std::size_t pj = 0; pj < fvp.size(); ++pj)
+                {
+                    if (fvp[pj].type == "cyclic" || fvp[pj].type == "cyclicAMI") continue;
+                    for (label i = 0; i < fvp[pj].size; ++i, ++bi)
+                        if (pj == pi) mask[bi] = fvp[pj].magSf[i];
+                }
+                frMagSf_.emplace_back();
+                frMagSf_.back().copyFrom(mask);
+                // OF re-reads flowRate_->value(t) each call; steady + constant -> the seeded value. It is
+                // recovered from the seeded BC rather than re-parsed: avgU*sum(rho_seed*magSf) = -mdot.
+                frPatches_.push_back(FlowRatePatch{U.boundary[pi]->flowRateValue()});
+            }
+            if (hasFlowRate_) { frNx_.copyFrom(nx); frNy_.copyFrom(ny); frNz_.copyFrom(nz); }
+        }
         // any totalPressure p patch -> recompute its fixedValue refValue each step from the patch velocity + flux.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             if (p.boundary[pi]->bcCategory() == 7)
@@ -330,7 +364,8 @@ namespace brae {
                                        kDdt, sDdt, ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr,   // ddt(k)/ddt(omega) + kOmegaSSTDDES/IDDES DES limiter (no-op for RANS)
                                        compressible_ ? &th_.rho : nullptr,   // rho-weight every k/omega term, as OF's alpha*rho* does
                                        compressible_ ? &th_.mu : nullptr,   // laminar dynamic mu; F1/F2 get nu = mu/rho from it
-                                       (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr);   // nu at WALL faces for omegaWallFunction/G0
+                                       (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr,   // nu at WALL faces for omegaWallFunction/G0
+                                       compressible_ ? &rhoBnd_ : nullptr);   // rho_b: divU is div of the VOLUMETRIC flux, not the mass flux
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
@@ -385,7 +420,8 @@ namespace brae {
             deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
             deviceBCValue(dbU_.comp[1], Uk_[1], uby);
             deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
-            deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz);
+            deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz,
+                                      compressible_ ? &rhoBnd_ : nullptr);   // p in Pa -> rho-weighted dynamic head
         }
         // NVRTC device-coded BCs (codedFixedValue): run each compiled snippet over its patch faces, overwriting the
         // target field's refValue on the device from position/time/adjacent-cell value. Same updateCoeffs point as the
@@ -436,6 +472,7 @@ namespace brae {
             [&](const DeviceBuffer<scalar>& nutB,
                 DeviceBuffer<scalar>& muEffB)
             {
+                if (compressible_) deviceCopy(nutBndAll_, nutB);   // same nut the momentum wall uses -> alphat_b
                 if (!compressible_)
                 {
                     deviceAxpy(1.0, nutB, muEffB);
@@ -1120,6 +1157,12 @@ namespace brae {
         compressible_ = true;
     }
 
+    void DeviceSimpleSolver::setAlphatPrt(const std::vector<scalar>& prtFace)
+    {
+        if (!prtFace.empty()) prtBnd_.copyFrom(prtFace);
+    }
+
+
     // See the header for why the phases are ordered UEqn -> EEqn -> pEqn -> thermo -> turbulence.
     DeviceSimpleResidual DeviceSimpleSolver::rhoSimpleStep()
     {
@@ -1143,23 +1186,56 @@ namespace brae {
         deviceGatherWallNu(wfBndIdx_, nuWallBnd_, wfNu_);   // same nu, in the wall-face ordering omega/G0 uses
         deviceCopy(nuBndConst_, muBnd_);
 
+        // flowRateInletVelocity (massFlowRate): OF recomputes avgU = -mdot/gSum(rho*magSf) every time the
+        // U boundary is updated, so it tracks the inlet density as the solution develops. Done here, before
+        // the momentum predictor, so the predictor sees the same inlet OF's does.
+        for (std::size_t k = 0; k < frPatches_.size(); ++k)
+        {
+            const scalar sumRhoA = deviceDot(rhoBnd_, frMagSf_[k]);
+            if (sumRhoA <= 0.0) continue;
+            deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -frPatches_[k].mdot / sumRhoA, frNx_, frNy_, frNz_);
+        }
+
         solveMomentumPredictor(res);
 
         // EEqn, with OF's kinetic-energy term: EEqn.H is div(phi,he) + div(phi,K) - laplacian(alphaEff,he).
         // K is built from the velocity the momentum predictor just produced, matching OF's ordering.
+        // sensibleInternalEnergy convects Ekp = 0.5|U|^2 + p/rho, sensibleEnthalpy just K = 0.5|U|^2.
+        // p_b comes from the pressure BC and rho_b from the boundary p and T, so the boundary half of
+        // div(phi,Ekp) is evaluated on the patch exactly as OF's fvc::div does, not extrapolated.
         DeviceBuffer<scalar> kineticSrc;
-        deviceEnergyKineticSource(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], phiInt_, phiBnd_, kineticSrc);
+        DeviceBuffer<scalar> pBndK;
+        if (tc_.internalEnergy) deviceBCValue(dbP_, dp_, pBndK);
+        deviceEnergyKineticSource(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], phiInt_, phiBnd_, kineticSrc,
+                                  tc_.internalEnergy ? &dp_ : nullptr,
+                                  tc_.internalEnergy ? &th_.rho : nullptr,
+                                  tc_.internalEnergy ? &pBndK : nullptr,
+                                  tc_.internalEnergy ? &rhoBnd_ : nullptr,
+                                  &dbHe_, ctl_.limitedHe, ctl_.twoBykHe);   // div(phi,K|Ekp) scheme
+        // alphaEff on the PATCHES, so the alphatWallFunction actually reaches the wall heat flux.
+        // ALWAYS when compressible, not just when turbulent. OF's laplacian uses the PATCH diffusivity,
+        // alpha_b = alphah(p_b, T_b) evaluated at the BOUNDARY temperature. With transport const that
+        // equals the adjacent cell value and the distinction is invisible; under sutherland a 700 K wall
+        // against a 370 K first cell makes mu_b ~1.6x the cell mu, and using the cell value understates
+        // the wall heat flux by that much while converging perfectly.
+        DeviceBuffer<scalar> alphaEffBnd;
+        if (compressible_)
+            deviceAlphaEffBoundary(muBnd_, rhoBnd_,
+                                   ctl_.turbulent ? &nutBndAll_ : nullptr,
+                                   prtBnd_.size() ? &prtBnd_ : nullptr,
+                                   tc_, alphaEffBnd);
         deviceSolveEnergy(
             dm,
             dbHe_,
             th_,
+            tc_,
             phiInt_,
             phiBnd_,
             zeroSrc_,
-            false,
-            false,
+            ctl_.limitedHe,   // div(phi,h|e) limitedLinear, from fvSchemes -- was hardcoded false
+            ctl_.luHe,        // div(phi,h|e) linearUpwind,   from fvSchemes -- was hardcoded false
             ctl_.nonOrth,
-            0.0,
+            ctl_.twoBykHe,
             rc_.relaxHe,
             1e-10,
             0.0,
@@ -1167,9 +1243,19 @@ namespace brae {
             false,
             nullptr,
             nullptr,
-            &kineticSrc);
+            &kineticSrc,
+            alphaEffBnd.size() ? &alphaEffBnd : nullptr);
 
         correctPressureVelocity(res);
+
+        // pressureControl::limit(p), in OF's position: after the pressure solve and the U correction,
+        // BEFORE rho is recomputed. Clamping after rho would let one NaN density through per iteration.
+        if (rc_.limitMaxP || rc_.limitMinP)
+        {
+            deviceLimitPressure(dp_,
+                                rc_.limitMinP ? rc_.pMinLimit : -1e300,
+                                rc_.limitMaxP ? rc_.pMaxLimit : 1e300);
+        }
 
         // thermo.correct() then rho.relax(): p and he have both moved, so every T-dependent property is
         // stale until this runs, and the relaxation stops the outer loop oscillating on the raw update.
