@@ -44,6 +44,10 @@ struct DeviceSimpleControls
     // fvSchemes like every other div scheme; brae used to hardcode upwind here and silently ignore what the
     // case asked for, which is a first-order downgrade that still converges. The K/Ekp term takes the same
     // scheme because OF's tutorials point div(phi,K) at the same entry ($energy) as div(phi,e).
+    // div(phi,h|e) "bounded": OF's boundedConvectionScheme subtracts fvm::Sp(fvc::surfaceIntegrate(phi), he).
+    // It vanishes at converged continuity, so every steady duct gate passes without it -- but it is a real
+    // STABILISER while div(phi) != 0, and the NACA0012 case at Mach 0.72 diverges in one iteration without it.
+    bool   boundedHe = false;
     bool   limitedHe = false;                      // div(phi,h|e) "limitedLinear"
     bool   luHe = false;                           // div(phi,h|e) "linearUpwind"
     scalar twoBykHe = 2.0;

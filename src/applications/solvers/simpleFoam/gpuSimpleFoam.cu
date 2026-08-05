@@ -631,6 +631,18 @@ int main(int argc, char** argv)
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
 
+        // BRAE_DUMP_PHI: write the conservative face flux, the one quantity that carries between SIMPLE
+        // iterations and is not in any written cell field. Diagnostic only.
+        if (std::getenv("BRAE_DUMP_PHI"))
+        {
+            const std::vector<scalar> phiI = solver.phiInternal();
+            FILE* fp = std::fopen(std::getenv("BRAE_DUMP_PHI"), "w");
+            if (fp)
+            {
+                for (std::size_t i = 0; i < phiI.size(); ++i) std::fprintf(fp, "%.17g\n", phiI[i]);
+                std::fclose(fp);
+            }
+        }
         // BRAE_DUMP_CONTINUITY: localise the per-cell continuity imbalance R[c]=sum_f phi_f and bucket sum|R| by
         // region (wall-adjacent / farfield-adjacent / interior) to find WHERE continuity fails to close.
         if (std::getenv("BRAE_DUMP_CONTINUITY"))

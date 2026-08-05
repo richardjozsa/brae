@@ -136,6 +136,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedHe = true; ctl.twoBykHe = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luHe = true;
+                    if (hasWord(ln, "bounded")) ctl.boundedHe = true;
                 }
                 if (ln.find("div(phi,nuTilda)") != std::string::npos)   // SA: nuTilda uses the k-slot scheme flags
                 {

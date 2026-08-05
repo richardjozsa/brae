@@ -568,6 +568,129 @@ void deviceGatherWallNu(
     cudaCheck(cudaGetLastError(), "gatherWallNu");
 }
 
+// out[i] = cell[faceCell[i]] -- plain adjacent-cell extrapolation for a boundary face.
+__global__
+void gatherCellToFaceK(
+    int n,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ cellVal,
+    scalar* __restrict__ faceVal)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    faceVal[i] = cellVal[fc[i]];
+}
+
+// nut at boundary FACES for the SST, evaluated the way OF fills it rather than extrapolated from the cell.
+//
+// OF sets nut by field assignment (kOmegaSSTBase::correctNut):
+//     nut_ = a1*k/max(a1*omega, b1*F23*sqrt(S2));   nut_.correctBoundaryConditions();
+// so a 'calculated' patch carries that expression evaluated on the BOUNDARY k, omega, F23 and S2 --
+// correctBoundaryConditions() leaves such a patch alone. F23 = F2 unless the F3 option is on.
+//
+//     F2   = tanh(arg2^2),  arg2 = max(2 sqrt(k)/(betaStar omega y), 500 nu/(y^2 omega))
+//     S2   = 2 magSqr(symm(gradU)),  gradU at the face = gradC + n (x) (snGrad - n & gradC)
+//
+// The boundary gradient is the same expression device_divdevreff.cu's gradBKernel uses (OF gaussGrad::
+// correctBoundaryConditions), reproduced here so the SST does not depend on the stress module's layout.
+__global__
+void sstNutBoundaryK(
+    int nB,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ kBnd,
+    const scalar* __restrict__ omBnd,
+    const scalar* __restrict__ yCell,   // CELL wall distance. NOT the boundary bndY_, which brae stores as
+                                        // 0 on every non-wall face -- and non-wall faces are exactly the
+                                        // ones this evaluates. OF's y()[patchi] on a calculated patch is
+                                        // the adjacent cell's wallDist, which is what this indexes.
+    const scalar* __restrict__ nuB,      // per-face nu (compressible); null -> the scalar nu
+    scalar nu,
+    const scalar* __restrict__ gradU,    // CELL gradient (9 x nC)
+    int nC,
+    const scalar* __restrict__ nx,
+    const scalar* __restrict__ ny,
+    const scalar* __restrict__ nz,
+    const scalar* __restrict__ uxb,
+    const scalar* __restrict__ uyb,
+    const scalar* __restrict__ uzb,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    const scalar* __restrict__ dc,
+    const label*  __restrict__ calcMask, // 1 where the nut BC is 'calculated'
+    scalar a1,
+    scalar b1,
+    scalar betaStar,
+    const scalar* __restrict__ nutCell,
+    scalar* __restrict__ nutBnd)
+{
+    const int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi >= nB) return;
+    const int c = fc[bi];
+    if (!calcMask || !calcMask[bi]) return;          // wall/zeroGradient patches keep what the caller set
+
+    const scalar kb = kBnd[bi], ob = omBnd[bi], y = yCell[c];
+    const scalar nuf = nuB ? nuB[bi] : nu;
+    if (!(ob > scalar(0)) || !(y > scalar(0))) { nutBnd[bi] = nutCell[c]; return; }
+
+    // boundary gradU, then S2
+    scalar gc[9];
+    for (int q = 0; q < 9; ++q) gc[q] = gradU[q*nC + c];
+    const scalar nv[3] = { nx[bi], ny[bi], nz[bi] };
+    const scalar sn[3] = { (uxb[bi]-Ux[c])*dc[bi], (uyb[bi]-Uy[c])*dc[bi], (uzb[bi]-Uz[c])*dc[bi] };
+    scalar ngc[3];
+    for (int j = 0; j < 3; ++j)
+        ngc[j] = nv[0]*gc[0*3+j] + nv[1]*gc[1*3+j] + nv[2]*gc[2*3+j];
+    scalar gb[9];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            gb[i*3+j] = gc[i*3+j] + nv[i]*(sn[j] - ngc[j]);
+    scalar ss = 0.0;
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+        {
+            const scalar sab = 0.5*(gb[a*3+b] + gb[b*3+a]);
+            ss += sab*sab;
+        }
+    const scalar S2 = 2.0*ss;
+
+    const scalar arg2 = fmax(2.0*sqrt(fmax(kb, scalar(0)))/(betaStar*ob*y), 500.0*nuf/(y*y*ob));
+    const scalar F2   = tanh(arg2*arg2);
+    nutBnd[bi] = a1*kb / fmax(a1*ob, b1*F2*sqrt(fmax(S2, scalar(0))));
+}
+
+void deviceSSTNutBoundary(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& kBnd,
+    const DeviceBuffer<scalar>& omBnd,
+    const DeviceBuffer<scalar>& yCell,
+    const DeviceBuffer<scalar>* nuB,
+    scalar nu,
+    const DeviceBuffer<scalar>& gradU,
+    int nC,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<label>& calcMask,
+    const KOmegaSSTCoeffs& co,
+    const DeviceBuffer<scalar>& nutCell,
+    DeviceBuffer<scalar>& nutBnd)
+{
+    const int nB = dbU.comp[0].n;
+    if (nB == 0 || nutBnd.size() != static_cast<std::size_t>(nB)) return;
+    DeviceBuffer<scalar> uxb, uyb, uzb;
+    deviceBCValue(dbU.comp[0], Ux, uxb);
+    deviceBCValue(dbU.comp[1], Uy, uyb);
+    deviceBCValue(dbU.comp[2], Uz, uzb);
+    sstNutBoundaryK<<<nBlocks(nB), TPB>>>(nB, dbU.comp[0].faceCell.data(), kBnd.data(), omBnd.data(),
+                                          yCell.data(), nuB ? nuB->data() : nullptr, nu,
+                                          gradU.data(), nC, dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
+                                          uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
+                                          dbU.comp[0].deltaCoeffs.data(), calcMask.data(),
+                                          co.a1, co.b1, co.betaStar, nutCell.data(), nutBnd.data());
+    cudaCheck(cudaGetLastError(), "sstNutBoundary");
+}
+
 void deviceWallOmegaG0(
     const DeviceWallData& w,
     const DeviceBuffer<scalar>& k,
@@ -761,7 +884,9 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* rho,     // compressible: rho-weight the reactions and the diffusivity
     const DeviceBuffer<scalar>* muLam,   // compressible: laminar DYNAMIC viscosity mu [Pa s]
     const DeviceBuffer<scalar>* nuWallFace,   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
-    const DeviceBuffer<scalar>* rhoBnd)   // compressible: rho at boundary faces, for the volumetric flux
+    const DeviceBuffer<scalar>* rhoBnd,    // compressible: rho at boundary faces, for the volumetric flux
+    const DeviceBuffer<scalar>* nutBnd,    // nut at boundary FACES -> DkEff/DomegaEff(patchi), as OF's laplacian uses
+    const DeviceBuffer<scalar>* muBnd)     // compressible: mu at boundary faces (the +mu of rho*D+mu)
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -870,10 +995,35 @@ void deviceKOmegaSSTCorrect(
     if (rho && muLam) scaleDEffCompressible(*rho, *muLam, DomegaEff);
 
     // omega equation (loose solve) with the near-wall setValues constraint (omega0)
+    // OF's laplacian(alpha*rho*DomegaEff, omega) uses the PATCH diffusivity, DomegaEff(patchi) =
+    // alphaOmega(F1_b)*nut_b + nu_b -- not the adjacent cell's. Same correction that took kEpsilon from
+    // 5e-3 to 1e-13. F1 is taken at the adjacent cell: OF evaluates alphaOmega(F1) as a volScalarField
+    // whose boundary is F1's boundary, and F1 is a calculated field, so its patch value is the assigned
+    // expression; using the cell F1 is an approximation ONLY in the blend factor, not in nut_b itself.
+    DeviceBuffer<scalar> DomB, DkB;
+    if (nutBnd && nutBnd->size())
+    {
+        const int nB = static_cast<int>(nutBnd->size());
+        // F1 extrapolated from the adjacent cell. NOT deviceBCValue(dbOmega, F1, ...) -- that applies
+        // OMEGA's boundary conditions to F1, so a fixedValue omega inlet returns omega's refValue (400)
+        // where F1 must lie in [0,1]. Measured: that made omega 100x worse (3.1e-5 -> 3.2e-3).
+        DeviceBuffer<scalar> F1b;
+        F1b.resize(nB);
+        gatherCellToFaceK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), F1.data(), F1b.data());
+        cudaCheck(cudaGetLastError(), "F1b");
+        DomB.resize(nB); DkB.resize(nB);
+        deviceDEff(F1b, *nutBnd, co.alphaOmega1, co.alphaOmega2, rho ? scalar(0) : nu, DomB);
+        deviceDEff(F1b, *nutBnd, co.alphaK1,     co.alphaK2,     rho ? scalar(0) : nu, DkB);
+        if (rho && rhoBnd && muBnd && muBnd->size())
+        {
+            scaleDEffCompressible(*rhoBnd, *muBnd, DomB);
+            scaleDEffCompressible(*rhoBnd, *muBnd, DkB);
+        }
+    }
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, bounded, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
-                               &wall, &omega0, ami, cyc, sDdt);
+                               &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr);
     deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
@@ -883,7 +1033,7 @@ void deviceKOmegaSSTCorrect(
     deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr, rho); },
-                               nullptr, nullptr, ami, cyc, kDdt);
+                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr);
     deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).

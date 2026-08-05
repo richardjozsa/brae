@@ -58,6 +58,7 @@ void deviceSolveEnergy(
     const DeviceBuffer<scalar>& phiInt,
     const DeviceBuffer<scalar>& phiBnd,
     const DeviceBuffer<scalar>& divU,
+    bool bounded,   // div(phi,h|e) "bounded": -Sp(div(phi), he). Stabiliser while continuity is unconverged.
     bool limited,
     bool linearUpwind,
     bool nonOrth,

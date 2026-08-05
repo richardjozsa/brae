@@ -300,6 +300,10 @@ private:
     DeviceBoundary dbHe_{};
     DeviceBuffer<scalar> pD_, pU_, pL_, diagCp_, bp_;            // persistent pressure matrix (graph-stable addresses)
     DeviceBuffer<label>  bndIsWall_, adjustMask_;              // wall mask (true boundary nut); adjustPhi adjustable mask
+    // kEpsilon: 1 on boundary faces whose 0/nut BC is 'calculated'. OF fills those by field assignment
+    // (Cmu*k_b^2/eps_b) rather than extrapolating the cell, and the two differ by >12x at a fixed-k inlet.
+    DeviceBuffer<label>  nutCalcMask_;
+    bool hasNutCalc_ = false;
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces
     // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
     // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed

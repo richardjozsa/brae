@@ -42,6 +42,7 @@ void mixedUpdateKernel(
     const label* __restrict__ fc,
     const scalar* __restrict__ phiB,
     const scalar* __restrict__ magSf,
+    const scalar* __restrict__ rhoBnd,   // compressible: phiB is a MASS flux, so U.n = phiB/(rho_b*|Sf|)
     const scalar* __restrict__ Ux,
     const scalar* __restrict__ Uy,
     const scalar* __restrict__ Uz,
@@ -57,7 +58,12 @@ void mixedUpdateKernel(
     if (!mu && !mp) return;
     const int c = fc[i];
     const scalar mU = sqrt(Ux[c] * Ux[c] + Uy[c] * Uy[c] + Uz[c] * Uz[c]);   // local |U| (adjacent cell)
-    scalar ct = (phiB[i] / magSf[i]) / fmax(mU, 1e-30);                      // (U.n)/|U|
+    // OF: valueFraction = 0.5 +/- 0.5*(U_b & nf)/mag(U_b). U.n must be the VOLUMETRIC normal velocity.
+    // phiB is the mass flux on the compressible path, so it has to be divided by rho_b first -- otherwise
+    // ct carries a spurious factor of rho, and since ct is clamped to [-1,1] it SATURATES, collapsing OF's
+    // continuous Robin blend into a binary switch that pins the far field.
+    const scalar rw = rhoBnd ? rhoBnd[i] : scalar(1);
+    scalar ct = (phiB[i] / (rw * magSf[i])) / fmax(mU, 1e-30);                // (U.n)/|U|
     ct = fmin(fmax(ct, -1.0), 1.0);
     if (mu)   // velocity sign
     {
@@ -280,12 +286,15 @@ void deviceUpdateMixedFreestream(
     const DeviceBuffer<scalar>& phiBnd,
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
-    const DeviceBuffer<scalar>& Uz)
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>* rhoBnd)
 {
     const int n = dbP.n;
     if (n == 0) return;
     mixedUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].mixedMask.data(), dbP.mixedMask.data(), dbP.faceCell.data(),
-                                           phiBnd.data(), dbP.magSf.data(), Ux.data(), Uy.data(), Uz.data(),
+                                           phiBnd.data(), dbP.magSf.data(),
+                                           (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr,
+                                           Ux.data(), Uy.data(), Uz.data(),
                                            dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
                                            dbU.comp[2].valueFraction.data(), dbP.valueFraction.data());
     cudaCheck(cudaGetLastError(), "mixedUpdate");

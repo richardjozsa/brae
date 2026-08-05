@@ -172,7 +172,11 @@ void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, c
 void deviceBoundaryNut(const DeviceBoundary& db, const DeviceBuffer<label>& isWall, const DeviceBuffer<scalar>& y,
                        const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& nut, scalar nu, DeviceBuffer<scalar>& nutBnd,
                        const KEpsilonCoeffs& co = {}, scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction
-                       const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
+                       const DeviceBuffer<scalar>* nuFace = nullptr,   // compressible: per-face nu = mu_b/rho_b
+                       // kEpsilon: on a 'calculated' nut patch OF carries Cmu*k_b^2/eps_b, not the cell value.
+                       const DeviceBuffer<label>*  calcMask = nullptr,
+                       const DeviceBuffer<scalar>* kBnd = nullptr,
+                       const DeviceBuffer<scalar>* epsBnd = nullptr);
 
 // The full device kEpsilon::correct(): production -> wall functions/override -> eps eqn (with the wall
 // setValues constraint) -> k eqn -> correctNut. Updates k/eps/nut in place. Mirrors the CPU correct().
@@ -194,7 +198,9 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             const DeviceBuffer<scalar>* rho = nullptr,          // compressible: alpha*rho weighting
                             const DeviceBuffer<scalar>* muLam = nullptr,        // compressible: laminar dynamic mu
                             const DeviceBuffer<scalar>* rhoBnd = nullptr,       // compressible: rho at boundary faces
-                            const DeviceBuffer<scalar>* nuWallFace = nullptr);  // compressible: nu = mu_b/rho_b per wall face   // transient fvm::ddt(k)/ddt(eps)
+                            const DeviceBuffer<scalar>* nuWallFace = nullptr,  // compressible: nu = mu_b/rho_b per wall face
+                            const DeviceBuffer<scalar>* nutBnd = nullptr,      // nut at boundary faces -> patch diffusivity
+                            const DeviceBuffer<scalar>* muBnd = nullptr);      // compressible: mu at boundary faces   // transient fvm::ddt(k)/ddt(eps)
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -222,7 +228,9 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<scalar>* rho = nullptr,   // compressible: rho-weight reactions + diffusivity
                             const DeviceBuffer<scalar>* muLam = nullptr,   // compressible: laminar DYNAMIC viscosity mu [Pa s]
                             const DeviceBuffer<scalar>* nuWallFace = nullptr,   // compressible: nu = mu_b/rho_b per WALL face
-                            const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at boundary faces (volumetric flux for divU)
+                            const DeviceBuffer<scalar>* rhoBnd = nullptr,   // compressible: rho at boundary faces (volumetric flux for divU)
+                            const DeviceBuffer<scalar>* nutBnd = nullptr,   // nut at boundary faces -> patch diffusivity
+                            const DeviceBuffer<scalar>* muBnd = nullptr);   // compressible: mu at boundary faces
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,

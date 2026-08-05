@@ -1039,6 +1039,20 @@ set_tests_properties(rho_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 600)
 
+# rhoSimpleFoam kEpsilon gate. Same duct as the kOmegaSST gate, RASModel kEpsilon.
+# Tolerance is 2e-2 rather than the SST's 5e-4 for a MEASURED reason: brae's kEpsilon already differs
+# from OF by k 5.09e-3 / epsilon 8.11e-3 in the INCOMPRESSIBLE solver on this same geometry
+# (brae_simpleFoam vs OF simpleFoam), so that is the floor. This gate certifies the COMPRESSIBLE
+# additions land on that floor, not brae's kEpsilon fidelity -- which is a separate open item.
+# Dropping the rho weighting gives k 5.0e-2 / eps 2.3e-2, well clear of the floor, so it still bites.
+add_test(NAME ke_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ke_vs_openfoam.sh)
+set_tests_properties(ke_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
 # rhoSimpleFoam BC gate: flowRateInletVelocity. OF sets U_b = avgU*n with
 #   avgU = -flowRate/gSum(rho*magSf)   (flowRateInletVelocityFvPatchVectorField::updateValues)
 # using the OUTWARD normal, so a positive rate is inflow. The gate runs the massFlowRate form, whose sum
@@ -1141,6 +1155,15 @@ add_executable(test_thermo_perfect_gas tests/test_thermo_perfect_gas.cu)
 target_include_directories(test_thermo_perfect_gas PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_thermo_perfect_gas PRIVATE brae_core)
 add_test(NAME thermo_perfect_gas COMMAND test_thermo_perfect_gas)
+
+# heRhoThermo/perfectGas must parse identically to hePsiThermo, and heRhoThermo with any OTHER
+# equationOfState must be refused. Asserted at the PARSE level because brae is not run-to-run
+# bit-reproducible (~3e-9 on T after one iteration), so a solver-level equivalence check would need a
+# statistical argument; the claim itself is deterministic.
+add_executable(test_thermo_type_equiv tests/test_thermo_type_equiv.cu)
+target_include_directories(test_thermo_type_equiv PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_thermo_type_equiv PRIVATE brae_core)
+add_test(NAME thermo_type_equiv COMMAND test_thermo_type_equiv)
 
 # Cyclic increment C3b: cyclic coupling inside an iterative solver (periodic Poisson)
 add_executable(test_cyclic_poisson tests/test_cyclic_poisson.cu)

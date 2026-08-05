@@ -52,7 +52,21 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
     const std::string eos = tt->wordOr("equationOfState", "");
     const std::string energy = tt->wordOr("energy", "");
 
-    thermoRequire(type == "hePsiThermo", "type", type, "hePsiThermo");
+    // heRhoThermo is accepted ONLY with perfectGas, where it is provably the same arithmetic:
+    //   hePsiThermo::calculate  -> psi = mixture.psi(p,T);           rho comes out as psi*p
+    //   heRhoThermo::calculate  -> psi = mixture.psi(p,T);  rho = mixture.rho(p,T)
+    //   perfectGas              -> rho = p/(R T),  psi = 1/(R T)  =>  rho == psi*p exactly
+    // Both then take mu and alphah from the same mixture functions. So for perfectGas the two thermo
+    // types are bit-identical and refusing heRhoThermo blocks real cases for no reason.
+    //
+    // For ANY other equationOfState (rhoConst, perfectFluid, icoPolynomial, Boussinesq, liquids) rho is
+    // NOT psi*p, the two genuinely differ, and heRhoThermo stays refused -- accepting it there would run
+    // the wrong density and converge.
+    thermoRequire(
+        type == "hePsiThermo" || (type == "heRhoThermo" && eos == "perfectGas"),
+        "type",
+        type,
+        "hePsiThermo, or heRhoThermo with equationOfState perfectGas");
     thermoRequire(mixture == "pureMixture", "mixture", mixture, "pureMixture");
     thermoRequire(thermo == "hConst", "thermo", thermo, "hConst");
     thermoRequire(eos == "perfectGas", "equationOfState", eos, "perfectGas");

@@ -119,6 +119,25 @@ int main(int argc, char** argv)
         }
 
         DeviceSimpleControls ctl;
+        // The pressure needs a reference iff NO p patch fixes the value -- otherwise the all-Neumann
+        // system is singular. gpuSimpleFoam has always done this scan; the compressible driver never did,
+        // so needRef stayed at its default false and a closed compressible domain (all walls, or
+        // fixedFluxPressure everywhere) would solve a singular pressure equation with no reference and
+        // no adjustPhi. Same rule as the incompressible driver: a fixedValue p, or a freestreamPressure
+        // (bcCategory 4, fixedValue on outflow), references the pressure.
+        ctl.needRef = true;
+        for (const auto& bf : p.boundary)
+            if (bf->fixesValue() || bf->bcCategory() == 4)
+            {
+                ctl.needRef = false;
+                break;
+            }
+        if (ctl.needRef)
+        {
+            // rc already carries these, read from the SIMPLE sub-dict by readRhoSimpleControls.
+            ctl.pRefCell = rc.pRefCell;
+            ctl.pRefValue = rc.pRefValue;
+        }
         ctl.nu = tc.mu0;                       // replaced every iteration by th_.mu; only the seed matters
         parseFvSchemesControls(caseDir, ctl);
 
@@ -130,10 +149,18 @@ int main(int argc, char** argv)
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' for rhoSimpleFoam (RAS or laminar)");
         ctl.turbulent = (simType == "RAS");
         readTurbulenceModel(turbProps, ctl);
-        if (ctl.turbulent && !ctl.sst)
+        // kOmegaSST and kEpsilon are both rho-weighted (every RHS term, the diffusivity, the volumetric
+        // divU and the per-face wall nu). SA and the kOmegaSST variants are not, so they stay refused:
+        // running one down the incompressible path converges to a wrong answer rather than failing.
+        // Standard kEpsilon = not SST, not SA, not realizableKE. realizableKE stays refused because its
+        // epsilon reaction is a DIFFERENT expression (deviceEpsReactionRealizable, strain-based) that has
+        // NOT been rho-weighted -- accepting it here would run an unweighted reaction and converge wrong.
+        const bool keStandard = !ctl.sst && !ctl.sa && !ctl.keCoeffs.realizable;
+        if (ctl.turbulent && !ctl.sst && !keStandard)
             throw std::runtime_error(
-                "brae: rhoSimpleFoam supports kOmegaSST only so far. The other RAS models are not yet "
-                "rho-weighted, and running one down the incompressible path gives a converged wrong answer.");
+                "brae: rhoSimpleFoam supports kOmegaSST and kEpsilon so far. SpalartAllmaras and "
+                "realizableKE are not rho-weighted, and running one down the incompressible path gives a "
+                "converged wrong answer, so they are refused instead.");
 
         // div(phi,h|e) linearUpwind is HONOURED: measured against OF on the heated duct it agrees to
         // 8.2e-7, i.e. as well as upwind does. An earlier measurement said otherwise (7.1e-2) and was
@@ -163,7 +190,9 @@ int main(int argc, char** argv)
         const FoamDict* fldSrc = fld ? fld : rf;
         ctl.relaxU = eqSrc ? eqSrc->scalarOr("U", 1.0) : 1.0;
         ctl.relaxK = eqSrc ? eqSrc->scalarOr("k", 1.0) : 1.0;
-        ctl.relaxEps = eqSrc ? eqSrc->scalarOr("omega", 1.0) : 1.0;
+        // OF looks these up by FIELD NAME: "omega" on kOmegaSST, "epsilon" on kEpsilon.
+        const std::string second = ctl.sst ? "omega" : "epsilon";
+        ctl.relaxEps = eqSrc ? eqSrc->scalarOr(second, 1.0) : 1.0;
         ctl.relaxP = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
 
         const FoamDict* solvers = fvSolution.subDict("solvers");
@@ -174,10 +203,10 @@ int main(int argc, char** argv)
         };
         ctl.tolP = solverTol("p", 1e-6);
         ctl.tolU = solverTol("U", 1e-8);
-        ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol("omega", 1e-8));
+        ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol(second, 1e-8));
 
         TurbulenceFields tf;
-        if (ctl.turbulent) tf = readTurbulenceFields(t0, fvp, nC, ctl, "omega", U);
+        if (ctl.turbulent) tf = readTurbulenceFields(t0, fvp, nC, ctl, second, U);
 
         // Per-boundary-face Prt from 0/alphat. OF keeps two DIFFERENT turbulent Prandtl numbers in one
         // case: alphatWallFunction reads its own from the patch (default 0.85) while the turbulence model
@@ -226,8 +255,13 @@ int main(int argc, char** argv)
         deviceThermoUpdate(th, solver.pDevice(), tc);
         deviceRhoSeedPrev(th);
 
+        // What brae RESOLVED from the case, not what the dict says. A relaxation factor silently left at
+        // 1.0 is invisible in the fields and fatal on a stiff case.
+        std::printf("brae_rhoSimpleFoam: relax  p=%g U=%g e|h=%g k=%g %s=%g rho=%g   pLimit=[%g, %g]\n",
+                    ctl.relaxP, ctl.relaxU, rc.relaxHe, ctl.relaxK, second.c_str(), ctl.relaxEps, tc.relaxRho,
+                    rc.limitMinP ? rc.pMinLimit : -1.0, rc.limitMaxP ? rc.pMaxLimit : -1.0);
         std::printf("brae_rhoSimpleFoam: %ld cells, subsonic %s, R=%.3f Cp=%.1f\n",
-                    (long)nC, ctl.turbulent ? "kOmegaSST" : "laminar", tc.R, tc.Cp);
+                    (long)nC, ctl.turbulent ? (ctl.sst ? "kOmegaSST" : "kEpsilon") : "laminar", tc.R, tc.Cp);
 
         for (int iter = 1; iter <= endTime; ++iter)
         {
@@ -258,7 +292,8 @@ int main(int argc, char** argv)
         if (ctl.turbulent)
         {
             writeVolField(t0 + "/k",     outDir + "/k",     solver.k(),   fvp, 12);
-            writeVolField(t0 + "/omega", outDir + "/omega", solver.eps(), fvp, 12);   // de_ slot holds omega on SST
+            // the 2nd turbulence scalar shares one slot: omega on kOmegaSST, epsilon on kEpsilon
+            writeVolField(t0 + "/" + second, outDir + "/" + second, solver.eps(), fvp, 12);
             writeVolField(t0 + "/nut",   outDir + "/nut",   solver.nut(), fvp, 12);
         }
         std::printf("brae_rhoSimpleFoam: wrote %s\n", outDir.c_str());

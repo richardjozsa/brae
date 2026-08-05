@@ -17,18 +17,17 @@
 # wall heat flux. That is why this compares seven fields against OF rather than checking residuals.
 set -e
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
-SRC=${SRC:-$(cd "$(dirname "$0")/rhoSST" && pwd)}
+SRC=${SRC:-$(cd "$(dirname "$0")/rhoKE" && pwd)}
 BUILD=${BUILD:-$(cd "$(dirname "$0")/../build" && pwd)}
-WORK=${WORK:-/tmp/brae_sst_vs_of}
-# 2e-5. Tightened a third time, again because the "floor" was a bug rather than discretisation:
-#   - nut on a 'calculated' patch must be EVALUATED, a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)), not
-#     extrapolated from the cell. That took p to machine precision.
-#   - the k/omega laplacian must use the PATCH diffusivity alphaK(F1_b)*nut_b + nu_b.
-# Order mattered: with an extrapolated nut_b the second change made omega 100x WORSE, so it was measured
-# and disabled until the first landed. One iteration from an identical developed state now agrees to
-# ~2e-8; the residual is F1_b extrapolated from the cell rather than evaluated. Fields land at ~3e-6
-# here, so 2e-5 keeps ~7x margin and still catches every bug this gate has caught (5e-2, 3e-2, 3e-4).
-TOL=${TOL:-2e-5}
+WORK=${WORK:-/tmp/brae_ke_vs_of}
+# 1e-5. This gate has been tightened twice, each time because what looked like an inherent "floor" was a
+# bug. 2e-2 -> 3e-3 when nut on a 'calculated' patch turned out to need Cmu*k_b^2/eps_b rather than the
+# extrapolated cell value (12.8x at a fixed-k inlet). 3e-3 -> 1e-5 when the k/epsilon laplacian turned out
+# to need the PATCH diffusivity DkEff(patchi) = nut_b/sigmak + nu, not the adjacent cell's.
+# With both, one iteration from an identical developed state agrees to 7e-14 and the converged
+# incompressible case to 1e-13 -- i.e. brae's kEpsilon IS OpenFOAM's. Fields land at ~3e-6 here, so 1e-5
+# keeps ~3x margin and still catches either bug (5e-3 and 6e-4 respectively).
+TOL=${TOL:-1e-5}
 
 if [ ! -f "$OFBASHRC" ]; then echo "OpenFOAM not found at $OFBASHRC -- skipping"; exit 77; fi
 source "$OFBASHRC" 2>/dev/null || true
@@ -65,7 +64,7 @@ def rd(path):
 
 # rho is derived by OF, not written by default -- rhoSimpleFoam writes it only with writeObjects. It is
 # compared when present on BOTH sides and skipped (not silently passed) otherwise.
-FIELDS = ("T", "p", "U", "k", "omega", "nut", "rho")
+FIELDS = ("T", "p", "U", "k", "epsilon", "nut", "rho")
 bad = 0
 checked = 0
 for f in FIELDS:

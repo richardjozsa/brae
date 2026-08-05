@@ -36,6 +36,18 @@ namespace brae {
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
         dbP_  = buildDeviceBoundary(p, fvp, g);
         wall_ = buildDeviceWallData(m, g, fvp, U);
+        if (nut)
+        {
+            std::vector<label> cm;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                const bool calc = (fvp[pi].type != "wall") && (nut->boundary[pi]->bcCategory() == 2);
+                if (calc) hasNutCalc_ = true;
+                for (label i = 0; i < fvp[pi].size; ++i) cm.push_back(calc ? 1 : 0);
+            }
+            if (hasNutCalc_) nutCalcMask_.copyFrom(cm);
+        }
         {
             // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping type=="wall" patches;
             // DeviceBoundary walks the same fvp skipping cyclic/cyclicAMI (a wall is neither), so the wall
@@ -365,7 +377,11 @@ namespace brae {
                                        compressible_ ? &th_.rho : nullptr,   // rho-weight every k/omega term, as OF's alpha*rho* does
                                        compressible_ ? &th_.mu : nullptr,   // laminar dynamic mu; F1/F2 get nu = mu/rho from it
                                        (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr,   // nu at WALL faces for omegaWallFunction/G0
-                                       compressible_ ? &rhoBnd_ : nullptr);   // rho_b: divU is div of the VOLUMETRIC flux, not the mass flux
+                                       compressible_ ? &rhoBnd_ : nullptr,   // rho_b: divU is div of the VOLUMETRIC flux, not the mass flux
+                                       // Order matters: with an EXTRAPOLATED nut_b this made omega worse
+                                       // (3.1e-5 -> 3.2e-3). Enabled only now that nut_b is evaluated.
+                                       nutBndAll_.size() ? &nutBndAll_ : nullptr,
+                                       compressible_ ? &muBnd_ : nullptr);
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
@@ -379,7 +395,13 @@ namespace brae {
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
                                       ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
-                                      kDdt, sDdt);   // transient fvm::ddt(k)/ddt(epsilon)  (sDdt = the 2nd-scalar bundle)
+                                      kDdt, sDdt,   // transient fvm::ddt(k)/ddt(epsilon)  (sDdt = the 2nd-scalar bundle)
+                                      compressible_ ? &th_.rho : nullptr,   // alpha*rho on every k/eps RHS term + diffusivity
+                                      compressible_ ? &th_.mu : nullptr,    // laminar dynamic mu
+                                      compressible_ ? &rhoBnd_ : nullptr,   // rho_b: divU from the VOLUMETRIC flux
+                                      (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr,   // nu at wall faces (OF nu(patchi))
+                                      nutBndAll_.size() ? &nutBndAll_ : nullptr,   // nut_b -> DkEff/DepsEff(patchi)
+                                      compressible_ ? &muBnd_ : nullptr);
         }
     }
 
@@ -409,7 +431,8 @@ namespace brae {
             }
         }
         // mixed freestreamVelocity/Pressure: recompute the per-face valueFraction from the (lagged) flow angle.
-        if (hasMixed_) deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
+        if (hasMixed_) deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
+                                                  compressible_ ? &rhoBnd_ : nullptr);   // phiBnd_ is a MASS flux
         if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         // totalPressure p: recompute refValue = p0 - 0.5*neg(phi)|U_b|^2 from the boundary velocity (deviceBCValue
@@ -472,7 +495,7 @@ namespace brae {
             [&](const DeviceBuffer<scalar>& nutB,
                 DeviceBuffer<scalar>& muEffB)
             {
-                if (compressible_) deviceCopy(nutBndAll_, nutB);   // same nut the momentum wall uses -> alphat_b
+                deviceCopy(nutBndAll_, nutB);   // same nut: alphat_b (compressible) + DkEff/DepsEff(patchi)
                 if (!compressible_)
                 {
                     deviceAxpy(1.0, nutB, muEffB);
@@ -518,8 +541,31 @@ namespace brae {
             else   // k-based wall nut: nutkWallFunction (smooth), or atmNutkWallFunction (rough) when ctl_.atmZ0>0
             {
                 DeviceBuffer<scalar> nutBnd;
+                // kEpsilon only: the 'calculated' nut patches carry Cmu*k_b^2/eps_b. The SST's nut has a
+                // different expression (a1*k/max(a1*omega, b1*F2*sqrt(S2))) that needs boundary F2 and S2,
+                // so it keeps the extrapolated value until that is measured and built.
+                DeviceBuffer<scalar> kB, eB;
+                const bool keNut = hasNutCalc_ && !ctl_.sst && !ctl_.sa && !ctl_.keCoeffs.realizable;
+                if (keNut) { deviceBCValue(dbK_, dk_, kB); deviceBCValue(dbEps_, de_, eB); }
                 deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs, ctl_.atmZ0, ctl_.atmBoundNut,
-                                  compressible_ ? &nuWallBnd_ : nullptr);
+                                  compressible_ ? &nuWallBnd_ : nullptr,
+                                  keNut ? &nutCalcMask_ : nullptr,
+                                  keNut ? &kB : nullptr,
+                                  keNut ? &eB : nullptr);
+                // SST: the 'calculated' patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
+                // expression from kEpsilon's, needing boundary F2 and S2. Overwrites those faces only.
+                if (hasNutCalc_ && ctl_.sst)
+                {
+                    DeviceBuffer<scalar> kBs, omBs, gradUs;
+                    deviceBCValue(dbK_, dk_, kBs);
+                    deviceBCValue(dbEps_, de_, omBs);
+                    deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs,
+                                hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                    deviceSSTNutBoundary(dbU_, kBs, omBs, y_,   // CELL wall distance (bndY_ is 0 off-wall)
+                                         compressible_ ? &nuWallBnd_ : nullptr, ctl_.nu,
+                                         gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
+                                         nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
+                }
                 addWallNutToMuEff(nutBnd, nuEffBnd);
             }
         }
@@ -1203,6 +1249,10 @@ namespace brae {
         // sensibleInternalEnergy convects Ekp = 0.5|U|^2 + p/rho, sensibleEnthalpy just K = 0.5|U|^2.
         // p_b comes from the pressure BC and rho_b from the boundary p and T, so the boundary half of
         // div(phi,Ekp) is evaluated on the patch exactly as OF's fvc::div does, not extrapolated.
+        // div(phi) for the energy equation's "bounded" term. Was passed as zeros, which silently
+        // disabled the term even when fvSchemes asked for it.
+        DeviceBuffer<scalar> divPhiHe;
+        deviceDiv(dm, phiInt_, phiBnd_, divPhiHe);
         DeviceBuffer<scalar> kineticSrc;
         DeviceBuffer<scalar> pBndK;
         if (tc_.internalEnergy) deviceBCValue(dbP_, dp_, pBndK);
@@ -1231,7 +1281,8 @@ namespace brae {
             tc_,
             phiInt_,
             phiBnd_,
-            zeroSrc_,
+            divPhiHe,
+            ctl_.boundedHe,
             ctl_.limitedHe,   // div(phi,h|e) limitedLinear, from fvSchemes -- was hardcoded false
             ctl_.luHe,        // div(phi,h|e) linearUpwind,   from fvSchemes -- was hardcoded false
             ctl_.nonOrth,
@@ -1252,6 +1303,16 @@ namespace brae {
         // BEFORE rho is recomputed. Clamping after rho would let one NaN density through per iteration.
         if (rc_.limitMaxP || rc_.limitMinP)
         {
+            // BRAE_DUMP_PLIMIT: report the PRE-clamp extrema, which is what OF's pressureControl prints
+            // ("pressureControl: p max ..."). Comparable line-for-line against OF's log, and the only way
+            // to compare a pressure field that both codes then saturate at the same limits.
+            if (std::getenv("BRAE_DUMP_PLIMIT"))
+            {
+                const std::vector<scalar> ph = dp_.host();
+                scalar lo = ph.empty() ? 0.0 : ph[0], hi = lo;
+                for (scalar v : ph) { lo = std::min(lo, v); hi = std::max(hi, v); }
+                std::fprintf(stderr, "pressureControl(brae): p max %g  p min %g\n", hi, lo);
+            }
             deviceLimitPressure(dp_,
                                 rc_.limitMinP ? rc_.pMinLimit : -1e300,
                                 rc_.limitMaxP ? rc_.pMaxLimit : 1e300);

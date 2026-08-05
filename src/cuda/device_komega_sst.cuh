@@ -10,6 +10,7 @@
 // Gradients are produced by deviceGaussGrad (k,omega) / deviceGbyNu-style gradU in the model driver; here the
 // kernels are pointwise on flat fields. Validated vs OF on a frozen state (ctest gpu_komega_sst).
 #include "device_buffer.cuh"
+#include "device_boundary.cuh"   // DeviceVectorBoundary (SST nut boundary)
 #include "komega_sst_coeffs.cuh"
 
 namespace brae {
@@ -72,6 +73,14 @@ void deviceWallOmegaG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, c
                        DeviceBuffer<scalar>& omega0, DeviceBuffer<scalar>& G0, const KOmegaSSTCoeffs& co, int nutWall = 0,
                        scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
                        const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+
+// nut at boundary faces for the SST, evaluated as OF's field assignment fills it (see the .cu).
+void deviceSSTNutBoundary(const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& kBnd,
+                          const DeviceBuffer<scalar>& omBnd, const DeviceBuffer<scalar>& yCell,
+                          const DeviceBuffer<scalar>* nuB, scalar nu, const DeviceBuffer<scalar>& gradU, int nC,
+                          const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                          const DeviceBuffer<label>& calcMask, const KOmegaSSTCoeffs& co,
+                          const DeviceBuffer<scalar>& nutCell, DeviceBuffer<scalar>& nutBnd);
 
 // C6 k equation
 // k reaction (adds to diag + source). Mirrors the k block of kOmegaSSTBase::correct() (incompressible):
