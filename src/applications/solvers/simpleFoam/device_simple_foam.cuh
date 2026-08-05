@@ -181,6 +181,27 @@ public:
     std::vector<scalar> p()   const { return dp_.host(); }
     // Device-side p, for the compressible thermo update (which must not round-trip through the host).
     const DeviceBuffer<scalar>& pDevice() const { return dp_; }
+    // Turbulence magnitude for the divergence tripwire: sum|k| + sum|second scalar|, as a DEVICE reduction
+    // (no D2H of the fields). Used only to detect blow-up, never as a convergence measure.
+    scalar turbSumMag() const
+    {
+        scalar s = 0;
+        if (dk_.size()) s += deviceSumMag(dk_);
+        if (de_.size()) s += deviceSumMag(de_);
+        return s;
+    }
+    // Per-face turbulent-inlet data, so the boundary values can be refreshed per iteration (OF parity).
+    void setTurbulentInlets(const std::vector<label>& tiMask, const std::vector<scalar>& tiIntensity,
+                            const std::vector<label>& mlMask, const std::vector<scalar>& mlLength)
+    {
+        bool any = false;
+        for (label m : tiMask) if (m) { any = true; break; }
+        if (!any) for (label m : mlMask) if (m) { any = true; break; }
+        if (!any) return;
+        tiMask_.copyFrom(tiMask); tiIntensity_.copyFrom(tiIntensity);
+        mlMask_.copyFrom(mlMask); mlLength_.copyFrom(mlLength);
+        hasTurbInlet_ = true;
+    }
     std::vector<scalar> k()   const { return dk_.host(); }
     std::vector<scalar> eps() const { return de_.host(); }
     std::vector<scalar> ReThetat() const { return ReThetat_.host(); }   // kOmegaSSTLM
@@ -324,6 +345,14 @@ private:
     std::vector<FlowRatePatch> frPatches_;
     std::vector<DeviceBuffer<scalar>> frMagSf_;
     DeviceBuffer<scalar> frNx_, frNy_, frNz_;
+    // turbulentIntensityKineticEnergyInlet / turbulentMixingLength*Inlet: per-face masks + coefficients so
+    // the inlet k and epsilon|omega can be REBUILT each outer iteration, as OF's updateCoeffs does. Frozen
+    // set-up values are exact only when the inlet U never moves; flowRateInletVelocity moves it.
+    DeviceBuffer<label>  tiMask_;      // 1 where k has a turbulentIntensityKineticEnergyInlet face
+    DeviceBuffer<scalar> tiIntensity_;
+    DeviceBuffer<label>  mlMask_;      // 1 = epsilon, 2 = omega
+    DeviceBuffer<scalar> mlLength_;
+    bool hasTurbInlet_ = false;
     bool hasFlowRate_ = false;
     DeviceBuffer<label>  wfBndIdx_;   // wall-face -> boundary-face index (built once)
     DeviceBuffer<scalar> wfNu_;       // nu = mu_b/rho_b gathered onto wall faces, for omegaWallFunction/G0

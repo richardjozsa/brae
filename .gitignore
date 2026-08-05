@@ -37,6 +37,8 @@ validation/*
 !validation/rhoKE/
 !validation/rhoCtl/
 !validation/rhoLUturb/
+!validation/rhoIO/
+!validation/rhoTI/
 !validation/energyBox/
 !validation/rho_vs_openfoam.sh
 !validation/rhoE_vs_openfoam.sh
@@ -48,6 +50,8 @@ validation/*
 !validation/ke_vs_openfoam.sh
 !validation/luturb_vs_openfoam.sh
 !validation/sa_vs_openfoam.sh
+!validation/io_vs_openfoam.sh
+!validation/ti_vs_openfoam.sh
 !validation/ctl_vs_openfoam.sh
 !validation/energy_vs_openfoam.sh
 

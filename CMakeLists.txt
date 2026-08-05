@@ -748,6 +748,25 @@ set_tests_properties(sa_vs_openfoam PROPERTIES
                      DEPENDS brae
                      TIMEOUT 1200)
 
+# inletOutlet on TEMPERATURE -- the only gate that exercises the energy boundary's inletOutlet mask.
+add_test(NAME io_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/io_vs_openfoam.sh)
+set_tests_properties(io_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# Turbulent inlet BCs on a flowRateInletVelocity inlet -- the only gate where the set-up value and the
+# converged value differ, so the per-iteration refresh is actually exercised.
+add_test(NAME ti_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ti_vs_openfoam.sh)
+set_tests_properties(ti_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
 # rhoSimpleFoam phase 2: mass flux reduces exactly to the volumetric flux at constant density
 add_executable(test_rho_flux tests/test_rho_flux.cu)
 target_include_directories(test_rho_flux PRIVATE ${BRAE_HEADER_DIRS})
@@ -790,6 +809,13 @@ add_executable(test_residual_control tests/test_residual_control.cu)
 target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_residual_control PRIVATE brae_core)
 add_test(NAME residual_control COMMAND test_residual_control)
+
+# diag_compare: DIAGNOSTIC, not a test. Assembles the same scalar equation as the OpenFOAM utility
+# in tools/dumpScalarMatrix and compares the matrix cell by cell. Needs OF's Ddiag/Dsource in the case,
+# so it is built but never registered with ctest.
+add_executable(diag_compare tests/diag_compare.cu)
+target_include_directories(diag_compare PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(diag_compare PRIVATE brae_core)
 
 add_executable(test_linear_upwind_const tests/test_linear_upwind_const.cu)
 target_include_directories(test_linear_upwind_const PRIVATE ${BRAE_HEADER_DIRS})

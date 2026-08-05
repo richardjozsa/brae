@@ -287,6 +287,10 @@ try
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+    // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face masks so it
+    // refreshes them each iteration instead of freezing the set-up value.
+    solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
+                              tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
     solver.setDdtScheme(ddtScheme, ddtOcCoeff);
     // CrankNicolson RESTART: if the previous run wrote the ddt0 fields (present in the restart time dir), reload them and
     // prime the time state so the FIRST resumed step is full CN using the exact stored old ddt -> seamless (like OF's

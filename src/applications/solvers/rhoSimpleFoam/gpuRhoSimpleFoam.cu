@@ -28,9 +28,11 @@
 #include "thermo_parse.cuh"
 #include "rho_simple_controls.cuh"
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with simpleFoam/pimpleFoam)
+#include "brae_notice.cuh"   // noticeIgnored/Approximated/Defaulted: never drop an input silently
 #include "scheme_parse.cuh"        // parseFvSchemesControls
 #include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -186,6 +188,25 @@ int main(int argc, char** argv)
         }
 
         // OF looks these up by FIELD NAME: "omega" on kOmegaSST, "epsilon" on kEpsilon.
+        // fvOptions. The compressible driver did not open this file AT ALL, where gpuSimpleFoam reads it
+        // and refuses anything it cannot apply. angledDuctExplicitFixedCoeff carries an
+        // explicitPorositySource that dominates its momentum balance, plus two constraints -- all three
+        // vanished in silence and the case still converged, to a different problem. Refuse instead: brae
+        // does not run a case with a dropped source term.
+        {
+            std::ifstream fa(caseDir + "/system/fvOptions"), fb(caseDir + "/constant/fvOptions");
+            if (fa.good() || fb.good())
+            {
+                noticeIgnored("fvOptions", "found an fvOptions file; the compressible solver cannot apply "
+                                           "any source or constraint yet");
+                throw std::runtime_error(
+                    "brae: this case has an fvOptions file, and brae_rhoSimpleFoam cannot apply fvOptions "
+                    "sources/constraints. Running anyway would SILENTLY drop them (a porosity source, a "
+                    "temperature constraint) and converge to a different problem. Remove or disable it, or "
+                    "use the incompressible solver, which supports a subset.");
+            }
+        }
+
         const std::string second = ctl.sst ? "omega" : "epsilon";
         readRelaxationFactors(fvSolution, ctl);   // shared; adds the alpha<=0 guard this copy lacked
 
@@ -234,6 +255,10 @@ int main(int argc, char** argv)
         DeviceBoundary dbT = buildDeviceBoundary(T, fvp, g);
         DeviceBoundary dbHe = buildDeviceBoundary(T, fvp, g);
         deviceEnergyBoundaryFromT(dbT, tc, dbHe);
+        // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face
+        // masks so it refreshes them each iteration instead of freezing the set-up value.
+        solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
+                                  tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
         solver.setCompressible(tc, rc, std::move(dbHe));
         solver.setAlphatPrt(prtFace);
         solver.setEnergySolver(eSolve.tol, eSolve.relTol, eSolve.useGS);

@@ -160,6 +160,15 @@ void deviceUpdateSymmetry(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>&
 // refValue = p0 - 0.5*neg(phi_b)*magSqr(U_b)  (inflow phi<0 -> p0 - dynamic head; outflow -> p0). bcType stays
 // fixedValue(1). Call each step AFTER the U-boundary updates, with the boundary U (deviceBCValue of current U) + flux.
 // flowRateInletVelocity (massFlowRate): set U_b = avgU*n on the masked patch faces. See the .cu.
+// turbulentIntensityKineticEnergyInlet / turbulentMixingLength{DissipationRate,Frequency}Inlet.
+// OF re-evaluates both every updateCoeffs; these refresh the boundary refValue in place from the CURRENT
+// boundary U (for k) and the CURRENT boundary k (for epsilon|omega). mask: k side 1 = active;
+// second side 1 = epsilon, 2 = omega.
+void deviceUpdateTurbulentInletK(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& mask,
+                                 const DeviceBuffer<scalar>& intensity, DeviceBoundary& dbK);
+void deviceUpdateTurbulentInletSecond(const DeviceBoundary& dbK, const DeviceBuffer<label>& mask,
+                                      const DeviceBuffer<scalar>& len, scalar Cmu, DeviceBoundary& dbSecond);
+
 void deviceUpdateFlowRateInlet(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& maskMagSf, scalar avgU,
                                const DeviceBuffer<scalar>& nx, const DeviceBuffer<scalar>& ny,
                                const DeviceBuffer<scalar>& nz);

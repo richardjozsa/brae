@@ -390,3 +390,80 @@ void deviceUpdateTotalPressure(
 }
 
 } // namespace brae
+
+namespace brae {
+namespace {
+
+// turbulentIntensityKineticEnergyInlet: refValue = 1.5*I^2*|Up|^2, from the CURRENT boundary U.
+__global__
+void tkeInletKernel(
+    int n,
+    const label* __restrict__ mask,
+    const scalar* __restrict__ intensity,
+    const scalar* __restrict__ ux,
+    const scalar* __restrict__ uy,
+    const scalar* __restrict__ uz,
+    scalar* __restrict__ kRef)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !mask[i]) return;
+    const scalar u2 = ux[i]*ux[i] + uy[i]*uy[i] + uz[i]*uz[i];
+    kRef[i] = scalar(1.5) * intensity[i] * intensity[i] * u2;
+}
+
+// turbulentMixingLength{DissipationRate,Frequency}Inlet, from the CURRENT boundary k.
+//   epsilon: (Cmu^0.75/L)*k^1.5      omega: sqrt(k)/(Cmu^0.25*L)
+__global__
+void mixingLengthInletKernel(
+    int n,
+    const label* __restrict__ mask,      // 1 = epsilon, 2 = omega
+    const scalar* __restrict__ len,
+    const scalar* __restrict__ kRef,
+    scalar Cmu75,
+    scalar Cmu25,
+    scalar* __restrict__ sRef)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !mask[i]) return;
+    const scalar kb = fmax(kRef[i], scalar(0));
+    sRef[i] = (mask[i] == 1) ? Cmu75 * pow(kb, scalar(1.5)) / len[i]
+                             : sqrt(kb) / (Cmu25 * len[i]);
+}
+
+}   // namespace
+
+// OF re-evaluates both of these in updateCoeffs EVERY outer iteration, so they track the solution. brae
+// evaluated them once on the host at set-up. That is exact for a fixedValue U inlet (Up never moves) and
+// wrong for flowRateInletVelocity, where Up is rebuilt each iteration from the live boundary density: the
+// set-up value uses the SEED density (rhoInlet, or 1.0 when absent), so on angledDuct the frozen inlet |U|
+// is ~1.19x too large and k_inlet lands ~41% high, epsilon ~67% high.
+void deviceUpdateTurbulentInletK(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<label>& mask,
+    const DeviceBuffer<scalar>& intensity,
+    DeviceBoundary& dbK)
+{
+    const int n = dbK.n;
+    if (!n || !mask.size()) return;
+    tkeInletKernel<<<nBlocks(n), TPB>>>(n, mask.data(), intensity.data(),
+                                        dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(),
+                                        dbU.comp[2].refValue.data(), dbK.refValue.data());
+    cudaCheck(cudaGetLastError(), "tkeInlet");
+}
+
+void deviceUpdateTurbulentInletSecond(
+    const DeviceBoundary& dbK,
+    const DeviceBuffer<label>& mask,
+    const DeviceBuffer<scalar>& len,
+    scalar Cmu,
+    DeviceBoundary& dbSecond)
+{
+    const int n = dbSecond.n;
+    if (!n || !mask.size()) return;
+    mixingLengthInletKernel<<<nBlocks(n), TPB>>>(n, mask.data(), len.data(), dbK.refValue.data(),
+                                                 pow(Cmu, scalar(0.75)), pow(Cmu, scalar(0.25)),
+                                                 dbSecond.refValue.data());
+    cudaCheck(cudaGetLastError(), "mixingLengthInlet");
+}
+
+}   // namespace brae

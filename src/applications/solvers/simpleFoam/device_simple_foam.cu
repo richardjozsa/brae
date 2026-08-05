@@ -420,6 +420,23 @@ namespace brae {
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);
         deviceUpdateInletOutlet(dbP_, phiBnd_);
+        // The ENERGY boundary too. dbHe_ inherits T's BC types, so an `inletOutlet` T outlet -- which
+        // every stock rhoSimpleFoam tutorial has -- arrives here masked as inletOutlet and MUST be
+        // resolved per iteration like the others. It was omitted: the mask was set at build time and
+        // never consulted, so the outlet enthalpy stayed clamped at fixedValue(inletValue) with full
+        // convection AND laplacian coupling, where OF switches to zeroGradient on outflow. It propagated
+        // straight into rhoBnd_ (built from dbHe_), hence the outlet density, the outlet mass flux and
+        // the pressure field.
+        if (compressible_ && dbHe_.n) deviceUpdateInletOutlet(dbHe_, phiBnd_);
+        // Turbulent inlets, rebuilt from the CURRENT boundary U and k -- OF re-evaluates these in
+        // updateCoeffs every outer iteration. Must run BEFORE the inletOutlet resolve below consumes
+        // dbK_/dbEps_, and after dbU_'s own refValue has been refreshed (flowRateInletVelocity).
+        if (hasTurbInlet_ && ctl_.turbulent && !ctl_.les)
+        {
+            deviceUpdateTurbulentInletK(dbU_, tiMask_, tiIntensity_, dbK_);
+            deviceUpdateTurbulentInletSecond(dbK_, mlMask_, mlLength_,
+                                             ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+        }
         if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
         {
             deviceUpdateInletOutlet(dbK_, phiBnd_);

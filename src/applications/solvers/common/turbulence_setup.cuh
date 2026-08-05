@@ -162,12 +162,14 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
 }
 
 // The turbulence start fields, read from fieldDir with the nut wall function + turbulent-inlet BCs applied.
-struct TurbulenceFields { GeometricField<scalar> k, eps, nut, ReThetat, gammaInt; };
+struct TurbulenceFields { GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;     TurbulentInletMasks turbInletMasks;
+};
 
 inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const std::vector<FvPatch>& fvp, label nC,
                                              DeviceSimpleControls& ctl, const std::string& secondName,
                                              const GeometricField<vector>& U)
 {
+    TurbulentInletMasks masks;
         // Wall-function fidelity guard -- fail loud on a nut/epsilon/omega wall-function BC placed on a patch NOT typed
         // 'wall': brae gates the near-wall model on the geometric patch type, so the wall function would be SILENTLY
         // inert. Conservative on the patch match -- only errors when the BC patch resolves to a concrete non-'wall'
@@ -264,8 +266,10 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             const scalar wCmu = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
             applyTurbulentInletK(k, kFD, U, fvp);
             applyTurbulentInletSecond(eps, sFD, k, wCmu, fvp);
+            // ...and the per-face description of WHICH faces to recompute each iteration (OF updateCoeffs).
+            masks = buildTurbulentInletMasks(kFD, sFD, fvp);
         }
-    return { std::move(k), std::move(eps), std::move(nut), std::move(ReThetat), std::move(gammaInt) };
+    return { std::move(k), std::move(eps), std::move(nut), std::move(ReThetat), std::move(gammaInt), std::move(masks) };
 }
 
 }  // namespace brae
