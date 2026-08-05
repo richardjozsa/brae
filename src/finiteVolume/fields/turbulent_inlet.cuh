@@ -10,6 +10,7 @@
 #include "fv_patch_field.cuh"
 #include "foam_field_reader.cuh"
 #include "fv_patch.cuh"
+#include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include <cmath>
 #include <memory>
 #include <vector>
@@ -25,13 +26,7 @@ inline void applyTurbulentInletK(
 {
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        const PatchFieldData<scalar>* b = nullptr;
-        for (const auto& bd : kFD.boundary)
-            if (bd.name == fvp[pi].name)
-            {
-                b = &bd;
-                break;
-            }
+        const PatchFieldData<scalar>* b = findPatchEntry(kFD.boundary, fvp[pi]);
         if (!b || b->type != "turbulentIntensityKineticEnergyInlet") continue;
         const std::vector<vector>& Uin = U.boundary[pi]->value();
         std::vector<scalar> kin(fvp[pi].size);
@@ -53,13 +48,7 @@ inline void applyTurbulentInletSecond(
     const scalar Cmu75 = std::pow(Cmu, 0.75), Cmu25 = std::pow(Cmu, 0.25);
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        const PatchFieldData<scalar>* b = nullptr;
-        for (const auto& bd : sFD.boundary)
-            if (bd.name == fvp[pi].name)
-            {
-                b = &bd;
-                break;
-            }
+        const PatchFieldData<scalar>* b = findPatchEntry(sFD.boundary, fvp[pi]);
         if (!b) continue;
         const bool eps = (b->type == "turbulentMixingLengthDissipationRateInlet");
         const bool om  = (b->type == "turbulentMixingLengthFrequencyInlet");
@@ -102,10 +91,8 @@ inline TurbulentInletMasks buildTurbulentInletMasks(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;   // DeviceBoundary skips these
-        const PatchFieldData<scalar>* kb = nullptr;
-        const PatchFieldData<scalar>* sb = nullptr;
-        for (const auto& bd : kFD.boundary) if (bd.name == fvp[pi].name) { kb = &bd; break; }
-        for (const auto& bd : sFD.boundary) if (bd.name == fvp[pi].name) { sb = &bd; break; }
+        const PatchFieldData<scalar>* kb = findPatchEntry(kFD.boundary, fvp[pi]);
+        const PatchFieldData<scalar>* sb = findPatchEntry(sFD.boundary, fvp[pi]);
         const bool ti = kb && kb->type == "turbulentIntensityKineticEnergyInlet";
         const int  ml = (sb && sb->type == "turbulentMixingLengthDissipationRateInlet") ? 1
                       : (sb && sb->type == "turbulentMixingLengthFrequencyInlet")       ? 2 : 0;

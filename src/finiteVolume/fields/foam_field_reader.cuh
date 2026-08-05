@@ -40,6 +40,11 @@ struct PatchFieldData
     std::string    name;
     std::string    type;
     bool           hasValue     = false;
+    // uniformFixedValue whose uniformValue is a Function1 (table / polynomial / coded / expression)
+    // rather than a constant. brae cannot evaluate those, and the danger is that the entry ALSO carries a
+    // stale `value` from an overridden fixedValue entry, so the field silently takes that constant
+    // instead. Recorded here and refused at construction rather than guessed at.
+    std::string    unsupportedFunction1;
     bool           valueUniform = false;
     T              uniformValue{};
     std::vector<T> values;
@@ -331,8 +336,25 @@ inline FieldData<T> readField(const std::string& path)
                             p.valueUniform = true;
                             p.hasValue = true;
                         }
-                        else   // table/coded/Function1 -> skip (paren-aware); dispatch will throw if no value
+                        else   // table / polynomial / coded / expression: skip the entry, then REFUSE.
                         {
+                            // Relying on "dispatch throws when there is no value" is not enough: a case
+                            // that overrides an earlier `type fixedValue; value uniform X;` still has
+                            // hasValue == true, so the Function1 silently degrades to the constant X.
+                            // squareBendLiq does exactly that (T walls: expression, stale value 350).
+                            // A dict form ({ type expression; ... }) names its Function1 inside, so peek
+                            // the `type` keyword -- "a dictionary" is a much worse error message than
+                            // "expression".
+                            p.unsupportedFunction1 = m;
+                            if (m == "{")
+                            {
+                                const std::string t1 = ts.peek();
+                                if (t1 == "type")
+                                {
+                                    ts.next();
+                                    p.unsupportedFunction1 = ts.peek();
+                                }
+                            }
                             skipToSemicolon(ts, m == "(" ? 1 : 0);
                         }
                         ts.expect(";");

@@ -566,14 +566,6 @@ foreach(_np 1 2)
     else()
         set(_amitol 1e-3)
     endif()
-    add_test(NAME ami_oracle_np${_np}
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_oracle.sh
-                     $<TARGET_FILE:brae>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/tc_wedge_ami
-                     ${CMAKE_CURRENT_BINARY_DIR}/ami_oracle_work_np${_np}
-                     ${_np} ${_amitol} ${_amitol}
-                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/compare_ami_fields.py)
-    set_tests_properties(ami_oracle_np${_np} PROPERTIES LABELS slow TIMEOUT 400 SKIP_RETURN_CODE 125)
 endforeach()
 
 # Single-GPU hardening regression lock: assert each fail-loud guard still fires on a mutated case
@@ -767,6 +759,24 @@ set_tests_properties(ti_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 900)
 
+# linearUpwind on the kinetic-energy term + grad(K)'s own boundary values (sensibleInternalEnergy).
+add_test(NAME ke2_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ke2_vs_openfoam.sh)
+set_tests_properties(ke2_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# Regex-keyed boundaryField entries (alphatWallFunction Prt) -- OF patch/group/regex resolution.
+add_test(NAME rx_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/rx_vs_openfoam.sh)
+set_tests_properties(rx_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
 # rhoSimpleFoam phase 2: mass flux reduces exactly to the volumetric flux at constant density
 add_executable(test_rho_flux tests/test_rho_flux.cu)
 target_include_directories(test_rho_flux PRIVATE ${BRAE_HEADER_DIRS})
@@ -809,6 +819,17 @@ add_executable(test_residual_control tests/test_residual_control.cu)
 target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_residual_control PRIVATE brae_core)
 add_test(NAME residual_control COMMAND test_residual_control)
+
+add_executable(test_overset_refused tests/test_overset_refused.cu)
+target_include_directories(test_overset_refused PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_overset_refused PRIVATE brae_core)
+add_executable(test_uniform_function1 tests/test_uniform_function1.cu)
+target_include_directories(test_uniform_function1 PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_uniform_function1 PRIVATE brae_core)
+add_test(NAME uniform_function1 COMMAND test_uniform_function1)
+
+add_test(NAME overset_refused
+         COMMAND test_overset_refused ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
 # diag_compare: DIAGNOSTIC, not a test. Assembles the same scalar equation as the OpenFOAM utility
 # in tools/dumpScalarMatrix and compares the matrix cell by cell. Needs OF's Ddiag/Dsource in the case,

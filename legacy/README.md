@@ -16,6 +16,7 @@ ordinary CUDA kernels — that is what brae *is*, and all of it lives in `src/` 
 | `src/TurbulenceModels/RAS/parallel_kepsilon.cuh` | host distributed kEpsilon |
 | `src/cuda/device_pcg_distributed.cu` | distributed PCG |
 | `tests/` (34 files) | every `parallel_*`, `gpu_parallel_*`, `distributed_ami`, `nvshmem_smoke` test |
+| `tests/ami_oracle.sh` | compares a single-GPU AMI run against a **distributed np=1** run, so it needs `-parallel`. Missed by the first sweep because its name matches none of the patterns above -- it stayed registered and failed once `-parallel` began refusing. The single-GPU AMI tests (`ami_weights`, `ami_device`, `ami_geometry`) are unaffected and remain in `tests/`. |
 
 ## What deliberately did NOT move, and why
 

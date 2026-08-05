@@ -112,7 +112,8 @@ void kineticFaceFluxK(
     const label* __restrict__ neighbour,
     const scalar* __restrict__ phiInt,
     const scalar* __restrict__ K,
-    const scalar* __restrict__ cdw,     // null -> upwind; else limitedLinear with the gradient below
+    const scalar* __restrict__ cdw,     // null -> upwind|linearUpwind; else limitedLinear (gradient below)
+    int linUpwind,                      // 1 -> Gauss linearUpwind: K_f = K_up + (Cf - C_up).grad(K)_up
     const scalar* __restrict__ gx,
     const scalar* __restrict__ gy,
     const scalar* __restrict__ gz,
@@ -130,6 +131,17 @@ void kineticFaceFluxK(
     const int P = owner[f], N = neighbour[f];
     const scalar ph = phiInt[f];
     const scalar pos0 = (ph >= scalar(0)) ? scalar(1) : scalar(0);
+    if (linUpwind)
+    {
+        // OF's EEqn carries this term as fvc::div (fully EXPLICIT), so linearUpwind is simply a different
+        // face value -- no deferred-correction split is needed, unlike the implicit div(phi,he).
+        const int Uc = (ph > scalar(0)) ? P : N;
+        const scalar dxu = (Uc == P) ? dOwnX[f] : dNeiX[f];
+        const scalar dyu = (Uc == P) ? dOwnY[f] : dNeiY[f];
+        const scalar dzu = (Uc == P) ? dOwnZ[f] : dNeiZ[f];
+        ffc[f] = ph * (K[Uc] + dxu*gx[Uc] + dyu*gy[Uc] + dzu*gz[Uc]);
+        return;
+    }
     scalar W = pos0;
     if (cdw)
     {
@@ -192,9 +204,10 @@ void deviceEnergyKineticSource(
     const DeviceBuffer<scalar>* rho,
     const DeviceBuffer<scalar>* pBndIn,   // and the same at boundary faces
     const DeviceBuffer<scalar>* rhoBndIn,
-    const DeviceBoundary* dbHe,           // for grad(K) when the scheme is limitedLinear
+    const DeviceBoundary* dbHe,           // for grad(K) when the scheme is limitedLinear or linearUpwind
     bool limited,
-    scalar twoByk)
+    scalar twoByk,
+    bool linearUpwind)
 {
     const bool ekp = (p && rho && p->size() && rho->size());
     const int nC = dm.nCells;
@@ -207,23 +220,43 @@ void deviceEnergyKineticSource(
                                          K.data());
     cudaCheck(cudaGetLastError(), "kineticEnergy");
 
-    // grad(K) for the limiter. K is built from U and p, so it has no BC of its own -- the adjacent-cell
-    // (zeroGradient) boundary value is the consistent choice and is what OF's fvc::grad of a constructed
-    // volScalarField("Ekp", ...) sees, since that field is created with calculated/extrapolated patches.
-    DeviceBuffer<scalar> gx, gy, gz;
-    if (limited)
+    // K at boundary faces, built from the BOUNDARY velocity and (for Ekp) the boundary p and rho -- the
+    // same expression as the cell value, which is exactly what OF's constructed volScalarField("Ekp", ...)
+    // carries on its calculated patches. Hoisted above the gradient because grad(K) needs it.
+    //
+    // It previously used deviceBCValue(*dbHe, K, ...), i.e. it applied the ENERGY field's BC descriptor to
+    // the K array: at a fixedValue he patch that returns he's refValue, not K's boundary value at all. The
+    // error was masked for limitedLinear, whose gradient only feeds a limiter clamped to [0,1], but it
+    // goes straight into the face value for linearUpwind -- enabling linearUpwind on top of the wrong
+    // gradient made T four times WORSE (9.3e-02 vs 2.0e-02), which is how this was found.
+    const int nB = dbU.comp[0].n;
+    DeviceBuffer<scalar> Kb, ubx, uby, ubz;
+    const bool ekpB = ekp && pBndIn && rhoBndIn && nB > 0
+                   && pBndIn->size() == static_cast<std::size_t>(nB)
+                   && rhoBndIn->size() == static_cast<std::size_t>(nB);
+    if (nB > 0)
     {
-        DeviceBuffer<scalar> Kb2;
-        if (dbHe) deviceBCValue(*dbHe, K, Kb2);
-        deviceGaussGrad(dm, K, Kb2, gx, gy, gz);
+        deviceBCValue(dbU.comp[0], Ux, ubx);
+        deviceBCValue(dbU.comp[1], Uy, uby);
+        deviceBCValue(dbU.comp[2], Uz, ubz);
+        Kb.resize(nB);
+        kineticEnergyK<<<nBlocks(nB), TPB>>>(nB, ubx.data(), uby.data(), ubz.data(),
+                                             ekpB ? pBndIn->data() : nullptr,
+                                             ekpB ? rhoBndIn->data() : nullptr,
+                                             Kb.data());
+        cudaCheck(cudaGetLastError(), "kineticEnergyBnd");
     }
+
+    DeviceBuffer<scalar> gx, gy, gz;
+    if (limited || linearUpwind) deviceGaussGrad(dm, K, Kb, gx, gy, gz);
     DeviceBuffer<scalar> ffc;
     ffc.resize(nF);
     kineticFaceFluxK<<<nBlocks(nF), TPB>>>(nF, dm.owner.data(), dm.nei.data(), phiInt.data(), K.data(),
                                            limited ? dm.w.data() : nullptr,
-                                           limited ? gx.data() : nullptr,
-                                           limited ? gy.data() : nullptr,
-                                           limited ? gz.data() : nullptr,
+                                           linearUpwind ? 1 : 0,
+                                           (limited || linearUpwind) ? gx.data() : nullptr,
+                                           (limited || linearUpwind) ? gy.data() : nullptr,
+                                           (limited || linearUpwind) ? gz.data() : nullptr,
                                            dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
                                            dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
                                            twoByk, ffc.data());
@@ -237,23 +270,8 @@ void deviceEnergyKineticSource(
 
     // K at boundary faces, from the boundary velocity (noSlip walls give K_b = 0, which is the point:
     // the flow gives up its kinetic energy there and OF puts that into the enthalpy equation).
-    const int nB = dbU.comp[0].n;
     if (nB > 0)
     {
-        DeviceBuffer<scalar> ubx, uby, ubz;
-        deviceBCValue(dbU.comp[0], Ux, ubx);
-        deviceBCValue(dbU.comp[1], Uy, uby);
-        deviceBCValue(dbU.comp[2], Uz, ubz);
-        DeviceBuffer<scalar> Kb;
-        Kb.resize(nB);
-        const bool ekpB = ekp && pBndIn && rhoBndIn && pBndIn->size() == static_cast<std::size_t>(nB)
-                       && rhoBndIn->size() == static_cast<std::size_t>(nB);
-        kineticEnergyK<<<nBlocks(nB), TPB>>>(nB, ubx.data(), uby.data(), ubz.data(),
-                                             ekpB ? pBndIn->data() : nullptr,
-                                             ekpB ? rhoBndIn->data() : nullptr,
-                                             Kb.data());
-        cudaCheck(cudaGetLastError(), "kineticEnergyBnd");
-
         DeviceBuffer<scalar> sumPhi;
         sumPhi.resize(nC);
         cudaCheck(cudaMemsetAsync(sumPhi.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "sumPhi zero");

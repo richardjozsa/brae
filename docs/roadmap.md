@@ -45,10 +45,10 @@ against the current solvers -- it belongs on its own branch. It is not a boundar
 Scale is comparable to or larger than a whole solver port. Its value is in MOVING bodies (floating hulls,
 rotors), which is transient, so steady overset is the unusual case.
 
-> **Known hazard, unfixed:** `overset` is currently classified as a constraint patch type
-> (`foam_dict.cuh isConstraintPatchType`), so brae synthesises a default entry for it instead of refusing.
-> An overset case therefore RUNS and produces a wrong answer. That contradicts the guarantee below and
-> should be fixed before anything else in this backlog.
+> **Refused, as of the `overset_refused` gate.** `overset` was briefly classified as a constraint patch
+> type, so brae synthesised a default entry and an overset case RAN, converging to a wrong answer. It is
+> now removed from `isConstraintPatchType` and refused by name in `buildPatches`, restoring the guarantee
+> below. Support remains unscheduled.
 
 **Multi-GPU** is no longer scheduled. The distributed solvers moved to `legacy/` and are out of scope; see
 `legacy/README.md`. `brae ... -parallel` refuses at start-up.

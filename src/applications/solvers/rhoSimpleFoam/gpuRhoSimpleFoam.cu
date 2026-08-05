@@ -28,6 +28,7 @@
 #include "thermo_parse.cuh"
 #include "rho_simple_controls.cuh"
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with simpleFoam/pimpleFoam)
+#include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include "brae_notice.cuh"   // noticeIgnored/Approximated/Defaulted: never drop an input silently
 #include "scheme_parse.cuh"        // parseFvSchemesControls
 #include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
@@ -234,11 +235,16 @@ int main(int argc, char** argv)
             {
                 if (q.type == "cyclic" || q.type == "cyclicAMI") continue;   // DeviceBoundary skips these
                 scalar prt = tc.Prt;   // the MODEL's Prt away from an alphat wall function
+                // OF-style resolution (exact name, then group, then regex) -- NOT `pb.name == q.name`.
+                // squareBend* key this entry as "(?i).*walls" against a patch literally called `walls`,
+                // so exact matching missed it and Prt silently reverted to the model default 1.0 instead
+                // of the wall function's 0.85: wall alphat, and the wall heat flux, ~15% low.
                 if (haveAlphat)
-                    for (const PatchFieldData<scalar>& pb : alphatFd.boundary)
-                        if (pb.name == q.name
-                         && (pb.type == "compressible::alphatWallFunction" || pb.type == "alphatWallFunction"))
-                            prt = pb.Prt;
+                {
+                    const PatchFieldData<scalar>* pb = findPatchEntry(alphatFd.boundary, q);
+                    if (pb && (pb->type == "compressible::alphatWallFunction" || pb->type == "alphatWallFunction"))
+                        prt = pb->Prt;
+                }
                 prtFace.insert(prtFace.end(), static_cast<std::size_t>(q.size), prt);
             }
         }

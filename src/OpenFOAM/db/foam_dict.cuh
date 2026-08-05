@@ -38,7 +38,10 @@ inline bool isConstraintPatchType(const std::string& t)
 {
     return t == "empty" || t == "symmetryPlane" || t == "symmetry" || t == "wedge" || t == "cyclic"
         || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicSlip" || t == "processor"
-        || t == "processorCyclic" || t == "nonuniformTransformCyclic" || t == "overset";
+        || t == "processorCyclic" || t == "nonuniformTransformCyclic";
+    // NOTE: "overset" is deliberately NOT here. It is a coupled patch whose fvPatchField cannot be
+    // synthesised from the mesh type -- treating it as a constraint made an unsupported overset case run
+    // silently. buildPatches refuses it outright (fv_patch.cu).
 }
 
 struct FoamDict

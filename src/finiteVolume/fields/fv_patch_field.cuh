@@ -609,6 +609,16 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFieldData<T>& d)
 {
+    if (d.type == "uniformFixedValue" && !d.unsupportedFunction1.empty())
+    {
+        // A non-constant uniformValue. Refusing rather than falling back to whatever `value` happens to
+        // be present, which would look like a converged run at the wrong boundary value.
+        throw std::runtime_error(
+            "brae: patch " + p.name + " has uniformFixedValue with a non-constant uniformValue ('"
+            + d.unsupportedFunction1 + "'). brae evaluates only `constant`/`uniform` Function1 entries. "
+            "Running would silently substitute the patch's `value` entry, so it is refused. Replace it "
+            "with a constant, or use codedFixedValue.");
+    }
     if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue")
         // uniformFixedValue: steady constant = fixedValue. codedFixedValue: seed with `value`; the NVRTC device kernel
         // (device_coded_bc) OVERWRITES this patch's refValue each step from the compiled `code` snippet (the driver

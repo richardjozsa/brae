@@ -91,6 +91,8 @@ void deviceEnergyKineticSource(
     const DeviceBuffer<scalar>* rhoBnd = nullptr,
     const DeviceBoundary* dbHe = nullptr,   // grad(K) boundary, for the limitedLinear face value
     bool limited = false,                   // div(phi,K|Ekp) limitedLinear (else upwind)
-    scalar twoByk = 2.0);
+    scalar twoByk = 2.0,
+    bool linearUpwind = false);             // div(phi,K|Ekp) Gauss linearUpwind (explicit term, so the
+                                            // correction goes straight into the face value)
 
 } // namespace brae
