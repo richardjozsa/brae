@@ -9,8 +9,10 @@
 // (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. BOTH the momentum ddt AND the
 // turbulence transport ddt (fvm::ddt(k/eps/omega/nuTilda)) are fully implicit + OF-exact -- the turbulence is transient
 // URANS/DES, not quasi-steady (see device_simple_foam.cu:294). fvSchemes div/laplacian schemes are parsed; phi output +
-// restart, CrankNicolson ddt0 restart and coded (fixedValue/mixed) BCs are wired. NOT yet: MRF, fvOptions,
-// adjustTimeStep + maxCo (adaptive dt), runtime functionObjects (probes/forces/fieldAverage), distributed
+// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs and forceCoeffs (Cd/Cl/Cm, sampled on the write
+// cadence to postProcessing/forceCoeffs/) are wired. NOT yet: MRF, fvOptions,
+// adjustTimeStep + maxCo (adaptive dt), a general functionObject framework (forceCoeffs above is hard-wired, NOT
+// a framework -- probes/fieldAverage/sampling/surfaces are still absent and are silently ignored), distributed
 // (multi-GPU) transient. The first three are REFUSED at start-up rather than silently skipped (see main).
 // Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae; `brae` hands
 // over to it whenever a case's controlDict says `application pimpleFoam` (solvers/common/solver_dispatch.cuh).
@@ -27,6 +29,7 @@
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
 #include "fvc.cuh"
+#include "forces.cuh"               // wallForces + forceCoeffs (shared with gpuSimpleFoam)
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"       // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuSimpleFoam)
 #include <cctype>
@@ -382,6 +385,77 @@ try
         }
     };
 
+    // ---- forceCoeffs (Cd/Cl/Cm) sampling -------------------------------------------------------------------
+    // The steady solver evaluates forces ONCE at convergence (gpuSimpleFoam.cu). A DES has no converged state:
+    // the wake sheds, so Cd(t) oscillates and only its TIME AVERAGE is meaningful. So sample it through the run
+    // and stream to postProcessing/forceCoeffs/<startTime>/coefficient.dat, matching OF's layout closely enough
+    // that the same plotting scripts work.
+    //
+    // COST: wallForces runs fvc::gaussGrad over the whole mesh ON THE HOST and calls nearWallDist internally,
+    // both mesh-wide and single-threaded. On 6M cells that is seconds per call, so sampling EVERY timestep would
+    // dwarf the solve (16 000 calls). It is therefore sampled on the WRITE cadence by default -- 160 samples over
+    // this run, ~7 per shedding cycle, enough for a stable mean if not a spectrum. BRAE_FORCE_INTERVAL overrides
+    // it (in timesteps) when a finer Cd(t) trace is worth the cost.
+    std::vector<std::string> forceWalls;
+    for (const auto& q : fvp)
+        if (q.type == "wall") forceWalls.push_back(q.name);
+    const FoamDict* fcFuncs = controlDict.subDict("functions");
+    const FoamDict* fcDict = nullptr;
+    if (fcFuncs)
+        for (const auto& s : fcFuncs->subs)
+            if (s.second.wordOr("type", "") == "forceCoeffs") { fcDict = &s.second; break; }
+    const long forceInterval = std::getenv("BRAE_FORCE_INTERVAL")
+                             ? std::atol(std::getenv("BRAE_FORCE_INTERVAL")) : 0;   // 0 -> follow the write cadence
+    std::ofstream fcOut;
+    if (fcDict && ctl.turbulent && !forceWalls.empty()) {
+        const std::string fdir = caseDir + "/postProcessing/forceCoeffs/" + timeName(startTime);
+        std::error_code fec; std::filesystem::create_directories(fdir, fec);
+        fcOut.open(fdir + "/coefficient.dat");
+        fcOut << "# Time\tCd\tCl\tCm\tFx\tFy\tFz\n";
+        fcOut.setf(std::ios::scientific); fcOut.precision(8);
+        std::printf("  forceCoeffs: sampling Cd/Cl/Cm -> postProcessing/forceCoeffs/%s/coefficient.dat%s\n",
+                    timeName(startTime).c_str(),
+                    forceInterval > 0 ? (" every " + std::to_string(forceInterval) + " steps").c_str() : " on the write cadence");
+    } else if (fcDict) {
+        // Do not let a forceCoeffs block look like it is running when it is not.
+        std::printf("  forceCoeffs: present in controlDict but NOT sampled (%s)\n",
+                    !ctl.turbulent ? "laminar case" : "no wall patches");
+    }
+
+    // Evaluate forces from the CURRENT device state and append one row. Mirrors the steady solver's block
+    // (gpuSimpleFoam.cu): pull U/p back, re-evaluate wall BCs, then wallForces on the requested patches.
+    auto sampleForces = [&](scalar tval) {
+        if (!fcOut.is_open()) return;
+        const std::vector<vector> Ug = solver.U();
+        const std::vector<scalar> pg = solver.p();
+        for (label c = 0; c < nC; ++c) U.internal[c] = Ug[c];
+        p.internal = pg;
+        U.evaluateBoundary();
+        p.evaluateBoundary();
+        const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
+        const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
+        const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
+        const bool velNutWall = ctl.sa || ctl.nutWall != NutWall::Nutk;
+        const std::vector<scalar> saNutWall = velNutWall ? solver.nutWall() : std::vector<scalar>();
+        const std::vector<scalar>* nwb = velNutWall ? &saNutWall : nullptr;
+        auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
+        const std::vector<std::string> fcP = fcDict->wordListOr("patches", forceWalls);
+        const scalar rhoInf  = fcDict->scalarOr("rhoInf", 1.0), magUInf = fcDict->scalarOr("magUInf", 1.0);
+        const scalar Aref    = fcDict->scalarOr("Aref", 1.0),   lRef    = fcDict->scalarOr("lRef", 1.0);
+        const vector liftDir = toV(fcDict->scalarListOr("liftDir", {}), vector{0,1,0});
+        const vector dragDir = toV(fcDict->scalarListOr("dragDir", {}), vector{1,0,0});
+        const vector pitchAx = toV(fcDict->scalarListOr("pitchAxis", {}), vector{0,0,1});
+        const vector CofR    = toV(fcDict->scalarListOr("CofR", {}), vector{0,0,0});
+        const ForceResult F  = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, fcP, rhoInf, 0.0, CofR,
+                                          wCmu, wKappa, wE, nwb);
+        const ForceCoeffs cc = forceCoeffs(F, dragDir, liftDir, pitchAx, rhoInf, magUInf, Aref, lRef);
+        const vector T = F.total();
+        fcOut << tval << '\t' << cc.Cd << '\t' << cc.Cl << '\t' << cc.Cm << '\t'
+              << T.x << '\t' << T.y << '\t' << T.z << '\n';
+        fcOut.flush();                       // a long DES should not lose its Cd trace if the run is killed
+        std::printf("  forceCoeffs: Cd=%.6e  Cl=%.6e  Cm=%.6e\n", cc.Cd, cc.Cl, cc.Cm);
+    };
+
     // ---- transient time loop ----
     const scalar tEnd = endTime + 0.5 * deltaT;
     long timeIndex = 0;
@@ -396,11 +470,14 @@ try
         if (!std::getenv("BRAE_ALLOW_NONFINITE")
             && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
-        if (isWriteTime(timeIndex, t)) { writeTimeDir(tn); lastWritten = tn; }
+        const bool isWrite = isWriteTime(timeIndex, t);
+        if (isWrite) { writeTimeDir(tn); lastWritten = tn; }
+        // Sample Cd on the write cadence, or on BRAE_FORCE_INTERVAL when set (see the cost note above).
+        if (forceInterval > 0 ? (timeIndex % forceInterval == 0) : isWrite) sampleForces(t);
     }
     {
         const std::string tn = timeName(startTime + deltaT * (scalar)timeIndex);
-        if (tn != lastWritten) writeTimeDir(tn);
+        if (tn != lastWritten) { writeTimeDir(tn); sampleForces(startTime + deltaT * (scalar)timeIndex); }
     }
     return 0;
 }

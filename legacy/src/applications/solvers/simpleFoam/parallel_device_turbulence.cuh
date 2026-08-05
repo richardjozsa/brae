@@ -120,6 +120,14 @@ void prodAndWallKernel(
     else           { G[c] = nut[c] * gByNu[c]; }
 }
 
+// SA wall diffusivity: DnuTildaEff = (nuTilda + nu)/sigmaNut evaluated at the PATCH value of nuTilda.
+__global__
+void saDEffBndKernel(int n, const scalar* __restrict__ ntB, scalar nu, scalar sigma, scalar* __restrict__ gB)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) gB[i] = (ntB[i] + nu) / sigma;
+}
+
 // lower-bound a field in place (OF bound(psi, small)).
 __global__
 void boundFieldKernel(scalar* __restrict__ psi, scalar lo, int nC)
@@ -701,6 +709,21 @@ inline void parallelDeviceSpalartAllmarasCorrect(
 
     DeviceBuffer<scalar> gI, gB; std::vector<DeviceBuffer<scalar>> gG;
     faceGammaGeo(D, dbNuTilda, gI, gB, gG);
+    // faceGammaGeo's boundary value is deviceBCValue(dbNuTilda, D), which applies NUTILDA's BC descriptor
+    // to the D array: at a fixedValue-0 SA wall that returns 0, dropping the wall diffusion entirely.
+    // OF's DnuTildaEff() is a volScalarField (SpalartAllmarasBase.C:381-390), so its wall value is
+    // (nuTilda_b + nu)/sigmaNut = nu/sigmaNut there. Rebuild the boundary gamma from the nuTilda PATCH
+    // values, mirroring the single-GPU fix in device_spalart.cu.
+    {
+        DeviceBuffer<scalar> ntB;
+        deviceBCValue(dbNuTilda, nuTilda, ntB);
+        if (ntB.size() == gB.size() && ntB.size())
+        {
+            const int nb_ = static_cast<int>(ntB.size());
+            detail::saDEffBndKernel<<<nb(nb_), TPB, 0, cudaStreamPerThread>>>(nb_, ntB.data(), nu, co.sigmaNut, gB.data());
+            cudaCheck(cudaGetLastError(), "parallel SA DEff boundary");
+        }
+    }
     DeviceBuffer<scalar> Sp(std::vector<scalar>(nC, 0.0)), Su(std::vector<scalar>(nC, 0.0));
     deviceSAReaction(dm, nuTilda, Stilda, fw, y, gradNt2, co, Sp, Su);   // += ; Sp/Su pre-zeroed above
     if (bounded) { DeviceBuffer<scalar> vDiv; deviceHadamard(vDiv, divU, dm.V); deviceAxpy(-1.0, vDiv, Sp); }

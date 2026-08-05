@@ -26,7 +26,6 @@
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
-#include "parallel_device_foam.cuh"   // brae ... -parallel: the distributed DEVICE path (one rank per GPU)
 
 #include <algorithm>
 #include <cctype>
@@ -132,8 +131,15 @@ int main(int argc, char** argv)
         //   mpirun -np N brae -case <dir> -parallel
         // Gated on the flag rather than on Pstream::nProcs() so a plain `brae -case ...` never initialises
         // MPI -- which also keeps the -cases fork orchestrator above clear of it.
+        // -parallel (multi-GPU) is OUT OF SCOPE; the distributed solver lives in legacy/ and is not built.
+        // REFUSE rather than fall through to the single-GPU path: under `mpirun -np N` that would run N
+        // redundant identical solves, each writing over the others' time directories.
         for (int i = 1; i < argc; ++i)
-            if (std::string(argv[i]) == "-parallel") return runParallelDeviceFoam(argc, argv);
+            if (std::string(argv[i]) == "-parallel")
+                throw std::runtime_error(
+                    "brae: -parallel (multi-GPU) is not supported in this build. The distributed solver was "
+                    "moved to legacy/ and is out of scope; see legacy/README.md. Run brae single-GPU without "
+                    "-parallel (and without mpirun).");
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
         for (int i = 1; i < argc; ++i)

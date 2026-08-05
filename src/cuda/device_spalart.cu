@@ -293,12 +293,31 @@ void deviceSpalartAllmarasCorrect(
     if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
     if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
     cudaCheck(cudaGetLastError(), "SA assemble");
+    // OF's DnuTildaEff() is a volScalarField, (nuTilda + nu)/sigmaNut, so the LAPLACIAN's wall-face
+    // coefficient uses the PATCH value of nuTilda (SpalartAllmarasBase.C:381-390, and
+    // gaussLaplacianScheme.C uses gamma.boundaryField()). At an SA wall nuTilda is fixedValue 0, so OF's
+    // wall diffusivity is exactly nu/sigmaNut.
+    //
+    // Without DBnd the fallback uses the adjacent CELL's D = (nuTilda_P + nu)/sigmaNut, i.e. too large by
+    // (1 + nuTilda_P/nu) -- a median factor of ~133 on airFoil2D. That is a spurious implicit sink on every
+    // wall-adjacent cell worth ~0.23/fw of the whole destruction term, which over-damps nuTilda exactly
+    // where the measured error lives. It is SA-specific because the boundary laplacian weight is zero for a
+    // zeroGradient patch, so the k/omega walls never saw it.
+    DeviceBuffer<scalar> ntBnd, DB;
+    deviceBCValue(dbNuTilda, nuTilda, ntBnd);
+    if (ntBnd.size())
+    {
+        DB.resize(ntBnd.size());
+        saDEffKernel<<<nBlocks(static_cast<int>(ntBnd.size())), TPB>>>(static_cast<int>(ntBnd.size()),
+                                                                      ntBnd.data(), nu, co.sigmaNut, DB.data());
+        cudaCheck(cudaGetLastError(), "SA DEff boundary");
+    }
     deviceSolveScalarTransport(dm, dbNuTilda, nuTilda, "nuTilda", D, phiInt, phiBnd, divU, bounded, limited, linearUpwind, nonOrth, twoByk,
                                relax, tol, relTol, checkEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    saReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), nuTilda.data(), Stilda.data(),
                                        fw.data(), dScale.data(), gradNt2.data(), co, diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc, ntDdt);
+                               nullptr, nullptr, ami, cyc, ntDdt, DB.size() ? &DB : nullptr);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut");

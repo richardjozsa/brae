@@ -47,6 +47,7 @@ validation/*
 !validation/sst_vs_openfoam.sh
 !validation/ke_vs_openfoam.sh
 !validation/luturb_vs_openfoam.sh
+!validation/sa_vs_openfoam.sh
 !validation/ctl_vs_openfoam.sh
 !validation/energy_vs_openfoam.sh
 
