@@ -241,19 +241,28 @@ int main(int argc, char** argv)
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' (RAS or laminar)");
         readTurbulenceModel(turbProps, ctl);
 
-        // Scalar linearUpwind (deferred correction) is implemented in the scalar scaffold but currently DEGRADES
-        // turbulence accuracy (explicit lagged correction + loose under-relaxed turb solve + steep near-wall
-        // gradients): airFoil2D SA overshoots nuTilda (Cd worse), pitzDaily SST k/p worse than the upwind baseline.
-        // Default OFF -> scalars use upwind (the validated behavior). BRAE_SCALAR_LINEARUPWIND=1 honours the scheme (A/B).
+        // Scalar linearUpwind is gated OFF here as a COLD-START STABILITY guard, not for accuracy. The
+        // original comment claimed it "degrades turbulence accuracy vs OF"; that was measured with the old
+        // line-based fvSchemes parser (the one that leaked schemes between statements) and is wrong. What
+        // the re-measurement actually shows:
+        //   - discretisation is CORRECT: one iteration from OF's own converged pitzDaily state, tight
+        //     solvers, linearUpwind on k -> k agrees with OF to 1.6e-06 (omega 3.3e-05, p exact).
+        //   - the compressible duct converges to OF at k 2.0e-06 / nut 8.1e-07 with it honoured, and is
+        //     1.6e-02 off on nut with it downgraded -- so rhoSimpleFoam now HONOURS it.
+        //   - but from a COLD start pitzDaily SST diverges (NaN ~iter 550) with linearUpwind on k, where
+        //     OF converges at 357. Bisected: k's correction diverges, omega's is stable (upwind/upwind and
+        //     upwind/linearUpwind both converge). Ruled out: SIMPLEC (diverges with consistent no too),
+        //     gradient limiting (both unlimited), regex relaxation (brae honours ".*" 0.9), the Pk
+        //     production limiter and k/omega bounding (both present and OF-exact).
+        // So the guard stays until that cold-start path is fixed, but it is a robustness workaround with a
+        // known accuracy cost, NOT the validated behaviour. BRAE_SCALAR_LINEARUPWIND=1 honours the scheme.
         if (!std::getenv("BRAE_SCALAR_LINEARUPWIND"))
         {
-            // Detect-the-route: if fvSchemes ASKED for linearUpwind on a turbulence scalar, say loudly that cf is
-            // running upwind instead (do not silently honour-then-ignore). The gating is deliberate (accuracy), but
-            // the user must see that the requested scheme is not the one being applied.
+            // Never silently honour-then-ignore: if fvSchemes asked for it, say that upwind is running.
             if (ctl.luK || ctl.luEps)
-                std::fprintf(stderr, "brae WARNING: div(phi,<turbulence scalar>) requested 'linearUpwind' but cf is running "
-                             "UPWIND (default: the scalar linearUpwind deferred correction degrades turbulence accuracy vs "
-                             "OF). Set BRAE_SCALAR_LINEARUPWIND=1 to honour the requested scheme.\n");
+                std::fprintf(stderr, "brae WARNING: div(phi,<turbulence scalar>) requested 'linearUpwind' but brae is "
+                             "running UPWIND (cold-start stability guard; the discretisation itself matches OF to "
+                             "1.6e-06). Set BRAE_SCALAR_LINEARUPWIND=1 to honour the requested scheme.\n");
             ctl.luK = false;
             ctl.luEps = false;
         }
@@ -276,8 +285,8 @@ int main(int argc, char** argv)
                     simType.c_str(), ctl.turbulent ? (ctl.sst ? " (kOmegaSST)" : " (kEpsilon)") : "", ctl.nu);
         std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s\n",
                     ctl.relaxU, ctl.relaxP, ctl.tolP, ctl.tolU, endTime, hasRC ? "on" : "off");
-        std::printf("  schemes: bounded=%d linearUpwind(U)=%d nonOrth(corrected)=%d nonOrthLimit=%.3g consistent(SIMPLEC)=%d limitedLinear(k=%d,eps=%d) linearUpwind(k=%d,eps=%d)\n",
-                    ctl.bounded, ctl.linearUpwind, ctl.nonOrth, ctl.nonOrthLimit, ctl.consistent, ctl.limitedK, ctl.limitedEps, ctl.luK, ctl.luEps);
+        std::printf("  schemes: bounded(U=%d,k=%d,eps=%d) linearUpwind(U)=%d nonOrth(corrected)=%d nonOrthLimit=%.3g consistent(SIMPLEC)=%d limitedLinear(k=%d,eps=%d) linearUpwind(k=%d,eps=%d)\n",
+                    ctl.bounded, ctl.boundedK, ctl.boundedEps, ctl.linearUpwind, ctl.nonOrth, ctl.nonOrthLimit, ctl.consistent, ctl.limitedK, ctl.limitedEps, ctl.luK, ctl.luEps);
         std::printf("  grad(U) cellLimited k=%.3g (0=unlimited)\n", ctl.gradULimitK);
         std::printf("  linear solver (GaussSeidel from fvSolution; else BiCGStab): U=%d k|nuTilda=%d eps|omega=%d\n", ctl.gsU, ctl.gsK, ctl.gsEps);
 
@@ -420,7 +429,10 @@ int main(int argc, char** argv)
         {
             std::printf("  No finite volume options present\n");   // OF createFvOptions.H message
         }
-        auto ok = [](scalar res, scalar ctlv) { return ctlv < 0 || res < ctlv; };
+        // OF simpleControl::criteriaSatisfied: an unlisted field is not a criterion, and a run only
+        // converges if at least one criterion was ACTUALLY checked (see solvers/common/residual_control.cuh).
+        int rcChecked = 0;
+        auto ok = [&](scalar res, scalar ctlv) { if (ctlv < 0) return true; ++rcChecked; return res < ctlv; };
         // OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time)
         const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
         const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);   // OF default GREAT -> only the final state
@@ -541,10 +553,15 @@ int main(int argc, char** argv)
             // them (OF). U stays gated on Ux alone: brae tracks no valid/solved directions, so the out-of-plane
             // component of a 2D/empty or wedge case has a DEGENERATE residual (stuck ~0.1, never reaching tol) that
             // would wrongly block convergence on every 2D case -- gating all U components needs that infra first.
+            rcChecked = 0;
             converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU);
             if (converged)
                 for (const auto& e : turbulenceReport())
                     if (!ok(e.perf.initialResidual, resCtl->scalarOr(e.field, -1))) { converged = false; break; }
+            // OF's `checked` safety: `residualControl { }`, or a dict naming only fields brae does not
+            // check, must NOT report convergence. Without this brae stopped after ONE iteration and wrote
+            // a plausible-looking field set (simpleControl.C:51-57).
+            converged = converged && rcChecked > 0;
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
             if (!converged && iter != endTime && isWriteTime(iter, tval)) writeTimeDir(timeName(tval));  // intermediate writes
         }

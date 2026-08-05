@@ -48,6 +48,15 @@ struct DeviceSimpleControls
     // It vanishes at converged continuity, so every steady duct gate passes without it -- but it is a real
     // STABILISER while div(phi) != 0, and the NACA0012 case at Mach 0.72 diverges in one iteration without it.
     bool   boundedHe = false;
+    // Same story for the turbulence scalars. OF's `bounded` is a per-SCHEME wrapper
+    // (boundedConvectionScheme wraps one div), so div(phi,k) can be bounded while div(phi,U) is not.
+    // brae read `bounded` only off the div(phi,U) line and reused that one flag for every scalar, so
+    // demo/delta and demo/f16 (`div(phi,U) Gauss LUST` + `div(phi,nuTilda) bounded ...`) ran nuTilda
+    // UNBOUNDED. The term is -Sp(div(phi),f): on an upwind row it takes diag from sum|outflow phi| to
+    // sum|inflow phi| = sum|offdiag|, i.e. it guarantees marginal diagonal dominance. Without it any
+    // cell with net inflow (everywhere, before continuity converges) is not diagonally dominant.
+    bool   boundedK   = false;   // div(phi,k) / div(phi,nuTilda)
+    bool   boundedEps = false;   // div(phi,epsilon) / div(phi,omega)
     bool   limitedHe = false;                      // div(phi,h|e) "limitedLinear"
     bool   luHe = false;                           // div(phi,h|e) "linearUpwind"
     scalar twoBykHe = 2.0;

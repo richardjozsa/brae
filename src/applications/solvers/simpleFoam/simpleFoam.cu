@@ -192,7 +192,9 @@ int main(int argc, char** argv)
         }
 
         // SIMPLE loop
-        auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };
+        // OF: unlisted field = not a criterion; converge only if a criterion was actually checked.
+        int rcChecked = 0;
+        auto ok = [&](scalar res, scalar ctl) { if (ctl < 0) return true; ++rcChecked; return res < ctl; };
         int iter = 0;
         bool converged = false;
         for (iter = 1; iter <= endTime && !converged; ++iter)
@@ -219,7 +221,9 @@ int main(int argc, char** argv)
             if (master && (iter == 1 || iter % 50 == 0))
                 std::printf("  iter %4d:  Ux %.3e  p %.3e%s\n", iter, r.Ux, r.p,
                             turbulent ? ("  k " + std::to_string(tres.k) + "  eps " + std::to_string(tres.eps)).c_str() : "");
+            rcChecked = 0;
             converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU) && (!turbulent || (ok(tres.k, rcK) && ok(tres.eps, rcE)));
+            converged = converged && rcChecked > 0;   // OF's `checked` safety (simpleControl.C:57)
         }
         const int nIter = converged ? iter - 1 : endTime;
         if (master) std::printf(converged ? "SIMPLE solution converged in %d iterations\n"

@@ -620,6 +620,7 @@ void deviceKEpsilonCorrect(
     scalar relaxK,
     scalar tol,
     bool bounded,
+    bool boundedEps,   // div(phi,epsilon|omega) `bounded`; `bounded` above is div(phi,k)'s
     bool limitedK,
     bool limitedEps,
     scalar twoBykK,
@@ -711,7 +712,7 @@ void deviceKEpsilonCorrect(
             scaleDEffCompressibleKE(*rhoBnd, *muBnd, DkB);
         }
     }
-    deviceSolveScalarTransport(dm, dbEps, eps, "epsilon", Deps, phiInt, phiBnd, divPhi, bounded, limitedEps, linearUpwindEps, nonOrth, twoBykEps,
+    deviceSolveScalarTransport(dm, dbEps, eps, "epsilon", Deps, phiInt, phiBnd, divPhi, boundedEps, limitedEps, linearUpwindEps, nonOrth, twoBykEps,
                                relaxEps, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    if (co.realizable) deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, diag, src);

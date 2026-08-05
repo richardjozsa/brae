@@ -360,14 +360,14 @@ namespace brae {
             const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr, ddtc.cn ? &gammaIntddt0_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
-                                             ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
+                                             ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
+                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.boundedEps,
                                        ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
@@ -390,7 +390,7 @@ namespace brae {
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
-                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
+                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.boundedEps,
                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear

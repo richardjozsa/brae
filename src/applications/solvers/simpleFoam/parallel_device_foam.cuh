@@ -552,7 +552,9 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             }
             lap("buildSolver");   // buildDeviceMesh + buildAMG + NVSHMEM halo/symmetric-heap alloc
 
-            auto ok = [](scalar res, scalar ctl) { return ctl < 0 || res < ctl; };
+            // OF: unlisted field = not a criterion; converge only if a criterion was actually checked.
+            int rcChecked = 0;
+            auto ok = [&](scalar res, scalar ctl) { if (ctl < 0) return true; ++rcChecked; return res < ctl; };
             bool converged = false;
             int iter = 0;
             for (iter = 1; iter <= endTime && !converged; ++iter)
@@ -563,7 +565,8 @@ inline int runParallelDeviceFoam(int argc, char** argv)
                     std::printf("  iter %4d:  Ux %.3e  p %.3e  | avg krylov/iter %ld\n",
                                 iter, r.Ux, r.p, solver.krylovIters() / iter);
                 // residualControl on U/p (the turbulence fields co-converge; step() returns only U/p residuals).
-                converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU);
+                rcChecked = 0;
+                converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU) && rcChecked > 0;   // OF's `checked` safety
             }
             nIter = converged ? iter - 1 : endTime;
             if (master)

@@ -188,6 +188,7 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                            DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut,
                            const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
                            scalar nu, scalar relaxEps, scalar relaxK, scalar tol, bool bounded = false,
+                           bool boundedEps = false,   // div(phi,epsilon) `bounded` (bounded = div(phi,k)'s)
                            bool limitedK = false, bool limitedEps = false, scalar twoBykK = 2.0, scalar twoBykEps = 2.0,
                            const KEpsilonCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
                            bool linearUpwindK = false, bool linearUpwindEps = false, bool nonOrth = false,
@@ -212,6 +213,7 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& omega, DeviceBuffer<scalar>& nut,
                             const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
                             scalar nu, scalar relaxOmega, scalar relaxK, scalar tol, bool bounded = false,
+                            bool boundedEps = false,   // div(phi,omega) `bounded` (bounded = div(phi,k)'s)
                             bool limitedK = false, bool limitedOmega = false, scalar twoBykK = 2.0, scalar twoBykOmega = 2.0,
                             const KOmegaSSTCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
                             bool linearUpwindK = false, bool linearUpwindOmega = false, bool nonOrth = false, scalar gradULimitK = 0.0,

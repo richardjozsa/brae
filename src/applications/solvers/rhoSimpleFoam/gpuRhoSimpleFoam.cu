@@ -168,20 +168,21 @@ int main(int argc, char** argv)
         // wrong -- it used a one-line fvSchemes, which the old line-based parser let leak the energy
         // scheme onto div(phi,U). The parser now splits on statements, so layout cannot do that.
         //
-        // The turbulence scalars keep gpuSimpleFoam's opt-out: that gate predates this work and its
-        // claim (linearUpwind degrades k/omega vs OF) has not been re-measured here, so it is left as
-        // found rather than flipped on an untested assumption.
-        if (!std::getenv("BRAE_SCALAR_LINEARUPWIND"))
+        // Turbulence-scalar linearUpwind is HONOURED here. That opt-out was inherited from gpuSimpleFoam
+        // on an unmeasured claim ("linearUpwind degrades k/omega vs OF"); measured on this path it is the
+        // DOWNGRADE that is the error. validation/luturb_vs_openfoam.sh (the rhoSST duct with
+        // div(phi,k|omega) = linearUpwind) against OF v2412, converged fields:
+        //     honoured : k 2.0e-06   omega 3.2e-06   nut 8.1e-07
+        //     upwind   : k 6.8e-03   omega 8.9e-03   nut 1.6e-02
+        // so running upwind against a case that asked for linearUpwind cost 1.6% on nut.
+        //
+        // gpuSimpleFoam keeps its guard for a DIFFERENT reason -- pitzDaily SST diverges from a cold start
+        // with linearUpwind on k -- and that is a convergence-path problem, not this discretisation: ONE
+        // iteration from OF's own converged pitzDaily state agrees to 1.6e-06 on k. See the note there.
+        // BRAE_SCALAR_LINEARUPWIND=0 forces upwind as an escape hatch.
+        if (const char* luEnv = std::getenv("BRAE_SCALAR_LINEARUPWIND"))
         {
-            if (ctl.luK || ctl.luEps)
-            {
-                std::fprintf(stderr,
-                    "brae WARNING: fvSchemes requests 'linearUpwind' on div(phi,k|omega) but brae is "
-                    "running UPWIND there. Set BRAE_SCALAR_LINEARUPWIND=1 to honour it. The energy "
-                    "equation honours linearUpwind unconditionally (validated against OpenFOAM).\n");
-            }
-            ctl.luK = false;
-            ctl.luEps = false;
+            if (std::atoi(luEnv) == 0) { ctl.luK = false; ctl.luEps = false; }
         }
 
         // OF looks these up by FIELD NAME: "omega" on kOmegaSST, "epsilon" on kEpsilon.

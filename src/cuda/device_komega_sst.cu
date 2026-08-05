@@ -856,6 +856,7 @@ void deviceKOmegaSSTCorrect(
     scalar relaxK,
     scalar tol,
     bool bounded,
+    bool boundedEps,   // div(phi,epsilon|omega) `bounded`; `bounded` above is div(phi,k)'s
     bool limitedK,
     bool limitedOmega,
     scalar twoBykK,
@@ -1020,7 +1021,7 @@ void deviceKOmegaSSTCorrect(
             scaleDEffCompressible(*rhoBnd, *muBnd, DkB);
         }
     }
-    deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, bounded, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
+    deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, boundedEps, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
                                &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr);
@@ -1037,6 +1038,24 @@ void deviceKOmegaSSTCorrect(
     deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
+    //
+    // F2 is RECOMPUTED here from the just-solved, just-bounded k and omega. OF's correctNut is
+    //     nut_ = a1_*k_/max(a1_*omega_, b1_*F23()*sqrt(S2));            (kOmegaSSTBase.C:123)
+    // where F23() is a FRESH call, so F2 is evaluated with the post-solve fields; only S2 is the stale
+    // pre-solve one, and OF passes that in deliberately as an argument.
+    //
+    // brae used the F2 computed above (line ~974) from the PRE-solve k/omega, pairing a stale F2 with
+    // post-solve k and omega. F2 is a function of BOTH fields, so that is a one-iteration lag in the
+    // k<->omega coupling: in the shear-limited branch nut = a1*k/(b1*F2*sqrt(S2)) is directly
+    // proportional to 1/F2, and the resulting nut feeds G and DkEff/DomegaEff on the next iteration --
+    // a lagged feedback loop between the two equations.
+    //
+    // Invisible at convergence (F2_stale == F2_fresh there), so neither the converged-field gates nor a
+    // one-iteration-from-developed-state reproducer can see it. It only bites in the transient, which is
+    // exactly the regime a second-order convection scheme sharpens: pitzDaily kOmegaSST with
+    // linearUpwind on BOTH k and omega converged to 5e-5 and then went unstable, while either scalar
+    // alone was fine -- the signature of a coupling term, not of either equation.
+    deviceF2(k, omega, y, nu, co, F2, nuCell);
     deviceNutSST(k, omega, F2, S2, co, nut);
 }
 

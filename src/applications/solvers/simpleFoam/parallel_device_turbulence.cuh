@@ -498,6 +498,13 @@ inline void parallelDeviceKOmegaSSTCorrect(
         detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(k.data(), 1e-15, nC);
     }
     // ---- correctNut (Bradshaw limiter) ----
+    // F2 is RECOMPUTED from the just-solved, just-bounded k and omega, matching OF's correctNut, where
+    // F23() is a fresh call (kOmegaSSTBase.C:123) and only S2 is deliberately the stale pre-solve one.
+    // The F2 built above (line ~470) comes from the PRE-solve fields; pairing it with post-solve k and
+    // omega lags the k<->omega coupling by one iteration, since F2 depends on BOTH. Same fix as the
+    // single-GPU path in device_komega_sst.cu -- see the longer note there for why no converged-field
+    // gate can see this (F2_stale == F2_fresh at convergence; it only shows in the transient).
+    deviceF2(k, omega, y, nu, co, F2);
     deviceNutSST(k, omega, F2, S2, co, nut);
 }
 

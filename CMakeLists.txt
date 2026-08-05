@@ -1144,6 +1144,16 @@ set_tests_properties(sst_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 900)
 
+# linearUpwind on the turbulence scalars -- every other gate uses upwind there, so this is the only
+# one that can see which convection scheme k/omega actually run.
+add_test(NAME luturb_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/luturb_vs_openfoam.sh)
+set_tests_properties(luturb_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1200)
+
 # rhoSimpleFoam phase 2: mass flux reduces exactly to the volumetric flux at constant density
 add_executable(test_rho_flux tests/test_rho_flux.cu)
 target_include_directories(test_rho_flux PRIVATE ${BRAE_HEADER_DIRS})
@@ -1181,6 +1191,17 @@ add_executable(test_linear_solver_setup tests/test_linear_solver_setup.cu)
 target_include_directories(test_linear_solver_setup PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_linear_solver_setup PRIVATE brae_core)
 add_test(NAME linear_solver_setup COMMAND test_linear_solver_setup)
+
+add_executable(test_residual_control tests/test_residual_control.cu)
+target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_residual_control PRIVATE brae_core)
+add_test(NAME residual_control COMMAND test_residual_control)
+
+add_executable(test_linear_upwind_const tests/test_linear_upwind_const.cu)
+target_include_directories(test_linear_upwind_const PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_linear_upwind_const PRIVATE brae_core)
+add_test(NAME linear_upwind_const
+         COMMAND test_linear_upwind_const ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
 # Cyclic increment C3b: cyclic coupling inside an iterative solver (periodic Poisson)
 add_executable(test_cyclic_poisson tests/test_cyclic_poisson.cu)

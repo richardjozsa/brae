@@ -119,6 +119,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
+                    if (hasWord(ln, "bounded")) ctl.boundedK = true;
                 }
                 if (ln.find("div(phi,epsilon)") != std::string::npos || ln.find("div(phi,omega)") != std::string::npos)
                 {
@@ -126,6 +127,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedEps = true; ctl.twoBykEps = t; }   // 2nd turb scalar (eps|omega)
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luEps = true;
+                    if (hasWord(ln, "bounded")) ctl.boundedEps = true;
                 }
                 // Energy: OF names the field "h" for sensibleEnthalpy and "e" for sensibleInternalEnergy,
                 // and the kinetic term "K" or "Ekp" to match. Any of them sets the same flags.
@@ -144,6 +146,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
+                    if (hasWord(ln, "bounded")) ctl.boundedK = true;   // SA: nuTilda uses the k slot
                 }
                 if (ln.find("Gauss") != std::string::npos || ln.find("snGrad") != std::string::npos ||
                     ln.find("laplacian") != std::string::npos || ln.find("default") != std::string::npos)
