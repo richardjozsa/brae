@@ -136,6 +136,9 @@ public:
     // Per-boundary-face Prt from 0/alphat: alphatWallFunction patches carry their own (OF default 0.85),
     // every other face uses the turbulence model's (OF default 1.0). Optional -- absent, the model's is used.
     void setAlphatPrt(const std::vector<scalar>& prtFace);
+    // Energy linear solver from fvSolution solvers.(h|e). Was hardcoded tol=1e-10, relTol=0, BiCGStab.
+    void setEnergySolver(scalar tol, scalar relTol, bool useGS)
+    { eTol_ = tol; eRelTol_ = relTol; eUseGS_ = useGS; }
     void setCompressible(
         const ThermoCoeffs& tc,
         const RhoSimpleControls& rc,
@@ -308,6 +311,8 @@ private:
     // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
     // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed
     // muEff_b = mu_b + rho_b*nut_b and the kinematic nu_b = mu_b/rho_b the wall functions ask for.
+    scalar eTol_ = 1e-10, eRelTol_ = 0.0;
+    bool   eUseGS_ = false;
     DeviceBuffer<scalar> rhoBnd_, muBnd_, nuWallBnd_;
     // flowRateInletVelocity, massFlowRate form: OF recomputes avgU = -mdot/gSum(rho*magSf) every call, so
     // it moves with the solution. frMagSf_ is magSf masked to the flowRate patches (0 elsewhere), making

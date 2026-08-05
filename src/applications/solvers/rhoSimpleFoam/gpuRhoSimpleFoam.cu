@@ -29,6 +29,7 @@
 #include "rho_simple_controls.cuh"
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with simpleFoam/pimpleFoam)
 #include "scheme_parse.cuh"        // parseFvSchemesControls
+#include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -195,15 +196,11 @@ int main(int argc, char** argv)
         ctl.relaxEps = eqSrc ? eqSrc->scalarOr(second, 1.0) : 1.0;
         ctl.relaxP = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
 
-        const FoamDict* solvers = fvSolution.subDict("solvers");
-        auto solverTol = [&](const std::string& f, scalar def)
-        {
-            const FoamDict* sd = solvers ? solvers->subDict(f) : nullptr;
-            return sd ? sd->scalarOr("tolerance", def) : def;
-        };
-        ctl.tolP = solverTol("p", 1e-6);
-        ctl.tolU = solverTol("U", 1e-8);
-        ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol(second, 1e-8));
+        // fvSolution -> ctl, through the SHARED reader. This driver previously read only tolP/tolU/tolKE
+        // by hand and silently dropped relTol{P,U,KE}, consistent (SIMPLEC), nNonOrthogonalCorrectors,
+        // the smoothSolver selection and the perf knobs -- see linear_solver_setup.cuh.
+        readLinearSolverControls(fvSolution, second, ctl);
+        const EnergySolverControls eSolve = readEnergySolverControls(fvSolution, tc.internalEnergy);
 
         TurbulenceFields tf;
         if (ctl.turbulent) tf = readTurbulenceFields(t0, fvp, nC, ctl, second, U);
@@ -246,6 +243,7 @@ int main(int argc, char** argv)
         deviceEnergyBoundaryFromT(dbT, tc, dbHe);
         solver.setCompressible(tc, rc, std::move(dbHe));
         solver.setAlphatPrt(prtFace);
+        solver.setEnergySolver(eSolve.tol, eSolve.relTol, eSolve.useGS);
 
         // Seed the thermo: T from the case, he from T, then one thermo.correct() so rho/psi/mu/alpha are
         // consistent before the first momentum predictor, and rhoPrev so the first relax has a partner.
@@ -257,6 +255,12 @@ int main(int argc, char** argv)
 
         // What brae RESOLVED from the case, not what the dict says. A relaxation factor silently left at
         // 1.0 is invisible in the fields and fatal on a stiff case.
+        std::printf("brae_rhoSimpleFoam: solve  relTol p=%g U=%g k/%s=%g e|h=%g   tol p=%g U=%g e|h=%g   "
+                    "GS U=%d k=%d %s=%d e|h=%d   SIMPLEC=%d nNonOrth=%d\n",
+                    ctl.relTolP, ctl.relTolU, second.c_str(), ctl.relTolKE, eSolve.relTol,
+                    ctl.tolP, ctl.tolU, eSolve.tol,
+                    (int)ctl.gsU, (int)ctl.gsK, second.c_str(), (int)ctl.gsEps, (int)eSolve.useGS,
+                    (int)ctl.consistent, ctl.nNonOrth);
         std::printf("brae_rhoSimpleFoam: relax  p=%g U=%g e|h=%g k=%g %s=%g rho=%g   pLimit=[%g, %g]\n",
                     ctl.relaxP, ctl.relaxU, rc.relaxHe, ctl.relaxK, second.c_str(), ctl.relaxEps, tc.relaxRho,
                     rc.limitMinP ? rc.pMinLimit : -1.0, rc.limitMaxP ? rc.pMaxLimit : -1.0);

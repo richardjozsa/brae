@@ -35,6 +35,7 @@ validation/*
 !validation/rhoFRvol/
 !validation/rhoSST/
 !validation/rhoKE/
+!validation/rhoCtl/
 !validation/energyBox/
 !validation/rho_vs_openfoam.sh
 !validation/rhoE_vs_openfoam.sh
@@ -44,6 +45,7 @@ validation/*
 !validation/fr_vs_openfoam.sh
 !validation/sst_vs_openfoam.sh
 !validation/ke_vs_openfoam.sh
+!validation/ctl_vs_openfoam.sh
 !validation/energy_vs_openfoam.sh
 
 # CTest-generated output (regenerated on every ctest run)

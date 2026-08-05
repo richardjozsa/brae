@@ -1288,10 +1288,10 @@ namespace brae {
             ctl_.nonOrth,
             ctl_.twoBykHe,
             rc_.relaxHe,
-            1e-10,
-            0.0,
-            1,
-            false,
+            eTol_,              // fvSolution solvers.(h|e).tolerance -- was hardcoded 1e-10
+            eRelTol_,           //                        .relTol     -- was hardcoded 0.0
+            ctl_.bicgCheckEvery,
+            eUseGS_,            //                        .solver smoothSolver -- was hardcoded false
             nullptr,
             nullptr,
             &kineticSrc,
