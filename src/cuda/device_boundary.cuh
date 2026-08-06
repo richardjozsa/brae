@@ -28,6 +28,9 @@ struct DeviceBoundary
     DeviceBuffer<label>  symMask;            // 1 if the face is slip/symmetry (per-comp vf=|n_k|, ref recomputed each step)
     DeviceBuffer<label>  tpMask;             // 1 if the face is totalPressure (fixedValue-p, refValue recomputed each step)
     DeviceBuffer<scalar> valueFraction;     // per-face vf for mixed faces (deviceUpdateMixedFreestream); blends 0->1
+    // fixedGradient's prescribed normal gradient, per face. ZERO for every other BC, which is what makes
+    // one code path serve both: OF's fixedGradient IS zeroGradient plus a source proportional to g.
+    DeviceBuffer<scalar> refGrad;
     DeviceBuffer<scalar> refValue, p0, deltaCoeffs, magSf;   // p0 = totalPressure reference (constant; refValue = p0 - 0.5*neg(phi)|U|^2)
     DeviceBuffer<label>  faceCell;
 };
@@ -38,7 +41,7 @@ inline DeviceBoundary buildDeviceBoundary(
     const FvGeometry& g)
 {
     std::vector<label> ty, fc, io, oio, mx, pv, sm, tp;
-    std::vector<scalar> ref, dc, ms, vf, p0;
+    std::vector<scalar> ref, dc, ms, vf, p0, rg;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;                     // cyclic = internal-like (handled by appended faces)
@@ -50,6 +53,7 @@ inline DeviceBoundary buildDeviceBoundary(
         const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
         const std::vector<scalar>& val = f.boundary[pi]->value();   // inletOutlet/outletInlet/mixed: value() = refValue; totalPressure: p0
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
+        const std::vector<scalar>* rgp = f.boundary[pi]->refGradPtr();         // fixedGradient: per-face g
         for (label i = 0; i < fvp[pi].size; ++i)
         {
             // Categories whose VALUE is resolved per-step but whose TYPE is a plain fixedValue: inletOutlet,
@@ -64,6 +68,7 @@ inline DeviceBoundary buildDeviceBoundary(
             tp.push_back(cat == 7 ? 1 : 0);
             p0.push_back(cat == 7 ? val[i] : 0.0);   // totalPressure: mask + the reference p0
             vf.push_back((cat == 5 && vfp) ? (*vfp)[i] : 0.0);
+            rg.push_back(rgp ? (*rgp)[i] : 0.0);
             ref.push_back(val[i]);
             dc.push_back(fvp[pi].deltaCoeffs[i]);
             ms.push_back(g.magSf()[fvp[pi].start + i]);
@@ -81,6 +86,7 @@ inline DeviceBoundary buildDeviceBoundary(
     db.tpMask.copyFrom(tp);
     db.p0.copyFrom(p0);
     db.valueFraction.copyFrom(vf);
+    db.refGrad.copyFrom(rg);
     db.refValue.copyFrom(ref);
     db.deltaCoeffs.copyFrom(dc);
     db.magSf.copyFrom(ms);
@@ -184,7 +190,7 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
     const FvGeometry& g)
 {
     std::vector<label> ty[3], fc, io, oio, mx, pv, sm;
-    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3];
+    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3];   // rg = fixedGradient, per component
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;                     // cyclic = internal-like (handled by appended faces)
@@ -197,6 +203,9 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         const bool sym = f.boundary[pi]->isSymmetry();
         const std::vector<vector>& val = f.boundary[pi]->value();   // inletOutlet/mixed: value() = freestreamValue (= refValue)
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
+        // fixedGradient on a VECTOR field: the gradient is a vector, so it splits per component -- each
+        // DeviceBoundary in comp[] carries its own refGrad, exactly as each carries its own refValue.
+        const std::vector<vector>* rgv = f.boundary[pi]->refGradPtr();
         for (label i = 0; i < fvp[pi].size; ++i)
         {
             fc.push_back(fvp[pi].faceCells[i]);
@@ -215,6 +224,10 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
                 nrm[0].push_back(Sf.x * inv);
                 nrm[1].push_back(Sf.y * inv);
                 nrm[2].push_back(Sf.z * inv);
+            }
+            {
+                const vector gv = rgv ? (*rgv)[static_cast<std::size_t>(i)] : vector{0, 0, 0};
+                rg[0].push_back(gv.x); rg[1].push_back(gv.y); rg[2].push_back(gv.z);
             }
             const scalar rv[3] = { val[i].x, val[i].y, val[i].z };
             if (sym)   // mixed kernels; vf_k=|n_k|, ref recomputed per step (init = host value v - n(n.v))
@@ -257,6 +270,7 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         db.comp[k].symMask.copyFrom(sm);
         db.comp[k].valueFraction.copyFrom(vf[k]);
         db.comp[k].refValue.copyFrom(ref[k]);
+        db.comp[k].refGrad.copyFrom(rg[k]);
         db.comp[k].deltaCoeffs.copyFrom(dc);
         db.comp[k].magSf.copyFrom(ms);
         db.comp[k].faceCell.copyFrom(fc);

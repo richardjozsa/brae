@@ -342,21 +342,21 @@ try
         if (std::filesystem::exists(fieldDir + "/include"))
             std::filesystem::copy(fieldDir + "/include", outDir + "/include",
                 std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
-        writeVolField(fieldDir + "/U", outDir + "/U", solver.U(), fvp, precision);
-        writeVolField(fieldDir + "/p", outDir + "/p", solver.p(), fvp, precision);
+        writeVolField(fieldDir + "/U", outDir + "/U", solver.U(), fvp, precision, solver.UBoundary());
+        writeVolField(fieldDir + "/p", outDir + "/p", solver.p(), fvp, precision, solver.pBoundary());
         // phi is the restart-critical conservative flux -> write it LOSSLESS (>=17 = double max_digits10) so its
         // write->read round-trip is bit-identical (16 sig figs loses the last bit) and a restart resumes the EXACT flux
         // with no continuity transient. The viz fields (U/p/turbulence) keep the user's writePrecision.
         writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp, std::max(precision, 17));
         if (ctl.les) {   // pure LES Smagorinsky: only the algebraic sub-grid nut (no k/epsilon/omega/nuTilda field)
-            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
+            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision, solver.nutBoundary());
         } else if (ctl.sa) {
-            writeVolField(fieldDir + "/nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
-            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
+            writeVolField(fieldDir + "/nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision, solver.nuTildaBoundary());
+            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision, solver.nutBoundary());
         } else if (ctl.turbulent) {
-            writeVolField(fieldDir + "/k",          outDir + "/k",          solver.k(),   fvp, precision);
-            writeVolField(fieldDir + "/" + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision);
-            writeVolField(fieldDir + "/nut",        outDir + "/nut",        solver.nut(), fvp, precision);
+            writeVolField(fieldDir + "/k",          outDir + "/k",          solver.k(),   fvp, precision, solver.kBoundary());
+            writeVolField(fieldDir + "/" + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision, solver.epsBoundary());
+            writeVolField(fieldDir + "/nut",        outDir + "/nut",        solver.nut(), fvp, precision, solver.nutBoundary());
             if (ctl.lm) {
                 writeVolField(fieldDir + "/ReThetat", outDir + "/ReThetat", solver.ReThetat(), fvp, precision);
                 writeVolField(fieldDir + "/gammaInt", outDir + "/gammaInt", solver.gammaInt(), fvp, precision);

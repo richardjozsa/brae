@@ -54,6 +54,9 @@ public:
     // and the freestream sign (true = velocity vf=0.5-0.5 U.n/|U|, false = pressure vf=0.5+0.5 U.n/|U|).
     virtual const std::vector<scalar>* valueFractionPtr() const { return nullptr; }
     virtual bool mixedVelocitySign() const { return true; }
+    // fixedGradient's prescribed normal gradient; null for every other BC, so the device refGrad stays 0
+    // and zeroGradient behaves exactly as before.
+    virtual const std::vector<T>* refGradPtr() const { return nullptr; }
 
     const std::vector<T>& value() const { return value_; }
     void setValue(const std::vector<T>& v) { value_ = v; }   // e.g. nutkWallFunction writing nut at walls
@@ -269,6 +272,43 @@ public:
     bool fixesValue() const override { return false; }
 };
 
+// fixedGradient: the normal gradient is prescribed, the value follows.
+//     value = patchInternalField + gradient/deltaCoeffs        (fixedGradientFvPatchField.C:191)
+// In the matrix it is EXACTLY zeroGradient plus a source: valueInternalCoeffs 1 and
+// gradientInternalCoeffs 0 are the same as zeroGradient's, and only the boundary coefficients pick up the
+// gradient (valueBoundaryCoeffs = g/deltaCoeffs, gradientBoundaryCoeffs = g -- .C:205,216,224,232). That is
+// why the device side carries a per-face refGrad that is simply ZERO for zeroGradient: one code path, and
+// every existing zeroGradient patch keeps its exact behaviour.
+template <typename T>
+class FixedGradientPatchField : public fvPatchField<T>
+{
+public:
+    FixedGradientPatchField(const FvPatch& p, bool uniform, const T& g, const std::vector<T>& gs)
+        : fvPatchField<T>(p), uniform_(uniform), gUniform_(g), gValues_(gs)
+    {
+        grad_.assign(static_cast<std::size_t>(p.size), T{});
+        for (label i = 0; i < p.size; ++i)
+            grad_[static_cast<std::size_t>(i)] =
+                uniform_ ? gUniform_
+                         : (static_cast<std::size_t>(i) < gValues_.size() ? gValues_[static_cast<std::size_t>(i)] : T{});
+    }
+    void evaluate(const std::vector<T>& internal) override
+    {
+        const std::vector<T> pif = this->patchInternalField(internal);
+        this->value_.resize(pif.size());
+        for (std::size_t i = 0; i < pif.size(); ++i)
+            this->value_[i] = pif[i] + grad_[i] / this->patch_.deltaCoeffs[i];
+    }
+    bool fixesValue() const override { return false; }          // the VALUE is not fixed; the gradient is
+    const std::vector<T>* refGradPtr() const override { return &grad_; }
+
+private:
+    bool uniform_;
+    T gUniform_;
+    std::vector<T> gValues_;
+    std::vector<T> grad_;
+};
+
 // noSlip: fixed zero (velocity wall).
 template <typename T>
 class NoSlipPatchField : public fvPatchField<T>
@@ -436,6 +476,13 @@ public:
     bool fixesValue() const override { return true; }               // OF mixedFvPatchField::fixesValue() == true
     int  bcCategory() const override { return 5; }                  // device: mixed (per-face valueFraction blend)
     const std::vector<scalar>* valueFractionPtr() const override { return &vf_; }
+    // mixedEnergy / an external-convection wall carries refGradient beside refValue. Stored per face and
+    // handed to DeviceBoundary::refGrad through the same hook fixedGradient uses (B5); the kernels apply
+    // OF's (1-vf) weight, so a mixed patch with refGradient 0 stays bit-identical to before.
+    const std::vector<T>* refGradPtr() const override { return refGrad_.empty() ? nullptr : &refGrad_; }
+    void setRefGrad(std::vector<T> g) { refGrad_ = std::move(g); }
+    // A plain `mixed` patch STATES its valueFraction; only the freestream family recomputes it per step.
+    void setValueFraction(std::vector<scalar> f) { vf_ = std::move(f); }
     bool mixedVelocitySign() const override { return velocitySign_; }
     // OF mixed coeffs with refGrad = 0 (host correctness; the device blends the same way in its kernels):
     std::vector<T> gradientInternalCoeffs() const override        // -vf*deltaCoeffs
@@ -469,6 +516,8 @@ public:
 private:
     bool                velocitySign_;  // true: vf=0.5-0.5 U.n/|U| (velocity); false: 0.5+0.5 ... (pressure)
     std::vector<scalar> vf_;            // per-face valueFraction (seed 0.5; device recomputes from the flow angle)
+
+    std::vector<T> refGrad_;
 };
 
 // processor: rank<->rank coupled patch. The exchange receives the NEIGHBOUR cells' values (the
@@ -610,6 +659,12 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFieldData<T>& d)
 {
+    if (d.type == "fixedGradient")
+    {
+        if (!d.hasGradient)
+            throw std::runtime_error("brae: patch " + p.name + " is fixedGradient but has no 'gradient' entry.");
+        return std::make_unique<FixedGradientPatchField<T>>(p, d.gradientUniform, d.gradientUniformValue, d.gradientValues);
+    }
     if (d.type == "pressureInletOutletVelocity" && d.hasTangentialVelocity)
     {
         // OF: refValue = tangentialVelocity - n*(n & tangentialVelocity), i.e. the tangential component
@@ -709,6 +764,35 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues, true);
     if (d.type == "freestreamPressure")   // mixed, pressure sign (0.5 + 0.5 U.n/|U|)
         return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues, false);
+    // Plain `mixed` (Robin): refValue + refGradient + valueFraction, all given by the case. Unlike
+    // freestream*/inletOutlet the valueFraction is FIXED, not recomputed from the flux, so the device does
+    // not need a per-step update -- the seeded vf is the answer. This is the shape basicThermo maps a
+    // `mixed` T patch onto (-> mixedEnergy), which is how an external-convection wall is written.
+    if (d.type == "mixed")
+    {
+        if (!d.hasValueFraction)
+            throw std::runtime_error(
+                "brae: patch " + p.name + " is `mixed` but has no `valueFraction` entry. OF requires all "
+                "three of refValue, refGradient and valueFraction; running with a guessed blend would "
+                "silently solve a different boundary condition.");
+        auto mp = std::make_unique<MixedPatchField<T>>(p, d.refValueUniform, d.refValueUniformValue,
+                                                      d.refValues, /*velocitySign*/ true);
+        {
+            std::vector<scalar> f(static_cast<std::size_t>(p.size), d.vfUniform ? d.vfUniformValue : scalar(0));
+            if (!d.vfUniform)
+                for (std::size_t i = 0; i < f.size() && i < d.vfValues.size(); ++i) f[i] = d.vfValues[i];
+            mp->setValueFraction(std::move(f));
+        }
+        if (d.hasGradient)
+        {
+            std::vector<T> g(static_cast<std::size_t>(p.size),
+                             d.gradientUniform ? d.gradientUniformValue : T{});
+            if (!d.gradientUniform)
+                for (std::size_t i = 0; i < g.size() && i < d.gradientValues.size(); ++i) g[i] = d.gradientValues[i];
+            mp->setRefGrad(std::move(g));
+        }
+        return mp;
+    }
     // pressureInletOutletVelocity (directionMixed): device recomputes the inflow normal-projection each step (cat 6).
     if (d.type == "pressureInletOutletVelocity")
         return std::make_unique<PressureInletOutletVelocityPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
@@ -807,6 +891,22 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         else throw std::runtime_error("brae: atmBoundaryLayerInlet{K,Epsilon,Omega} is a scalar BC");
     }
     // codedFixedValue is handled above (seeded as fixedValue; the NVRTC device kernel overwrites its refValue per step).
+    if (d.type == "externalWallHeatFluxTemperature" || d.type == "compressible::externalWallHeatFluxTemperature")
+    {
+        // The other half of B5, and deliberately still a refusal. In `flux`/`power` mode this BC is
+        // exactly a fixedGradient with g = q/kappa -- which brae can now express -- but kappa is
+        // kappaEff, i.e. Cp*(alpha + alphat), so it varies per face AND changes every outer iteration as
+        // the turbulence develops. Freezing it at the initial value is not a mild approximation: alphat
+        // at a heated turbulent wall grows by orders of magnitude, so the imposed flux would drift far
+        // from the requested q while the run still converged and still looked physical. Refuse, and say
+        // what to substitute.
+        throw std::runtime_error(
+            "brae: patch " + p.name + " uses externalWallHeatFluxTemperature, which brae does not "
+            "implement: its gradient is q/kappaEff and kappaEff = Cp*(alpha + alphat) changes every "
+            "iteration, so a frozen value would impose a flux the case never asked for. If kappa is "
+            "effectively constant for your case, compute g = q/kappa yourself and use "
+            "`type fixedGradient; gradient uniform <g>;` -- brae discretises that exactly (see B5).");
+    }
     throw std::runtime_error("brae: unsupported BC type '" + d.type + "' on patch " + p.name);
 }
 

@@ -13,6 +13,7 @@
 #include "device_cyclic.cuh"
 #include "device_interface.cuh"   // interfaceAssembleMomentum/OffDiagSum/ZeroWallIfCoeff
 #include "device_amg.cuh"         // deviceSymGaussSeidel
+#include "stage_dump.cuh"      // Phase 0 stage harness
 #include "device_ddt.cuh"         // ScalarDdt + deviceFvmDdtDiag/Source (transient turbulence)
 #include <cuda_runtime.h>
 #include <vector>
@@ -126,14 +127,32 @@ void deviceSolveScalarTransport(
     DeviceAMI* ami = nullptr,
     DeviceCyclic* cyc = nullptr,
     const ScalarDdt& ddt = ScalarDdt{},   // transient fvm::ddt(f); default (steady) -> no-op
-    const DeviceBuffer<scalar>* DBnd = nullptr)   // per-FACE boundary diffusivity; null -> adjacent-cell value
+    const DeviceBuffer<scalar>* DBnd = nullptr,   // per-FACE boundary diffusivity; null -> adjacent-cell value
+    // OF `grad(<field>) cellLimited Gauss linear <k>`. 0 = unlimited. The gradient feeds the limitedLinear
+    // weight, the linearUpwind deferred correction and the non-orthogonal laplacian correction, so an
+    // unlimited gradient on a field the case asked to limit is a different discretisation, not a detail.
+    // Only grad(U) was ever honoured; grad(k)/grad(omega)/grad(e) lines were parsed by nothing.
+    scalar gradLimitK = 0.0,
+    // OF's bound(f, fMin) exists for POSITIVE-DEFINITE quantities: k, epsilon, omega, nuTilda. Every
+    // turbulence caller here is one of those, so the default is true. The ENERGY is not: EEqn.H never
+    // bounds he, and OF's sensible energy is legitimately NEGATIVE below the reference temperature
+    // (air at 298 K has he = -8.59e4 J/kg). Bounding it there replaces the whole field with ~0 and
+    // pins T at Cp*Tref/Cv = 417.7 K, which is exactly what NACA0012 did once he was given OF's
+    // reference point. Harmless while brae used he = Cv*T > 0 -- which is why it survived this long.
+    bool boundPositive = true)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
     deviceInterpolate(dm, D, Df);
     DeviceBuffer<scalar> aD, aU, aL, lD, lU, lL, luCorr, lapCorr;   // luCorr/lapCorr = linearUpwind / non-orth deferred sources (empty otherwise)
     DeviceBuffer<scalar> gx, gy, gz;                               // grad(field): shared by limitedLinear / linearUpwind / non-orth
-    if (limited || linearUpwind || nonOrth) { DeviceBuffer<scalar> bv; deviceBCValue(db, field, bv); deviceGaussGrad(dm, field, bv, gx, gy, gz); }
+    if (limited || linearUpwind || nonOrth)
+    {
+        DeviceBuffer<scalar> bv;
+        deviceBCValue(db, field, bv);
+        deviceGaussGrad(dm, field, bv, gx, gy, gz);
+        if (gradLimitK > 0.0) deviceCellLimitGrad(dm, field, bv, gx, gy, gz, gradLimitK);
+    }
     if (limited) deviceDivLimitedCoeffs(dm, phiInt, field, gx, gy, gz, twoByk, aD, aU, aL);   // Gauss limitedLinear: implicit limited weight
     else
     {
@@ -183,6 +202,14 @@ void deviceSolveScalarTransport(
         cudaCheck(cudaGetLastError(), "setValues");
     }
     DeviceBuffer<scalar> diagC, B; deviceFold(dm, aRD, src, aIC, aBC, diagC, B);
+    // Stage harness: the assembled system for this transported scalar, at its first assembly only.
+    if (stageDumpActive() && stageDumpFirstOnly((std::string("xport-") + fieldName).c_str()))
+    {
+        stageDump(std::string("stage_") + fieldName + "D",   diagC);
+        stageDump(std::string("stage_") + fieldName + "Src", B);
+        stageDump(std::string("stage_") + fieldName + "Diff", D);
+        stageDump(std::string("stage_") + fieldName + "Psi",  field);
+    }
     const DeviceLduView sv = (ami && ami->n)
         ? deviceLduViewAmi(dm, diagC, aU, aL, ami->n, ami->ownCell.data(), ami->off.data(), ami->nbrCell.data(), ami->weight.data(), ami->ifCoeff.data())
         : (cyc && cyc->n)
@@ -199,7 +226,7 @@ void deviceSolveScalarTransport(
     if (gs) deviceSymGaussSeidel(sv, B, field, deviceSumMag(B) + 1e-20, tol, relTolKE, 3000, &perf);
     else    perf = deviceJacobiBiCGStab(sv, B, field, deviceSumMag(B) + 1e-20, tol, relTolKE, 3000, keCheckEvery);  // loose (relTol); interface in the Amul
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
-    deviceBoundField(dm, field, 1e-15);                           // OF bound(field): neg -> local avg, not floor
+    if (boundPositive) deviceBoundField(dm, field, 1e-15);        // OF bound(field): neg -> local avg, not floor
 }
 
 } // namespace brae

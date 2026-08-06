@@ -24,6 +24,10 @@ struct RhoSimpleControls
     // Refused at start-up rather than silently ignored: a transonic case run down the subsonic branch
     // converges to a wrong answer without complaining. Phase 5 lifts this.
     bool transonic = false;
+    // heRhoThermo: OF's `rho = thermo.rho()` after the pressure solve returns the STORED rho_, so rho lags
+    // the just-solved pressure by one outer iteration. hePsiThermo returns p_*psi_ and does not. Set from
+    // ThermoCoeffs::rhoThermoType by the driver.
+    bool rhoLagsPressure = false;
 
     // OF pressureControl: the cell whose pressure is pinned when the domain is closed. Unused when a
     // boundary fixes p, which is the common external-aero case.

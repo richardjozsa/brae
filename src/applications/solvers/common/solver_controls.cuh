@@ -60,6 +60,42 @@ struct DeviceSimpleControls
     bool   limitedHe = false;                      // div(phi,h|e) "limitedLinear"
     bool   luHe = false;                           // div(phi,h|e) "linearUpwind"
     scalar twoBykHe = 2.0;
+    // div(phi,K|Ekp), the KINETIC term -- a separate fvSchemes entry from div(phi,h|e) and a separate
+    // discretisation in OF. All four keys used to OR into the He slots, so a case asking for
+    // `div(phi,e) linearUpwind` + `div(phi,K) upwind` ran the kinetic term second-order anyway (and the
+    // reverse ran the energy equation first-order). They agree in every stock tutorial, where both are
+    // `$energy` -- which is exactly why the merge went unnoticed.
+    bool   boundedKin = false;
+    bool   limitedKin = false;
+    bool   luKin = false;
+    scalar twoBykKin = 2.0;
+    bool   foundKinScheme = false;                 // false -> mirror the He slots (the old behaviour)
+    // OF's RAS/LES `turbulence` switch (RASModel.C:70, getOrDefault<Switch>("turbulence", true)). `off`
+    // makes correct() return immediately: k, epsilon/omega and nut stay FROZEN at their initial values
+    // while the momentum equation keeps using that frozen nut. It is NOT the same as `simulationType
+    // laminar`, where nut is zero and never read. brae never read the switch, so a case asking to freeze
+    // the turbulence ran a fully live model. Found by dict_audit (E5) once the audit was made to run on
+    // REFUSED cases -- aerofoilNACA0012 sets it, and aerofoilNACA0012 refuses on fvOptions.
+    bool   turbulenceOn = true;
+    // B1: SIMPLE/transonic. OF's rhoSimpleFoam pEqn.H takes a different branch entirely -- the pressure
+    // equation gains an IMPLICIT convection term fvm::div(phid, p) with phid = (psi_f/rho_f)*phiHbyA, the
+    // part of phiHbyA now carried implicitly is subtracted off, and the matrix is relaxed (the subsonic
+    // branch relaxes only the FIELD, never the equation). Running a transonic case down the subsonic
+    // branch converges to a wrong answer in silence, which is why this was a refusal until now.
+    bool   transonic = false;
+    // OF fvMatrix::relax() applies relaxationFactors/equations/<field> and does NOTHING when the entry is
+    // absent (fvMatrix.C:1250-1263 -- it only relaxes if relaxEquation() finds one). Both facts matter:
+    // the factor AND whether it was given.
+    bool   hasRelaxPEqn = false;
+    scalar relaxPEqn = 1.0;
+    // grad(<turbulence scalar>) / grad(energy) cellLimited coefficients. Separate from gradULimitK: OF takes
+    // one gradScheme entry per field, and aerofoilNACA0012 limits grad(U), grad(k) and grad(omega) alike.
+    scalar gradKLimitK = 0.0;                      // grad(k) / grad(omega) / grad(epsilon) / grad(nuTilda)
+    scalar gradHeLimitK = 0.0;                     // grad(h) / grad(e)
+    // The cellLimited coefficient of the gradient the KINETIC term's linearUpwind uses. Separate from
+    // gradHeLimitK because fvSchemes gives div(phi,K|Ekp) its own entry, which may name a different
+    // gradient from div(phi,h|e); it falls back to the energy's when the case omits it.
+    scalar gradKinLimitK = 0.0;                    // grad(K) / grad(Ekp)
     KEpsilonCoeffs keCoeffs;                       // k-eps model coeffs (default = OF); read from turbulenceProperties RAS.kEpsilonCoeffs.
     bool   sst = false;                            // RASModel kOmegaSST (the "second turbulence scalar" eps slot holds omega).
     bool   lm = false;                             // RASModel kOmegaSSTLM (sst + Langtry-Menter gamma-ReThetat transition).

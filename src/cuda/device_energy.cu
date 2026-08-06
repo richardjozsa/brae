@@ -1,6 +1,7 @@
 // device_energy.cu -- alphaEff assembly and the he solve.
 
 #include "device_energy.cuh"
+#include "stage_dump.cuh"
 #include "device_scalar_transport.cuh"
 #include "thermo_model.cuh"
 #include <stdexcept>
@@ -8,16 +9,27 @@
 namespace brae {
 
 // Boundary he from boundary T. Linear for hConst, so bcType is untouched and only the value moves.
+//
+// The GRADIENT transforms too, and by a different rule than the value: OF's gradientEnergy sets
+// gradient() = Cpv(p, Tw)*Tw.snGrad() (gradientEnergyFvPatchScalarField.C:111). For hConst,
+// d(he)/dT is exactly Cpv -- Cv when the energy variable is sensibleInternalEnergy, Cp otherwise --
+// so the chain rule reproduces OF's expression without needing Tw at all. Note Hf drops out: it
+// shifts he by a constant and a constant has zero gradient. A fixedGradient T wall whose gradient
+// was copied across UNSCALED would be wrong by a factor of Cpv, i.e. ~1005 for air -- so this is
+// the difference between a heat-flux wall and an essentially adiabatic one.
 __global__
 void heBndFromTK(
     int n,
     ThermoCoeffs c,
     const scalar* __restrict__ refT,
-    scalar* __restrict__ refHe)
+    const scalar* __restrict__ gradT,
+    scalar* __restrict__ refHe,
+    scalar* __restrict__ gradHe)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     refHe[i] = hConstTToHe(refT[i], c);
+    if (gradT) gradHe[i] = (c.internalEnergy ? thermoCv(c) : c.Cp) * gradT[i];
 }
 
 void deviceEnergyBoundaryFromT(
@@ -32,11 +44,15 @@ void deviceEnergyBoundaryFromT(
             "brae: deviceEnergyBoundaryFromT needs the he boundary to share the T boundary's structure.");
     }
     dbHe.refValue.resize(dbT.n);
+    const bool hasGrad = dbT.refGrad.size() == static_cast<std::size_t>(dbT.n);
+    if (hasGrad) dbHe.refGrad.resize(dbT.n);
     heBndFromTK<<<nBlocks(dbT.n), TPB>>>(
         dbT.n,
         c,
         dbT.refValue.data(),
-        dbHe.refValue.data());
+        hasGrad ? dbT.refGrad.data() : nullptr,
+        dbHe.refValue.data(),
+        hasGrad ? dbHe.refGrad.data() : nullptr);
     cudaCheck(cudaGetLastError(), "heBndFromT");
 }
 
@@ -207,7 +223,8 @@ void deviceEnergyKineticSource(
     const DeviceBoundary* dbHe,           // for grad(K) when the scheme is limitedLinear or linearUpwind
     bool limited,
     scalar twoByk,
-    bool linearUpwind)
+    bool linearUpwind,
+    scalar gradLimitK)
 {
     const bool ekp = (p && rho && p->size() && rho->size());
     const int nC = dm.nCells;
@@ -219,6 +236,7 @@ void deviceEnergyKineticSource(
                                          ekp ? rho->data() : nullptr,
                                          K.data());
     cudaCheck(cudaGetLastError(), "kineticEnergy");
+    if (stageDumpActive() && stageDumpFirstOnly("Ekp")) stageDump("stage_Ekp", K);
 
     // K at boundary faces, built from the BOUNDARY velocity and (for Ekp) the boundary p and rho -- the
     // same expression as the cell value, which is exactly what OF's constructed volScalarField("Ekp", ...)
@@ -248,7 +266,14 @@ void deviceEnergyKineticSource(
     }
 
     DeviceBuffer<scalar> gx, gy, gz;
-    if (limited || linearUpwind) deviceGaussGrad(dm, K, Kb, gx, gy, gz);
+    if (limited || linearUpwind)
+    {
+        deviceGaussGrad(dm, K, Kb, gx, gy, gz);
+        // `linearUpwind <gradName>` names a CELL-LIMITED gradient in every stock aerofoil case. Running
+        // this correction unlimited put the whole first-iteration energy error of NACA0012 into the two
+        // cells either side of the first face off the wall (measured: -1.5e3/+1.5e3 on cells 2400/2401).
+        if (gradLimitK > 0.0) deviceCellLimitGrad(dm, K, Kb, gx, gy, gz, gradLimitK);
+    }
     DeviceBuffer<scalar> ffc;
     ffc.resize(nF);
     kineticFaceFluxK<<<nBlocks(nF), TPB>>>(nF, dm.owner.data(), dm.nei.data(), phiInt.data(), K.data(),
@@ -309,7 +334,8 @@ void deviceSolveEnergy(
     DeviceAMI* ami,
     DeviceCyclic* cyc,
     const DeviceBuffer<scalar>* kineticSrc,
-    const DeviceBuffer<scalar>* alphaEffBnd)
+    const DeviceBuffer<scalar>* alphaEffBnd,
+    scalar gradLimitK)
 {
     if (th.n == 0) return;
 
@@ -350,7 +376,9 @@ void deviceSolveEnergy(
         ami,
         cyc,
         ScalarDdt{},
-        alphaEffBnd);
+        alphaEffBnd,
+        gradLimitK,   // grad(he) cellLimited coeff, from the gradient `linearUpwind` names in fvSchemes
+        false);       // no bound(he) -- OF bounds only positive-definite quantities, and he is not one
 }
 
 } // namespace brae

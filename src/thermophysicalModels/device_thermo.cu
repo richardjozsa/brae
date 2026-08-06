@@ -44,7 +44,8 @@ void thermoUpdateK(
 
     const scalar psii = perfectGasPsi(Ti, c);
     psi[i] = psii;
-    rho[i] = fmin(fmax(psii * pi, c.rhoMin), c.rhoMax);
+    // null rho -> this call is OF's thermo.correct(), which leaves the solver's rho field alone.
+    if (rho) rho[i] = fmin(fmax(psii * pi, c.rhoMin), c.rhoMax);
 
     const scalar mui = transportMu(Ti, c);
     mu[i] = mui;
@@ -67,7 +68,8 @@ void heFromTK(
 void deviceThermoUpdate(
     DeviceThermo& th,
     const DeviceBuffer<scalar>& p,
-    const ThermoCoeffs& c)
+    const ThermoCoeffs& c,
+    bool updateRho)
 {
     if (th.n == 0) return;
     thermoUpdateK<<<nBlocks(th.n), TPB>>>(
@@ -76,7 +78,7 @@ void deviceThermoUpdate(
         p.data(),
         th.he.data(),
         th.T.data(),
-        th.rho.data(),
+        updateRho ? th.rho.data() : nullptr,
         th.psi.data(),
         th.mu.data(),
         th.alpha.data());
@@ -111,6 +113,22 @@ void rhoSeedPrevK(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     rhoPrev[i] = rho[i];
+}
+
+// The same relaxation applied to an arbitrary rho buffer, for the BOUNDARY half of the solver's rho
+// field. OF has one `rho` volScalarField and `rho.relax()` relaxes its internal AND boundary values
+// together; brae stores the two separately, so the boundary one needs the identical treatment or the
+// pressure equation's phiHbyA weighting sees an unrelaxed density. Same kernel, deliberately: two
+// copies of this arithmetic is two places for them to diverge.
+void deviceRhoRelaxBuffer(
+    DeviceBuffer<scalar>& rho,
+    DeviceBuffer<scalar>& rhoPrev,
+    const ThermoCoeffs& c)
+{
+    const int n = static_cast<int>(rho.size());
+    if (n == 0 || rhoPrev.size() != rho.size()) return;
+    rhoRelaxK<<<nBlocks(n), TPB>>>(n, c.relaxRho, c.rhoMin, c.rhoMax, rho.data(), rhoPrev.data());
+    cudaCheck(cudaGetLastError(), "rhoRelaxBuffer");
 }
 
 void deviceRhoRelax(

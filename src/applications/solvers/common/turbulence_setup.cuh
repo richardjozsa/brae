@@ -6,6 +6,7 @@
 // gpuSimpleFoam so both drivers stay identical. Call readTurbulenceModel BEFORE readTurbulenceFields (needs ctl.sst).
 #include "solver_controls.cuh"
 #include "foam_dict.cuh"
+#include "brae_notice.cuh"
 #include "foam_field_reader.cuh"
 #include "geometric_field.cuh"
 #include "fv_patch.cuh"
@@ -95,6 +96,17 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 return;
             }
             const FoamDict* ras = turbProps.subDict("RAS");
+            // OF Switch: yes/no/on/off/true/false/1/0. Default true when absent (RASModel.C:70).
+            if (ras)
+            {
+                const std::string sw = ras->wordOr("turbulence", "true");
+                ctl.turbulenceOn = !(sw == "off" || sw == "no" || sw == "false" || sw == "0");
+                if (!ctl.turbulenceOn)
+                    noticeApplied("turbulenceProperties RAS/turbulence",
+                                  "'" + sw + "' -- the model is FROZEN: k/epsilon|omega/nut keep their initial "
+                                  "values and momentum uses that frozen nut (OF RASModel::correct() returns "
+                                  "immediately). This is not the same as simulationType laminar.");
+            }
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
             ctl.lm  = (model == "kOmegaSSTLM");                 // Langtry-Menter transition = kOmegaSST + gamma-ReThetat
             ctl.sst = (model == "kOmegaSST") || ctl.lm;
@@ -267,11 +279,22 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                 gammaInt.evaluateBoundary();
                 std::printf("  kOmegaSSTLM (Langtry-Menter transition): + ReThetat + gammaInt transport\n");
             }
-            // turbulent-inlet BCs: inflow value computed from U (k) then from k (epsilon/omega).
-            const scalar wCmu = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
-            applyTurbulentInletK(k, kFD, U, fvp);
-            applyTurbulentInletSecond(eps, sFD, k, wCmu, fvp);
-            // ...and the per-face description of WHICH faces to recompute each iteration (OF updateCoeffs).
+            // turbulent-inlet BCs are NOT evaluated here. OF's rule is that a boundary condition updates
+            // when ITS OWN equation is assembled: turbulentIntensityKineticEnergyInlet and
+            // turbulentMixingLengthDissipationRateInlet are k/epsilon BCs, so their updateCoeffs() first
+            // fires inside kEqn/epsEqn (kEpsilon.C:252,273) -- called from turbulence->correct(), the LAST
+            // phase of the outer iteration. Until then the patch simply holds the `value` entry read from
+            // the file, exactly like any other fixedValue-derived BC at construction.
+            //
+            // Evaluating them here instead made the FIRST momentum solve see an inlet k recomputed from
+            // the set-up velocity. On squareBend that is k = 1.5*(0.05*523.087)^2 = 1026 against the
+            // file's `uniform 1`, so the inlet `calculated` nut (Cmu*k_b^2/eps_b) came out 0.0877 instead
+            // of 0.09*1/200 = 4.5e-04 -- and the inlet boundary diffusivity 157x OF's, which propagated
+            // through Upred, HbyA, phiHbyA, phid and p.
+            //
+            // A3 fixed these inlets being FROZEN at set-up and never refreshed. The refresh is right; doing
+            // it a phase early is not. Only the per-face MASKS are built here -- they say WHICH faces
+            // correctTurbulence() must recompute, which is set-up information, not a value.
             masks = buildTurbulentInletMasks(kFD, sFD, fvp);
         }
     return { std::move(k), std::move(eps), std::move(nut), std::move(ReThetat), std::move(gammaInt), std::move(masks) };

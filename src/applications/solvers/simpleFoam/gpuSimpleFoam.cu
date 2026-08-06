@@ -255,20 +255,33 @@ int main(int argc, char** argv)
         //     solvers, linearUpwind on k -> k agrees with OF to 1.6e-06 (omega 3.3e-05, p exact).
         //   - the compressible duct converges to OF at k 2.0e-06 / nut 8.1e-07 with it honoured, and is
         //     1.6e-02 off on nut with it downgraded -- so rhoSimpleFoam now HONOURS it.
-        //   - but from a COLD start pitzDaily SST diverges (NaN ~iter 550) with linearUpwind on k, where
-        //     OF converges at 357. Bisected: k's correction diverges, omega's is stable (upwind/upwind and
-        //     upwind/linearUpwind both converge). Ruled out: SIMPLEC (diverges with consistent no too),
-        //     gradient limiting (both unlimited), regex relaxation (brae honours ".*" 0.9), the Pk
-        //     production limiter and k/omega bounding (both present and OF-exact).
-        // So the guard stays until that cold-start path is fixed, but it is a robustness workaround with a
-        // known accuracy cost, NOT the validated behaviour. BRAE_SCALAR_LINEARUPWIND=1 honours the scheme.
-        if (!std::getenv("BRAE_SCALAR_LINEARUPWIND"))
+        //   - but from a COLD start pitzDaily SST diverges where OF converges. Bisected cleanly, with the
+        //     `div(phi,epsilon)` line pinned so it cannot leak into luEps (an earlier bisect was
+        //     contaminated by exactly that and wrongly blamed k alone):
+        //         luK=1 luEps=0  converges     luK=0 luEps=1  converges
+        //         luK=0 luEps=0  converges     luK=1 luEps=1  NaN
+        //     So it is a COUPLED k-omega instability -- neither correction destabilises anything by
+        //     itself. Ruled out by measurement: SIMPLEC, gradient limiting, regex relaxation, the Pk
+        //     limiter, k/omega bounding, constant preservation, the matrix assembly (diagonal and source
+        //     match OF's fvScalarMatrix to 1.8e-06), and the near-wall matrix manipulation.
+        //
+        // SPALART-ALLMARAS IS EXEMPT, and the reason is structural rather than empirical: SA transports ONE
+        // scalar. deviceSpalartAllmarasCorrect takes luK only and never reads luEps, so the luK=1,luEps=1
+        // state the divergence requires is unreachable. Downgrading SA was protecting it from a
+        // two-equation failure mode it cannot have, and the cost was large: airFoil2D nuTilda 1.67 upwind
+        // vs 3.6e-03 honoured, a factor of 460. gpuPimpleFoam never had this guard, so the same SA-IDDES
+        // case already ran linearUpwind there -- the steady path was giving a different answer to the
+        // transient one for identical input.
+        //
+        // The two-equation guard stays until the coupled divergence is understood.
+        if (!std::getenv("BRAE_SCALAR_LINEARUPWIND") && !ctl.sa)
         {
             // Never silently honour-then-ignore: if fvSchemes asked for it, say that upwind is running.
             if (ctl.luK || ctl.luEps)
-                std::fprintf(stderr, "brae WARNING: div(phi,<turbulence scalar>) requested 'linearUpwind' but brae is "
-                             "running UPWIND (cold-start stability guard; the discretisation itself matches OF to "
-                             "1.6e-06). Set BRAE_SCALAR_LINEARUPWIND=1 to honour the requested scheme.\n");
+                std::fprintf(stderr, "brae WARNING: div(phi,k|epsilon|omega) requested 'linearUpwind' but brae is "
+                             "running UPWIND on the TWO-equation models (cold-start guard against a coupled "
+                             "k-omega divergence; the discretisation itself matches OF to 1.6e-06, and SA is "
+                             "unaffected and honours it). Set BRAE_SCALAR_LINEARUPWIND=1 to honour it anyway.\n");
             ctl.luK = false;
             ctl.luEps = false;
         }
@@ -489,18 +502,18 @@ int main(int argc, char** argv)
                     std::filesystem::copy(fieldDir + "/include", outDir + "/include",
                         std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec2);
             }
-            writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, precision);
-            writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, precision);
+            writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, precision, solver.UBoundary());
+            writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, precision, solver.pBoundary());
             if (ctl.sa)   // one-equation: the k slot holds nuTilda
             {
-                writeVolField(wsrc + "nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
-                writeVolField(wsrc + "nut",     outDir + "/nut",     solver.nut(), fvp, precision);
+                writeVolField(wsrc + "nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision, solver.nuTildaBoundary());
+                writeVolField(wsrc + "nut",     outDir + "/nut",     solver.nut(), fvp, precision, solver.nutBoundary());
             }
             else if (ctl.turbulent)
             {
-                writeVolField(wsrc + "k", outDir + "/k", solver.k(), fvp, precision);
-                writeVolField(wsrc + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision);
-                writeVolField(wsrc + "nut", outDir + "/nut", solver.nut(), fvp, precision);
+                writeVolField(wsrc + "k", outDir + "/k", solver.k(), fvp, precision, solver.kBoundary());
+                writeVolField(wsrc + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision, solver.epsBoundary());
+                writeVolField(wsrc + "nut", outDir + "/nut", solver.nut(), fvp, precision, solver.nutBoundary());
                 if (ctl.lm)   // kOmegaSSTLM transition fields
                 {
                     writeVolField(wsrc + "ReThetat", outDir + "/ReThetat", solver.ReThetat(), fvp, precision);

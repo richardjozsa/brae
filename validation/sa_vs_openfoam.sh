@@ -48,12 +48,15 @@ rm -rf "$WORK.brae"; mkdir -p "$WORK.brae"
 cp -r "$TUT"/* "$WORK.brae/"
 cp -rf "$WORK/constant/polyMesh" "$WORK.brae/constant/"
 rm -rf "$WORK.brae/0"; cp -r "$WORK.brae/0.orig" "$WORK.brae/0"
-# airFoil2D asks for `div(phi,nuTilda) bounded Gauss linearUpwind grad(nuTilda)`. The STEADY driver gates
-# turbulence-scalar linearUpwind off by default as a cold-start stability guard (see gpuSimpleFoam.cu), so
-# without this the gate would compare brae-on-upwind against OF-on-linearUpwind and fail for the wrong
-# reason. Measured here: running upwind against this case costs nuTilda 1.67 vs 3.6e-03 -- a factor of 460,
-# which is by far the sharpest evidence yet that the downgrade is expensive on external aero.
-BRAE_SCALAR_LINEARUPWIND=1 "$BUILD/brae" -case "$WORK.brae" > "$WORK.brae/log.brae" 2>&1
+# NO env override here, deliberately: this gate must test the SHIPPED DEFAULT. airFoil2D asks for
+# `div(phi,nuTilda) bounded Gauss linearUpwind grad(nuTilda)`, and brae now honours it for SA. It used to
+# force upwind on every turbulence scalar, so the gate had to set BRAE_SCALAR_LINEARUPWIND=1 to pass --
+# i.e. brae's own default failed its own gate, and the override hid that. Cost of the downgrade, measured
+# here: nuTilda 1.67 upwind vs 3.6e-03 honoured, a factor of 460.
+#
+# SA is exempt from the two-equation guard for a structural reason, not an empirical one: it transports ONE
+# scalar, so the luK=1,luEps=1 state the coupled k-omega divergence requires cannot arise.
+"$BUILD/brae" -case "$WORK.brae" > "$WORK.brae/log.brae" 2>&1
 BRLAST=$(ls -d "$WORK.brae"/[0-9]* | grep -v '/0$' | sort -g | tail -1)
 
 python3 - "$WORK/$OFLAST" "$BRLAST" "$TOL" "$NUTMAX" <<'PY'
@@ -105,8 +108,15 @@ if nt is None:
     print("  FAIL nuTilda not compared -- that is the field this gate is FOR")
     bad += 1
 elif nt > nutmax:
-    print(f"  FAIL nuTilda {nt:.4e} > {nutmax:.0e}: the wall-face diffusivity is likely back to the")
-    print(f"       adjacent-cell value (that produced 3.4e-01 here). See SpalartAllmarasBase.C:381-390.")
+    print(f"  FAIL nuTilda {nt:.4e} > {nutmax:.0e}. Two regressions produce this, and the MAGNITUDE tells")
+    print( "       them apart:")
+    print( "        ~3.4e-01  the laplacian's wall-face diffusivity is back to the adjacent CELL value")
+    print( "                  instead of the patch value (SpalartAllmarasBase.C:381-390 -- DnuTildaEff is a")
+    print( "                  volScalarField, so at a fixedValue-0 SA wall it is nu/sigmaNut).")
+    print( "        ~1.7e+00  div(phi,nuTilda) is running UPWIND against a case asking for linearUpwind,")
+    print( "                  i.e. SA has been caught by the two-equation cold-start guard again. SA must")
+    print( "                  stay exempt: it transports one scalar, so the coupled k-omega failure mode")
+    print( "                  that guard exists for is unreachable (gpuSimpleFoam.cu).")
     bad += 1
 
 print(f"sa_vs_openfoam: {bad} failures over {checked} fields")

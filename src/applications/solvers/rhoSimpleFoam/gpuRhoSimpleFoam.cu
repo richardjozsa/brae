@@ -30,6 +30,10 @@
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with simpleFoam/pimpleFoam)
 #include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include "brae_notice.cuh"   // noticeIgnored/Approximated/Defaulted: never drop an input silently
+#include "start_time.cuh"   // OF startFrom latestTime/firstTime (shared with simpleFoam)
+#include "residual_control.cuh"   // OF simpleControl::criteriaSatisfied (shared with simpleFoam)
+#include "dict_audit.cuh"   // name every dict entry brae read and then ignored
+#include "write_control.cuh"   // OF writeControl/writeInterval/purgeWrite cadence (shared with simpleFoam)
 #include "scheme_parse.cuh"        // parseFvSchemesControls
 #include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
 #include <cstdio>
@@ -56,17 +60,20 @@ int main(int argc, char** argv)
 
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
         const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");
+        // Read here rather than at its point of use so the audit guard below can outlive it -- the guard
+        // holds pointers and must be destroyed BEFORE the dicts it reports on.
+        const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
 
-        const ThermoCoeffs tc = readThermoCoeffs(caseDir);
+        // E5: report on EVERY exit, refusals included. Declared after all three dicts so it is destroyed
+        // first. The two stock tutorials most worth auditing (aerofoilNACA0012, angledDuct) both refuse on
+        // fvOptions, so before this they were the only cases never audited.
+        DictAuditScope audit;
+        audit.add(controlDict, "system/controlDict");
+        audit.add(fvSolution, "system/fvSolution");
+        audit.add(turbProps, "constant/turbulenceProperties");
+
+        const ThermoCoeffs tc = readThermoCoeffs(caseDir, &fvSolution);   // share the dict so dict_audit sees these lookups
         const RhoSimpleControls rc = readRhoSimpleControls(fvSolution, tc.internalEnergy);
-        if (rc.transonic)
-        {
-            throw std::runtime_error(
-                "brae: SIMPLE/transonic yes is not implemented. brae's rhoSimpleFoam is subsonic only "
-                "(the transonic branch adds fvm::div(phid,p), which is not in this build). Running a "
-                "transonic case down the subsonic branch converges to a wrong answer silently, so it is "
-                "refused instead.");
-        }
 
         PrimitiveMesh m;
         m.read(caseDir + "/constant/polyMesh");
@@ -75,7 +82,13 @@ int main(int argc, char** argv)
         const std::vector<FvPatch> fvp = buildPatches(m, g);
         const label nC = m.nCells();
 
-        const std::string t0 = caseDir + "/0";
+        // C6: startFrom was ignored here -- the start directory was hardcoded to "0", so `startFrom
+        // latestTime` (the standard way to CONTINUE a compressible run) silently restarted from scratch
+        // and then converged to a perfectly good answer, having discarded the restart.
+        const std::string t0 = caseDir + "/" + resolveStartTime(
+            caseDir,
+            controlDict.wordOr("startFrom", "startTime"),
+            controlDict.wordOr("startTime", "0"));
         GeometricField<vector> U = buildField<vector>(readField<vector>(t0 + "/U"), fvp, nC);
         GeometricField<scalar> p = buildField<scalar>(readField<scalar>(t0 + "/p"), fvp, nC);
         GeometricField<scalar> T = buildField<scalar>(readField<scalar>(t0 + "/T"), fvp, nC);
@@ -152,12 +165,57 @@ int main(int argc, char** argv)
             ctl.pRefCell = rc.pRefCell;
             ctl.pRefValue = rc.pRefValue;
         }
-        ctl.nu = tc.mu0;                       // replaced every iteration by th_.mu; only the seed matters
+        // ctl.nu is the KINEMATIC viscosity [m^2/s]; tc.mu0 is DYNAMIC [Pa s]. Assigning one to the other
+        // was a units error off by rho -- ~1.2x for air at STP, but rho spans 0.87..1.16 even on the small
+        // heated duct and far more on a real compressible case.
+        //
+        // The old comment said "only the seed matters", and that was true until E5: with `turbulence on`
+        // the per-iteration solve overwrites nut from th_.mu, so the bad seed washes out in one iteration
+        // and no gate could see it. With OF's `RAS { turbulence off; }` the model never runs, so the
+        // startup correctNut IS the answer -- and its F2 (arg2 = max(2*sqrt(k)/(betaStar*omega*y),
+        // 500*nu/(y^2*omega))) then uses mu as nu, activating the Bradshaw limiter where OF leaves it
+        // inactive. Measured on rhoTI with the switch off: 40 inlet-column cells wrong by 75%.
+        //
+        // Seeded from the case's OWN initial state rather than a constant. Still a single scalar where OF
+        // has a field -- validateTurbulence() runs before the thermo is seeded, so a per-cell nu is not
+        // available there. Tracked as E7.
+        {
+            scalar rhoMean = 0.0;
+            for (label i = 0; i < nC; ++i) rhoMean += p.internal[i] / (tc.R * T.internal[i]);
+            rhoMean = (nC > 0) ? rhoMean / static_cast<scalar>(nC) : scalar(1);
+            ctl.nu = tc.mu0 / rhoMean;
+        }
+        // B1: the transonic branch IS implemented below (phid, the phiHbyA subtraction, implicit
+        // fvm::div(phid,p) folded into the pressure matrix, pEqn.relax(), and a BiCGStab solve because the
+        // resulting matrix is not symmetric). It is NOT trusted yet, so it stays behind this refusal.
+        //
+        // Measured, honestly:
+        //   * a low-Mach compressible duct converges in 105 iterations against OF's 104 and agrees to
+        //     p 7.0e-09, T 1.8e-07, U 3.5e-06, rho 1.7e-07 -- but that case does NOT DISCRIMINATE: the
+        //     subsonic branch gives the same answer to 1e-11, so it shows the branch does not BREAK a
+        //     subsonic case, not that it is right.
+        //   * squareBend, the actual tutorial B1 exists for, diverges: contGlobal -2.83e+02 at iteration 1
+        //     and NaN by iteration 50. Root cause not yet established.
+        //
+        // Shipping it on that evidence would be exactly the failure this whole audit is about -- a case
+        // that runs, converges, and is wrong. BRAE_TRANSONIC=1 enables it for continued work.
+        const char* trEnv = std::getenv("BRAE_TRANSONIC");
+        if (rc.transonic && !(trEnv && std::atoi(trEnv) != 0))
+        {
+            throw std::runtime_error(
+                "brae: SIMPLE/transonic yes is implemented but NOT VALIDATED, so it is refused. The "
+                "pressure equation gains an implicit fvm::div(phid,p) (OF rhoSimpleFoam pEqn.H); brae's "
+                "version converges and matches OF on a low-Mach duct but DIVERGES on the squareBend "
+                "tutorial (contGlobal -283 at iteration 1). Running it would converge to a wrong answer on "
+                "some cases and blow up on others. Set BRAE_TRANSONIC=1 to run it anyway for development.");
+        }
+        const_cast<RhoSimpleControls&>(rc).rhoLagsPressure = tc.rhoThermoType;   // heRhoThermo rho timing
+        ctl.transonic = rc.transonic;   // B1: OF pEqn.H transonic branch (guarded above)
         parseFvSchemesControls(caseDir, ctl);
 
         // Turbulence, through the SAME readers simpleFoam and pimpleFoam use, so a compressible case gets
         // exactly the model selection, coefficient set and wall-function guards an incompressible one does.
-        const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
+        // (turbProps itself is read above, next to the other dicts, so the audit guard can hold it.)
         const std::string simType = turbProps.wordOr("simulationType", "laminar");
         if (simType != "RAS" && simType != "laminar")
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' for rhoSimpleFoam (RAS or laminar)");
@@ -286,6 +344,9 @@ int main(int argc, char** argv)
         deviceThermoHeFromT(th, tc);
         deviceThermoUpdate(th, solver.pDevice(), tc);
         deviceRhoSeedPrev(th);
+        // E7: OF validates the turbulence model AFTER the thermo is constructed; brae's solver ctor did it
+        // before, so correctNut ran against a placeholder inlet density. Redo it now that rho is real.
+        solver.revalidateAfterThermo();
 
         // What brae RESOLVED from the case, not what the dict says. A relaxation factor silently left at
         // 1.0 is invisible in the fields and fatal on a stiff case.
@@ -301,40 +362,90 @@ int main(int argc, char** argv)
         std::printf("brae_rhoSimpleFoam: %ld cells, subsonic %s, R=%.3f Cp=%.1f\n",
                     (long)nC, ctl.turbulent ? (ctl.sst ? "kOmegaSST" : "kEpsilon") : "laminar", tc.R, tc.Cp);
 
+        // C5: SIMPLE residualControl. The compressible driver had none at all -- it always ran to endTime,
+        // so a case asking to stop at p 1e-4 burned every remaining iteration and, more importantly, brae
+        // reported a different iteration count than OF for the same input while claiming to run the same
+        // case. OF's rule (empty dict never converges; `achieved && checked`) lives in the shared
+        // ResidualControl, and its dict lookup is regex-aware, which matters here: every stock tutorial
+        // writes its turbulence criteria as a pattern, e.g. `"(k|omega|e)" 1e-4`.
+        const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
+        ResidualControl resControl(simpleDict ? simpleDict->subDict("residualControl") : nullptr);
+        // OF names the energy field by the case's own energy variable; the solve reports it as "he".
+        const std::string heName = tc.internalEnergy ? "e" : "h";
+        std::printf("  residualControl=%s\n", resControl.active() ? "on" : "off");
+
+        // OF controlDict write cadence. dict_audit found that this driver read NONE of writeControl /
+        // writeInterval / purgeWrite / deltaT / stopAt: it wrote exactly one time directory, at the end,
+        // so a case asking to write every N iterations silently got nothing until convergence. The policy
+        // is shared with gpuSimpleFoam (write_control.cuh); only the payload below is solver-specific.
+        WriteControl wc(controlDict);
+        const std::string wsrc = t0 + "/";
+        auto writeTimeDir = [&](const std::string& tname)
+        {
+            const std::string outDir = caseDir + "/" + tname;
+            std::filesystem::create_directories(outDir);
+            writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, 12, solver.UBoundary());
+            writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, 12, solver.pBoundary());
+            {
+                std::vector<scalar> Tout(nC);
+                th.T.copyTo(Tout);
+                writeVolField(wsrc + "T", outDir + "/T", Tout, fvp, 12, solver.TBoundary());
+            }
+            {
+                // rho, so the gate can compare the EOS result directly rather than inferring it from p and T.
+                // 0/T is only a TEMPLATE for the FoamFile header here -- the identity, the dimensions and every
+                // boundary entry are declared, not inherited. Written from T alone, rho came out as `object T`,
+                // dimensions of temperature, an inlet density of 300 and (once B5 landed) a fixedGradient
+                // density of 20000 kg/m^4, all of which OF reads back without complaint.
+                static const DerivedFieldSpec rhoSpec{"rho", "dimensions      [1 -3 0 0 0 0 0];"};
+                std::vector<scalar> rhoOut(nC);
+                th.rho.copyTo(rhoOut);
+                writeVolField(wsrc + "T", outDir + "/rho", rhoOut, fvp, 12, solver.rhoBoundary(), &rhoSpec);
+            }
+            if (ctl.turbulent)
+            {
+                writeVolField(wsrc + "k", outDir + "/k", solver.k(), fvp, 12, solver.kBoundary());
+                // the 2nd turbulence scalar shares one slot: omega on kOmegaSST, epsilon on kEpsilon
+                writeVolField(wsrc + second, outDir + "/" + second, solver.eps(), fvp, 12, solver.epsBoundary());
+                writeVolField(wsrc + "nut", outDir + "/nut", solver.nut(), fvp, 12, solver.nutBoundary());
+            }
+            std::printf("written %s/{U,p,T,rho%s}\n", outDir.c_str(),
+                        ctl.turbulent ? (ctl.sst ? ",k,omega,nut" : ",k,epsilon,nut") : "");
+            wc.recordWritten(caseDir, tname);
+        };
+
+        int nIter = endTime;
+        bool converged = false;
         for (int iter = 1; iter <= endTime; ++iter)
         {
+            clearTurbulenceReport();
             const DeviceSimpleResidual r = solver.rhoSimpleStep();
             if (iter % 50 == 0 || iter == 1)
             {
                 std::printf("Time = %d   Ux %.4e  p %.4e  contGlobal %.4e\n",
                             iter, r.Ux, r.p, r.contGlobal);
             }
+            resControl.beginIteration();
+            // U is gated on Ux alone, matching gpuSimpleFoam: brae tracks no solved-directions mask, so the
+            // out-of-plane component of a 2D/empty or wedge case carries a degenerate residual that would
+            // wrongly block convergence on every 2D case.
+            bool achieved = resControl.ok(r.p, "p") && resControl.ok(r.Ux, "U");
+            if (achieved)
+                for (const auto& e : turbulenceReport())
+                    if (!resControl.ok(e.perf.initialResidual, e.field == "he" ? heName : e.field)) { achieved = false; break; }
+            if (resControl.converged(achieved)) { converged = true; nIter = iter; break; }
+            // Intermediate write. Skipped on the last iteration, which the final write below covers.
+            const scalar tval = wc.timeValue(iter);
+            if (iter != endTime && wc.isWriteTime(iter, tval)) writeTimeDir(WriteControl::timeName(tval));
         }
+        std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
+                              : "SIMPLE reached endTime (%d iterations)\n", nIter);
 
-        const std::string outDir = caseDir + "/" + std::to_string(endTime);
-        std::filesystem::create_directories(outDir);
-        const std::string wsrc = t0 + "/";
-        writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, 12);
-        writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, 12, solver.pBoundary());
-        {
-            std::vector<scalar> Tout(nC);
-            th.T.copyTo(Tout);
-            writeVolField(wsrc + "T", outDir + "/T", Tout, fvp, 12, solver.TBoundary());
-        }
-        {
-            // rho, so the gate can compare the EOS result directly rather than inferring it from p and T.
-            std::vector<scalar> rhoOut(nC);
-            th.rho.copyTo(rhoOut);
-            writeVolField(wsrc + "T", outDir + "/rho", rhoOut, fvp, 12);
-        }
-        if (ctl.turbulent)
-        {
-            writeVolField(t0 + "/k",     outDir + "/k",     solver.k(),   fvp, 12, solver.kBoundary());
-            // the 2nd turbulence scalar shares one slot: omega on kOmegaSST, epsilon on kEpsilon
-            writeVolField(t0 + "/" + second, outDir + "/" + second, solver.eps(), fvp, 12, solver.epsBoundary());
-            writeVolField(t0 + "/nut",   outDir + "/nut",   solver.nut(), fvp, 12, solver.nutBoundary());
-        }
-        std::printf("brae_rhoSimpleFoam: wrote %s\n", outDir.c_str());
+        // Always write the final (converged / endTime) state, as OF's writeAndEnd does. Named from the
+        // TIME VALUE, not the iteration count, so a case with deltaT != 1 gets OF's directory names.
+        const std::string finalName = WriteControl::timeName(wc.timeValue(nIter));
+        writeTimeDir(finalName);
+        std::printf("brae_rhoSimpleFoam: wrote %s\n", (caseDir + "/" + finalName).c_str());
         return 0;
     }
     catch (const std::exception& e)

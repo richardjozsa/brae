@@ -71,7 +71,10 @@ void deviceSolveEnergy(
     DeviceAMI* ami = nullptr,
     DeviceCyclic* cyc = nullptr,
     const DeviceBuffer<scalar>* kineticSrc = nullptr,   // V*div(phi,K); see deviceEnergyKineticSource
-    const DeviceBuffer<scalar>* alphaEffBnd = nullptr);   // alphaEff at boundary FACES (OF alphaEff(patchi))
+    const DeviceBuffer<scalar>* alphaEffBnd = nullptr,   // alphaEff at boundary FACES (OF alphaEff(patchi))
+    // cellLimited coefficient of the gradient the he linearUpwind correction uses. OF takes it from the
+    // scheme ARGUMENT (`linearUpwind limited`), so it is not always the grad(e) entry. 0 = unlimited.
+    scalar gradLimitK = 0.0);
 
 // V*div(phi, K) with K = 0.5|U|^2, upwind-interpolated and "bounded" exactly as OF's
 // div(phi,K) bounded Gauss upwind is. OF's rhoSimpleFoam EEqn.H carries this term next to div(phi,he);
@@ -92,7 +95,8 @@ void deviceEnergyKineticSource(
     const DeviceBoundary* dbHe = nullptr,   // grad(K) boundary, for the limitedLinear face value
     bool limited = false,                   // div(phi,K|Ekp) limitedLinear (else upwind)
     scalar twoByk = 2.0,
-    bool linearUpwind = false);             // div(phi,K|Ekp) Gauss linearUpwind (explicit term, so the
+    bool linearUpwind = false,              // div(phi,K|Ekp) Gauss linearUpwind (explicit term, so the
                                             // correction goes straight into the face value)
+    scalar gradLimitK = 0.0);               // cellLimited coeff of grad(K|Ekp); 0 = unlimited
 
 } // namespace brae

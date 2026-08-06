@@ -201,7 +201,10 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             const DeviceBuffer<scalar>* rhoBnd = nullptr,       // compressible: rho at boundary faces
                             const DeviceBuffer<scalar>* nuWallFace = nullptr,  // compressible: nu = mu_b/rho_b per wall face
                             const DeviceBuffer<scalar>* nutBnd = nullptr,      // nut at boundary faces -> patch diffusivity
-                            const DeviceBuffer<scalar>* muBnd = nullptr);      // compressible: mu at boundary faces   // transient fvm::ddt(k)/ddt(eps)
+                            const DeviceBuffer<scalar>* muBnd = nullptr,       // compressible: mu at boundary faces
+                            // OF `grad(k)`/`grad(epsilon)` cellLimited coefficient (0 = unlimited); see the
+                            // kOmegaSST declaration below for why this is distinct from gradULimitK.
+                            scalar gradScalarLimitK = 0.0);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -232,7 +235,12 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<scalar>* nuWallFace = nullptr,   // compressible: nu = mu_b/rho_b per WALL face
                             const DeviceBuffer<scalar>* rhoBnd = nullptr,   // compressible: rho at boundary faces (volumetric flux for divU)
                             const DeviceBuffer<scalar>* nutBnd = nullptr,   // nut at boundary faces -> patch diffusivity
-                            const DeviceBuffer<scalar>* muBnd = nullptr);   // compressible: mu at boundary faces
+                            const DeviceBuffer<scalar>* muBnd = nullptr,   // compressible: mu at boundary faces
+                            // OF `grad(k)`/`grad(omega)` cellLimited coefficient (0 = unlimited). Distinct from
+                            // gradULimitK above, which limits grad(U) for the production term; this one limits the
+                            // TRANSPORTED scalar's own gradient, which feeds its limitedLinear weight, its
+                            // linearUpwind correction and the non-orth laplacian correction.
+                            scalar gradScalarLimitK = 0.0);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,

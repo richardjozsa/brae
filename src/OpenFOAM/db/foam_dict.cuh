@@ -9,6 +9,7 @@
 #include <fstream>
 #include <map>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -49,8 +50,16 @@ struct FoamDict
     std::vector<std::pair<std::string, std::vector<std::string>>> leaves;   // key -> value tokens
     std::vector<std::pair<std::string, FoamDict>>                 subs;     // key -> subdict
 
+    // Every key this dict was ever ASKED for. The point is the complement: a key that is in the file but
+    // never in here is an input brae read off disk and then ignored -- the single failure mode that has
+    // produced almost every defect in this project (present, parsed, never applied). Recorded on the
+    // lookup path itself so it cannot drift from what the code actually consumes; `mutable` because
+    // asking a question about a dict is logically const.
+    mutable std::set<std::string> queried;
+
     const FoamDict* subDict(const std::string& key) const
     {
+        queried.insert(key);
         for (const auto& s : subs)
             if (s.first == key) return &s.second;          // literal wins (duplicates were merged at parse)
         const FoamDict* hit = nullptr;
@@ -59,7 +68,7 @@ struct FoamDict
             if (s.first == key) continue;
             try
             {
-                if (std::regex_match(key, compileFoamRegex(s.first))) hit = &s.second;
+                if (std::regex_match(key, compileFoamRegex(s.first))) { hit = &s.second; queried.insert(s.first); }
             }
             catch (...) {}
         }
@@ -68,6 +77,7 @@ struct FoamDict
     // Regex-aware leaf lookup: literal first, else last matching wildcard key (OF semantics).
     const std::vector<std::string>* find(const std::string& name) const
     {
+        queried.insert(name);
         const std::vector<std::string>* lit = nullptr;      // LAST literal match wins, as in OpenFOAM
         for (const auto& l : leaves)
             if (l.first == name) lit = &l.second;
@@ -78,7 +88,9 @@ struct FoamDict
             if (l.first == name) continue;
             try
             {
-                if (std::regex_match(name, compileFoamRegex(l.first))) hit = &l.second;
+                // A regex key that MATCHED counts as consumed -- `"(k|omega|e)" 1e-4` is one entry
+                // answering three questions, and reporting it unread would be noise, not a gap.
+                if (std::regex_match(name, compileFoamRegex(l.first))) { hit = &l.second; queried.insert(l.first); }
             }
             catch (...) {}
         }

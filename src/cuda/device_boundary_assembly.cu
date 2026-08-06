@@ -20,6 +20,8 @@ void bcValueKernel(
     const scalar* __restrict__ vf,
     const label* __restrict__ fc,
     const scalar* __restrict__ internal,
+    const scalar* __restrict__ rgr,     // fixedGradient g (null/zero elsewhere)
+    const scalar* __restrict__ dcv,
     scalar* __restrict__ value)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -29,8 +31,16 @@ void bcValueKernel(
                                                                                          // face value is the halo-
                                                                                          // interpolated one, injected
                                                                                          // by DeviceHalo::scatterBoundaryValues -- never derived from the local cell.
-    else if (type[i] == 0) value[i] = internal[fc[i]];                                   // extrapolated -> internal cell
-    else if (type[i] == 5) value[i] = (1.0 - vf[i]) * internal[fc[i]] + vf[i] * ref[i];  // mixed (Robin)
+    else if (type[i] == 0) value[i] = internal[fc[i]] + (rgr ? rgr[i] / dcv[i] : scalar(0));   // zeroGradient, or
+                                                                                         // fixedGradient when refGrad
+                                                                                         // is non-zero: OF's
+                                                                                         // patchInternalField + g/deltaCoeffs
+
+    // mixed (Robin). OF evaluate(): lerp(patchInternal + refGrad/dc, refValue, vf)
+    // = (1-vf)*(internal + refGrad/dc) + vf*refValue  (mixedFvPatchField.C:239-247). The refGrad term rides
+    // INSIDE the (1-vf) branch, which is what makes mixedEnergy's refGrad = Cpv*Tw.refGrad() land correctly.
+    else if (type[i] == 5)
+        value[i] = (1.0 - vf[i]) * (internal[fc[i]] + (rgr ? rgr[i] / dcv[i] : scalar(0))) + vf[i] * ref[i];
     else                   value[i] = ref[i];                                            // fixedValue / calculated
 }
 
@@ -47,6 +57,7 @@ void bcLaplacianKernel(
     const scalar* __restrict__ magSf,
     const scalar* __restrict__ gammaCell,
     const label* __restrict__ fc,
+    const scalar* __restrict__ rgr,     // fixedGradient g (null/zero elsewhere)
     scalar* __restrict__ iC,
     scalar* __restrict__ bC)
 {
@@ -56,7 +67,14 @@ void bcLaplacianKernel(
     const scalar pG = gammaCell[fc[i]] * magSf[i];                        // pGamma = gammaf_b * |Sf|
     const scalar w = (type[i] == 1) ? 1.0 : ((type[i] == 5) ? vf[i] : 0.0);
     iC[i] = pG * (-w * dc[i]);
-    bC[i] = -pG * (w * ref[i] * dc[i]);   // gradIC=-vf*dc, gradBC=vf*ref*dc
+    // + the fixedGradient term: OF's gradientBoundaryCoeffs = g, and brae's bC is -pG times OF's, so a
+    // prescribed gradient adds -pG*g. refGrad is 0 on every other BC, so this is a no-op there.
+    // OF gradientBoundaryCoeffs = lerp(refGrad, dc*refValue, vf) = vf*refValue*dc + (1-vf)*refGrad
+    // (mixedFvPatchField.C:302-310). The refGrad weight is (1-vf), NOT 1 -- it is only 1 for
+    // fixedGradient, where vf = 0. Getting that wrong is invisible until a `mixed` patch carries a
+    // non-zero refGradient, which is exactly the mixedEnergy case.
+    const scalar wg = (type[i] == 5) ? (scalar(1) - vf[i]) : scalar(1);
+    bC[i] = -pG * (w * ref[i] * dc[i] + wg * (rgr ? rgr[i] : scalar(0)));
 }
 
 
@@ -70,6 +88,7 @@ void bcLaplacianFaceKernel(
     const scalar* __restrict__ dc,
     const scalar* __restrict__ magSf,
     const scalar* __restrict__ gammaFace,
+    const scalar* __restrict__ rgr,
     scalar* __restrict__ iC,
     scalar* __restrict__ bC)
 {
@@ -78,8 +97,12 @@ void bcLaplacianFaceKernel(
 
     const scalar pG = gammaFace[i] * magSf[i];
     const scalar w = (type[i] == 1) ? 1.0 : ((type[i] == 5) ? vf[i] : 0.0);
+    const scalar wg = (type[i] == 5) ? (scalar(1) - vf[i]) : scalar(1);   // OF's lerp weight on refGrad
     iC[i] = pG * (-w * dc[i]);
-    bC[i] = -pG * (w * ref[i] * dc[i]);
+    // Same fixedGradient source as bcLaplacianKernel. It has to be in BOTH: the energy equation is the
+    // only caller of the face-diffusivity variant, and a heat-flux wall is precisely an energy BC -- so
+    // adding the term to the cell-diffusivity kernel alone leaves the one case B5 exists for unheated.
+    bC[i] = -pG * (w * ref[i] * dc[i] + wg * (rgr ? rgr[i] : scalar(0)));
 }
 
 
@@ -89,6 +112,8 @@ void bcDivKernel(
     const label* __restrict__ type,
     const scalar* __restrict__ ref,
     const scalar* __restrict__ vf,
+    const scalar* __restrict__ rgr,     // fixedGradient g (null/zero elsewhere)
+    const scalar* __restrict__ dcv,
     const scalar* __restrict__ phiB,
     scalar* __restrict__ iC,
     scalar* __restrict__ bC)
@@ -109,7 +134,13 @@ void bcDivKernel(
     // valueInternalCoeffs: fixedValue 0, zeroGradient/calculated 1, mixed 1-vf. valueBoundaryCoeffs: fixedValue ref,
     // mixed vf*ref, else 0.
     const scalar vIC = (type[i] == 1) ? 0.0 : ((type[i] == 5) ? (1.0 - vf[i]) : 1.0);
-    const scalar vBC = (type[i] == 1) ? ref[i] : ((type[i] == 5) ? vf[i] * ref[i] : 0.0);
+    // + fixedGradient: OF's valueBoundaryCoeffs = g/deltaCoeffs (valueInternalCoeffs stays 1, as for
+    // zeroGradient). Zero elsewhere.
+    // OF valueBoundaryCoeffs = lerp(refGrad/dc, refValue, vf) = vf*refValue + (1-vf)*refGrad/dc
+    // (mixedFvPatchField.C:279-290) -- again the (1-vf) weight on the gradient part.
+    const scalar wgv = (type[i] == 5) ? (scalar(1) - vf[i]) : scalar(1);
+    const scalar vBC = ((type[i] == 1) ? ref[i] : ((type[i] == 5) ? vf[i] * ref[i] : 0.0))
+                     + wgv * (rgr ? rgr[i] / dcv[i] : scalar(0));
     iC[i] = phiB[i] * vIC;
     bC[i] = -phiB[i] * vBC;
 }
@@ -134,7 +165,9 @@ void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& interna
 {
     value.resize(db.n);
     bcValueKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
-                                          db.faceCell.data(), internal.data(), value.data());
+                                          db.faceCell.data(), internal.data(),
+                                          db.refGrad.size() ? db.refGrad.data() : nullptr,
+                                          db.deltaCoeffs.data(), value.data());
     cudaCheck(cudaGetLastError(), "bcValue");
 }
 
@@ -148,7 +181,8 @@ void deviceBCLaplacianCoeffsFace(
     iC.resize(db.n);
     bC.resize(db.n);
     bcLaplacianFaceKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
-                                                  db.deltaCoeffs.data(), db.magSf.data(), gammaFace.data(), iC.data(), bC.data());
+                                                  db.deltaCoeffs.data(), db.magSf.data(), gammaFace.data(),
+                                                  db.refGrad.size() ? db.refGrad.data() : nullptr, iC.data(), bC.data());
     cudaCheck(cudaGetLastError(), "bcLaplacianFace");
 }
 
@@ -163,6 +197,7 @@ void deviceBCLaplacianCoeffs(
     bC.resize(db.n);
     bcLaplacianKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                               db.deltaCoeffs.data(), db.magSf.data(), gammaCell.data(), db.faceCell.data(),
+                                              db.refGrad.size() ? db.refGrad.data() : nullptr,
                                               iC.data(), bC.data());
     cudaCheck(cudaGetLastError(), "bcLaplacian");
 }
@@ -177,6 +212,7 @@ void deviceBCDivCoeffs(
     iC.resize(db.n);
     bC.resize(db.n);
     bcDivKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
+                                        db.refGrad.size() ? db.refGrad.data() : nullptr, db.deltaCoeffs.data(),
                                         phiB.data(), iC.data(), bC.data());
     cudaCheck(cudaGetLastError(), "bcDiv");
 }

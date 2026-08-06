@@ -10,13 +10,23 @@
 #include "foam_dict.cuh"
 #include "thermo_types.cuh"
 #include "thermo_model.cuh"   // thermoCv
+#include "foam_constants.cuh"   // foamRR(): OF's DimensionedConstants NA*k
 #include <stdexcept>
 #include <string>
 
 namespace brae {
 
-// Universal gas constant, OpenFOAM's specie::RR [J/(kmol K)]. molWeight is in kg/kmol, so R = RR/W.
-inline constexpr scalar thermoRR = 8314.46261815324;
+// The universal gas constant lives in foam_constants.cuh (foamRR()), resolved at RUNTIME the way OF
+// resolves it: RR = 1e3*NA*k from `DimensionedConstants` in OpenFOAM's etc/controlDict, falling back to
+// OF v2412's own value when that file is not reachable.
+//
+// It was a compile-time constant here, and wrong once already: brae carried the CODATA-2018
+// 8314.46261815324 while OF v2412 computes 8314.47006650545. That 8.958e-07 relative gap propagated to R,
+// psi and rho in every compressible case, and was found as an unexplained 9.06e-07 floor on rho in
+// hf_vs_openfoam that SURVIVED after brae was made to stop at OF's own iteration count -- OF's written rho
+// missed OF's own p/(R*T) by 8.958e-07 while brae's matched its own to 1e-11, which pointed at the constant
+// rather than at convergence. brae's number was the more physically current one, and that is precisely why
+// it was wrong: the contract is to reproduce OpenFOAM.
 
 inline void thermoRequire(
     bool ok,
@@ -32,7 +42,12 @@ inline void thermoRequire(
 }
 
 // Reads the dictionary and fills ThermoCoeffs. Throws on anything outside the supported set.
-inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
+// `fvSolutionIn` lets the caller hand over the fvSolution it ALREADY read. That is not just a saved file
+// read: FoamDict records which keys were queried so dict_audit can name the entries brae ignored, and a
+// second independent readDict of the same file records those lookups on an object nobody audits. rhoMin,
+// rhoMax and relaxationFactors/fields/rho were reported unread for exactly that reason while being read
+// perfectly well here -- an audit that cries wolf is an audit people stop reading.
+inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir, const FoamDict* fvSolutionIn = nullptr)
 {
     const FoamDict dict = readDict(caseDir + "/constant/thermophysicalProperties");
     ThermoCoeffs c;
@@ -76,6 +91,7 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
         energy,
         "sensibleEnthalpy, sensibleInternalEnergy");
     c.internalEnergy = (energy == "sensibleInternalEnergy");
+    c.rhoThermoType  = (type == "heRhoThermo");   // same arithmetic as hePsiThermo, DIFFERENT rho timing
     thermoRequire(
         transport == "sutherland" || transport == "const",
         "transport",
@@ -98,14 +114,20 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
     {
         throw std::runtime_error("brae: mixture.specie.molWeight must be positive.");
     }
-    c.R = thermoRR / W;
+    c.R = foamRR() / W;   // OF's DimensionedConstants when reachable, else thermoRRfallback
 
-    // thermodynamics: hConst wants Cp and the heat of formation
+    // thermodynamics: hConst wants Cp, the heat of formation, and the reference point of the sensible
+    // enthalpy. OF's hConstThermo reads Tref/Href here too (hConstThermo.C:40-41), defaulting Tref to
+    // Tstd and Href to 0 -- and Hs = Cp*(T - Tref) + Href is the he the energy equation transports, so
+    // silently assuming Tref = 0 shifts he by Cp*Tstd (~3.0e5 J/kg for air).
+    c.Tref = foamTstd();
     const FoamDict* thermoDict = mix->subDict("thermodynamics");
     if (thermoDict)
     {
-        c.Cp = thermoDict->scalarOr("Cp", c.Cp);
-        c.Hf = thermoDict->scalarOr("Hf", c.Hf);
+        c.Cp   = thermoDict->scalarOr("Cp", c.Cp);
+        c.Hf   = thermoDict->scalarOr("Hf", c.Hf);
+        c.Tref = thermoDict->scalarOr("Tref", c.Tref);
+        c.Href = thermoDict->scalarOr("Href", c.Href);
     }
 
     // transport: sutherland wants (As, Ts), const wants (mu, Pr). Pr lives here in both cases.
@@ -141,7 +163,8 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir)
 
     // Bounds are a solver control, not a thermo property, so they come from fvSolution when present.
     // Absent, the ThermoCoeffs defaults stand.
-    const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");
+    const FoamDict fvSolutionOwn = fvSolutionIn ? FoamDict{} : readDict(caseDir + "/system/fvSolution");
+    const FoamDict& fvSolution = fvSolutionIn ? *fvSolutionIn : fvSolutionOwn;
     const FoamDict* simple = fvSolution.subDict("SIMPLE");
     if (simple)
     {

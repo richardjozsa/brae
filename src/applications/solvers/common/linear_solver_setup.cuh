@@ -19,6 +19,7 @@
 
 #include "solver_controls.cuh"
 #include "foam_dict.cuh"
+#include "brae_notice.cuh"   // noticeApproximated / noticeIgnored
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -59,6 +60,44 @@ inline void readLinearSolverControls(
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         return s ? s->scalarOr("relTol", 0.0) : 0.0;
     };
+    // E2/E3 (dict_audit): SAY what brae runs when it is not what the case asked for.
+    //
+    // A substituted linear solver is not a wrong answer -- it solves the same linear system to the same
+    // tolerance, so the converged SIMPLE result is unchanged. That is why this notices rather than
+    // refuses, per the rule in brae_notice.cuh. What it DOES change is the iteration count and the cost,
+    // and at a loose per-step relTol (0.01 on p is the SIMPLE norm) two solvers stop at different points,
+    // so the intermediate fields differ. A user comparing brae's "Solving for p" line against OF's has a
+    // right to know the solver is not the one they asked for.
+    //
+    // dict_audit found these unread: solvers/p/solver, solvers/p/smoother, solvers/(U|h|e)/preconditioner.
+    // `gs` says brae took the smoothSolver path for this field, i.e. it HONOURED the request -- in which
+    // case there is nothing to report. Passed explicitly rather than inferred from the label: comparing the
+    // dict's "smoothSolver" against a display string of "smoothSolver(symGaussSeidel)" made brae announce a
+    // substitution on every field it was in fact running exactly as asked. The negative control in
+    // tests/test_solver_notices.cu is what caught that, and it is the reason the test has one.
+    auto noticeSolverChoice = [&](const std::string& f, const char* braeRuns, bool gs)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        if (!s) return;
+        const std::string want = s->wordOr("solver", "");
+        const std::string smoo = s->wordOr("smoother", "");
+        const std::string prec = s->wordOr("preconditioner", "");
+        if (!want.empty() && !gs && want != braeRuns)
+            noticeApproximated("solvers/" + f + " solver",
+                               "case asks '" + want + "', brae runs " + braeRuns +
+                               " (same linear system and tolerance -- iteration count and cost differ)");
+        // A smoother entry only means anything to brae when it actually took the smoothSolver path.
+        if (!smoo.empty() && !gs)
+            noticeIgnored("solvers/" + f + " smoother",
+                          "'" + smoo + "' -- brae is not running a smoothSolver on this field");
+        // brae's Krylov solvers are Jacobi (diagonal) preconditioned throughout; there is no selection.
+        // Reported even on the smoothSolver path is wrong -- a smoothSolver has no preconditioner in OF
+        // either, so the entry would be inert there too.
+        if (!prec.empty() && !gs && prec != "diagonal" && prec != "none")
+            noticeApproximated("solvers/" + f + " preconditioner",
+                               "case asks '" + prec + "', brae preconditions with Jacobi (diagonal)");
+    };
+
     // OF's selection, exactly: solver smoothSolver + a GaussSeidel-family smoother -> brae's symmetric
     // multicolor deviceSymGaussSeidel. Anything else (PBiCG[Stab]/GAMG/...) keeps BiCGStab.
     auto useSymGS = [&](const std::string& f)
@@ -76,6 +115,10 @@ inline void readLinearSolverControls(
     ctl.gsU = useSymGS("U");
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;
+    // p is never the case's choice: brae runs AMG-PCG (Jacobi-PCG on an interface-coupled mesh, where the
+    // Galerkin coarse operator cannot represent the interface edges) whatever the dict says.
+    noticeSolverChoice("p", "AMG-PCG", false);   // p never takes the smoothSolver path
+    noticeSolverChoice("U", "Jacobi-BiCGStab", ctl.gsU);
 
     if (ctl.turbulent)
     {
@@ -85,6 +128,7 @@ inline void readLinearSolverControls(
             ctl.relTolKE = solverRelTol("nuTilda");
             ctl.gsK = useSymGS("nuTilda");
             ctl.gsEps = false;
+            noticeSolverChoice("nuTilda", "Jacobi-BiCGStab", ctl.gsK);
         }
         else
         {
@@ -92,6 +136,8 @@ inline void readLinearSolverControls(
             ctl.relTolKE = std::fmin(solverRelTol("k"), solverRelTol(secondName));
             ctl.gsK = useSymGS("k");
             ctl.gsEps = useSymGS(secondName);
+            noticeSolverChoice("k", "Jacobi-BiCGStab", ctl.gsK);
+            noticeSolverChoice(secondName, "Jacobi-BiCGStab", ctl.gsEps);
         }
     }
 
@@ -133,6 +179,9 @@ inline void readRelaxationFactors(const FoamDict& fvSolution, DeviceSimpleContro
 {
     const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
     const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
+    // B1: the pressure EQUATION relaxation, distinct from the pressure FIELD relaxation in fields{}.
+    // Only the transonic branch relaxes the pEqn, and only when the entry exists (OF fvMatrix::relax()).
+    if (eqs && eqs->found("p")) { ctl.hasRelaxPEqn = true; ctl.relaxPEqn = eqs->scalarOr("p", 1.0); }
     const FoamDict* fld = rf ? rf->subDict("fields") : nullptr;
     // OF accepts BOTH the modern nested {equations{} fields{}} and the legacy FLAT {p ..; U ..;} form. Fall
     // back to the flat keys when a sub-dict is absent, so a legacy case isn't silently left un-relaxed
@@ -193,6 +242,25 @@ inline EnergySolverControls readEnergySolverControls(
     {
         const std::string sm = s->wordOr("smoother", "");
         e.useGS = (sm == "symGaussSeidel" || sm == "GaussSeidel");
+    }
+    // E2/E3: same reporting as the momentum/turbulence fields. The energy entry is usually a REGEX in the
+    // stock tutorials -- `"(U|h|e)" { solver smoothSolver; ... preconditioner DILU; }` -- which is exactly
+    // why dict_audit flagged `solvers/(U|h|e)/preconditioner`: brae read the tolerances out of that entry
+    // and never looked at the preconditioner in it.
+    {
+        const std::string want = s->wordOr("solver", "");
+        const std::string smoo = s->wordOr("smoother", "");
+        const std::string prec = s->wordOr("preconditioner", "");
+        const std::string field = std::string("solvers/") + primary;
+        if (!want.empty() && !e.useGS && want != "Jacobi-BiCGStab")
+            noticeApproximated(field + " solver",
+                               "case asks '" + want + "', brae runs Jacobi-BiCGStab"
+                               " (same linear system and tolerance -- iteration count and cost differ)");
+        if (!smoo.empty() && !e.useGS)
+            noticeIgnored(field + " smoother", "'" + smoo + "' -- brae is not running a smoothSolver on this field");
+        if (!prec.empty() && !e.useGS && prec != "diagonal" && prec != "none")
+            noticeApproximated(field + " preconditioner",
+                               "case asks '" + prec + "', brae preconditions with Jacobi (diagonal)");
     }
     return e;
 }

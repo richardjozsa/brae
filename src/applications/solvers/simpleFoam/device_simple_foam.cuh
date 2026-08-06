@@ -77,6 +77,18 @@ public:
     // motorBike AND pitzDaily, i.e. fully laminar; harmless on attached flows but the seed of divergence on high-Re
     // skewed meshes. kMin_/epsilonMin_/omegaMin_ default to SMALL (= 1e-15), matching the floors used in correct().
     void validateTurbulence();
+    // E7: re-run OF's validate() ONCE the thermo exists, which is where OF does it.
+    //
+    // OF constructs the thermo, THEN the turbulence model, THEN calls validate() -> correctNut(). brae
+    // constructs the solver (validate included) before the compressible driver has seeded the thermo, so
+    // its startup correctNut saw a boundary velocity built from a PLACEHOLDER density: a
+    // flowRateInletVelocity patch falls back to `rhoInlet` until a real rho exists, and on rhoTI that is
+    // 1.0 against a true 1.161, giving an inlet U of 58.85 m/s instead of 50.69 against a uniform internal
+    // 50. The resulting du/dx = 354 makes sqrt(S2) = 500.6 and trips the SST Bradshaw limiter, so
+    // nut/(k/omega) came out 0.2477 where OF has 1 -- predicted to six decimals by that arithmetic before
+    // any code changed. Invisible with `turbulence on` (the next iteration overwrites the seed), and the
+    // answer with `turbulence off`.
+    void revalidateAfterThermo();
     // PIMPLE-foundation composable phase: turbulence transport (k/eps/omega/nuTilda -> nut). Uses only members,
     // so SIMPLE's step() and a future PIMPLE outer loop both call it (once per outer corrector) unchanged.
     void correctTurbulence();
@@ -239,10 +251,31 @@ public:
         for (std::size_t i = 0; i < h.size(); ++i) t[i] = hConstHeToT(h[i], tc_);
         return t;
     }
+    // U on the boundary: each component evaluated against its own descriptor, then recombined. Needed
+    // because a vector BC can be per-component (slip/symmetry set vf = |n_k| per component), so there is
+    // no single scalar evaluation that covers it.
+    std::vector<vector> UBoundary() const
+    {
+        if (!dbU_.comp[0].n) return {};
+        DeviceBuffer<scalar> b0, b1, b2;
+        deviceBCValue(dbU_.comp[0], Uk_[0], b0);
+        deviceBCValue(dbU_.comp[1], Uk_[1], b1);
+        deviceBCValue(dbU_.comp[2], Uk_[2], b2);
+        const std::vector<scalar> h0 = b0.host(), h1 = b1.host(), h2 = b2.host();
+        std::vector<vector> v(h0.size());
+        for (std::size_t i = 0; i < h0.size(); ++i) v[i] = vector{h0[i], h1[i], h2[i]};
+        return v;
+    }
+    // nuTilda shares the k slot on the SA path.
+    std::vector<scalar> nuTildaBoundary() const { return boundaryOf(dbK_, dk_); }
     std::vector<scalar> kBoundary()   const { return boundaryOf(dbK_,   dk_); }
     std::vector<scalar> epsBoundary() const { return boundaryOf(dbEps_, de_); }
     std::vector<scalar> pBoundary()   const { return boundaryOf(dbP_,   dp_); }
     std::vector<scalar> phiBoundary() const { return phiBnd_.host(); }
+    // rho on the boundary -- the EOS result the solve actually used, already maintained per face by the
+    // pressure equation (phiHbyA is rho-weighted with it). Not derivable from the T/p descriptors here,
+    // which is why it needs its own accessor rather than boundaryOf().
+    std::vector<scalar> rhoBoundary() const { return compressible_ ? rhoBnd_.host() : std::vector<scalar>{}; }
 
     // CrankNicolson ddt0 (stored old ddt) persistence -- get/set for seamless restart (the driver writes+reads these).
     bool isCrankNicolson() const { return ddtScheme_ == DdtScheme::CrankNicolson; }
@@ -368,6 +401,15 @@ private:
     scalar eTol_ = 1e-10, eRelTol_ = 0.0;
     bool   eUseGS_ = false;
     DeviceBuffer<scalar> rhoBnd_, muBnd_, nuWallBnd_;
+    // The BOUNDARY half of the solver's own `rho` field -- the one OF relaxes. rhoBnd_ above is
+    // thermo.rho() at the boundary, recomputed fresh from p_b and T_b every time it is asked for, which
+    // is right for everything that reads thermo.rho() (nu(patchi), alphaEff(patchi), the turbulence
+    // model). It is WRONG for `phiHbyA = fvc::interpolate(rho)*fvc::flux(HbyA)`, which reads the solver's
+    // rho field, and that field is assigned once per outer iteration and then relaxed.
+    DeviceBuffer<scalar> rhoBndP_, rhoBndPPrev_;
+    // pEqn.relax() source (D - D0)*p. Absolute, so it is added to bp_ AFTER deviceFoldPressure (which
+    // multiplies divPhi by the cell volume); a member so the fold site can see it.
+    DeviceBuffer<scalar> pRelaxSrc_;
     // flowRateInletVelocity, massFlowRate form: OF recomputes avgU = -mdot/gSum(rho*magSf) every call, so
     // it moves with the solution. frMagSf_ is magSf masked to the flowRate patches (0 elsewhere), making
     // the patch sum a single dot product against the live boundary rho; frN_ holds the outward normals.

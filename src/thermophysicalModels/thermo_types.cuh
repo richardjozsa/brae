@@ -21,7 +21,15 @@ struct ThermoCoeffs
 {
     scalar R = 287.058;      // specific gas constant, R_universal/molWeight  [J/(kg K)]
     scalar Cp = 1005.0;      // heat capacity at constant pressure (hConst)   [J/(kg K)]
-    scalar Hf = 0.0;         // heat of formation; sensibleEnthalpy sets he = Cp*T + Hf
+    scalar Hf = 0.0;         // heat of formation (OF hConstThermo Hc()). It belongs to the ABSOLUTE
+                             // enthalpy Ha = Hs + Hc() only; the he that rhoSimpleFoam transports is the
+                             // SENSIBLE one, so this must NOT appear in hConstTToHe. Kept because it is
+                             // a real dictionary entry and a reader that dropped it would be lying.
+
+    // OF hConstThermo: Hs = Cp*(T - Tref) + Href, both read from the `thermodynamics` sub-dict with
+    // these defaults (hConstThermo.C:40-41 -- `Tref` defaults to Tstd, `Href` to 0).
+    scalar Tref = 298.15;    // reference temperature of the sensible enthalpy  [K]
+    scalar Href = 0.0;       // sensible enthalpy at Tref                       [J/kg]
 
     // energy sensibleInternalEnergy (OF "e") instead of sensibleEnthalpy ("h"). Every stock OF
     // rhoSimpleFoam tutorial uses e, so this is not an exotic option. It changes FOUR things, not one:
@@ -34,6 +42,15 @@ struct ThermoCoeffs
     //
     // Missing the gamma on alphaEff would converge cleanly with a ~40% wrong thermal diffusivity.
     bool   internalEnergy = false;
+    // heRhoThermo vs hePsiThermo. The ARITHMETIC is identical for perfectGas (rho == psi*p), which is why
+    // brae accepts both -- but the TIMING is not, and rhoSimpleFoam depends on it. At the end of
+    // pEqn.H/pcEqn.H OF does `rho = thermo.rho()` with NO thermo.correct(), and that returns:
+    //     psiThermo::rho()  ->  p_*psi_        recomputed with the JUST-SOLVED p
+    //     rhoThermo::rho()  ->  rho_           the STORED field, from before the pressure solve
+    // So a heRhoThermo case carries a rho that lags the pressure by one outer iteration, and a
+    // hePsiThermo case does not. Treating them alike makes rho wrong on every compressible tutorial that
+    // uses heRhoThermo -- squareBend among them.
+    bool   rhoThermoType = false;
     // NOTE: Cv is NOT stored. It is Cp - R by definition (perfectGas::CpMCv = R) and is derived on
     // demand by thermoCv(). A stored copy only has to be filled by one code path to be wrong in every
     // other -- a test or a future caller constructing ThermoCoeffs directly would keep a stale default.

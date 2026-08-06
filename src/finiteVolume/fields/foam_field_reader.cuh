@@ -50,6 +50,23 @@ struct PatchFieldData
     // tangential refValue at zero, so honouring the key would need per-face storage it does not have.
     // Recorded so it can be refused instead of quietly changing the boundary condition.
     bool           hasTangentialVelocity = false;
+    // fixedGradient (and the heat-flux BCs derived from it): the prescribed normal gradient.
+    // Plain `mixed` (Robin) carries refValue + refGradient + valueFraction. refGradient shares the
+    // gradient* slots below; these two are its own. Distinct from inletValue*, which inletOutlet and the
+    // freestream family use for a refValue whose blend the DEVICE recomputes each step.
+    bool           hasRefValue      = false;
+    bool           refValueUniform  = false;
+    T              refValueUniformValue{};
+    std::vector<T> refValues;
+    bool           hasValueFraction = false;
+    bool           vfUniform        = false;
+    scalar         vfUniformValue   = 0;
+    std::vector<scalar> vfValues;
+
+    bool           hasGradient    = false;
+    bool           gradientUniform = false;
+    T              gradientUniformValue{};
+    std::vector<T> gradientValues;
     bool           valueUniform = false;
     T              uniformValue{};
     std::vector<T> values;
@@ -449,6 +466,45 @@ inline FieldData<T> readField(const std::string& path)
                         p.inletUniformValue = p.uniformValue;
                         p.inletValues = p.values;
                         p.hasInletValue = true;
+                        ts.expect(";");
+                    }
+                    // `gradient` is fixedGradient's key, `refGradient` is mixed's. They fill the same slot
+                    // because they mean the same thing to the discretisation -- the difference is the (1-vf)
+                    // weight the kernels apply on a mixed patch (OF mixedFvPatchField.C:279-310).
+                    else if (key == "gradient" || key == "refGradient")
+                    {
+                        readValueOrInternal(ts, fd, p.gradientUniform, p.gradientUniformValue, p.gradientValues);
+                        p.hasGradient = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "refValue" && p.type == "mixed")
+                    {
+                        readValueOrInternal(ts, fd, p.refValueUniform, p.refValueUniformValue, p.refValues);
+                        p.hasRefValue = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "valueFraction")
+                    {
+                        // Always a SCALAR field, even on a vector patch (OF blends component-wise with one
+                        // fraction), so it cannot go through readValueOrInternal<T>.
+                        const std::string w = ts.peek();
+                        if (w == "uniform")
+                        {
+                            ts.next();
+                            p.vfUniform = true;
+                            p.vfUniformValue = std::stod(ts.next());
+                        }
+                        else
+                        {
+                            ts.next();                      // nonuniform
+                            if (ts.peek() == "List<scalar>") ts.next();
+                            const int n = std::stoi(ts.next());
+                            ts.expect("(");
+                            p.vfValues.resize(static_cast<std::size_t>(n));
+                            for (int i = 0; i < n; ++i) p.vfValues[static_cast<std::size_t>(i)] = std::stod(ts.next());
+                            ts.expect(")");
+                        }
+                        p.hasValueFraction = true;
                         ts.expect(";");
                     }
                     else if (key == "tangentialVelocity")   // pressureInletOutletVelocity, optional

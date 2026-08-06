@@ -548,7 +548,7 @@ add_dependencies(brae brae_pimpleFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
-# slow-labelled (~2 min); regenerate the oracle with validation/komegasstlm_wall_vs_openfoam.sh.
+# slow-labelled (~2 min); regenerate the oracle with validation/legacy_cf/komegasstlm_wall_vs_openfoam.sh -- QUARANTINED (D5): it's still on retired cf paths and cannot run as-is.
 add_test(NAME komegasstlm_flatplate
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/validation/lm_ctest.sh
                  $<TARGET_FILE:brae> ${CMAKE_CURRENT_SOURCE_DIR}/validation/lmFlatPlate)
@@ -710,9 +710,74 @@ set_tests_properties(rhoE_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 600)
 
+# E1 (dict_audit finding): OF controlDict write cadence on the compressible driver. Found by the audit --
+# gpuRhoSimpleFoam read NONE of writeControl/writeInterval/purgeWrite/deltaT and wrote one time directory.
+add_test(NAME wc_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/wc_vs_openfoam.sh)
+set_tests_properties(wc_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# E5b (dict_audit, found only once the audit ran on REFUSED cases): OF RAS { turbulence off; } freezes the
+# model -- k/epsilon|omega/nut keep their initial values and momentum uses that frozen nut.
+add_test(NAME turbswitch_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/turbswitch_vs_openfoam.sh)
+set_tests_properties(turbswitch_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# mixedEnergy: a  (Robin) T wall -- the third of OF's three energy BC families, and the only one
+# that exercises OF's (1-vf) weight on refGrad.
+add_test(NAME mx_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/mx_vs_openfoam.sh)
+set_tests_properties(mx_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# heRhoThermo vs hePsiThermo rho TIMING at the end of pEqn.H. Compared at iteration 1, because the effect
+# IS a one-iteration lag and a low-Mach case cannot distinguish the two.
+add_test(NAME rhotiming_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhotiming_vs_openfoam.sh)
+set_tests_properties(rhotiming_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# B5: heat-flux wall (fixedGradient T). The compressible gates above all use fixedValue T walls, which
+# exercise only the fixedEnergy half of basicThermo::heBoundaryTypes(); a fixedGradient T was read and then
+# silently discretised as zeroGradient, i.e. an adiabatic wall that converged to a plausible wrong answer.
+# Also the only gate that asserts OpenFOAM can PARSE what brae writes.
+add_test(NAME hf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/hf_vs_openfoam.sh)
+set_tests_properties(hf_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
 # rhoSimpleFoam phase 4 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam, kOmegaSST heated duct.
 # Compares seven fields (T p U k omega nut rho) -- the compressible turbulence coupling is the kind that
 # converges cleanly while being wrong, so residuals prove nothing here. Skipped (77) without an OF install.
+# aerofoilNACA0012 to CONVERGENCE vs OF. Slow (~700 outer iterations on both sides) and labelled so.
+# It is the only gate that can catch a defect living in the pressure equation's net mass balance rather
+# than in a field norm: the pinned-pressure bug reached endTime with every iteration-2 stage agreeing to
+# 1e-3. See the header of the script, and cudafoam/solver-porting-dissection.md for how it was found.
+add_test(NAME naca_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/naca_vs_openfoam.sh)
+set_tests_properties(naca_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     LABELS slow
+                     TIMEOUT 3600)
+
 add_test(NAME sst_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/sst_vs_openfoam.sh)
 set_tests_properties(sst_vs_openfoam PROPERTIES
@@ -824,6 +889,43 @@ target_include_directories(test_linear_solver_setup PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_linear_solver_setup PRIVATE brae_core)
 add_test(NAME linear_solver_setup COMMAND test_linear_solver_setup)
 
+# D2: boundary coefficients (internalCoeffs/boundaryCoeffs) vs OF across four REAL BC types at once.
+add_test(NAME bc_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/bc_vs_openfoam.sh)
+set_tests_properties(bc_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS bcoeff_compare
+                     TIMEOUT 600)
+
+# D5: every validation/*_vs_openfoam.sh must be registered, runnable and asserting. 27 were none of those.
+add_executable(test_gate_registration tests/test_gate_registration.cu)
+target_include_directories(test_gate_registration PRIVATE ${BRAE_HEADER_DIRS})
+add_test(NAME gate_registration COMMAND test_gate_registration ${CMAKE_CURRENT_SOURCE_DIR})
+
+# E6: the universal gas constant must be RESOLVED like OF (DimensionedConstants NA*k), not compiled in.
+add_executable(test_sensible_energy tests/test_sensible_energy.cu)
+target_include_directories(test_sensible_energy PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_sensible_energy PRIVATE brae_core)
+add_test(NAME sensible_energy COMMAND test_sensible_energy)
+
+add_executable(test_foam_constants tests/test_foam_constants.cu)
+target_include_directories(test_foam_constants PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_foam_constants PRIVATE brae_core)
+add_test(NAME foam_constants COMMAND test_foam_constants)
+
+# E2/E3 (dict_audit): brae must SAY when it substitutes its own linear solver / preconditioner.
+add_executable(test_solver_notices tests/test_solver_notices.cu)
+target_include_directories(test_solver_notices PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_solver_notices PRIVATE brae_core)
+add_test(NAME solver_notices COMMAND test_solver_notices)
+
+# Group C: fvSchemes entries must resolve within their own sub-dictionary (C1-C4).
+add_executable(test_scheme_blocks tests/test_scheme_blocks.cu)
+target_include_directories(test_scheme_blocks PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_scheme_blocks PRIVATE brae_core)
+add_test(NAME scheme_blocks COMMAND test_scheme_blocks)
+
 add_executable(test_residual_control tests/test_residual_control.cu)
 target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_residual_control PRIVATE brae_core)
@@ -843,6 +945,17 @@ add_test(NAME overset_refused
 # diag_compare: DIAGNOSTIC, not a test. Assembles the same scalar equation as the OpenFOAM utility
 # in tools/dumpScalarMatrix and compares the matrix cell by cell. Needs OF's Ddiag/Dsource in the case,
 # so it is built but never registered with ctest.
+# D2: boundary coefficients (internalCoeffs/boundaryCoeffs) vs OF for REAL BC types. D1 compared only the
+# diagonal and source, and only with fixedValue/zeroGradient.
+# Phase 0 stage harness: compare one SIMPLE stage brae-vs-OF in dependency order.
+add_executable(stage_compare tests/stage_compare.cu)
+target_include_directories(stage_compare PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(stage_compare PRIVATE brae_core)
+
+add_executable(bcoeff_compare tests/bcoeff_compare.cu)
+target_include_directories(bcoeff_compare PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(bcoeff_compare PRIVATE brae_core)
+
 add_executable(diag_compare tests/diag_compare.cu)
 target_include_directories(diag_compare PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(diag_compare PRIVATE brae_core)

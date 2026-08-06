@@ -17,10 +17,23 @@ namespace brae {
 
 // he,p -> T,rho,psi,mu,alpha. Bounds rho and p, because a diverging pressure iterate drives rho negative
 // long before the residuals show anything wrong, and a negative rho poisons the next momentum solve.
+// rho = rhoPrev + relaxRho*(rho - rhoPrev) on an arbitrary buffer pair -- the BOUNDARY half of the
+// solver's rho field. See the .cu for why it must exist.
+void deviceRhoRelaxBuffer(
+    DeviceBuffer<scalar>& rho,
+    DeviceBuffer<scalar>& rhoPrev,
+    const ThermoCoeffs& c);
+
 void deviceThermoUpdate(
     DeviceThermo& th,
     const DeviceBuffer<scalar>& p,
-    const ThermoCoeffs& c);
+    const ThermoCoeffs& c,
+    // OF's thermo.correct() updates T, psi, mu and alpha and NOTHING ELSE. The solver's `rho` is a
+    // SEPARATE volScalarField (createFields.H) that rhoSimpleFoam assigns only at the end of
+    // pEqn.H -- `rho = thermo.rho(); rho.relax();` -- so it carries that relaxation into the next
+    // outer iteration. Pass false wherever OF calls thermo.correct(), so this stays a thermo update
+    // and does not silently double as a rho update that throws the relaxation away.
+    bool updateRho = true);
 
 // Laminar DYNAMIC viscosity AT BOUNDARY FACES, mu_b = Sutherland(T_b) -- OF transport_.mu(patchi).
 //
