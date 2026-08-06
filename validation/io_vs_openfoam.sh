@@ -114,20 +114,19 @@ if ofT is None or brT is None:
 else:
     ofMean = sum(ofT)/len(ofT)
     brMean = sum(brT)/len(brT)
-    # INFORMATIONAL ONLY -- deliberately not an assertion. brae writes a field's boundaryField as a
-    # pass-through of the INPUT file's boundary entry rather than the value it computed, so the written
-    # outlet T reads 300 K (the input `value`) whether or not the solve is correct. That is a separate,
-    # real defect (it affects every field's written boundary, and was first caught on nut), tracked in
-    # docs/rhosimplefoam-findings.md -- but asserting on it here would make this gate fail for the wrong
-    # reason and mask the thing it exists to catch.
-    #
-    # The internal fields are the strong witness anyway: reverting the dbHe_ inletOutlet update takes T
-    # from 2.7e-07 to 2.8e+00 against OpenFOAM, a factor of ten million, so the tolerance above cannot be
-    # satisfied by accident.
-    print(f"  (info) outlet T: OF mean {ofMean:.2f} K   brae WRITTEN mean {brMean:.2f} K   inletValue 300 K")
+    # Now an ASSERTION. This was informational while brae echoed the INPUT boundaryField instead of the
+    # values it computed -- the written outlet T read 300 K (the input `value`) whether the solve was right
+    # or not, so asserting on it would have failed for the wrong reason. The writer now emits the SOLVED
+    # boundary, so the written outlet T must track OpenFOAM's.
+    print(f"  outlet T: OF mean {ofMean:.2f} K   brae mean {brMean:.2f} K   inletValue 300 K")
+    if abs(brMean - ofMean) > 0.5:
+        print(f"  FAIL written outlet T differs from OpenFOAM by {abs(brMean-ofMean):.2f} K")
+        bad += 1
     if abs(brMean - 300.0) < 1e-9:
-        print( "  (info) brae's WRITTEN outlet T equals inletValue -- expected, the boundary writer is a")
-        print( "         pass-through of the input entry. Judge this gate on the internal fields above.")
+        print( "  FAIL the written outlet T is exactly inletValue -- either the inletOutlet mask on the")
+        print( "       ENERGY boundary is unresolved again, or the writer is back to echoing the input")
+        print( "       boundaryField instead of the computed one (foam_field_writer.cuh).")
+        bad += 1
 
 if checked < 3:
     print(f"  FAIL only {checked} fields compared -- the gate is not testing what it claims")

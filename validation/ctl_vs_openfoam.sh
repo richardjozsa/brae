@@ -59,12 +59,16 @@ import re, sys, math
 ofd, brd, tol = sys.argv[1], sys.argv[2], float(sys.argv[3])
 
 def rd(path):
+    # NOTE: non-greedy and anchored on `boundaryField`. The greedy form matched to the LAST ')' in
+    # the file, which was harmless only while boundary values were written as `uniform <x>`. Once the
+    # writer began emitting the SOLVED boundary as `nonuniform List<...>( ... )`, the greedy match
+    # swallowed the boundary values into the internal field and three gates failed on a correct solve.
     """Internal field as a flat list. Handles scalars and (x y z) vectors alike."""
     try:
         t = open(path).read()
     except OSError:
         return None
-    m = re.search(r'internalField\s+nonuniform[^(]*\((.*)\)\s*;', t, re.S)
+    m = re.search(r'internalField\s+nonuniform[^(]*\((.*?)\)\s*;\s*boundaryField', t, re.S)
     if not m:
         return None
     return [float(x) for x in re.findall(r'-?\d+\.?\d*[eE]?[-+]?\d*', m.group(1).replace('(', ' ').replace(')', ' '))]

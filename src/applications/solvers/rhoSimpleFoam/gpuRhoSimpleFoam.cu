@@ -97,10 +97,18 @@ int main(int argc, char** argv)
             RhoSimpleControls& rcm = const_cast<RhoSimpleControls&>(rc);
             if (rcm.pMaxFactor > 0.0 || rcm.pMinFactor > 0.0)
             {
+                // OF scans ONLY the patches that FIX a value (pressureControl.C:75-77:
+                // `if (pbf[patchi].fixesValue())`), because pMaxFactor/pMinFactor scale a KNOWN reference
+                // pressure -- a zeroGradient or calculated patch carries whatever the field currently
+                // holds there, which is not a reference at all. brae scanned every patch, so on a case
+                // with a non-uniform initial p the zeroGradient patches dragged the reference and the
+                // limits came out different from OF's. Identical on a uniform initial p, which is why
+                // every gate agreed.
                 scalar pRefMax = -1e300;
                 scalar pRefMin = 1e300;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
+                    if (!p.boundary[pi]->fixesValue()) continue;
                     const std::vector<scalar>& bv = p.boundary[pi]->value();
                     for (scalar v : bv)
                     {
@@ -111,8 +119,10 @@ int main(int argc, char** argv)
                 if (pRefMax <= -1e299)
                 {
                     throw std::runtime_error(
-                        "brae: SIMPLE/pMaxFactor or pMinFactor given, but no boundary pressure to scale "
-                        "them against. Specify absolute pMax/pMin instead (OF refuses the same case).");
+                        "brae: SIMPLE/pMaxFactor or pMinFactor given, but NO pressure patch fixes a value, "
+                        "so there is no reference pressure to scale. OpenFOAM refuses the same case "
+                        "(pressureControl.C: \"pressure limits are not set\"). Specify absolute pMax/pMin "
+                        "instead, or give the case a fixedValue pressure patch.");
                 }
                 if (rcm.pMaxFactor > 0.0) { rcm.pMaxLimit = pRefMax * rcm.pMaxFactor; rcm.limitMaxP = true; }
                 if (rcm.pMinFactor > 0.0) { rcm.pMinLimit = pRefMin * rcm.pMinFactor; rcm.limitMinP = true; }
@@ -305,11 +315,11 @@ int main(int argc, char** argv)
         std::filesystem::create_directories(outDir);
         const std::string wsrc = t0 + "/";
         writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, 12);
-        writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, 12);
+        writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, 12, solver.pBoundary());
         {
             std::vector<scalar> Tout(nC);
             th.T.copyTo(Tout);
-            writeVolField(wsrc + "T", outDir + "/T", Tout, fvp, 12);
+            writeVolField(wsrc + "T", outDir + "/T", Tout, fvp, 12, solver.TBoundary());
         }
         {
             // rho, so the gate can compare the EOS result directly rather than inferring it from p and T.
@@ -319,10 +329,10 @@ int main(int argc, char** argv)
         }
         if (ctl.turbulent)
         {
-            writeVolField(t0 + "/k",     outDir + "/k",     solver.k(),   fvp, 12);
+            writeVolField(t0 + "/k",     outDir + "/k",     solver.k(),   fvp, 12, solver.kBoundary());
             // the 2nd turbulence scalar shares one slot: omega on kOmegaSST, epsilon on kEpsilon
-            writeVolField(t0 + "/" + second, outDir + "/" + second, solver.eps(), fvp, 12);
-            writeVolField(t0 + "/nut",   outDir + "/nut",   solver.nut(), fvp, 12);
+            writeVolField(t0 + "/" + second, outDir + "/" + second, solver.eps(), fvp, 12, solver.epsBoundary());
+            writeVolField(t0 + "/nut",   outDir + "/nut",   solver.nut(), fvp, 12, solver.nutBoundary());
         }
         std::printf("brae_rhoSimpleFoam: wrote %s\n", outDir.c_str());
         return 0;

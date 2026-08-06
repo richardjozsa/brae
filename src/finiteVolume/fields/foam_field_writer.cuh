@@ -58,7 +58,9 @@ template <typename T>
 inline void writePatchEntry(
     std::ostream& os,
     const std::string& name,
-    const PatchFieldData<T>& d)
+    const PatchFieldData<T>& d,
+    const T* computed = nullptr,     // solver's boundary values for this patch, or null to echo the input
+    std::size_t nComputed = 0)
 {
     os << "    " << name << "\n    {\n";
     os << "        type            " << (d.type.empty() ? "zeroGradient" : d.type) << ";\n";
@@ -67,7 +69,18 @@ inline void writePatchEntry(
         os << "        inletValue      ";
         writeFieldValue(os, d.inletUniform, d.inletUniformValue, d.inletValues);
     }
-    if (d.hasValue)
+    if (computed && nComputed)
+    {
+        // The SOLVED boundary values, not the ones the case was started from. Echoing the input made
+        // every written boundaryField stale: a wall nut computed by the wall function was reported as
+        // whatever 0/nut happened to say, so anything post-processing brae's output (yPlus, wall shear,
+        // force decomposition, a restart) read a value the solve never used.
+        os << "        value           nonuniform List<" << foamListType(T{}) << "> \n"
+           << nComputed << "\n(\n";
+        for (std::size_t i = 0; i < nComputed; ++i) { formatFoamValue(os, computed[i]); os << '\n'; }
+        os << ")\n;\n";
+    }
+    else if (d.hasValue)
     {
         os << "        value           ";
         writeFieldValue(os, d.valueUniform, d.uniformValue, d.values);
@@ -82,7 +95,10 @@ inline void writeVolField(
     const std::string& outPath,
     const std::vector<T>& values,
     const std::vector<Patch>& patches,
-    int precision = 16)
+    int precision = 16,
+    // Flat boundary values in patch order, EXCLUDING cyclic/cyclicAMI -- the same flattening
+    // DeviceBoundary uses, so a solver buffer can be handed over unchanged. Empty -> echo the input.
+    const std::vector<T>& computedBoundary = {})
 {
     std::ifstream in(origPath);
     if (!in) throw std::runtime_error("writeVolField: cannot read " + origPath);
@@ -126,6 +142,7 @@ inline void writeVolField(
     }
     out << ")\n;\n\n";
     out << "boundaryField\n{\n";
+    std::size_t bndOff = 0;   // index into computedBoundary (coupled patches excluded)
     for (const Patch& p : patches)   // per mesh patch, matched like buildField
     {
         const PatchFieldData<T>* d = nullptr;
@@ -170,7 +187,14 @@ inline void writeVolField(
             synth.type = isConstraintPatchType(p.type) ? p.type : "zeroGradient";
             d = &synth;
         }
-        writePatchEntry(out, p.name, *d);
+        const bool coupled = (p.type == "cyclic" || p.type == "cyclicAMI");
+        const bool haveComputed = !computedBoundary.empty() && !coupled && p.size > 0
+                               && bndOff + static_cast<std::size_t>(p.size) <= computedBoundary.size()
+                               && p.type != "empty";
+        writePatchEntry(out, p.name, *d,
+                        haveComputed ? &computedBoundary[bndOff] : nullptr,
+                        haveComputed ? static_cast<std::size_t>(p.size) : 0);
+        if (!coupled) bndOff += static_cast<std::size_t>(p.size);
     }
     out << "}\n\n\n// ************************************************************************* //\n";
 }
@@ -233,7 +257,10 @@ inline void writeVolFieldRaw(
     const std::string& dims,
     const std::vector<T>& values,
     const std::vector<Patch>& patches,
-    int precision = 16)
+    int precision = 16,
+    // Flat boundary values in patch order, EXCLUDING cyclic/cyclicAMI -- the same flattening
+    // DeviceBoundary uses, so a solver buffer can be handed over unchanged. Empty -> echo the input.
+    const std::vector<T>& computedBoundary = {})
 {
     std::ofstream out(outPath);
     if (!out) throw std::runtime_error("writeVolFieldRaw: cannot write " + outPath);

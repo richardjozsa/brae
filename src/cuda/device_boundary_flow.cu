@@ -46,6 +46,12 @@ void mixedUpdateKernel(
     const scalar* __restrict__ Ux,
     const scalar* __restrict__ Uy,
     const scalar* __restrict__ Uz,
+    const scalar* __restrict__ Ub0,     // EVALUATED patch velocity (OF's `Up`), not the cell value
+    const scalar* __restrict__ Ub1,
+    const scalar* __restrict__ Ub2,
+    const scalar* __restrict__ nx,      // unit face normal
+    const scalar* __restrict__ ny,
+    const scalar* __restrict__ nz,
     scalar* __restrict__ vfU0,
     scalar* __restrict__ vfU1,
     scalar* __restrict__ vfU2,
@@ -56,15 +62,20 @@ void mixedUpdateKernel(
 
     const bool mu = maskU[i], mp = maskP[i];
     if (!mu && !mp) return;
-    const int c = fc[i];
-    const scalar mU = sqrt(Ux[c] * Ux[c] + Uy[c] * Uy[c] + Uz[c] * Uz[c]);   // local |U| (adjacent cell)
-    // OF: valueFraction = 0.5 +/- 0.5*(U_b & nf)/mag(U_b). U.n must be the VOLUMETRIC normal velocity.
-    // phiB is the mass flux on the compressible path, so it has to be divided by rho_b first -- otherwise
-    // ct carries a spurious factor of rho, and since ct is clamped to [-1,1] it SATURATES, collapsing OF's
-    // continuous Robin blend into a binary switch that pins the far field.
-    const scalar rw = rhoBnd ? rhoBnd[i] : scalar(1);
-    scalar ct = (phiB[i] / (rw * magSf[i])) / fmax(mU, 1e-30);                // (U.n)/|U|
-    ct = fmin(fmax(ct, -1.0), 1.0);
+    // OF, exactly:
+    //   freestreamVelocity  valueFraction = 0.5 - 0.5*(Up & nf)/mag(Up)   (…VelocityFvPatchVectorField.C:106)
+    //   freestreamPressure  valueFraction = 0.5 + 0.5*(Up & nf)/mag(Up)   (…PressureFvPatchScalarField.C:119)
+    // where Up is the PATCH velocity -- the same vector in both the dot product and the magnitude, so the
+    // ratio is a genuine direction cosine in [-1,1].
+    //
+    // brae previously formed it from mixed quantities: the normal component came from the face FLUX and
+    // the magnitude from the ADJACENT CELL speed. Those disagree wherever the patch and cell velocities
+    // differ, so the ratio was not a cosine, needed clamping to stay in range, and drifted from OF's
+    // continuous Robin blend at exactly the angles the blend exists to handle.
+    const scalar ubx = Ub0[i], uby = Ub1[i], ubz = Ub2[i];
+    const scalar mUb = sqrt(ubx*ubx + uby*uby + ubz*ubz);
+    scalar ct = (ubx*nx[i] + uby*ny[i] + ubz*nz[i]) / fmax(mUb, 1e-30);
+    ct = fmin(fmax(ct, -1.0), 1.0);   // |cos| <= 1 analytically; the clamp is only against roundoff now
     if (mu)   // velocity sign
     {
         const scalar vfu = 0.5 - 0.5 * ct;
@@ -291,10 +302,18 @@ void deviceUpdateMixedFreestream(
 {
     const int n = dbP.n;
     if (n == 0) return;
+    // OF's `Up` is the patch field's CURRENT value, i.e. the previous evaluate -- so evaluating here with
+    // the existing valueFraction before overwriting it is the same lag OF has.
+    DeviceBuffer<scalar> ub0, ub1, ub2;
+    deviceBCValue(dbU.comp[0], Ux, ub0);
+    deviceBCValue(dbU.comp[1], Uy, ub1);
+    deviceBCValue(dbU.comp[2], Uz, ub2);
     mixedUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].mixedMask.data(), dbP.mixedMask.data(), dbP.faceCell.data(),
                                            phiBnd.data(), dbP.magSf.data(),
                                            (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr,
                                            Ux.data(), Uy.data(), Uz.data(),
+                                           ub0.data(), ub1.data(), ub2.data(),
+                                           dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
                                            dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
                                            dbU.comp[2].valueFraction.data(), dbP.valueFraction.data());
     cudaCheck(cudaGetLastError(), "mixedUpdate");

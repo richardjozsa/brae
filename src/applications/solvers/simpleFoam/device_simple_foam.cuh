@@ -20,6 +20,7 @@
 #include "device_mesh.cuh"
 #include "device_ldu.cuh"
 #include "device_blas.cuh"
+#include "thermo_model.cuh"   // hConstHeToT: boundary he -> boundary T for the written field
 #include "device_pcg.cuh"
 #include "device_simple.cuh"
 #include "device_boundary.cuh"
@@ -212,6 +213,35 @@ public:
     std::vector<scalar> cellY() const { return y_.size() ? y_.host() : std::vector<scalar>(); }   // cell wall distance (SST/SA)
     // diagnostics: the conservative face flux (internal then boundary) for continuity-error localisation.
     std::vector<scalar> phiInternal() const { return phiInt_.host(); }
+    // The SOLVED boundary values, so the written boundaryField reports what the solve used rather than
+    // echoing the input file. nut is the one that matters most: on a wall its value comes from the wall
+    // function, and post-processing (yPlus, wall shear, force split) reads it straight back.
+    std::vector<scalar> nutBoundary() const
+    {
+        return nutBndAll_.size() ? nutBndAll_.host() : std::vector<scalar>();
+    }
+    // Generic: evaluate any cell field on its own boundary descriptor.
+    std::vector<scalar> boundaryOf(const DeviceBoundary& db, const DeviceBuffer<scalar>& f) const
+    {
+        if (!db.n || !f.size()) return {};
+        DeviceBuffer<scalar> b;
+        deviceBCValue(db, f, b);
+        return b.host();
+    }
+    // T on the boundary. he is the solved variable, so the boundary T is T(he_b) -- evaluating he's own
+    // BC (which now resolves inletOutlet per iteration) and converting, rather than echoing 0/T.
+    std::vector<scalar> TBoundary() const
+    {
+        if (!compressible_ || !dbHe_.n || !th_.he.size()) return {};
+        DeviceBuffer<scalar> heB;
+        deviceBCValue(dbHe_, th_.he, heB);
+        std::vector<scalar> h = heB.host(), t(h.size());
+        for (std::size_t i = 0; i < h.size(); ++i) t[i] = hConstHeToT(h[i], tc_);
+        return t;
+    }
+    std::vector<scalar> kBoundary()   const { return boundaryOf(dbK_,   dk_); }
+    std::vector<scalar> epsBoundary() const { return boundaryOf(dbEps_, de_); }
+    std::vector<scalar> pBoundary()   const { return boundaryOf(dbP_,   dp_); }
     std::vector<scalar> phiBoundary() const { return phiBnd_.host(); }
 
     // CrankNicolson ddt0 (stored old ddt) persistence -- get/set for seamless restart (the driver writes+reads these).
