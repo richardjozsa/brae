@@ -549,6 +549,13 @@ namespace brae {
                 deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
                 addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
+            else if (ctl_.nutWall == NutWall::NutU)   // nutUWallFunction (log-law yPlus, stepwise blend)
+            {
+                deviceBoundaryNutU(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                                   ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
+                                   compressible_ ? &nuWallBnd_ : nullptr);
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
+            }
             else if (ctl_.nutWall == NutWall::Blended)   // nutUBlendedWallFunction (velocity-based binomial n=4 blend) on kEps/kOmegaSST
             {
                 deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,

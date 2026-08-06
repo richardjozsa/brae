@@ -105,6 +105,53 @@ int main()
         else { std::printf("  FAIL plain fixedValue disturbed\n"); failures++; }
     }
 
+    // 4. pressureInletOutletVelocity with `tangentialVelocity` must be refused, and without it accepted.
+    // OF drives the tangential component (refValue = tv - n*(n & tv),
+    // pressureInletOutletVelocityFvPatchVectorField.C:135); brae leaves it at zero, so honouring the case
+    // would mean solving a swirl-free inlet where the case asked for swirl. The header said "not
+    // supported"; nothing enforced it.
+    {
+        std::filesystem::create_directories(base + "/tv");
+        auto writeU = [&](const std::string& dir, const std::string& body)
+        {
+            std::filesystem::create_directories(dir);
+            const std::string path = dir + "/U";
+            std::ofstream f(path);
+            f << "FoamFile { version 2.0; format ascii; class volVectorField; object U; }\n"
+              << "dimensions [0 1 -1 0 0 0 0];\n"
+              << "internalField uniform (0 0 0);\n"
+              << "boundaryField\n{\n" << body << "\n}\n";
+            return path;
+        };
+        FvPatch p;
+        p.name = "outlet";
+        p.type = "patch";
+        p.size = 1;
+        p.faceCells.assign(1, 0);
+        p.deltaCoeffs.assign(1, 1.0);
+        p.nf.assign(1, vector{1, 0, 0});
+        p.magSf.assign(1, 1.0);
+
+        const FieldData<vector> with = readField<vector>(writeU(base + "/tv/with",
+            "    outlet { type pressureInletOutletVelocity; tangentialVelocity uniform (0 5 0);\n"
+            "             value uniform (0 0 0); }"));
+        bool refused = false;
+        try { (void)makePatchField<vector>(p, with.boundary.at(0)); }
+        catch (const std::exception& e)
+        { refused = std::string(e.what()).find("tangentialVelocity") != std::string::npos; }
+        if (refused) std::printf("  OK   pressureInletOutletVelocity + tangentialVelocity refused by name\n");
+        else { std::printf("  FAIL tangentialVelocity accepted -- the tangential component would be zeroed\n"); failures++; }
+
+        // NEGATIVE CONTROL: the plain form is the one every simpleFoam tutorial uses; it must still build.
+        const FieldData<vector> without = readField<vector>(writeU(base + "/tv/without",
+            "    outlet { type pressureInletOutletVelocity; value uniform (0 0 0); }"));
+        bool built = true;
+        try { (void)makePatchField<vector>(p, without.boundary.at(0)); }
+        catch (const std::exception&) { built = false; }
+        if (built) std::printf("  OK   plain pressureInletOutletVelocity still accepted\n");
+        else { std::printf("  FAIL the plain form was refused too -- that breaks every case using it\n"); failures++; }
+    }
+
     std::printf("uniform_function1: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

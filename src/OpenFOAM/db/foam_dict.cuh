@@ -52,7 +52,7 @@ struct FoamDict
     const FoamDict* subDict(const std::string& key) const
     {
         for (const auto& s : subs)
-            if (s.first == key) return &s.second;          // literal wins
+            if (s.first == key) return &s.second;          // literal wins (duplicates were merged at parse)
         const FoamDict* hit = nullptr;
         for (const auto& s : subs)                                              // else last regex match
         {
@@ -68,8 +68,10 @@ struct FoamDict
     // Regex-aware leaf lookup: literal first, else last matching wildcard key (OF semantics).
     const std::vector<std::string>* find(const std::string& name) const
     {
+        const std::vector<std::string>* lit = nullptr;      // LAST literal match wins, as in OpenFOAM
         for (const auto& l : leaves)
-            if (l.first == name) return &l.second;          // literal wins
+            if (l.first == name) lit = &l.second;
+        if (lit) return lit;
         const std::vector<std::string>* hit = nullptr;
         for (const auto& l : leaves)                                                // else last regex match
         {
@@ -144,7 +146,39 @@ inline FoamDict parseDictBody(TokenStream& ts, bool top)
         if (ts.peek() == "{")
         {
             ts.next();
-            d.subs.emplace_back(key, parseDictBody(ts, false));
+            {
+                // A REPEATED sub-dictionary MERGES into the existing one, later keys winning -- OpenFOAM's
+                // documented behaviour and not the same rule as for leaf entries (those simply override).
+                // gasMixing's thermophysicalProperties relies on it: a full `thermoType { type hePsiThermo;
+                // ... equationOfState perfectGas; ... }` followed by `thermoType { type heRhoThermo; }`,
+                // which foamDictionary resolves to heRhoThermo + perfectGas. Replacing wholesale would have
+                // left a thermoType with nothing but `type`, and brae would refuse a case OpenFOAM runs.
+                FoamDict body = parseDictBody(ts, false);
+                FoamDict* existing = nullptr;
+                for (auto& sd : d.subs)
+                    if (sd.first == key) existing = &sd.second;
+                if (!existing)
+                {
+                    d.subs.emplace_back(key, std::move(body));
+                }
+                else
+                {
+                    for (auto& l : body.leaves)
+                    {
+                        bool replaced = false;
+                        for (auto& e : existing->leaves)
+                            if (e.first == l.first) { e.second = l.second; replaced = true; break; }
+                        if (!replaced) existing->leaves.push_back(l);
+                    }
+                    for (auto& sb : body.subs)
+                    {
+                        bool replaced = false;
+                        for (auto& e : existing->subs)
+                            if (e.first == sb.first) { e.second = sb.second; replaced = true; break; }
+                        if (!replaced) existing->subs.push_back(sb);
+                    }
+                }
+            }
         }
         else
         {

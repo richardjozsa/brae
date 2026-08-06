@@ -63,6 +63,36 @@ BRAE_HD inline scalar spaldingNutValue(scalar magUp, scalar magGradU, scalar y, 
     const scalar uTau = fmax(scalar(0.0), ut);
     return fmax(scalar(0.0), uTau*uTau / (magGradU + scalar(1e-300)) - nu);
 }
+// nutUWallFunction (OF nutUWallFunctionFvPatchScalarField, STEPWISE blender -- the default set by
+// wallFunctionBlenders(dict, blenderType::STEPWISE, 4)).
+//
+// yPlus comes from a fixed-point iteration on the log law rather than a Newton solve for uTau:
+//     kappaRe = kappa*magUp*y/nuw
+//     yp <- (kappaRe + yp)/(1 + log(E*yp))     seeded at yPlusLam, tol 0.01/yPlusLam, at most 10 passes
+// then
+//     nutVis = nuw
+//     nutLog = nuw*yPlus*kappa/log(max(E*yPlus, 1 + 1e-4))
+//     nutw   = (yPlus > yPlusLam ? nutLog : nutVis) - nutVis
+// The trailing subtraction is OF's `nutw -= nutVis`, so the viscous branch returns exactly 0 and the log
+// branch returns the TURBULENT part only.
+BRAE_HD inline scalar nutUWallValue(scalar magUp, scalar y, scalar nu, scalar kappa, scalar E, scalar yPlusLam)
+{
+    if (!(magUp > scalar(0)) || !(y > scalar(0)) || !(nu > scalar(0))) return scalar(0);
+    const scalar kappaRe = kappa * magUp * y / nu;
+    scalar yp = yPlusLam;
+    const scalar ryPlusLam = scalar(1) / yPlusLam;
+    for (int it = 0; it < 10; ++it)
+    {
+        const scalar last = yp;
+        yp = (kappaRe + yp) / (scalar(1) + log(fmax(E * yp, scalar(1e-300))));
+        if (fabs(ryPlusLam * (yp - last)) <= scalar(0.01)) break;
+    }
+    const scalar yPlus = fmax(scalar(0), yp);
+    if (yPlus <= yPlusLam) return scalar(0);                       // viscous branch: nutVis - nutVis
+    const scalar nutLog = nu * yPlus * kappa / log(fmax(E * yPlus, scalar(1) + scalar(1e-4)));
+    return fmax(scalar(0), nutLog - nu);
+}
+
 // nutUBlendedWallFunction: binomial n=4 blend of viscous/log velocity scales (OF, 10 iters, tol 1e-3, under-relaxed).
 BRAE_HD inline scalar blendedNutValue(scalar magUp, scalar magGradU, scalar y, scalar nu, scalar kappa, scalar E, scalar nutSeed)
 {
@@ -119,6 +149,11 @@ __device__ inline void wallProductionG0(
     scalar nutw;
     if (nutWall == 0)                                        // k-based: nutk (smooth) or atmNutk (rough, z0>0)
         nutw = kBasedWallNut(yPlusWall(Cmu25, y, kc, nu), y, atmZ0, atmBoundNut, nu, yplLam, kappa, E);
+    else if (nutWall == 3)                                   // nutUWallFunction (log-law yPlus, stepwise)
+    {
+        const scalar magUp = magG / fmax(dc, scalar(1e-300));
+        nutw = nutUWallValue(magUp, y, nu, kappa, E, yplLam);
+    }
     else                                                     // velocity-based: magUp = |U_cell - U_wall| = magG/dc
     {
         const scalar magUp = magG / fmax(dc, scalar(1e-300));

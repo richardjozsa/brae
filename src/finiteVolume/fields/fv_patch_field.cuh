@@ -403,7 +403,8 @@ public:
 // (full extrapolation); inflow (phi<0) -> the TANGENTIAL velocity is fixed to refValue (default 0) while the NORMAL
 // component is zeroGradient, so the pressure sets the inflow speed (value = n*(n.U_cell)). The DEVICE recomputes the
 // per-face inflow value each step (deviceUpdatePressureInletOutletVelocity); bcCategory()=6 marks it. Vector-only;
-// a non-zero `tangentialVelocity` field is NOT supported (default refValue 0 covers the simpleFoam tutorials).
+// a non-zero `tangentialVelocity` field is NOT supported and is now REFUSED at construction (it was
+// only a comment before, so a case carrying one ran with the tangential component silently zeroed).
 template <typename T>
 class PressureInletOutletVelocityPatchField : public ExtrapolatedValuePatchField<T>   // value() = written seed
 {
@@ -609,6 +610,17 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFieldData<T>& d)
 {
+    if (d.type == "pressureInletOutletVelocity" && d.hasTangentialVelocity)
+    {
+        // OF: refValue = tangentialVelocity - n*(n & tangentialVelocity), i.e. the tangential component
+        // is DRIVEN, not free. brae's piov kernel sets the tangential refValue to zero, so running this
+        // would silently solve a different boundary condition (a swirl-free inlet where the case asked
+        // for swirl). The header claimed this was unsupported; nothing enforced it until now.
+        throw std::runtime_error(
+            "brae: patch " + p.name + " is pressureInletOutletVelocity with a `tangentialVelocity` entry, "
+            "which brae does not apply -- it would silently run with zero tangential velocity. Remove the "
+            "entry (if the tangential component really is zero) or use a BC that fixes the full vector.");
+    }
     if (d.type == "uniformFixedValue" && !d.unsupportedFunction1.empty())
     {
         // A non-constant uniformValue. Refusing rather than falling back to whatever `value` happens to
@@ -730,7 +742,7 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // nutLowReWallFunction: OF calcNut()=0 (resolved viscous sublayer). cf's nutkWallFunction already yields nut=0 for
     // yPlus<yPlusLam, so on the low-Re mesh this BC is used on it is the same; nutUBlendedWallFunction is the same
     // log-law wall-nut family as nutk. Both -> Calculated (device wall nut from deviceBoundaryNut). Validated vs OF.
-    if (d.type == "nutLowReWallFunction" || d.type == "nutUBlendedWallFunction")
+    if (d.type == "nutUWallFunction" || d.type == "nutLowReWallFunction" || d.type == "nutUBlendedWallFunction")
         return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // cyclic: the device-resident solver couples it via appended internal faces (DeviceMesh), so the host patch
     // field is a no-op placeholder here (its value is unused; the FvPatch type "cyclic" drives the device skip).

@@ -15,7 +15,7 @@ namespace brae {
 // NOT from the turbulence model. nutk = k-based stepwise log law (nutkWallFunction); Spalding =
 // velocity-based Spalding blend (nutUSpaldingWallFunction); Blended = velocity-based binomial n=4
 // blend (nutUBlendedWallFunction). All three are honoured on any RAS model, exactly as OF does.
-enum class NutWall { Nutk, Spalding, Blended };
+enum class NutWall { Nutk, Spalding, Blended, NutU };   // NutU = nutUWallFunction (STEPWISE blender)
 
 struct DeviceSimpleControls
 {

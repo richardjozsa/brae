@@ -871,3 +871,50 @@ void deviceBoundaryNutBlended(
 
 
 } // namespace brae
+
+namespace brae {
+namespace {
+// nutUWallFunction boundary nut: log-law yPlus, STEPWISE blend (OF's default). Shares the wall-face
+// geometry and the |U_cell - U_wall| convention with the Spalding/Blended kernels above.
+__global__
+void nutUWallKernel(
+    int n, const label* __restrict__ fc, const label* __restrict__ isWall,
+    const scalar* __restrict__ y, const scalar* __restrict__ dc,
+    const scalar* __restrict__ Ux, const scalar* __restrict__ Uy, const scalar* __restrict__ Uz,
+    const scalar* __restrict__ nutCell, scalar nu, scalar kappa, scalar E, scalar yPlusLam,
+    scalar* __restrict__ nutBnd, const scalar* __restrict__ nuFace)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int c = fc[i];
+    if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
+    const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);   // wall is stationary
+    const scalar nuw = nuFace ? nuFace[i] : nu;
+    nutBnd[i] = nutUWallValue(magUp, y[i], nuw, kappa, E, yPlusLam);
+    (void)dc;
+}
+}   // namespace
+
+void deviceBoundaryNutU(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<label>& isWall,
+    const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& nutCell,
+    scalar nu, scalar kappa, scalar E,
+    DeviceBuffer<scalar>& nutBnd,
+    const DeviceBuffer<scalar>* nuFace)
+{
+    const int n = dbU.comp[0].n;
+    if (!n) return;
+    if (static_cast<int>(nutBnd.size()) != n) nutBnd.resize(n);
+    nutUWallKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
+                                        dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
+                                        nutCell.data(), nu, kappa, E, yPlusLamHost(kappa, E), nutBnd.data(),
+                                        nuFace ? nuFace->data() : nullptr);
+    cudaCheck(cudaGetLastError(), "nutUWall");
+}
+
+}   // namespace brae

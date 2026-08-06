@@ -45,6 +45,11 @@ struct PatchFieldData
     // stale `value` from an overridden fixedValue entry, so the field silently takes that constant
     // instead. Recorded here and refused at construction rather than guessed at.
     std::string    unsupportedFunction1;
+    // pressureInletOutletVelocity's optional `tangentialVelocity`. OF sets
+    // refValue = tv - n*(n & tv) (pressureInletOutletVelocityFvPatchVectorField.C:135); brae leaves the
+    // tangential refValue at zero, so honouring the key would need per-face storage it does not have.
+    // Recorded so it can be refused instead of quietly changing the boundary condition.
+    bool           hasTangentialVelocity = false;
     bool           valueUniform = false;
     T              uniformValue{};
     std::vector<T> values;
@@ -130,6 +135,14 @@ inline void readUniformOrList(
 
 // Read "uniform <v>" / "nonuniform List<...>" OR the OF self-reference "$internalField" (copy the internalField
 // entry). Used by value / inletValue / freestreamValue, any of which may be written as $internalField.
+// Does this token start a numeric literal? Used to spot a bare (keyword-less) value entry.
+inline bool isFoamNumber(const std::string& t)
+{
+    if (t.empty()) return false;
+    const char c = t[0];
+    return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
+}
+
 template <typename T>
 inline void readValueOrInternal(
     TokenStream& ts,
@@ -144,6 +157,18 @@ inline void readValueOrInternal(
         uniform = fd.internalUniform;
         uval = fd.internalUniformValue;
         vals = fd.internalField;
+    }
+    // A BARE value, i.e. no `uniform`/`nonuniform` keyword: `inletValue (0 0 0);`. OpenFOAM tolerates
+    // these because a boundary condition only reads the entries it cares about -- gasMixing's
+    // pressureInletOutletVelocity carries an `inletValue` that OF's implementation never looks at, so OF
+    // runs the case fine. brae parsed every known key unconditionally and died with
+    // "TokenStream: expected '(' got '0'", failing on a file OpenFOAM accepts and, worse, failing BEFORE
+    // reaching its own legitimate refusal (nutUWallFunction), so the message pointed at the wrong thing.
+    else if (ts.peek() == "(" || isFoamNumber(ts.peek()))
+    {
+        uniform = true;
+        uval = readFoamValue<T>(ts);
+        vals.clear();
     }
     else readUniformOrList(ts, uniform, uval, vals);
 }
@@ -425,6 +450,11 @@ inline FieldData<T> readField(const std::string& path)
                         p.inletValues = p.values;
                         p.hasInletValue = true;
                         ts.expect(";");
+                    }
+                    else if (key == "tangentialVelocity")   // pressureInletOutletVelocity, optional
+                    {
+                        p.hasTangentialVelocity = true;
+                        skipToSemicolon(ts);
                     }
                     else
                     {

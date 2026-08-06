@@ -294,6 +294,14 @@ void deviceSAReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda,
 // nutUSpaldingWallFunction boundary nut: wall faces -> Newton uTau from Spalding; other faces -> adjacent cell nut.
 // y / isWall are per boundary face (nearWallDist y, wall mask); nutBnd is in/out (warm-started seed). nu+nutBnd at
 // walls gives the SA wall shear (deep wall-function meshes, y+ >> 1).
+// nutUWallFunction (STEPWISE blender, OF's default): nut from the log-law yPlus fixed-point iteration.
+void deviceBoundaryNutU(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
+                        const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
+                        const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                        const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
+                        DeviceBuffer<scalar>& nutBnd,
+                        const DeviceBuffer<scalar>* nuFace = nullptr);
+
 void deviceBoundaryNutSpalding(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
                                const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
                                const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,

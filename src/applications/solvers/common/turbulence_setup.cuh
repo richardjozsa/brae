@@ -206,6 +206,10 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                 if (!gt.empty() && gt != "wall") continue;                 // only wall patches drive the choice
                 if (pb.type == "nutUSpaldingWallFunction") { ctl.nutWall = NutWall::Spalding; }
                 else if (pb.type == "nutUBlendedWallFunction") { ctl.nutWall = NutWall::Blended; }
+                // nutUWallFunction: OF's default blender is STEPWISE (nutUWallFunctionFvPatchScalarField.C:259,
+                // wallFunctionBlenders(dict, blenderType::STEPWISE, 4)). Any other blender is a different
+                // formula, so it is refused rather than approximated by the stepwise one.
+                else if (pb.type == "nutUWallFunction") { ctl.nutWall = NutWall::NutU; }
                 else if (pb.type == "atmNutkWallFunction")   // atmospheric rough-wall nut (k-based path + roughness z0)
                 {
                     ctl.atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
@@ -219,7 +223,8 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             }
             if (!ctl.sa && ctl.nutWall != NutWall::Nutk)
                 printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
-                       ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction" : "nutUBlendedWallFunction",
+                       ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
+                       : ctl.nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
                        ctl.sst ? "kOmegaSST" : "kEpsilon");
         };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
