@@ -1,6 +1,6 @@
 #pragma once
 // stage_dump.cuh -- write one SIMPLE stage's field to a plain text file, for stage-by-stage comparison
-// against OpenFOAM (docs/rhosimplefoam-restage-plan.md, Phase 0).
+// against OpenFOAM (cudafoam/rhosimplefoam-restage-plan.md, Phase 0).
 //
 // WHY THIS EXISTS. SIMPLE is segregated, so an error in one stage appears DOWNSTREAM and never upstream:
 //

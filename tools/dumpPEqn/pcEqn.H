@@ -15,7 +15,7 @@ volScalarField rhorAtU("rhorAtU", rho*rAtU);
 
 // dumpPEqn stage harness: the MOMENTUM stage's outputs, before any pressure work touches them. These are
 // upstream of phid/phiHbyA and are what a stage-by-stage comparison needs first (see
-// docs/rhosimplefoam-restage-plan.md). Written at iteration 1 only.
+// cudafoam/rhosimplefoam-restage-plan.md). Written at iteration 1 only.
 if (runTime.timeIndex() == braeDumpIter())
 {
     volScalarField("stage_rAU",  rAU).write();

@@ -1,6 +1,6 @@
 // stage_compare -- compare one SIMPLE stage between brae and OpenFOAM, in dependency order.
 //
-// Phase 0 of docs/rhosimplefoam-restage-plan.md. SIMPLE is segregated, so an error in one stage shows up
+// Phase 0 of cudafoam/rhosimplefoam-restage-plan.md. SIMPLE is segregated, so an error in one stage shows up
 // DOWNSTREAM and never upstream:
 //
 //     rAU/rAtU -> HbyA -> phiHbyA -> phid -> p -> U -> he -> turbulence

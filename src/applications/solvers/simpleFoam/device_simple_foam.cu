@@ -3,7 +3,7 @@
 // the class declaration (members + method signatures) stays in the header. Prerequisite for the PIMPLE solver,
 // which reuses solveMomentumPredictor / correctPressureVelocity / correctTurbulence under a transient loop.
 #include "device_simple_foam.cuh"
-#include "stage_dump.cuh"   // Phase 0 stage harness (docs/rhosimplefoam-restage-plan.md)
+#include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
 
 namespace brae {
 
