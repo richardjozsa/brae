@@ -34,7 +34,16 @@ body = re.search(r'\n(\d+)\s*\(\s*(.*?)\n\)', own, re.S).group(2)
 nc = max(int(x) for x in re.findall(r'^\d+$', body, re.M)) + 1
 p = pathlib.Path(w + "/0/p"); s = p.read_text()
 vals = "\n".join(f"{100000.0 + 800000.0*i/nc:.6g}" for i in range(nc))
-s = re.sub(r'internalField[^;]*;', f'internalField   nonuniform List<scalar>\n{nc}\n(\n{vals}\n)\n;', s, count=1)
+# 0.orig/p sets internalField with a #codeStream block, so a naive `internalField[^;]*;` stops at the
+# FIRST ';' -- which sits INSIDE the code body -- and leaves ' #}; };' dangling after the value list.
+# OpenFOAM rejects that outright ("Found UNDEFINED but expected EOF"); brae accepted it silently, so the
+# malformed case went unnoticed. Consume the whole codeStream block, and assert nothing was left behind.
+new_if = f'internalField   nonuniform List<scalar>\n{nc}\n(\n{vals}\n)\n;'
+s, n = re.subn(r'internalField\s+#codeStream\b.*?#\}\s*;\s*\}\s*;', new_if, s, count=1, flags=re.S)
+if n == 0:
+    s, n = re.subn(r'internalField[^;]*;', new_if, s, count=1)
+assert n == 1, "pm gate: could not rewrite internalField in 0/p"
+assert '#codeStream' not in s and '#}' not in s, "pm gate: left codeStream fragments in 0/p"
 p.write_text(s)
 print(f"nCells={nc}")
 PY
