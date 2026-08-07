@@ -39,7 +39,15 @@ p.write_text(s)
 print(f"nCells={nc}")
 PY
 
-OUT=$("$BUILD/brae_rhoSimpleFoam" -case "$WORK" 2>&1 | grep -i "pressureControl limits" | head -1)
+# The limits are computed and printed during SETUP, before the SIMPLE loop, so this gate does not need
+# a converged solve -- and must not depend on one. Two reasons it previously hung for the full 600s:
+#   1. brae's stdout is BLOCK-buffered into a pipe, so `| grep | head -1` sees nothing until ~4kB has
+#      accumulated -- which never happens if the run is slow. Capture to a file and grep the file instead.
+#   2. the case's own endTime is 1500 iterations. Cap it: the reference scan is done before iteration 1.
+sed -i 's/^endTime .*/endTime 1;/' "$WORK/system/controlDict"
+LOG="$WORK/log.brae"
+"$BUILD/brae_rhoSimpleFoam" -case "$WORK" > "$LOG" 2>&1 || true
+OUT=$(grep -i "pressureControl limits" "$LOG" | head -1)
 echo "  $OUT"
 python3 - "$OUT" <<'PY'
 import re, sys
