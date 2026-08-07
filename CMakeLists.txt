@@ -765,6 +765,18 @@ set_tests_properties(hf_vs_openfoam PROPERTIES
 # rhoSimpleFoam phase 4 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam, kOmegaSST heated duct.
 # Compares seven fields (T p U k omega nut rho) -- the compressible turbulence coupling is the kind that
 # converges cleanly while being wrong, so residuals prove nothing here. Skipped (77) without an OF install.
+# squareBend (transonic + consistent, Mach ~0.96) to CONVERGENCE vs OF. This is the evidence that
+# lifted the `transonic yes` refusal: it is the only gate with an ASYMMETRIC pressure matrix (implicit
+# fvm::div(phid,p) -> BiCGStab) and the only one on heRhoThermo's stored-rho timing at high Mach.
+add_test(NAME transonic_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/transonic_vs_openfoam.sh)
+set_tests_properties(transonic_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     LABELS slow
+                     TIMEOUT 1800)
+
 # aerofoilNACA0012 to CONVERGENCE vs OF. Slow (~700 outer iterations on both sides) and labelled so.
 # It is the only gate that can catch a defect living in the pressure equation's net mass balance rather
 # than in a field norm: the pinned-pressure bug reached endTime with every iteration-2 stage agreeing to

@@ -1,0 +1,11 @@
+FoamFile { version 2.0; format ascii; class volScalarField; object T; }
+dimensions [0 0 0 1 0 0 0]; internalField uniform 300;
+boundaryField {
+  inlet    { type fixedValue; value uniform 300; }
+  outlet   { type zeroGradient; }
+  // The point of this case: a HEAT-FLUX wall, not a fixed-temperature one. snGrad(T) is imposed and
+  // the wall temperature is part of the answer.
+  hotWall  { type fixedGradient; gradient uniform 20000; }
+  coldWall { type fixedValue; value uniform 300; }
+  frontBack { type empty; }
+}

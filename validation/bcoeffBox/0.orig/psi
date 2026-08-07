@@ -1,0 +1,9 @@
+FoamFile { version 2.0; format ascii; class volScalarField; object psi; }
+dimensions [0 0 0 0 0 0 0]; internalField uniform 1;
+boundaryField {
+  inlet     { type fixedValue; value uniform 3; }
+  outlet    { type inletOutlet; inletValue uniform 7; value uniform 1; }
+  gradWall  { type fixedGradient; gradient uniform 250; }
+  zeroWall  { type mixed; refValue uniform 5; refGradient uniform 120; valueFraction uniform 0.35; value uniform 2; }
+  frontBack { type empty; }
+}

@@ -1648,21 +1648,14 @@ namespace brae {
             alphaEffBnd.size() ? &alphaEffBnd : nullptr,
             ctl_.gradHeLimitK);   // grad(he) cellLimited coeff, from the gradient linearUpwind names
 
-        // OF's EEqn.H ends with thermo.correct(), so its PRESSURE equation sees psi/mu/alpha updated from
-        // the just-solved he. brae updated thermo only after the pressure step, leaving the pEqn on the
-        // previous iteration's psi. T/psi/mu/alpha depend on he alone (not p), so doing it here is exactly
-        // OF's ordering.
+        // OF EEqn.H ends with thermo.correct(), so the PRESSURE equation sees psi/mu/alpha from the
+        // just-solved he. brae used to update thermo only after the pressure step, leaving the pEqn on
+        // the previous iteration's psi; doing it here is OF's ordering.
         //
-        // updateRho = FALSE, and that is the whole point. thermo.correct() does NOT touch the solver's rho:
-        // rhoSimpleFoam's `rho` is its own volScalarField, written once per outer iteration at the end of
-        // pEqn.H as `rho = thermo.rho(); rho.relax();`. Recomputing rho = psi*p here silently discards that
-        // relaxation, because nothing relaxes it again before the NEXT pressure equation reads it.
-        //
-        // aerofoilNACA0012 relaxes rho by 0.01, so OF's rho barely moves off 1.17 while brae's was rebuilt
-        // each iteration from the pressureControl-railed p (10 kPa..200 kPa) -> rho 0.10..2.40. Measured at
-        // iteration 2: rho 62% off (ratio 0.085..2.07), and rhorAUf and the pressure diagonal inherited
-        // exactly that ratio. A case with no rho relaxation cannot see this at all.
-        deviceThermoUpdate(th_, dp_, tc_, /*updateRho=*/false);
+        // WHICH FIELDS THIS MOVES IS OF'S DEFINITION, not a decision taken here. hePsiThermo::calculate
+        // writes T/psi/mu/alpha and has no rho argument at all; heRhoThermo::calculate writes those AND
+        // rho. deviceThermoCorrect dispatches exactly as OF's virtual call does.
+        deviceThermoCorrect(th_, dp_, tc_);
 
         correctPressureVelocity(res);
 
@@ -1698,10 +1691,10 @@ namespace brae {
         // of the arithmetic and false of the timing: a heRhoThermo case must carry a rho that LAGS the
         // pressure by one outer iteration. squareBend is heRhoThermo, and its rho was 7.0e-02 off OF at
         // iteration 1 -- which then propagates into phid (+5%) and the whole transonic pressure equation.
-        DeviceBuffer<scalar> rhoPreP;
-        if (rc_.rhoLagsPressure) deviceCopy(rhoPreP, th_.rho);
-        deviceThermoUpdate(th_, dp_, tc_);
-        if (rc_.rhoLagsPressure) deviceCopy(th_.rho, rhoPreP);   // heRhoThermo: keep the stored rho
+        // OF pEqn.H tail: `rho = thermo.rho(); rho.relax();`. deviceThermoRho IS thermo.rho() --
+        // p*psi for hePsiThermo, the stored rho_ for heRhoThermo -- so the one-iteration lag a
+        // heRhoThermo case carries falls out of OF's own definition instead of a copy-restore dance.
+        deviceThermoRho(th_, dp_, tc_, th_.rho);
         deviceRhoRelax(th_, tc_);
         // ...and the BOUNDARY half of the same field, with the same factor. OF's rho.relax() relaxes the
         // internal and boundary values of one field together; brae keeps them in two buffers, so both

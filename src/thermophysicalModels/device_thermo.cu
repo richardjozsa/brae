@@ -5,6 +5,7 @@
 #include "thermo_model.cuh"
 #include "transport_model.cuh"
 #include "device_buffer.cuh"
+#include "device_blas.cuh"   // deviceCopy/deviceHadamard, for thermo.rho()
 #include "device_boundary.cuh"
 
 namespace brae {
@@ -65,24 +66,55 @@ void heFromTK(
     he[i] = hConstTToHe(T[i], c);
 }
 
-void deviceThermoUpdate(
+// hePsiThermo::calculate -- T, psi, mu, alpha. There is no rho parameter in OF's signature, so the
+// kernel is handed a null rho and leaves the solver's density alone.
+void deviceHePsiThermoCalculate(
     DeviceThermo& th,
     const DeviceBuffer<scalar>& p,
-    const ThermoCoeffs& c,
-    bool updateRho)
+    const ThermoCoeffs& c)
 {
     if (th.n == 0) return;
     thermoUpdateK<<<nBlocks(th.n), TPB>>>(
-        th.n,
-        c,
-        p.data(),
-        th.he.data(),
-        th.T.data(),
-        updateRho ? th.rho.data() : nullptr,
-        th.psi.data(),
-        th.mu.data(),
-        th.alpha.data());
-    cudaCheck(cudaGetLastError(), "thermoUpdate");
+        th.n, c, p.data(), th.he.data(), th.T.data(),
+        nullptr,                       // hePsiThermo::calculate has no rho argument
+        th.psi.data(), th.mu.data(), th.alpha.data());
+    cudaCheck(cudaGetLastError(), "hePsiThermoCalculate");
+}
+
+// heRhoThermo::calculate -- T, psi, RHO, mu, alpha (heRhoThermo.C: rhoCells[celli] = mixture_.rho(p,T)).
+void deviceHeRhoThermoCalculate(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& p,
+    const ThermoCoeffs& c)
+{
+    if (th.n == 0) return;
+    thermoUpdateK<<<nBlocks(th.n), TPB>>>(
+        th.n, c, p.data(), th.he.data(), th.T.data(),
+        th.rho.data(),                 // heRhoThermo::calculate DOES write rho
+        th.psi.data(), th.mu.data(), th.alpha.data());
+    cudaCheck(cudaGetLastError(), "heRhoThermoCalculate");
+}
+
+// basicThermo::correct() -> the mixture's calculate(). The virtual dispatch OF does at run time.
+void deviceThermoCorrect(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& p,
+    const ThermoCoeffs& c)
+{
+    if (c.rhoThermoType) deviceHeRhoThermoCalculate(th, p, c);
+    else                 deviceHePsiThermoCalculate(th, p, c);
+}
+
+// thermo.rho(): psiThermo returns p_*psi_, rhoThermo returns the stored rho_.
+void deviceThermoRho(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& p,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& rhoOut)
+{
+    if (th.n == 0) return;
+    if (c.rhoThermoType) deviceCopy(rhoOut, th.rho);          // rhoThermo::rho() -> rho_
+    else                 deviceHadamard(rhoOut, p, th.psi);   // psiThermo::rho() -> p_*psi_
 }
 
 // rho = rhoPrev + a*(rho - rhoPrev), then rhoPrev = rho. Bounds are re-applied because relaxing toward a

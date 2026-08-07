@@ -24,16 +24,41 @@ void deviceRhoRelaxBuffer(
     DeviceBuffer<scalar>& rhoPrev,
     const ThermoCoeffs& c);
 
-void deviceThermoUpdate(
+// OF has TWO calculate() functions with DIFFERENT SIGNATURES, not one function with a switch
+// (hePsiThermo.C / heRhoThermo.C):
+//
+//   hePsiThermo::calculate(p, T, he, psi,      mu, alpha, doOldTimes)   <- NO rho parameter
+//   heRhoThermo::calculate(p, T, he, psi, rho, mu, alpha, doOldTimes)   <- writes rhoCells too
+//
+// so brae mirrors them as two functions. An earlier version had a single `deviceThermoUpdate(..., bool
+// updateRho)`; that boolean was invented here rather than taken from OF, and picking its value was a
+// judgement call that got made wrong -- forcing it false for every thermo type took the transonic
+// squareBend from converged-in-136 to NaN. Naming the two OF functions removes the judgement.
+void deviceHePsiThermoCalculate(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& p,
+    const ThermoCoeffs& c);
+
+void deviceHeRhoThermoCalculate(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& p,
+    const ThermoCoeffs& c);
+
+// OF basicThermo::correct() -> calculate(). Dispatches on the thermo type exactly as OF's virtual call
+// does, so a call site reads like the solver line it mirrors (EEqn.H's thermo.correct()).
+void deviceThermoCorrect(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& p,
+    const ThermoCoeffs& c);
+
+// OF thermo.rho(). psiThermo::rho() returns p_*psi_ (recomputed from the CURRENT p); rhoThermo::rho()
+// returns the STORED rho_ that calculate() last wrote. rhoSimpleFoam's pEqn.H ends with
+// `rho = thermo.rho()`, so which of the two it gets is the whole heRhoThermo-lag question.
+void deviceThermoRho(
     DeviceThermo& th,
     const DeviceBuffer<scalar>& p,
     const ThermoCoeffs& c,
-    // OF's thermo.correct() updates T, psi, mu and alpha and NOTHING ELSE. The solver's `rho` is a
-    // SEPARATE volScalarField (createFields.H) that rhoSimpleFoam assigns only at the end of
-    // pEqn.H -- `rho = thermo.rho(); rho.relax();` -- so it carries that relaxation into the next
-    // outer iteration. Pass false wherever OF calls thermo.correct(), so this stays a thermo update
-    // and does not silently double as a rho update that throws the relaxation away.
-    bool updateRho = true);
+    DeviceBuffer<scalar>& rhoOut);
 
 // Laminar DYNAMIC viscosity AT BOUNDARY FACES, mu_b = Sutherland(T_b) -- OF transport_.mu(patchi).
 //

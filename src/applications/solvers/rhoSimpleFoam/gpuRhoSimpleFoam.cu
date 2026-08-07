@@ -185,30 +185,23 @@ int main(int argc, char** argv)
             rhoMean = (nC > 0) ? rhoMean / static_cast<scalar>(nC) : scalar(1);
             ctl.nu = tc.mu0 / rhoMean;
         }
-        // B1: the transonic branch IS implemented below (phid, the phiHbyA subtraction, implicit
-        // fvm::div(phid,p) folded into the pressure matrix, pEqn.relax(), and a BiCGStab solve because the
-        // resulting matrix is not symmetric). It is NOT trusted yet, so it stays behind this refusal.
+        // B1: the transonic branch (phid, the phiHbyA subtraction, implicit fvm::div(phid,p) folded into
+        // the pressure matrix, pEqn.relax(), and a BiCGStab solve because the resulting matrix is not
+        // symmetric). It ran behind a refusal until it could be shown right on a case that discriminates.
         //
-        // Measured, honestly:
-        //   * a low-Mach compressible duct converges in 105 iterations against OF's 104 and agrees to
-        //     p 7.0e-09, T 1.8e-07, U 3.5e-06, rho 1.7e-07 -- but that case does NOT DISCRIMINATE: the
-        //     subsonic branch gives the same answer to 1e-11, so it shows the branch does not BREAK a
-        //     subsonic case, not that it is right.
-        //   * squareBend, the actual tutorial B1 exists for, diverges: contGlobal -2.83e+02 at iteration 1
-        //     and NaN by iteration 50. Root cause not yet established.
+        // The refusal is now LIFTED, on this evidence:
+        //   * squareBend -- the actual tutorial B1 exists for, Mach ~0.96, transonic AND consistent
+        //     (SIMPLEC) -- converges in 160 iterations against OF's 156 and agrees to
+        //     p 1.8e-03, U 1.4e-03, T 6.0e-04, rho 1.6e-03, k 7.4e-03, epsilon 8.3e-03, nut 4.9e-03.
+        //     Gate `transonic_vs_openfoam`.
+        //   * a low-Mach compressible duct converges in 105 against OF's 104 (p 7.0e-09, T 1.8e-07).
+        //     That case does NOT discriminate -- the subsonic branch gives the same answer to 1e-11 --
+        //     so it only shows the branch does not BREAK a subsonic case. It is not the evidence here.
         //
-        // Shipping it on that evidence would be exactly the failure this whole audit is about -- a case
-        // that runs, converges, and is wrong. BRAE_TRANSONIC=1 enables it for continued work.
-        const char* trEnv = std::getenv("BRAE_TRANSONIC");
-        if (rc.transonic && !(trEnv && std::atoi(trEnv) != 0))
-        {
-            throw std::runtime_error(
-                "brae: SIMPLE/transonic yes is implemented but NOT VALIDATED, so it is refused. The "
-                "pressure equation gains an implicit fvm::div(phid,p) (OF rhoSimpleFoam pEqn.H); brae's "
-                "version converges and matches OF on a low-Mach duct but DIVERGES on the squareBend "
-                "tutorial (contGlobal -283 at iteration 1). Running it would converge to a wrong answer on "
-                "some cases and blow up on others. Set BRAE_TRANSONIC=1 to run it anyway for development.");
-        }
+        // What actually made squareBend work was NOT a transonic fix. It diverged (contGlobal -2.83e+02
+        // at iteration 1, NaN by 50) because of defects in the SHARED compressible path -- most recently
+        // the thermo-type-dependent rho update below. The transonic assembly had been right for a while
+        // behind an unrelated bug, which is the argument for fixing the chain before trusting a branch.
         const_cast<RhoSimpleControls&>(rc).rhoLagsPressure = tc.rhoThermoType;   // heRhoThermo rho timing
         ctl.transonic = rc.transonic;   // B1: OF pEqn.H transonic branch (guarded above)
         parseFvSchemesControls(caseDir, ctl);
@@ -342,7 +335,12 @@ int main(int argc, char** argv)
         DeviceThermo& th = solver.thermo();
         th.T.copyFrom(T.internal);
         deviceThermoHeFromT(th, tc);
-        deviceThermoUpdate(th, solver.pDevice(), tc);
+        deviceThermoCorrect(th, solver.pDevice(), tc);
+        // OF createFields.H: `volScalarField rho(IOobject("rho", ...), thermo.rho())`. rho is initialised
+        // from thermo.rho() as its OWN statement, because hePsiThermo::calculate never writes a rho --
+        // psiThermo has no rho_ field at all. Folding this into the correct() call is what the old
+        // deviceThermoUpdate did, and it is exactly the conflation that made picking `updateRho` a guess.
+        deviceThermoRho(th, solver.pDevice(), tc, th.rho);
         deviceRhoSeedPrev(th);
         // E7: OF validates the turbulence model AFTER the thermo is constructed; brae's solver ctor did it
         // before, so correctNut ran against a placeholder inlet density. Redo it now that rho is real.

@@ -1,0 +1,13 @@
+FoamFile { version 2.0; format ascii; class volScalarField; object T; }
+dimensions [0 0 0 1 0 0 0]; internalField uniform 300;
+boundaryField {
+  inlet    { type fixedValue; value uniform 300; }
+  outlet   { type zeroGradient; }
+  // The point of this case: a HEAT-FLUX wall, not a fixed-temperature one. snGrad(T) is imposed and
+  // the wall temperature is part of the answer.
+  // mixed (Robin): OF maps this to mixedEnergy, whose refGrad is Cpv*Tw.refGrad(). All three entries
+  // are required; the refGradient term carries a (1-vf) weight the fixedGradient path never exercises.
+  hotWall  { type mixed; refValue uniform 800; refGradient uniform 5000; valueFraction uniform 0.3; value uniform 400; }
+  coldWall { type fixedValue; value uniform 300; }
+  frontBack { type empty; }
+}
