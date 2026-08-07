@@ -34,12 +34,15 @@
 #include "residual_control.cuh"   // OF simpleControl::criteriaSatisfied (shared with simpleFoam)
 #include "dict_audit.cuh"   // name every dict entry brae read and then ignored
 #include "write_control.cuh"   // OF writeControl/writeInterval/purgeWrite cadence (shared with simpleFoam)
+#include "mrf_read.cuh"          // readCellZones (shared with the incompressible driver)
+#include "fv_options.cuh"       // OF fv::options: the SAME framework the incompressible driver uses
 #include "scheme_parse.cuh"        // parseFvSchemesControls
 #include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
 #include <cstdio>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <map>
 #include <stdexcept>
 #include <filesystem>
 #include <cmath>
@@ -249,24 +252,32 @@ int main(int argc, char** argv)
             if (std::atoi(luEnv) == 0) { ctl.luK = false; ctl.luEps = false; }
         }
 
-        // OF looks these up by FIELD NAME: "omega" on kOmegaSST, "epsilon" on kEpsilon.
-        // fvOptions. The compressible driver did not open this file AT ALL, where gpuSimpleFoam reads it
-        // and refuses anything it cannot apply. angledDuctExplicitFixedCoeff carries an
-        // explicitPorositySource that dominates its momentum balance, plus two constraints -- all three
-        // vanished in silence and the case still converged, to a different problem. Refuse instead: brae
-        // does not run a case with a dropped source term.
+        // fvOptions, read through the SAME framework the incompressible driver uses (readFvOptions +
+        // solver.setFvOptions). OF's fv::options is not a per-solver feature: every solver calls the same
+        // three hooks -- fvOptions(...) as an equation source, fvOptions.constrain(eqn), and
+        // fvOptions.correct(field) -- and rhoSimpleFoam differs from simpleFoam only in that its momentum
+        // source is rho-weighted (fvOptions(rho, U) vs fvOptions(U)) and it has energy hooks as well.
+        // So this reuses the framework rather than adding a compressible copy of it.
+        //
+        // Anything the reader recognises but cannot apply still REFUSES: the reason the compressible driver
+        // used to reject the whole file was that dropping a source silently converges to a different
+        // problem, and that argument is unchanged for the sources brae does not implement.
+        std::map<std::string, std::vector<label>> fvoZones;
         {
             std::ifstream fa(caseDir + "/system/fvOptions"), fb(caseDir + "/constant/fvOptions");
-            if (fa.good() || fb.good())
-            {
-                noticeIgnored("fvOptions", "found an fvOptions file; the compressible solver cannot apply "
-                                           "any source or constraint yet");
-                throw std::runtime_error(
-                    "brae: this case has an fvOptions file, and brae_rhoSimpleFoam cannot apply fvOptions "
-                    "sources/constraints. Running anyway would SILENTLY drop them (a porosity source, a "
-                    "temperature constraint) and converge to a different problem. Remove or disable it, or "
-                    "use the incompressible solver, which supports a subset.");
-            }
+            if (fa.good() || fb.good()) fvoZones = readCellZones(caseDir + "/constant/polyMesh");
+        }
+        const FvOptionsData fvo = readFvOptions(caseDir, fvoZones, g.V(), nC, g.C());
+        if (!fvo.unsupported.empty())
+        {
+            std::string msg = "brae: fvOptions contains source(s) brae cannot apply (they would be SILENTLY "
+                              "dropped -> wrong physics):";
+            for (const auto& u : fvo.unsupported) msg += "\n  - " + u;
+            msg += "\nRemove/disable them, or use a supported form. Supported on the compressible solver: "
+                   "limitTemperature, explicitPorositySource[DarcyForchheimer|fixedCoeff], "
+                   "vectorSemiImplicitSource, limitVelocity, velocityDampingConstraint; "
+                   "selectionMode all|cellZone.";
+            throw std::runtime_error(msg);
         }
 
         const std::string second = ctl.sst ? "omega" : "epsilon";
@@ -328,6 +339,18 @@ int main(int argc, char** argv)
                                   tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
         solver.setCompressible(tc, rc, std::move(dbHe));
         solver.setAlphatPrt(prtFace);
+        // Hand the parsed options to the solver. Reading them and NOT doing this is precisely the silent
+        // drop the old refusal existed to prevent -- and it is what happened on the first attempt here:
+        // the file parsed, the case ran, and limitTemperature with min=280/max=300 let T reach 314.5.
+        if (!fvo.empty())
+        {
+            solver.setFvOptions(fvo);
+            std::printf("  fvOptions: %d source(s)%s%s%s%s\n", fvo.count,
+                        fvo.limTActive ? " limitTemperature" : "",
+                        fvo.porActive  ? " explicitPorositySource" : "",
+                        fvo.hasMomentum ? " momentum" : "",
+                        fvo.limUActive ? " limitVelocity" : "");
+        }
         solver.setEnergySolver(eSolve.tol, eSolve.relTol, eSolve.useGS);
 
         // Seed the thermo: T from the case, he from T, then one thermo.correct() so rho/psi/mu/alpha are

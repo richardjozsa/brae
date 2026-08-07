@@ -337,6 +337,12 @@ private:
     bool   limUActive_ = false;
     scalar limUMax_ = 0;
     DeviceBuffer<label> limUCells_;   // limitVelocity clamp
+    // limitTemperature. Held as HE limits, not T limits: OF converts once with the case thermo and clamps
+    // the energy variable the equation actually solved (limitTemperature::correct(he)).
+    bool   limTActive_ = false;
+    bool   limTAllCells_ = false;     // selectionMode all -> the he BOUNDARY is clamped too
+    scalar limTMin_ = 0, limTMax_ = 0;
+    DeviceBuffer<label> limTCells_;
     bool   vdcActive_ = false;
     scalar vdcUMax_ = 0, vdcC_ = 1;
     DeviceBuffer<label> vdcCells_;   // velocityDampingConstraint

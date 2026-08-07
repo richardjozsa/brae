@@ -48,6 +48,16 @@ struct FvOptionsData
     bool                limUActive = false;
     scalar              limUMax = 0;
     std::vector<label>  limUCells;                  // empty => all cells
+    // limitTemperature (fvConstraint): clamp T into [Tmin, Tmax] on a selection, applied through the ENERGY
+    // variable. OF's limitTemperature::correct(he) converts the two temperature limits to he limits with the
+    // case's own thermo (heMin = thermo.he(p, Tmin, cells)) and clamps he, NOT T -- he is what the equation
+    // solved, so clamping T and converting back would leave he and T inconsistent for the rest of the
+    // iteration. It then clamps the he BOUNDARY too on every patch that does not fix a value, but only when
+    // the selection is the whole mesh (limitTemperature.C: `if (!cellSetOption::useSubMesh())`).
+    bool                limTActive = false;
+    scalar              limTMin = 0, limTMax = 0;
+    std::vector<label>  limTCells;                  // empty => all cells
+    bool                limTAllCells = false;       // selectionMode all -> also clamp the he boundary
     // velocityDampingConstraint (fvConstraint): implicit diagonal sink diag += C*V^(2/3)*(|U|-UMax) where |U|>UMax.
     bool                vdcActive = false;
     scalar              vdcUMax = 0, vdcC = 1;
@@ -130,9 +140,10 @@ inline FvOptionsData readFvOptions(
         const bool isAd  = (type == "actuationDiskSource");
         const bool isRot = (type == "rotorDisk" || type == "rotorDiskSource");
         const bool isVdc = (type == "velocityDampingConstraint");
+        const bool isLimT = (type == "limitTemperature");
         const std::string act = opt.wordOr("active", "yes");
         if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;   // inactive -> skip (OF)
-        if (!isVec && !isSca && !isPor && !isMvf && !isLim && !isAd && !isRot && !isVdc)
+        if (!isVec && !isSca && !isPor && !isMvf && !isLim && !isAd && !isRot && !isVdc && !isLimT)
         {
             fo.unsupported.push_back("source '" + s.first + "' has unsupported type '" + type + "'");
             continue;
@@ -173,6 +184,34 @@ inline FvOptionsData readFvOptions(
             ++fo.count;
             continue;
         }
+        if (isLimT)   // limitTemperature (clamp T into [min, max] via the energy variable)
+        {
+            // OF reads them as plain `min`/`max` on the option dict (limitTemperature.C read()).
+            fo.limTMin = co.scalarOr("min", opt.scalarOr("min", 0.0));
+            fo.limTMax = co.scalarOr("max", opt.scalarOr("max", 0.0));
+            if (!(fo.limTMax > fo.limTMin))
+            {
+                fo.unsupported.push_back("limitTemperature '" + s.first + "': needs max > min");
+                continue;
+            }
+            const std::string selMode = co.wordOr("selectionMode", opt.wordOr("selectionMode", "all"));
+            if (selMode == "cellZone")
+            {
+                const auto it = zones.find(co.wordOr("cellZone", opt.wordOr("cellZone", "")));
+                if (it != zones.end()) fo.limTCells = it->second;
+            }
+            else if (selMode != "all")
+            {
+                fo.unsupported.push_back("limitTemperature '" + s.first + "': selectionMode '" + selMode
+                                         + "' -- brae supports all|cellZone");
+                continue;
+            }
+            fo.limTAllCells = (selMode == "all");
+            fo.limTActive = true;
+            ++fo.count;
+            continue;
+        }
+
         if (isLim)   // limitVelocity (clamp |U| <= max)
         {
             fo.limUMax = co.scalarOr("max", opt.scalarOr("max", 0.0));

@@ -148,6 +148,56 @@ void limitUKernel(
 } // namespace
 
 
+// he clamp on a cell selection. Same shape as limitUKernel: gather through the selection list.
+__global__
+void limitEnergyKernel(int n, const label* __restrict__ cells, scalar heMin, scalar heMax,
+                       scalar* __restrict__ he)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const label c = cells[i];
+    if      (he[c] < heMin) he[c] = heMin;
+    else if (he[c] > heMax) he[c] = heMax;
+}
+
+void deviceFvoLimitEnergy(
+    const DeviceBuffer<label>& cells,
+    scalar heMin,
+    scalar heMax,
+    DeviceBuffer<scalar>& he)
+{
+    const int n = static_cast<int>(cells.size());
+    if (!n) return;
+    limitEnergyKernel<<<nBlocks(n), TPB>>>(n, cells.data(), heMin, heMax, he.data());
+    cudaCheck(cudaGetLastError(), "limitTemperature");
+}
+
+// Boundary half: every face whose patch does not fix a value. OF's test is fvPatchField::fixesValue(); on
+// the device that is bcType == 1 (brae: 0 extrapolated, 1 fixedValue, 2 calculated), and an inletOutlet
+// face has already been resolved to 0|1 for this iteration, so the same test covers it.
+__global__
+void limitEnergyBndKernel(int n, const label* __restrict__ bcType, scalar heMin, scalar heMax,
+                          scalar* __restrict__ heBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (bcType[i] == 1) return;                     // fixesValue() -> OF leaves it alone
+    if      (heBnd[i] < heMin) heBnd[i] = heMin;
+    else if (heBnd[i] > heMax) heBnd[i] = heMax;
+}
+
+void deviceFvoLimitEnergyBoundary(
+    const DeviceBoundary& dbHe,
+    scalar heMin,
+    scalar heMax,
+    DeviceBuffer<scalar>& heBnd)
+{
+    const int n = static_cast<int>(heBnd.size());
+    if (!n || dbHe.n != n) return;
+    limitEnergyBndKernel<<<nBlocks(n), TPB>>>(n, dbHe.bcType.data(), heMin, heMax, heBnd.data());
+    cudaCheck(cudaGetLastError(), "limitTemperatureBnd");
+}
+
 void deviceFvoLimitVelocity(
     const DeviceBuffer<label>& cells,
     scalar maxU,

@@ -6,6 +6,7 @@
 //   relaxSrc[comp][c]  -= V*((Cd - I*isoCd).U)[comp]    (explicit, anisotropic remainder)
 // Diagonal d/f only (identity coordinateSystem). Cells are a cellZone (unique) -> no atomics needed.
 #include "cf_types.cuh"
+#include "device_boundary.cuh"   // DeviceBoundary, for the limitTemperature boundary clamp
 #include "device_buffer.cuh"
 
 namespace brae {
@@ -29,6 +30,17 @@ void deviceFvoPorositySource(const DevicePorosity& por, int comp, scalar nu, con
 // exceeds max, preserving direction).
 void deviceFvoLimitVelocity(const DeviceBuffer<label>& cells, scalar maxU,
                             DeviceBuffer<scalar>& Ux, DeviceBuffer<scalar>& Uy, DeviceBuffer<scalar>& Uz);
+
+// limitTemperature (OF fv::limitTemperature::correct(he)): clamp the ENERGY variable into [heMin, heMax] on
+// the given cells. The caller converts the T limits with the case thermo -- OF does the same
+// (heMin = thermo.he(p, Tmin, cells)) and clamps he rather than T, because he is what the equation solved.
+void deviceFvoLimitEnergy(const DeviceBuffer<label>& cells, scalar heMin, scalar heMax,
+                          DeviceBuffer<scalar>& he);
+
+// The he BOUNDARY half of the same clamp, applied only where the patch does NOT fix a value and only when
+// the selection is the whole mesh (limitTemperature.C: `if (!cellSetOption::useSubMesh())`).
+void deviceFvoLimitEnergyBoundary(const DeviceBoundary& dbHe, scalar heMin, scalar heMax,
+                                  DeviceBuffer<scalar>& heBnd);
 
 // velocityDampingConstraint (OF fv::velocityDampingConstraint::addDamping, called from constrain(eqn) after relax):
 // for cells where |U| > UMax, diag[c] += C*V[c]^(2/3)*(|U|-UMax) (implicit-only diagonal sink; all 3 components share

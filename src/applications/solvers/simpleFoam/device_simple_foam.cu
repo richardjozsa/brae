@@ -1648,6 +1648,21 @@ namespace brae {
             alphaEffBnd.size() ? &alphaEffBnd : nullptr,
             ctl_.gradHeLimitK);   // grad(he) cellLimited coeff, from the gradient linearUpwind names
 
+        // OF EEqn.H: `EEqn.solve(); fvOptions.correct(he); thermo.correct();` -- the constraint is applied
+        // to he BEFORE the thermo update, so T and every property derived from it come out of the clamped
+        // energy. Clamping after thermo.correct() would leave T and he disagreeing for the rest of the step.
+        if (limTActive_)
+        {
+            deviceFvoLimitEnergy(limTCells_, limTMin_, limTMax_, th_.he);
+            // OF clamps the he boundary too, but only for selectionMode all (`!cellSetOption::useSubMesh()`).
+            if (limTAllCells_ && dbHe_.n > 0)
+            {
+                DeviceBuffer<scalar> heB;
+                deviceBCValue(dbHe_, th_.he, heB);
+                deviceFvoLimitEnergyBoundary(dbHe_, limTMin_, limTMax_, heB);
+            }
+        }
+
         // OF EEqn.H ends with thermo.correct(), so the PRESSURE equation sees psi/mu/alpha from the
         // just-solved he. brae used to update thermo only after the pressure step, leaving the pEqn on
         // the previous iteration's psi; doing it here is OF's ordering.
@@ -1802,6 +1817,23 @@ namespace brae {
             mvfMask01_.copyFrom(m01);
             deviceHadamard(mvfMaskV_, dm_.V, mvfMask01_);                     // maskV = V in the selection (0 else)
             mvfVtot_ = deviceSumMag(mvfMaskV_);                               // total selection volume
+        }
+        if (fo.limTActive)
+        {
+            limTActive_ = true;
+            limTAllCells_ = fo.limTAllCells;
+            // OF converts the two TEMPERATURE limits into ENERGY limits once, with the case's own thermo
+            // (limitTemperature.C: heMin = thermo.he(p, Tmin, cells)), and clamps he. With hConst the
+            // conversion is exact and p-independent, so the two limits are scalars rather than fields.
+            limTMin_ = hConstTToHe(fo.limTMin, tc_);
+            limTMax_ = hConstTToHe(fo.limTMax, tc_);
+            std::vector<label> tc = fo.limTCells;
+            if (tc.empty())   // selectionMode all
+            {
+                tc.resize(nC_);
+                for (label c = 0; c < nC_; ++c) tc[c] = c;
+            }
+            limTCells_.copyFrom(tc);
         }
         if (fo.limUActive)
         {
