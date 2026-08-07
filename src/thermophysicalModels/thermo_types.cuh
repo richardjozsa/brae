@@ -9,7 +9,7 @@
 //
 // Scope today is perfectGas + hConst + (const | Sutherland), which is why Cp is a constant here rather
 // than a field. janaf makes Cp a function of T and would move it into DeviceThermo -- every consumer
-// already goes through deviceThermoUpdate, so that change stays local to this subsystem.
+// already goes through deviceThermoCorrect, so that change stays local to this subsystem.
 
 #include "cf_types.cuh"
 #include "device_buffer.cuh"

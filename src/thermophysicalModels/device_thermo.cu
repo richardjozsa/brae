@@ -1,4 +1,4 @@
-// device_thermo.cu -- kernels behind deviceThermoUpdate.
+// device_thermo.cu -- kernels behind deviceThermoCorrect / deviceThermoRho.
 
 #include "device_thermo.cuh"
 #include "equation_of_state.cuh"

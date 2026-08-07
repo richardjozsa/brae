@@ -74,7 +74,8 @@ int main()
 
     // startup path, then the per-iteration path
     deviceThermoHeFromT(th, c);
-    deviceThermoUpdate(th, p, c);
+    deviceThermoCorrect(th, p, c);          // OF thermo.correct()
+    deviceThermoRho(th, p, c, th.rho);      // OF rho = thermo.rho()
 
     std::vector<scalar> gT(n);
     std::vector<scalar> gRho(n);
@@ -114,7 +115,8 @@ int main()
     // nothing about the other, which is exactly how the sutherland error survived.
     c.sutherland = false;
     c.mu0 = 1.8e-05;
-    deviceThermoUpdate(th, p, c);
+    deviceThermoCorrect(th, p, c);          // OF thermo.correct()
+    deviceThermoRho(th, p, c, th.rho);      // OF rho = thermo.rho()
     th.mu.copyTo(gMu);
     th.alpha.copyTo(gAlpha);
     for (int i = 0; i < n; ++i)
@@ -136,10 +138,15 @@ int main()
         }
     }
 
-    // rho bounding must clamp, not merely warn
+    // rho bounding must clamp, not merely warn. OF v2412's rhoSimpleFoam has no rhoMin/rhoMax at all --
+    // brae keeps the clamp as a safety net inside deviceRhoRelax, NOT in thermo.rho(), so that is what
+    // has to be exercised here. (a=1 makes the relaxation itself a no-op, isolating the clamp.)
     c.sutherland = true;
     c.rhoMax = 0.5;
-    deviceThermoUpdate(th, p, c);
+    c.relaxRho = 1.0;
+    deviceThermoCorrect(th, p, c);          // OF thermo.correct()
+    deviceThermoRho(th, p, c, th.rho);      // OF rho = thermo.rho()
+    deviceRhoRelax(th, c);                  // brae: clamp to [rhoMin,rhoMax], then relax (a=1 -> no blend)
     th.rho.copyTo(gRho);
     for (int i = 0; i < n; ++i)
     {
@@ -154,7 +161,8 @@ int main()
     {
         c.sutherland = true;
         c.rhoMax = 1e+06;
-        deviceThermoUpdate(th, p, c);
+        deviceThermoCorrect(th, p, c);          // OF thermo.correct()
+        deviceThermoRho(th, p, c, th.rho);      // OF rho = thermo.rho()
         std::vector<scalar> rhoNew(n);
         th.rho.copyTo(rhoNew);
 
@@ -190,7 +198,8 @@ int main()
     {
         c.Prt = 0.85;
         c.rhoMax = 1e+06;
-        deviceThermoUpdate(th, p, c);
+        deviceThermoCorrect(th, p, c);          // OF thermo.correct()
+        deviceThermoRho(th, p, c, th.rho);      // OF rho = thermo.rho()
         std::vector<scalar> rhoNow(n);
         th.rho.copyTo(rhoNow);
 

@@ -6,7 +6,7 @@
 // the three model headers change, and no consumer has to be audited.
 //
 // Call order in the SIMPLE loop mirrors OpenFOAM: solve he, then thermo.correct(), then use rho/psi in
-// the pressure equation. deviceThermoUpdate IS thermo.correct().
+// the pressure equation. deviceThermoCorrect IS thermo.correct().
 
 #include "cf_types.cuh"
 #include "device_buffer.cuh"

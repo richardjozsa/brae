@@ -730,7 +730,7 @@ namespace brae {
         // slip/symmetry: the boundary diagonal differs per component (vf_k=|n_k|), so the SHARED relax/rAU diagonal
         // must use OF's cmptMax(cmptMag(iC0,iC1,iC2)), not comp[0] alone (== comp[0] when components are equal, so
         // every other BC is unaffected). Compute the per-component boundary iC and the per-face max magnitude.
-        DeviceBuffer<scalar> iCmaxMag;
+        DeviceBuffer<scalar> iCmaxMag, iCmin;
         if (hasSym_)
         {
             DeviceBuffer<scalar> r1IC,r1BC,r1lIC,r1lBC, r2IC,r2BC,r2lIC,r2lBC;
@@ -741,6 +741,7 @@ namespace brae {
             deviceBCLaplacianCoeffsFace(dbU_.comp[2], nuEffBnd, r2lIC, r2lBC);
             deviceAxpy(-1.0,r2lIC,r2IC);
             deviceCmptMaxMag3(r0IC, r1IC, r2IC, iCmaxMag);   // OF fvMatrix::relax adds cmptMax(cmptMag(iC)) to the diagonal
+            deviceCmptMin3(r0IC, r1IC, r2IC, iCmin);         // ... and REMOVES cmptMin(iC), a different quantity
         }
         // + implicit fvm::ddt(U) DIAGONAL (rho=1 incompressible): coefft*rDeltaT*V, shared by all 3 components, added
         // to the assembled diagonal BEFORE relax -- OF assembles fvm::ddt into UEqn, then UEqn.relax(). No-op for SIMPLE.
@@ -748,7 +749,13 @@ namespace brae {
         DeviceBuffer<scalar> delta;   // mDiagR is now a member
         deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.relaxU, mDiagR, delta,
                         hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
-                        hasSym_ ? iCmaxMag.data() : nullptr);
+                        hasSym_ ? iCmaxMag.data() : nullptr,
+                        hasSym_ ? iCmin.data() : nullptr);
+        if (stageDumpActive() && stageDumpFirstOnly("mommat"))
+        {
+            stageDump("stage_mDiag0", mDiag);     // assembled momentum diagonal BEFORE relax (OF D0)
+            stageDump("stage_mDiagR", mDiagR);    // ... and AFTER relax (OF D)
+        }
         // velocityDampingConstraint: OF fvOptions.constrain(UEqn) runs AFTER UEqn.relax() and adds an implicit diagonal
         // sink (no source) where |U|>UMax. Add to the relaxed diagonal so it feeds the predictor AND rAU/HbyA (= OF A()).
         if (vdcActive_) deviceFvoVelocityDamping(vdcCells_, vdcUMax_, vdcC_, dm.V, Uk_[0], Uk_[1], Uk_[2], mDiagR);
@@ -877,6 +884,8 @@ namespace brae {
             // which mirrors meanVelocityForce's eqn += Su) -> relaxSrc -= (V/Vtot)*T*diskDir (a momentum sink/turbine).
             if (adActive_) deviceAxpy(-adT*(kk==0?adDiskDir_.x:kk==1?adDiskDir_.y:adDiskDir_.z)/adVtot_, adMaskVDisk_, relaxSrc[kk]);
             if (rotor_.active) deviceAxpy(-1.0, *rotorF[kk], relaxSrc[kk]);   // rotorDiskSource: relaxSrc -= force (OF eqn -= force)
+            if (stageDumpActive() && stageDumpFirstOnly(kk==0?"msrc0":(kk==1?"msrc1":"msrc2")))
+                stageDump(std::string("stage_mSrc") + char('0'+kk), relaxSrc[kk]);   // OF UEqn.source() minus -V*grad(p)
             DeviceBuffer<scalar> s;
             deviceHadamard(s, dm.V, *gg[kk]);
             deviceScale(s,-1.0);
