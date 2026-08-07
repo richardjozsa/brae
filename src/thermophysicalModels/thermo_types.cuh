@@ -96,6 +96,14 @@ struct DeviceThermo
 
     // Turbulent thermal diffusivity. Zero until the compressible turbulence models land; the energy
     // equation already reads alphaEff = alpha + alphat so that phase does not touch the EEqn.
+    // OF keeps TWO densities and brae used to keep one. `rho` here is the SOLVER's field --
+    // rhoSimpleFoam's own volScalarField, assigned once per outer iteration at the end of pEqn.H
+    // (`rho = thermo.rho(); rho.relax();`) and read by the momentum/pressure equations. `rhoThermo` is the
+    // THERMO's internal rho_, which heRhoThermo::calculate() rewrites on every thermo.correct().
+    // Conflating them let calculate() overwrite the RELAXED solver rho mid-iteration, so a case with
+    // `relaxationFactors/fields/rho 0.01` never actually relaxed: measured on angledDuct at iteration 2,
+    // OF's rho spread was 0.002 and brae's 0.94.
+    DeviceBuffer<scalar> rhoThermo;
     DeviceBuffer<scalar> alphat;
 
     // Density from the previous outer iteration, for rho.relax(). SIMPLE updates rho from a pressure
@@ -112,6 +120,7 @@ struct DeviceThermo
         psi.resize(n);
         mu.resize(n);
         alpha.resize(n);
+        rhoThermo.resize(n);
         alphat.resize(n);
         rhoPrev.resize(n);
     }

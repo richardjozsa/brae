@@ -184,12 +184,34 @@ private:
 class FlowRateInletVelocityPatchField : public FixedValuePatchField<vector>
 {
 public:
+    // The patch VALUE starts as the case's own `value` entry, exactly as OF does. OF's
+    // flowRateInletVelocity is a fixedValue whose value is only replaced when updateCoeffs() first runs --
+    // which happens when the momentum equation is assembled, i.e. AFTER createFields.H has already built
+    // phi from the seeded field. On angledDuct (`value uniform (0 0 0)`, massFlowRate 0.1) that makes OF's
+    // inlet mass flux EXACTLY 0 in the first momentum equation and -0.1 from the second onward (measured).
+    //
+    // brae used to compute avgU*n here, in the constructor, so its very first flux was already -0.1. Every
+    // coefficient agreed (sum|iC| to 8 s.f., avgU to 5 s.f.) but the convective boundaryCoeffs did not:
+    // OF's bC = -phi_b*U_b vanishes at iteration 1 while brae's did not, leaving sum|bC| 303x apart.
     FlowRateInletVelocityPatchField(
         const FvPatch& p,
         scalar flowRate,
         bool isMass,
-        scalar rhoInlet)
-        : FixedValuePatchField<vector>(p, false, vector{}, build(p, flowRate, isMass, rhoInlet)),
+        scalar rhoInlet,
+        bool valueUniform,
+        const vector& uniformValue,
+        const std::vector<vector>& values)
+        : FixedValuePatchField<vector>(
+              p,
+              // OF's dict constructor: if the case gives a `value`, that IS the starting field; if it does
+              // not, OF calls evaluate() -> updateCoeffs() and starts from the computed avgU*n
+              // (flowRateInletVelocityFvPatchVectorField.C). Both branches matter and they differ per case:
+              // angledDuct gives `value uniform (0 0 0)` (so OF's first inlet flux is 0), squareBend gives
+              // no value at all (so OF's first inlet flux is already -mdot). Taking only the first branch
+              // segfaulted squareBend on an empty value list; taking only the second was the 303x bC error.
+              (valueUniform || !values.empty()) ? valueUniform : false,
+              uniformValue,
+              (valueUniform || !values.empty()) ? values : build(p, flowRate, isMass, rhoInlet)),
           isMass_(isMass), flowRate_(flowRate)
     {}
     // 9 = flowRateInletVelocity: refValue recomputed per step from the live boundary rho (mass form only).
@@ -727,7 +749,8 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
                 throw std::runtime_error("brae: flowRateInletVelocity 'extrapolateProfile true' on patch " +
                     p.name + " is not implemented (it rescales the extrapolated internal profile rather "
                     "than applying a uniform normal velocity). Remove it to use the uniform form.");
-            return std::make_unique<FlowRateInletVelocityPatchField>(p, d.flowRate, d.flowRateIsMass, d.rhoInlet);
+            return std::make_unique<FlowRateInletVelocityPatchField>(
+                p, d.flowRate, d.flowRateIsMass, d.rhoInlet, d.valueUniform, d.uniformValue, d.values);
         }
         else throw std::runtime_error("brae: flowRateInletVelocity is a velocity (vector) BC");
     }

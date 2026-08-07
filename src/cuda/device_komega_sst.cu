@@ -888,7 +888,11 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* rhoBnd,    // compressible: rho at boundary faces, for the volumetric flux
     const DeviceBuffer<scalar>* nutBnd,    // nut at boundary FACES -> DkEff/DomegaEff(patchi), as OF's laplacian uses
     const DeviceBuffer<scalar>* muBnd,
-    scalar gradScalarLimitK)     // compressible: mu at boundary faces (the +mu of rho*D+mu)
+    scalar gradScalarLimitK,
+    const DeviceBuffer<label>*  fvoKMask,
+    const DeviceBuffer<scalar>* fvoKVal,
+    const DeviceBuffer<label>*  fvoEMask,
+    const DeviceBuffer<scalar>* fvoEVal)     // compressible: mu at boundary faces (the +mu of rho*D+mu)
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -1025,7 +1029,8 @@ void deviceKOmegaSSTCorrect(
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, boundedEps, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
-                               &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr, gradScalarLimitK);
+                               &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr, gradScalarLimitK,
+                               true, fvoEMask, fvoEVal);
     deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
@@ -1035,7 +1040,8 @@ void deviceKOmegaSSTCorrect(
     deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr, rho); },
-                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK);
+                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
+                               true, fvoKMask, fvoKVal);
     deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).

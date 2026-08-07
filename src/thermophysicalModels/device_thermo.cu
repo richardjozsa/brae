@@ -90,7 +90,7 @@ void deviceHeRhoThermoCalculate(
     if (th.n == 0) return;
     thermoUpdateK<<<nBlocks(th.n), TPB>>>(
         th.n, c, p.data(), th.he.data(), th.T.data(),
-        th.rho.data(),                 // heRhoThermo::calculate DOES write rho
+        th.rhoThermo.data(),           // heRhoThermo::calculate writes the THERMO's rho_, not the solver's
         th.psi.data(), th.mu.data(), th.alpha.data());
     cudaCheck(cudaGetLastError(), "heRhoThermoCalculate");
 }
@@ -113,7 +113,7 @@ void deviceThermoRho(
     DeviceBuffer<scalar>& rhoOut)
 {
     if (th.n == 0) return;
-    if (c.rhoThermoType) deviceCopy(rhoOut, th.rho);          // rhoThermo::rho() -> rho_
+    if (c.rhoThermoType) deviceCopy(rhoOut, th.rhoThermo);    // rhoThermo::rho() -> the stored rho_
     else                 deviceHadamard(rhoOut, p, th.psi);   // psiThermo::rho() -> p_*psi_
 }
 

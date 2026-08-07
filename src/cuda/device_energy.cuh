@@ -16,6 +16,7 @@
 // before the momentum coupling exists would make Gate 1 untestable against scalarTransportFoam.
 
 #include "cf_types.cuh"
+#include "device_kepsilon.cuh"   // DeviceWallData (the shared setValues mask)
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
@@ -74,7 +75,11 @@ void deviceSolveEnergy(
     const DeviceBuffer<scalar>* alphaEffBnd = nullptr,   // alphaEff at boundary FACES (OF alphaEff(patchi))
     // cellLimited coefficient of the gradient the he linearUpwind correction uses. OF takes it from the
     // scheme ARGUMENT (`linearUpwind limited`), so it is not always the grad(e) entry. 0 = unlimited.
-    scalar gradLimitK = 0.0);
+    scalar gradLimitK = 0.0,
+    // fvOptions fixedTemperatureConstraint: OF's `eqn.setValues(cells, he(T))`. Reuses the SAME matrix
+    // manipulation the epsilon wall function uses -- a mask of constrained cells and their he value.
+    const DeviceWallData* fixT = nullptr,
+    const DeviceBuffer<scalar>* fixTHe = nullptr);
 
 // V*div(phi, K) with K = 0.5|U|^2, upwind-interpolated and "bounded" exactly as OF's
 // div(phi,K) bounded Gauss upwind is. OF's rhoSimpleFoam EEqn.H carries this term next to div(phi,he);

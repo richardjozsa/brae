@@ -444,7 +444,10 @@ namespace brae {
                                        // (3.1e-5 -> 3.2e-3). Enabled only now that nut_b is evaluated.
                                        nutBndAll_.size() ? &nutBndAll_ : nullptr,
                                        compressible_ ? &muBnd_ : nullptr,
-                                       ctl_.gradKLimitK);   // grad(k)/grad(omega) cellLimited (C2)
+                                       ctl_.gradKLimitK,
+                                       // fvOptions scalarFixedValueConstraint (k / omega)
+                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
+                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);   // grad(k)/grad(omega) cellLimited (C2)
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
@@ -465,7 +468,10 @@ namespace brae {
                                       (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr,   // nu at wall faces (OF nu(patchi))
                                       nutBndAll_.size() ? &nutBndAll_ : nullptr,   // nut_b -> DkEff/DepsEff(patchi)
                                       compressible_ ? &muBnd_ : nullptr,
-                                      ctl_.gradKLimitK);   // grad(k)/grad(epsilon) cellLimited (C2)
+                                      ctl_.gradKLimitK,   // grad(k)/grad(epsilon) cellLimited (C2)
+                                      // fvOptions scalarFixedValueConstraint (OF eqn.setValues per field)
+                                      fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
+                                      fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);
         }
     }
 
@@ -474,6 +480,7 @@ namespace brae {
         // The flux this outer iteration INHERITS. OF's dumpPEqn writes the same quantity at the top of
         // pEqn.H, and the momentum predictor does not touch phi, so the two are directly comparable.
         if (stageDumpActive() && stageDumpFirstOnly("phiIn")) stageDump("stage_phiIn", phiInt_);
+        if (stageDumpActive() && stageDumpFirstOnly("phiInB")) stageDump("stage_phiInB", phiBnd_);
         const DeviceMesh& dm = dm_;
         const scalar tol = ctl_.tolU;
         // Transient fvm::ddt(U): the ONE term steady SIMPLE lacks. steadyState (SIMPLE) -> ddtc.active==false -> the two
@@ -1048,6 +1055,17 @@ namespace brae {
         if (hasSym_) deviceConstrainSymmetryHbyA(dbU_, Uk_[0], Uk_[1], Uk_[2], hxb, hyb, hzb);
         DeviceBuffer<scalar> phiHb;
         deviceBoundaryFlux(dm,hxb,hyb,hzb,phiHb);
+        // OF pcEqn.H line 1: `rho = thermo.rho();` -- the SIMPLEC/transonic path REFRESHES the solver's
+        // rho at the TOP, before phiHbyA is built, and again at the bottom. pEqn.H (subsonic) does NOT:
+        // it only assigns rho at the end. Counted directly in the two files: pcEqn.H has the statement in
+        // its first three lines, pEqn.H has none.
+        //
+        // brae had no top-of-file refresh on either path, so phiHbyA was weighted with the PREVIOUS
+        // iteration's rho. That was masked while thermo.correct() happened to overwrite rho mid-iteration;
+        // separating the solver and thermo densities exposed it. Measured on squareBend at iteration 1 with
+        // every linear system at machine tolerance: HbyA exact to 7.5e-07 but phiHbyA 1.68e-02 -- the only
+        // quantity that would not come down with solver tolerance.
+        if (ctl_.consistent) deviceThermoRho(th_, dp_, tc_, th_.rho);
         if (compressible_)
         {
             // OF rhoSimpleFoam pEqn.H: phiHbyA = fvc::interpolate(rho)*fvc::flux(HbyA), i.e. a MASS flux.
@@ -1646,7 +1664,14 @@ namespace brae {
             nullptr,
             &kineticSrc,
             alphaEffBnd.size() ? &alphaEffBnd : nullptr,
-            ctl_.gradHeLimitK);   // grad(he) cellLimited coeff, from the gradient linearUpwind names
+            ctl_.gradHeLimitK,
+            fixTActive_ ? &fixTMask_ : nullptr,   // fvOptions fixedTemperatureConstraint (OF eqn.setValues)
+            fixTActive_ ? &fixTHe_   : nullptr);   // grad(he) cellLimited coeff, from the gradient linearUpwind names
+
+        // Capture the energy solve's residuals before correctTurbulence() clears the shared report store.
+        for (const ScalarSolveEntry& se : turbulenceReport())
+            if (se.field == "he")
+            { res.he = se.perf.initialResidual; res.heFinal = se.perf.finalResidual; res.heIters = se.perf.nIterations; }
 
         // OF EEqn.H: `EEqn.solve(); fvOptions.correct(he); thermo.correct();` -- the constraint is applied
         // to he BEFORE the thermo update, so T and every property derived from it come out of the clamped
@@ -1710,7 +1735,12 @@ namespace brae {
         // p*psi for hePsiThermo, the stored rho_ for heRhoThermo -- so the one-iteration lag a
         // heRhoThermo case carries falls out of OF's own definition instead of a copy-restore dance.
         deviceThermoRho(th_, dp_, tc_, th_.rho);
-        deviceRhoRelax(th_, tc_);
+        // OF pEqn.H: `rho = thermo.rho(); if (!simple.transonic()) { rho.relax(); }` -- the transonic
+        // branch does NOT relax rho, because its pressure equation already carries psi*p implicitly and
+        // relaxing rho on top of that lags the two against each other. brae relaxed unconditionally; that
+        // was invisible while thermo.correct() was overwriting rho anyway, and became a divergence
+        // (squareBend -> NaN) the moment the solver rho was separated and the relaxation started working.
+        if (!ctl_.transonic) deviceRhoRelax(th_, tc_);
         // ...and the BOUNDARY half of the same field, with the same factor. OF's rho.relax() relaxes the
         // internal and boundary values of one field together; brae keeps them in two buffers, so both
         // have to be stepped here or the pressure equation reads a relaxed rho inside and an unrelaxed
@@ -1802,6 +1832,9 @@ namespace brae {
             por_.active = true;
             por_.d = fo.porD;
             por_.f = fo.porF;
+            por_.fixed = fo.porFixed;                                  // porosityModels::fixedCoeff
+            por_.rhoRef = fo.porRhoRef;
+            for (int k = 0; k < 9; ++k) { por_.fa[k] = fo.porAlphaT[k]; por_.fb[k] = fo.porBetaT[k]; }
             por_.cells.copyFrom(fo.porCells);
         }
         if (fo.mvfActive)
@@ -1817,6 +1850,27 @@ namespace brae {
             mvfMask01_.copyFrom(m01);
             deviceHadamard(mvfMaskV_, dm_.V, mvfMask01_);                     // maskV = V in the selection (0 else)
             mvfVtot_ = deviceSumMag(mvfMaskV_);                               // total selection volume
+        }
+        if (!fo.fixScaVals.empty() && !fo.fixScaCells.empty())
+        {
+            std::vector<label> mask(nC_, 0);
+            for (label c : fo.fixScaCells) if (c >= 0 && c < nC_) mask[c] = 1;
+            fixScaMask_.copyFrom(mask);
+            const auto itk = fo.fixScaVals.find("k");
+            if (itk != fo.fixScaVals.end()) { fixScaK_ = true; fixScaKVal_.copyFrom(std::vector<scalar>(nC_, itk->second)); }
+            // the "second" turbulence scalar: epsilon on kEpsilon, omega on kOmegaSST -- brae holds both in de_
+            auto ite = fo.fixScaVals.find(ctl_.sst ? "omega" : "epsilon");
+            if (ite != fo.fixScaVals.end()) { fixScaE_ = true; fixScaEVal_.copyFrom(std::vector<scalar>(nC_, ite->second)); }
+        }
+        if (fo.fixTActive)
+        {
+            // OF: eqn.setValues(cells_, thermo.he(thermo.p(), Tuni, cells_)). The temperature is converted
+            // ONCE with the case thermo, exactly as limitTemperature's limits are.
+            fixTActive_ = true;
+            std::vector<label> mask(nC_, 0);
+            for (label c : fo.fixTCells) if (c >= 0 && c < nC_) mask[c] = 1;
+            fixTMask_.isWallCell.copyFrom(mask);
+            fixTHe_.copyFrom(std::vector<scalar>(nC_, hConstTToHe(fo.fixTTemp, tc_)));
         }
         if (fo.limTActive)
         {

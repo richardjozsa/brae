@@ -139,7 +139,13 @@ void deviceSolveScalarTransport(
     // (air at 298 K has he = -8.59e4 J/kg). Bounding it there replaces the whole field with ~0 and
     // pins T at Cp*Tref/Cv = 417.7 K, which is exactly what NACA0012 did once he was given OF's
     // reference point. Harmless while brae used he = Cv*T > 0 -- which is why it survived this long.
-    bool boundPositive = true)
+    bool boundPositive = true,
+    // fvOptions scalarFixedValueConstraint: OF FixedValueConstraint::constrain -> eqn.setValues(cells, value).
+    // Applied BEFORE the wall block, because kEpsilon.C runs fvOptions.constrain(epsEqn) at line 266 and
+    // boundaryManipulate (the epsilon wall function's own setValues) at 267 -- so on a cell claimed by both,
+    // the WALL FUNCTION wins. Same three kernels; only the mask and the values differ.
+    const DeviceBuffer<label>* fvoSetMask = nullptr,
+    const DeviceBuffer<scalar>* fvoSetVal = nullptr)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -192,7 +198,14 @@ void deviceSolveScalarTransport(
     DeviceBuffer<scalar> aRD, aDelta; deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
                                                       ifSumOff.size() ? ifSumOff.data() : nullptr);
     { DeviceBuffer<scalar> t; deviceHadamard(t, aDelta, field); deviceAxpy(1.0, t, src); }
-    if (wall && eps0)   // eps near-wall setValues constraint (k has none)
+    if (fvoSetMask && fvoSetVal)   // fvOptions scalarFixedValueConstraint (OF: before boundaryManipulate)
+    {
+        svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), fvoSetMask->data(), fvoSetVal->data(), aU.data(), aL.data(), src.data());
+        svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), fvoSetMask->data(), aIC.data(), aBC.data());
+        svCellKernel<<<nBlocks(nC), TPB>>>(nC, fvoSetMask->data(), aRD.data(), fvoSetVal->data(), src.data());
+        cudaCheck(cudaGetLastError(), "fvOptionsSetValues");
+    }
+        if (wall && eps0)   // eps near-wall setValues constraint (k has none)
     {
         svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), wall->isWallCell.data(), eps0->data(), aU.data(), aL.data(), src.data());
         svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), wall->isWallCell.data(), aIC.data(), aBC.data());

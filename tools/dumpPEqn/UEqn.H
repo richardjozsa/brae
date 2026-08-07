@@ -16,6 +16,17 @@
 
     fvOptions.constrain(UEqn);
 
+    if (runTime.timeIndex() == braeDumpIter())
+    {   // cell volume, so the porosity's V*tr(Cd) contribution can be decomposed from D = V/rAU
+        volScalarField VV
+        (
+            IOobject("stage_V", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedScalar(dimless, Zero), zeroGradientFvPatchScalarField::typeName
+        );
+        VV.primitiveFieldRef() = mesh.V();
+        VV.write();
+    }
+
     // Stage harness: the MOMENTUM equation's boundary coefficients, per patch, AFTER relax() and
     // constrain() -- the same state brae's iC/bC are in. internalCoeffs goes to the adjacent cell's
     // diagonal, boundaryCoeffs to its source. With the diagonal proven right and the source proven wrong,

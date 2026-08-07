@@ -36,6 +36,7 @@
 #include "write_control.cuh"   // OF writeControl/writeInterval/purgeWrite cadence (shared with simpleFoam)
 #include "mrf_read.cuh"          // readCellZones (shared with the incompressible driver)
 #include "fv_options.cuh"       // OF fv::options: the SAME framework the incompressible driver uses
+#include "of_residual_log.cuh"   // BRAE_OF_LOG=1: OF-format per-solve residuals, for iteration-by-iteration diffing
 #include "scheme_parse.cuh"        // parseFvSchemesControls
 #include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
 #include <cstdio>
@@ -103,6 +104,36 @@ int main(int argc, char** argv)
         // first pressure equation sees a volumetric phiHbyA and the first iteration is inconsistent.
         std::vector<scalar> rho0(nC);
         for (label i = 0; i < nC; ++i) rho0[i] = p.internal[i] / (tc.R * T.internal[i]);
+
+        // flowRateInletVelocity, seeded with the REGISTERED density -- OF's ordering, reproduced.
+        //
+        // createFields.H builds `rho` (line 12) BEFORE `U` (line 26), so when OF constructs the patch and
+        // evaluate()s it, updateCoeffs() finds the registered rho and takes
+        //     if (db().foundObject<volScalarField>(rhoName_)) updateValues(rhop);
+        // i.e. the REAL patch density. `rhoInlet` is the OTHER branch, reached only when no rho field is
+        // registered -- rhoSimpleFoam always registers one, so OF never uses it here. squareBend's
+        // `rhoInlet 0.5` is even commented "Guess for rho", and OF ignores it.
+        //
+        // brae reads U before p and T, so at construction it had no density and fell back to rhoInlet.
+        // Measured on squareBend: avgU 467.9 against OF's 611.7, ratio 1.3074, and the inlet momentum
+        // boundaryCoeffs 0.765x OF's while every internalCoeff matched to 8 s.f.
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (U.boundary[pi]->bcCategory() != 9) continue;          // 9 = mass-form flowRateInletVelocity
+            const scalar mdot = U.boundary[pi]->flowRateValue();
+            scalar sumRhoA = 0.0;
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const label c = fvp[pi].faceCells[i];
+                sumRhoA += rho0[c] * fvp[pi].magSf[i];                // gSum(rho*magSf), OF updateValues()
+            }
+            if (sumRhoA <= 0.0) continue;
+            const scalar avgU = -mdot / sumRhoA;
+            std::vector<vector> v(fvp[pi].size);
+            for (label i = 0; i < fvp[pi].size; ++i) v[i] = avgU * fvp[pi].nf[i];
+            U.boundary[pi]->setValue(v);
+        }
+
         const SurfaceScalarField phi = fvc::rhoFlux(rho0, U, m, g, fvp);
 
         // Resolve pMaxFactor/pMinFactor into absolute limits the way OF does: the reference is taken from
@@ -345,8 +376,9 @@ int main(int argc, char** argv)
         if (!fvo.empty())
         {
             solver.setFvOptions(fvo);
-            std::printf("  fvOptions: %d source(s)%s%s%s%s\n", fvo.count,
+            std::printf("  fvOptions: %d source(s)%s%s%s%s%s\n", fvo.count,
                         fvo.limTActive ? " limitTemperature" : "",
+                        fvo.fixTActive ? " fixedTemperatureConstraint" : "",
                         fvo.porActive  ? " explicitPorositySource" : "",
                         fvo.hasMomentum ? " momentum" : "",
                         fvo.limUActive ? " limitVelocity" : "");
@@ -363,6 +395,9 @@ int main(int argc, char** argv)
         // from thermo.rho() as its OWN statement, because hePsiThermo::calculate never writes a rho --
         // psiThermo has no rho_ field at all. Folding this into the correct() call is what the old
         // deviceThermoUpdate did, and it is exactly the conflation that made picking `updateRho` a guess.
+        // Seed the THERMO's rho_ too: heRhoThermo::calculate() would normally have written it, but the
+        // first correct() above ran before any pressure solve, so both densities start from the same
+        // state -- exactly as OF's createFields.H leaves them.
         deviceThermoRho(th, solver.pDevice(), tc, th.rho);
         deviceRhoSeedPrev(th);
         // E7: OF validates the turbulence model AFTER the thermo is constructed; brae's solver ctor did it
@@ -437,10 +472,14 @@ int main(int argc, char** argv)
 
         int nIter = endTime;
         bool converged = false;
+        scalar cumulativeCont = 0;   // OF's "cumulative =" in the continuity-error line
         for (int iter = 1; iter <= endTime; ++iter)
         {
             clearTurbulenceReport();
             const DeviceSimpleResidual r = solver.rhoSimpleStep();
+            // OF prints a cumulative continuity error; brae's residual carries the per-step one.
+            cumulativeCont += r.contGlobal;
+            printOfResidualLog(iter, r, cumulativeCont);   // no-op unless BRAE_OF_LOG=1
             if (iter % 50 == 0 || iter == 1)
             {
                 std::printf("Time = %d   Ux %.4e  p %.4e  contGlobal %.4e\n",
@@ -450,10 +489,23 @@ int main(int argc, char** argv)
             // U is gated on Ux alone, matching gpuSimpleFoam: brae tracks no solved-directions mask, so the
             // out-of-plane component of a 2D/empty or wedge case carries a degenerate residual that would
             // wrongly block convergence on every 2D case.
-            bool achieved = resControl.ok(r.p, "p") && resControl.ok(r.Ux, "U");
-            if (achieved)
-                for (const auto& e : turbulenceReport())
-                    if (!resControl.ok(e.perf.initialResidual, e.field == "he" ? heName : e.field)) { achieved = false; break; }
+            // EVERY criterion is evaluated, with no short circuit and no early break. OF does the same:
+            // solutionControl loops the whole residualControl_ list and ANDs the outcomes, because each
+            // entry also has to be COUNTED -- its `checked` flag is what stops an empty or unmatched dict
+            // from declaring convergence on nothing.
+            //
+            // `a && b` skips b whenever a is false, so on any iteration where p had not yet converged the
+            // U / e / turbulence targets were never looked up at all. The converged DECISION was the same
+            // (false either way), but the criteria were never counted and dict_audit correctly reported
+            // residualControl/U, /e and /(k|epsilon) as entries brae never read.
+            bool achieved = resControl.ok(r.p,  "p");
+            achieved      = resControl.ok(r.Ux, "U") && achieved;   // U gated on Ux alone (see below)
+            // The ENERGY, from the residual struct. correctTurbulence() clears the shared report store
+            // before the turbulence solves, so the EEqn's entry is gone by the time the loop below runs --
+            // `residualControl { e 1e-3; }` was therefore never evaluated and never counted.
+            achieved      = resControl.ok(r.he, heName) && achieved;
+            for (const auto& e : turbulenceReport())
+                achieved = resControl.ok(e.perf.initialResidual, e.field == "he" ? heName : e.field) && achieved;
             if (resControl.converged(achieved)) { converged = true; nIter = iter; break; }
             // Intermediate write. Skipped on the last iteration, which the final write below covers.
             const scalar tval = wc.timeValue(iter);

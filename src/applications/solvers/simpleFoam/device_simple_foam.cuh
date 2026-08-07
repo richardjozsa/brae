@@ -343,6 +343,16 @@ private:
     bool   limTAllCells_ = false;     // selectionMode all -> the he BOUNDARY is clamped too
     scalar limTMin_ = 0, limTMax_ = 0;
     DeviceBuffer<label> limTCells_;
+    // fixedTemperatureConstraint: OF constrains the ENERGY matrix (eqn.setValues), so this is carried as a
+    // per-cell mask + per-cell he value and handed to the same setValues path the eps wall function uses.
+    bool                fixTActive_ = false;
+    DeviceWallData      fixTMask_;    // only isWallCell is used by the setValues kernels
+    DeviceBuffer<scalar> fixTHe_;
+    // scalarFixedValueConstraint on k / epsilon|omega. Per-cell mask + per-cell value, handed to the same
+    // setValues path; OF applies it before the eps wall function (kEpsilon.C:266 then :267).
+    bool                 fixScaK_ = false, fixScaE_ = false;
+    DeviceBuffer<label>  fixScaMask_;
+    DeviceBuffer<scalar> fixScaKVal_, fixScaEVal_;
     bool   vdcActive_ = false;
     scalar vdcUMax_ = 0, vdcC_ = 1;
     DeviceBuffer<label> vdcCells_;   // velocityDampingConstraint

@@ -204,7 +204,13 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             const DeviceBuffer<scalar>* muBnd = nullptr,       // compressible: mu at boundary faces
                             // OF `grad(k)`/`grad(epsilon)` cellLimited coefficient (0 = unlimited); see the
                             // kOmegaSST declaration below for why this is distinct from gradULimitK.
-                            scalar gradScalarLimitK = 0.0);
+                            scalar gradScalarLimitK = 0.0,
+                            // fvOptions scalarFixedValueConstraint on k / epsilon (OF eqn.setValues).
+                            // Applied BEFORE the eps wall function, per kEpsilon.C:266-267.
+                            const DeviceBuffer<label>*  fvoKMask = nullptr,
+                            const DeviceBuffer<scalar>* fvoKVal  = nullptr,
+                            const DeviceBuffer<label>*  fvoEMask = nullptr,
+                            const DeviceBuffer<scalar>* fvoEVal  = nullptr);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -240,7 +246,13 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             // gradULimitK above, which limits grad(U) for the production term; this one limits the
                             // TRANSPORTED scalar's own gradient, which feeds its limitedLinear weight, its
                             // linearUpwind correction and the non-orth laplacian correction.
-                            scalar gradScalarLimitK = 0.0);
+                            scalar gradScalarLimitK = 0.0,
+                            // fvOptions scalarFixedValueConstraint on k / epsilon (OF eqn.setValues).
+                            // Applied BEFORE the eps wall function, per kEpsilon.C:266-267.
+                            const DeviceBuffer<label>*  fvoKMask = nullptr,
+                            const DeviceBuffer<scalar>* fvoKVal  = nullptr,
+                            const DeviceBuffer<label>*  fvoEMask = nullptr,
+                            const DeviceBuffer<scalar>* fvoEVal  = nullptr);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,

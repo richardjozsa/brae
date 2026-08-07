@@ -646,7 +646,11 @@ void deviceKEpsilonCorrect(
     const DeviceBuffer<scalar>* nuWallFace,   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
     const DeviceBuffer<scalar>* nutBnd,       // nut at boundary FACES -> DkEff/DepsEff(patchi), as OF's laplacian uses
     const DeviceBuffer<scalar>* muBnd,
-    scalar gradScalarLimitK)        // compressible: mu at boundary faces (the +mu of rho*D+mu)
+    scalar gradScalarLimitK,
+                            const DeviceBuffer<label>*  fvoKMask,
+                            const DeviceBuffer<scalar>* fvoKVal,
+                            const DeviceBuffer<label>*  fvoEMask,
+                            const DeviceBuffer<scalar>* fvoEVal)        // compressible: mu at boundary faces (the +mu of rho*D+mu)
 {
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
@@ -718,7 +722,8 @@ void deviceKEpsilonCorrect(
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    if (co.realizable) deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, diag, src);
                                    else               deviceEpsReaction(dm, eps, k, gByNu, divU, diag, src, co, rho); },
-                               &wall, &eps0, ami, cyc, eDdt, DepsB.size() ? &DepsB : nullptr, gradScalarLimitK);
+                               &wall, &eps0, ami, cyc, eDdt, DepsB.size() ? &DepsB : nullptr, gradScalarLimitK,
+                               true, fvoEMask, fvoEVal);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));
@@ -727,7 +732,8 @@ void deviceKEpsilonCorrect(
     deviceSolveScalarTransport(dm, dbK, k, "k", Dk, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReaction(dm, k, eps, G, divU, diag, src, rho); },
-                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK);
+                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
+                               true, fvoKMask, fvoKVal);
 
     // correctNut (cell): nut = Cmu k^2 / eps (realizableKE: rCmu k^2 / eps with the variable Cmu).
     if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);

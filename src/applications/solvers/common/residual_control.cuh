@@ -18,6 +18,7 @@
 // { foo 1e-5; }` converge instantly, which is exactly what `checked` exists to stop.
 
 #include "cf_types.cuh"
+#include <regex>
 #include "foam_dict.cuh"
 #include <string>
 
@@ -31,9 +32,35 @@ public:
     bool active() const { return dict_ != nullptr; }
 
     // Target for a field, or -1 when the dict does not list it (OF: unlisted -> not a criterion).
+    //
+    // OF stores each residualControl key as a wordRe -- a word OR A REGEX (solutionControl::read:
+    // `const word& fName = dEntry.keyword(); fd.name = fName.c_str();`, matched against the solved field
+    // name). So `"(k|epsilon)" 1e-3;` is ONE entry covering two fields, and the stock tutorials use it:
+    // angledDuct writes `"(k|epsilon)"`, aerofoilNACA0012 writes `"(k|omega|e)"`.
+    //
+    // An exact-name lookup finds neither, so those criteria were silently dropped and the run was gated
+    // on p alone -- dict_audit reported residualControl/U, /e and /(k|epsilon) as never read. A case is
+    // then declared converged on a subset of OF's criteria, which is the wrong answer in whichever
+    // direction the missing field happens to lie.
+    //
+    // Exact first, then regex with LAST match winning -- the same rule findPatchEntry applies to patch
+    // entries, so a regex-keyed case cannot resolve differently depending on which reader sees it.
     scalar target(const std::string& field) const
     {
-        return dict_ ? dict_->scalarOr(field, scalar(-1)) : scalar(-1);
+        if (!dict_) return scalar(-1);
+        if (const auto* t = dict_->find(field)) return dict_->scalarOr(field, scalar(-1));
+        scalar hit = scalar(-1);
+        for (const auto& lv : dict_->leaves)
+        {
+            const std::string& key = lv.first;
+            if (key.find_first_of("()|*?[].^$") == std::string::npos) continue;   // a plain word, already tried
+            try
+            {
+                if (std::regex_match(field, compileFoamRegex(key))) hit = dict_->scalarOr(key, scalar(-1));
+            }
+            catch (const std::regex_error&) { /* not a usable regex -> not a match, as OF treats it */ }
+        }
+        return hit;
     }
 
     // Test one field. An unlisted field is not a criterion and does NOT count as a performed check.

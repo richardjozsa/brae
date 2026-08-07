@@ -15,6 +15,14 @@ struct DevicePorosity {
     bool                active = false;
     DeviceBuffer<label> cells;          // porous cellZone cells
     vector              d{0,0,0}, f{0,0,0};   // adjusted Darcy d + Forchheimer f
+    // porosityModels::fixedCoeff. A DIFFERENT model, not a variant of the above: its coefficients are
+    // fixed (alpha [1/s], beta [1/m]) rather than derived from the viscosity, and OF stores them as FULL
+    // TENSORS because calcTransformModelData() rotates diag(alpha) into the coordinateSystem's frame
+    // (fixedCoeff.C: alpha_[zonei] = csys().transform(alphaCoeff)). Row-major 9 components.
+    bool                fixed = false;
+    scalar              fa[9] = {0,0,0,0,0,0,0,0,0};   // transformed alpha tensor
+    scalar              fb[9] = {0,0,0,0,0,0,0,0,0};   // transformed beta  tensor
+    scalar              rhoRef = 1.0;                  // fixedCoeff::correct: read only when the eqn is in force units
 };
 
 // diag[c] += V*isoCd for the porous cells.  Call once (mDiag) before rAU.

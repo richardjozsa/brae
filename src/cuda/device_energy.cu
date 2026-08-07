@@ -335,7 +335,9 @@ void deviceSolveEnergy(
     DeviceCyclic* cyc,
     const DeviceBuffer<scalar>* kineticSrc,
     const DeviceBuffer<scalar>* alphaEffBnd,
-    scalar gradLimitK)
+    scalar gradLimitK,
+    const DeviceWallData* fixT,
+    const DeviceBuffer<scalar>* fixTHe)
 {
     if (th.n == 0) return;
 
@@ -371,8 +373,8 @@ void deviceSolveEnergy(
         {
             if (kineticSrc && kineticSrc->size()) deviceAxpy(-1.0, *kineticSrc, source);
         },
-        nullptr,
-        nullptr,
+        fixT,        // fixedTemperatureConstraint -> setValues, as the eps wall constraint does
+        fixTHe,
         ami,
         cyc,
         ScalarDdt{},

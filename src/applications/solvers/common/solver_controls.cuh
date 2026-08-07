@@ -129,6 +129,10 @@ struct DeviceSimpleResidual
     scalar UxFinal = 0, UyFinal = 0, UzFinal = 0;
     int UxIters = 0, UyIters = 0, UzIters = 0;     // U per-component final + nIter
     int pIters = 0;
+    // energy. Captured here rather than left in the turbulence report because correctTurbulence() clears
+    // that store before the turbulence solves, which would wipe the EEqn entry the energy already pushed.
+    scalar he = 0, heFinal = 0;
+    int    heIters = 0;
     scalar contLocal = 0, contGlobal = 0;          // time step continuity errors, raw (driver applies deltaT + cumulative)
 };
 
