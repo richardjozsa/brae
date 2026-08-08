@@ -414,6 +414,26 @@ int main(int argc, char** argv)
         // masks so it refreshes them each iteration instead of freezing the set-up value.
         solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
                                   tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
+        // OF fvPatchField::fixesValue(), captured BEFORE any per-face inletOutlet resolution: bcType 1 is
+        // fixedValue, and only there is T prescribed rather than derived. Those faces must keep T_b exact
+        // and have he_b rebuilt from the live p_b every correct() -- for a liquid under
+        // sensibleInternalEnergy, e = h(T) - p/rho(T), so an he_b converted once at set-up goes stale the
+        // moment the pressure moves.
+        //
+        // NOTE mixedFvPatchField::fixesValue() is also true in OF, so inletOutlet counts as
+        // temperature-authoritative there too; brae still blends that patch in he-space and inverts. The
+        // difference is second order (the blend is between two nearby temperatures) and is NOT covered
+        // here -- only bcType 1 is claimed.
+        {
+            const std::vector<label>  tType = dbT.bcType.host();
+            const std::vector<scalar> tRef  = dbT.refValue.host();
+            if (tType.size() == tRef.size())
+            {
+                std::vector<label> fixMask(tType.size());
+                for (std::size_t i = 0; i < tType.size(); ++i) fixMask[i] = (tType[i] == 1) ? 1 : 0;
+                solver.setFixedBoundaryT(fixMask, tRef);
+            }
+        }
         solver.setCompressible(tc, rc, std::move(dbHe));
         solver.setAlphatPrt(prtFace);
         // Hand the parsed options to the solver. Reading them and NOT doing this is precisely the silent
@@ -475,6 +495,21 @@ int main(int argc, char** argv)
             dumpv("init_alpha", th.alpha.host());
             dumpv("init_Tb",   solver.TBoundary());
             dumpv("init_rhob", solver.rhoBoundary());
+            // THE PATCH MANIFEST, without which the boundary dumps above are just a flat list of numbers.
+            // A comparison script had to guess where each patch started, and a wrong guess degraded to
+            // comparing NOTHING and reporting perfect agreement -- which is exactly what happened to
+            // step 6's "boundary matches OF to 0.00e+00". Emitting name and face count per patch, in the
+            // same order and with the same cyclic/cyclicAMI exclusions DeviceBoundary applies, lets the
+            // gate assert it found every patch it expected and compared every face it found.
+            {
+                std::ofstream o(std::string(initDir) + "/init_patches");
+                o << "# name nFaces type   (DeviceBoundary order; cyclic/cyclicAMI excluded)\n";
+                for (const auto& q : fvp)
+                {
+                    if (q.type == "cyclic" || q.type == "cyclicAMI") continue;
+                    o << q.name << ' ' << q.size << ' ' << q.type << '\n';
+                }
+            }
             {   // cell centres, so a failing-cell list can be located in space without another tool
                 const std::vector<vector>& CC = g.C();
                 std::ofstream o(std::string(initDir) + "/init_C");

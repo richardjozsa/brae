@@ -309,7 +309,7 @@ namespace brae {
         if (!compressible_) return;
         // Same three steps the outer iteration runs, in the same order, so this is OF's validate() with
         // the state OF has at that point -- not a special startup path that could drift from the real one.
-        deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, TBnd_);
+        deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, &TFixMask_, &TFixBnd_, TBnd_);
         deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBnd_);
         // Seed the solver rho field's BOUNDARY half, and its prevIter, so the first rho.relax() blends
         // toward the same state OF's does. Seeding prevIter lazily on first use instead makes the first
@@ -1126,7 +1126,7 @@ namespace brae {
             if (rhoBndP_.size() == static_cast<std::size_t>(dbP_.n)) deviceCopy(rhoB, rhoBndP_);
             else
             {
-                deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, TBnd_);
+                deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, &TFixMask_, &TFixBnd_, TBnd_);
                 deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoB);
             }
             if (stageDumpActive() && stageDumpFirstOnly("rhoBphi")) stageDump("stage_rhoBphi", rhoB);
@@ -1655,7 +1655,7 @@ namespace brae {
         // expression nuEffBnd = nuBndConst_ + nut_b into muEff_b = mu_b + rho_b*nut_b once the wall nut is
         // rho_b-weighted (see addWallNutToMuEff).
         // One T_b for all three, as in OF's single boundary loop -- not three separate inversions of he_b.
-        deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, TBnd_);
+        deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, &TFixMask_, &TFixBnd_, TBnd_);
         deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBnd_);
         deviceThermoMuBoundary(TBnd_, tc_, muBnd_);
         deviceThermoNuBoundary(dbP_, dp_, TBnd_, tc_, nuWallBnd_);   // OF nu(patchi), for the wall functions
@@ -1843,7 +1843,7 @@ namespace brae {
         // one on the patches.
         if (compressible_)
         {
-            deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, TBnd_);
+            deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, &TFixMask_, &TFixBnd_, TBnd_);
             deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBndP_);
             if (rhoBndPPrev_.size() != rhoBndP_.size()) deviceCopy(rhoBndPPrev_, rhoBndP_);   // never on the
             deviceRhoRelaxBuffer(rhoBndP_, rhoBndPPrev_, tc_);                                 // seeded path

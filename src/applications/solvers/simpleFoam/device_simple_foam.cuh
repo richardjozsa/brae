@@ -258,6 +258,12 @@ public:
     std::vector<scalar> TBoundary() const
     {
         if (!compressible_ || !dbHe_.n || !th_.he.size()) return {};
+        // Prefer the boundary temperature the thermo already established this correct(). Re-deriving it
+        // here would be a SECOND inversion with its own answer: on a fixedValue patch the solver holds
+        // the prescribed value exactly, while an independent Newton lands a residual away from it, so
+        // brae would write 349.999999999999 for a wall OF writes as 350. Two code paths for one quantity
+        // is the same defect as the four boundary property kernels, just smaller.
+        if (TBnd_.size() == static_cast<std::size_t>(dbHe_.n)) return TBnd_.host();
         DeviceBuffer<scalar> heB;
         deviceBCValue(dbHe_, th_.he, heB);
         const std::vector<scalar> h = heB.host();
@@ -276,9 +282,22 @@ public:
                                                        : EnergyForm::sensibleEnthalpy;
             for (std::size_t i = 0; i < h.size(); ++i)
                 t[i] = h2oEnergyToT(form, h[i], i < pb.size() ? pb[i] : scalar(0), 300.0).T;
-            return t;
         }
-        for (std::size_t i = 0; i < h.size(); ++i) t[i] = hConstHeToT(h[i], tc_);
+        else
+        {
+            for (std::size_t i = 0; i < h.size(); ++i) t[i] = hConstHeToT(h[i], tc_);
+        }
+        // fixesValue LAST, and on BOTH paths. A prescribed temperature is an input, so it is copied
+        // rather than recovered -- an inversion would land a Newton residual away from it and write
+        // 349.999999999999 for a wall OF writes as 350. Applied here and not only in the branch above
+        // because this fallback runs before the first correct() has filled TBnd_, which is exactly when
+        // the initialisation dump is taken.
+        if (TFixMask_.size() == h.size() && TFixBnd_.size() == h.size())
+        {
+            const std::vector<label>  msk = TFixMask_.host();
+            const std::vector<scalar> fix = TFixBnd_.host();
+            for (std::size_t i = 0; i < h.size(); ++i) if (msk[i]) t[i] = fix[i];
+        }
         return t;
     }
     // U on the boundary: each component evaluated against its own descriptor, then recombined. Needed
@@ -451,6 +470,20 @@ private:
     // it -- OF heRhoThermo::calculate establishes T_b once per patch and then evaluates rho/mu/alphah
     // from it, rather than re-inverting he_b inside each one.
     DeviceBuffer<scalar> TBnd_;
+    // OF's fvPatchField::fixesValue(), captured from the T boundary at set-up: 1 where T is PRESCRIBED,
+    // with the prescribed value alongside. Those faces keep T_b exact and have he_b re-derived from the
+    // live p_b every correct(), instead of inverting an he_b frozen at the initial pressure.
+    DeviceBuffer<label>  TFixMask_;
+    DeviceBuffer<scalar> TFixBnd_;
+public:
+    // Both vectors are in DeviceBoundary face order and must be dbHe_.n long, or they are ignored.
+    void setFixedBoundaryT(const std::vector<label>& mask, const std::vector<scalar>& value)
+    {
+        if (mask.size() != value.size()) return;
+        TFixMask_.copyFrom(mask);
+        TFixBnd_.copyFrom(value);
+    }
+private:
     // The BOUNDARY half of the solver's own `rho` field -- the one OF relaxes. rhoBnd_ above is
     // thermo.rho() at the boundary, recomputed fresh from p_b and T_b every time it is asked for, which
     // is right for everything that reads thermo.rho() (nu(patchi), alphaEff(patchi), the turbulence

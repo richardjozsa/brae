@@ -335,22 +335,45 @@ void TBoundaryLiquidK(
     const scalar* __restrict__ heBnd,
     const label*  __restrict__ faceCell,
     const scalar* __restrict__ Tcell,
-    scalar* __restrict__ TBnd)
+    const label*  __restrict__ fixMask,  // 1 where the T patch fixes a value (OF fvPatchField::fixesValue)
+    const scalar* __restrict__ TFix,     // the prescribed T on those faces
+    scalar* __restrict__ TBnd,
+    scalar* __restrict__ heRef)          // dbHe.refValue, REWRITTEN on the fixed faces
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const scalar T0 = (faceCell && Tcell) ? Tcell[faceCell[i]] : scalar(300);
     const scalar pb = pBnd ? pBnd[i] : scalar(0);
+
+    // OF heRhoThermo::calculate branches on pT.fixesValue(), and this is that branch. Where T is
+    // prescribed, T IS THE INPUT: OF never inverts he_b there, it recomputes
+    //     phe[facei] = mixture_.HE(pp[facei], pT[facei])
+    // from the CURRENT boundary pressure, every calculate(). brae converted T -> he once at setup and
+    // then inverted that frozen he_b at the new pressure, so a fixed-temperature wall drifted as p moved.
+    //
+    // Measured on squareBendLiq: inlet p ran 100 kPa -> 150 kPa during iteration 1, and since
+    // e = h(T) - p/rho(T), a stale e_b is wrong by dp/rho = 50.25 J/kg, i.e. dT = dp/(rho*Cp) =
+    // +0.012013 K. The inlet came out at 300.012019 K against OF's exact 300. Predicted and measured
+    // agree to 6e-6 K, which is what identifies this as the cause rather than a tolerance.
+    if (fixMask && fixMask[i])
+    {
+        const scalar Tb = TFix[i];
+        TBnd[i] = Tb;                                  // exactly the prescribed value, never round-tripped
+        if (heRef) heRef[i] = h2oEnergy(form, pb, Tb); // re-derived at the CURRENT p_b
+        return;
+    }
+    const scalar T0 = (faceCell && Tcell) ? Tcell[faceCell[i]] : scalar(300);
     TBnd[i] = h2oEnergyToT(form, heBnd[i], pb, T0).T;
 }
 
 void deviceThermoTBoundary(
     const DeviceBoundary& dbP,
     const DeviceBuffer<scalar>& p,
-    const DeviceBoundary& dbHe,
+    DeviceBoundary& dbHe,
     const DeviceBuffer<scalar>& he,
     const ThermoCoeffs& c,
     const DeviceBuffer<scalar>* Tcell,
+    const DeviceBuffer<label>*  TFixMask,
+    const DeviceBuffer<scalar>* TFix,
     DeviceBuffer<scalar>& TBnd)
 {
     if (dbHe.n == 0) return;
@@ -363,6 +386,13 @@ void deviceThermoTBoundary(
         const bool needP = c.internalEnergy && dbP.n == dbHe.n;
         if (needP) deviceBCValue(dbP, p, pBnd);
         const bool haveGuess = Tcell && Tcell->size() && dbHe.faceCell.size();
+        const bool haveFix =
+            TFixMask && TFix
+            && TFixMask->size() == static_cast<std::size_t>(dbHe.n)
+            && TFix->size()     == static_cast<std::size_t>(dbHe.n);
+        // refValue is what a fixedValue he face contributes to the matrix, so refreshing it here is
+        // what actually propagates the corrected energy into the next energy solve.
+        const bool haveRef = dbHe.refValue.size() == static_cast<std::size_t>(dbHe.n);
         TBoundaryLiquidK<<<nBlocks(dbHe.n), TPB>>>(
             dbHe.n,
             c.internalEnergy ? EnergyForm::sensibleInternalEnergy : EnergyForm::sensibleEnthalpy,
@@ -370,7 +400,10 @@ void deviceThermoTBoundary(
             heBnd.data(),
             haveGuess ? dbHe.faceCell.data() : nullptr,
             haveGuess ? Tcell->data() : nullptr,
-            TBnd.data());
+            haveFix ? TFixMask->data() : nullptr,
+            haveFix ? TFix->data() : nullptr,
+            TBnd.data(),
+            (haveFix && haveRef) ? dbHe.refValue.data() : nullptr);
         cudaCheck(cudaGetLastError(), "TBoundaryLiquid");
         return;
     }

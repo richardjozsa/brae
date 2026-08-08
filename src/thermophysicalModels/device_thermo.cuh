@@ -201,13 +201,20 @@ void deviceThermoRhoBoundary(
 // `Tcell` seeds the liquid Newton from each face's owner cell and may be null (it then starts at 300 K);
 // it changes the iteration count only, never the converged answer, which is accepted on the energy
 // residual. Ignored entirely by the gas path, whose inversion is exact.
+// `TFixMask`/`TFix` carry OF's fixesValue() branch: on a face whose T patch PRESCRIBES a temperature,
+// T_b is that value exactly and he_b is re-derived from it at the current p_b (dbHe.refValue is
+// rewritten in place). Everywhere else he_b is authoritative and T_b is inverted from it. Pass null for
+// both to invert everywhere, which is what the gas path does anyway -- there he is p-independent, so a
+// once-converted he_b never goes stale and the round trip is exact.
 void deviceThermoTBoundary(
     const DeviceBoundary& dbP,
     const DeviceBuffer<scalar>& p,
-    const DeviceBoundary& dbHe,
+    DeviceBoundary& dbHe,
     const DeviceBuffer<scalar>& he,
     const ThermoCoeffs& c,
     const DeviceBuffer<scalar>* Tcell,
+    const DeviceBuffer<label>*  TFixMask,
+    const DeviceBuffer<scalar>* TFix,
     DeviceBuffer<scalar>& TBnd);
 
 } // namespace brae
