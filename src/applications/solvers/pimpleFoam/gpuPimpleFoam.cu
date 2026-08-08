@@ -17,6 +17,7 @@
 // Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae; `brae` hands
 // over to it whenever a case's controlDict says `application pimpleFoam` (solvers/common/solver_dispatch.cuh).
 #include "primitive_mesh.cuh"
+#include "../common/read_surface_field.cuh"   // readSurfaceField / readPhiIfPresent (OF READ_IF_PRESENT)
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -91,43 +92,7 @@ DdtScheme parseDdtScheme(const std::string& fvSchemesPath, scalar& ocCoeff)
     throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|CrankNicolson|steadyState).");
 }
 
-// Read a surfaceScalarField (phi) written by writeSurfaceField (or by OpenFOAM) back into a SurfaceScalarField shaped
-// exactly like fvc::flux: internal = the nInternalFaces flux list; boundary indexed [patch] with boundary[pi] sized
-// patches[pi].size. readField<scalar> parses the file transparently (it does not check the FoamFile class nor the list
-// length against nCells -- that check lives only in buildField, which we bypass). Values come from `calculated` patches;
-// zeros stand in for empty/cyclic/cyclicAMI/no-value patches (the ctor recomputes cyclic/AMI flux from U + skips them,
-// and an empty face flux is 0). Used only for a seamless restart (resume the exact written flux state).
-SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
-{
-    const FieldData<scalar> fd = readField<scalar>(path);
-    SurfaceScalarField ssf;
-    if (fd.internalUniform)
-        ssf.internal.assign(static_cast<std::size_t>(nInternalFaces), fd.internalUniformValue);
-    else if (static_cast<label>(fd.internalField.size()) != nInternalFaces)
-        throw std::runtime_error("readSurfaceField: " + path + " internalField has "
-            + std::to_string(fd.internalField.size()) + " faces, but the mesh has " + std::to_string(nInternalFaces)
-            + " internal faces (wrong mesh / decomposed phi).");
-    else
-        ssf.internal = fd.internalField;
 
-    ssf.boundary.resize(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-    {
-        std::vector<scalar> vals(static_cast<std::size_t>(patches[pi].size), scalar(0));
-        for (const auto& b : fd.boundary)   // pass-1 exact-name match (written phi lists exact mesh-patch names)
-        {
-            if (b.name != patches[pi].name) continue;
-            if (b.hasValue && patches[pi].type != "cyclic" && patches[pi].type != "cyclicAMI")
-            {
-                if (b.valueUniform) std::fill(vals.begin(), vals.end(), b.uniformValue);
-                else if (b.values.size() == vals.size()) vals = b.values;   // else keep zeros (defensive)
-            }
-            break;
-        }
-        ssf.boundary[pi] = std::move(vals);
-    }
-    return ssf;
-}
 
 // CodedBCSpec + parseCodedBCs + setupCodedBCs now live in coded_bc_setup.cuh (shared with gpuSimpleFoam).
 

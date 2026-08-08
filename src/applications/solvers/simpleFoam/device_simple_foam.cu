@@ -1062,6 +1062,7 @@ namespace brae {
         // non-assignable patch, NOT the projected HbyA. Project the cell U (HbyA_b = U_c - n(n.U_c) = U_b), matching
         // OF byte-for-byte and the mixed path above (both use U_b). Wall flux is still exactly 0 (normal removed).
         if (hasSym_) deviceConstrainSymmetryHbyA(dbU_, Uk_[0], Uk_[1], Uk_[2], hxb, hyb, hzb);
+        if (stageDumpActive() && stageDumpFirstOnly("HbyAb")) stageDump3("stage_HbyAb", hxb, hyb, hzb);
         DeviceBuffer<scalar> phiHb;
         deviceBoundaryFlux(dm,hxb,hyb,hzb,phiHb);
         // OF pcEqn.H line 1: `rho = thermo.rho();` -- the SIMPLEC/transonic path REFRESHES the solver's
@@ -1460,6 +1461,7 @@ namespace brae {
             stageDump("stage_pSolved", dp_);         // straight out of the linear solver
             stageDump("stage_phiSolved", phiInt_);
         }
+        if (stageDumpActive() && stageDumpFirstOnly("pSolved")) stageDump("stage_pSolved", dp_);   // pre-relax, pre-limit
         deviceScale(dp_, ctl_.relaxP);
         deviceAxpy(1.0 - ctl_.relaxP, pPrev, dp_);
         if (stageDumpActive() && stageDumpFirstOnly("pRelaxed")) stageDump("stage_pRelaxed", dp_);

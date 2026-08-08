@@ -17,6 +17,7 @@
 // dimensions line is checked.
 
 #include "primitive_mesh.cuh"
+#include "../common/read_surface_field.cuh"   // OF READ_IF_PRESENT for phi on restart
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -102,6 +103,14 @@ int main(int argc, char** argv)
 
         // Initial density, so the starting flux is a MASS flux like every later one. Without this the
         // first pressure equation sees a volumetric phiHbyA and the first iteration is inconsistent.
+        // Initial density, so the starting flux is a MASS flux like every later one. Without this the
+        // first pressure equation sees a volumetric phiHbyA and the first iteration is inconsistent.
+        //
+        // NOT YET OF-FAITHFUL: OF createFields.H builds rho with IOobject::READ_IF_PRESENT, so a restart
+        // resumes the STORED density -- which carries rho.relax()'s history and is not reproducible from
+        // p/(R*T) (measured at the angledDuct outlet: stored rho_b sits 1.9e-03 from p_b/(R*T_b)). Doing
+        // that properly means seeding the SOLVER's rho -- th_.rho AND rhoBndP_, which is what phiHbyA
+        // reads -- not this local vector, which only feeds the inlet seed and the fresh-start flux.
         std::vector<scalar> rho0(nC);
         for (label i = 0; i < nC; ++i) rho0[i] = p.internal[i] / (tc.R * T.internal[i]);
 
@@ -134,7 +143,11 @@ int main(int argc, char** argv)
             U.boundary[pi]->setValue(v);
         }
 
-        const SurfaceScalarField phi = fvc::rhoFlux(rho0, U, m, g, fvp);
+        // OF compressibleCreatePhi.H builds phi with IOobject::READ_IF_PRESENT, so a restart resumes the
+        // stored conservative MASS flux; rhoFlux(rho0,U) is only OF's fresh-start fallback. Recomputing it
+        // unconditionally began every restart from a flux the pressure equation had never corrected.
+        const SurfaceScalarField phi = readPhiIfPresent(t0, fvp, m.nInternalFaces(),
+                                                        fvc::rhoFlux(rho0, U, m, g, fvp));
 
         // Resolve pMaxFactor/pMinFactor into absolute limits the way OF does: the reference is taken from
         // the p BOUNDARY values (pressureControl.C scans p.boundaryField() over patches that fix a value).
