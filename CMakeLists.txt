@@ -863,6 +863,18 @@ set_tests_properties(pm_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 600)
 
+# endTime is an ABSOLUTE time (OF Time::run), not a run length, and a restarted run must reproduce a
+# continuous one. Both steady drivers read endTime as a length, which is only correct from startTime 0 --
+# so every fresh-start gate was blind to it. Uses rhoBox: the identity needs a QUIET state, and
+# angledDuct's cold start is chaotic under the pressureControl ceiling.
+add_test(NAME roundtrip_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/roundtrip_vs_openfoam.sh)
+set_tests_properties(roundtrip_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
 # flowRateInletVelocity must be fed the SOLVER's rho (the relaxed one OF registers), not thermo.rho().
 # Needs a case with BOTH a relaxed rho and a flow-rate inlet; angledDuct is the only one, which is why
 # this defect survived every other gate and left the case unable to converge at all.

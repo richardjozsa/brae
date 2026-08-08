@@ -462,7 +462,10 @@ int main(int argc, char** argv)
         const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);   // OF default GREAT -> only the final state
         const int    purgeWrite    = std::max(0, controlDict.intOr("purgeWrite", 0));
         const scalar deltaT        = controlDict.scalarOr("deltaT", 1.0);
-        const scalar startTimeVal  = controlDict.scalarOr("startTime", 0.0);
+        // The RESOLVED start, not controlDict's startTime: `startFrom latestTime` can make them differ,
+        // and every time value below is measured from the start. Taking the dict's value made a run
+        // restarted from 10 name its output 1, 2, 3... -- overwriting the case's own early history.
+        const scalar startTimeVal  = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
         long writeTimeIndex = 0;
         auto timeName = [](scalar t) -> std::string   // integer name for whole times (deltaT=1), else %g
         {
@@ -534,11 +537,23 @@ int main(int argc, char** argv)
             }
         };
 
+        // endTime is ABSOLUTE, not a run length. OF's Time::run() tests `value() < endTime - 0.5*deltaT`,
+        // so a case restarted at 10 with endTime 20 runs TEN more steps and finishes at 20. Looping
+        // `iter <= endTime` from 1 ran TWENTY and finished at 30 -- silently changing the iteration
+        // count, the write times, and any comparison of a restarted run against a continuous one. Only
+        // correct when startTime is 0, which is why every fresh-start case hid it.
+        const long nSteps = std::lround((static_cast<double>(endTime) - static_cast<double>(startTimeVal))
+                                        / static_cast<double>(deltaT));
+        if (nSteps < 1)
+            throw std::runtime_error(
+                "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
+                + startStr + "): there is nothing to run. endTime is an ABSOLUTE time, not a number of "
+                "iterations -- on a restart set it past the time you are restarting from.");
         int iter = 0;
         bool converged = false;
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
-        for (iter = 1; iter <= endTime && !converged; ++iter)
+        for (iter = 1; iter <= nSteps && !converged; ++iter)
         {
             const DeviceSimpleResidual r = solver.step();
             {
@@ -608,9 +623,9 @@ int main(int argc, char** argv)
             // a plausible-looking field set (simpleControl.C:51-57).
             converged = converged && rcChecked > 0;
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
-            if (!converged && iter != endTime && isWriteTime(iter, tval)) writeTimeDir(timeName(tval));  // intermediate writes
+            if (!converged && iter != nSteps && isWriteTime(iter, tval)) writeTimeDir(timeName(tval));  // intermediate writes
         }
-        const int nIter = converged ? iter - 1 : endTime;
+        const int nIter = converged ? iter - 1 : static_cast<int>(nSteps);
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
 

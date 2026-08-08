@@ -91,10 +91,14 @@ int main(int argc, char** argv)
         // C6: startFrom was ignored here -- the start directory was hardcoded to "0", so `startFrom
         // latestTime` (the standard way to CONTINUE a compressible run) silently restarted from scratch
         // and then converged to a perfectly good answer, having discarded the restart.
-        const std::string t0 = caseDir + "/" + resolveStartTime(
+        const std::string startName = resolveStartTime(
             caseDir,
             controlDict.wordOr("startFrom", "startTime"),
             controlDict.wordOr("startTime", "0"));
+        const std::string t0 = caseDir + "/" + startName;
+        // The ABSOLUTE time this run begins at. endTime is absolute too (OF's Time::run() tests
+        // value() < endTime - 0.5*deltaT), so the run length is endTime - startTime -- see the loop.
+        const scalar tStart = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
         GeometricField<vector> U = buildField<vector>(readField<vector>(t0 + "/U"), fvp, nC);
         GeometricField<scalar> p = buildField<scalar>(readField<scalar>(t0 + "/p"), fvp, nC);
         GeometricField<scalar> T = buildField<scalar>(readField<scalar>(t0 + "/T"), fvp, nC);
@@ -471,6 +475,9 @@ int main(int argc, char** argv)
         // so a case asking to write every N iterations silently got nothing until convergence. The policy
         // is shared with gpuSimpleFoam (write_control.cuh); only the payload below is solver-specific.
         WriteControl wc(controlDict);
+        // Time values are measured from where this run actually STARTS, which `startFrom latestTime`
+        // can make different from controlDict's startTime.
+        wc.setStartTime(tStart);
         const std::string wsrc = t0 + "/";
         auto writeTimeDir = [&](const std::string& tname)
         {
@@ -516,10 +523,22 @@ int main(int argc, char** argv)
             wc.recordWritten(caseDir, tname);
         };
 
-        int nIter = endTime;
+        // endTime is ABSOLUTE, not a run length. OF's Time::run() tests `value() < endTime - 0.5*deltaT`,
+        // so a case restarted at 10 with endTime 20 runs TEN more steps and finishes at 20. brae looped
+        // `iter <= endTime` from 1, which on that restart ran TWENTY steps and finished at 30 -- silently
+        // changing the iteration count, the write times, and any comparison of a restarted run against a
+        // continuous one. Only correct when startTime is 0, which is why every fresh-start case hid it.
+        const long nSteps = std::lround((static_cast<double>(endTime) - static_cast<double>(tStart))
+                                        / static_cast<double>(wc.deltaT()));
+        if (nSteps < 1)
+            throw std::runtime_error(
+                "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
+                + startName + "): there is nothing to run. endTime is an ABSOLUTE time, not a number of "
+                "iterations -- on a restart set it past the time you are restarting from.");
+        int nIter = static_cast<int>(nSteps);
         bool converged = false;
         scalar cumulativeCont = 0;   // OF's "cumulative =" in the continuity-error line
-        for (int iter = 1; iter <= endTime; ++iter)
+        for (int iter = 1; iter <= nSteps; ++iter)
         {
             clearTurbulenceReport();
             const DeviceSimpleResidual r = solver.rhoSimpleStep();
@@ -555,7 +574,7 @@ int main(int argc, char** argv)
             if (resControl.converged(achieved)) { converged = true; nIter = iter; break; }
             // Intermediate write. Skipped on the last iteration, which the final write below covers.
             const scalar tval = wc.timeValue(iter);
-            if (iter != endTime && wc.isWriteTime(iter, tval)) writeTimeDir(WriteControl::timeName(tval));
+            if (iter != nSteps && wc.isWriteTime(iter, tval)) writeTimeDir(WriteControl::timeName(tval));
         }
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);

@@ -62,6 +62,7 @@ validation/*
 !validation/energy_vs_openfoam.sh
 !validation/restart_vs_openfoam.sh
 !validation/flowrate_vs_openfoam.sh
+!validation/roundtrip_vs_openfoam.sh
 
 # CTest-generated output (regenerated on every ctest run)
 Testing/

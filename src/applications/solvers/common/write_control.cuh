@@ -46,6 +46,12 @@ public:
 
     scalar deltaT() const { return deltaT_; }
     scalar startTime() const { return startTime_; }
+
+    // `startFrom latestTime` can resolve to a directory that is NOT controlDict's startTime, and every
+    // time value this class produces is measured from the start. Without this, a run restarted from 10
+    // with `startTime 0` still in the dict names its output 1, 2, 3... -- overwriting the case's early
+    // history and losing the restart's place in the timeline. Call it with the RESOLVED start.
+    void setStartTime(scalar t) { startTime_ = t; }
     scalar timeValue(int iter) const { return startTime_ + static_cast<scalar>(iter) * deltaT_; }
 
     // Integer name for whole times (deltaT = 1, the steady case), else %g -- OF's timeName formatting.
