@@ -41,6 +41,33 @@ inline void thermoRequire(
         + ". (rhoSimpleFoam scope today is subsonic perfectGas.)");
 }
 
+// rhoMin/rhoMax/pMin and the rho relaxation factor are SOLVER controls, not thermo properties, so they
+// come from fvSolution and apply to every thermo model. Shared by the gas and liquid paths rather than
+// duplicated: the liquid path needs relaxRho just as much (squareBendLiq relaxes rho), and a second copy
+// is a second thing to forget when a control is added.
+inline void readCommonSolutionControls(
+    ThermoCoeffs& c,
+    const std::string& caseDir,
+    const FoamDict* fvSolutionIn)
+{
+    const FoamDict fvSolutionOwn = fvSolutionIn ? FoamDict{} : readDict(caseDir + "/system/fvSolution");
+    const FoamDict& fvSolution = fvSolutionIn ? *fvSolutionIn : fvSolutionOwn;
+    const FoamDict* simple = fvSolution.subDict("SIMPLE");
+    if (simple)
+    {
+        c.rhoMin = simple->scalarOr("rhoMin", c.rhoMin);
+        c.rhoMax = simple->scalarOr("rhoMax", c.rhoMax);
+        c.pMin   = simple->scalarOr("pMin", c.pMin);
+    }
+    // rho.relax() factor lives under relaxationFactors.fields.rho, as in OF.
+    const FoamDict* relax = fvSolution.subDict("relaxationFactors");
+    if (relax)
+    {
+        const FoamDict* fields = relax->subDict("fields");
+        if (fields) c.relaxRho = fields->scalarOr("rho", c.relaxRho);
+    }
+}
+
 // Reads the dictionary and fills ThermoCoeffs. Throws on anything outside the supported set.
 // `fvSolutionIn` lets the caller hand over the fvSolution it ALREADY read. That is not just a saved file
 // read: FoamDict records which keys were queried so dict_audit can name the entries brae ignored, and a
@@ -77,6 +104,41 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir, const FoamDict*
     // For ANY other equationOfState (rhoConst, perfectFluid, icoPolynomial, Boussinesq, liquids) rho is
     // NOT psi*p, the two genuinely differ, and heRhoThermo stays refused -- accepting it there would run
     // the wrong density and converge.
+    // LIQUID PATH. `properties liquid` selects OF's liquidProperties: there is no equationOfState, no
+    // transport and no thermo entry at all, because every property is a temperature correlation instead.
+    // OF builds it as (basic/rhoThermo/liquidThermo.H)
+    //   heRhoThermo<rhoThermo, pureMixture<species::thermo<
+    //       thermophysicalPropertiesSelector<liquidProperties>, sensibleInternalEnergy>>>
+    //
+    // EXACTLY ONE COMBINATION IS ACCEPTED, and deliberately not one more. OF also registers the
+    // sensibleEnthalpy variant, and liquidProperties carries dozens of substances; neither has been run
+    // end to end here, and "mathematically reachable" is not the same as "validated". Anything broader
+    // keeps falling through to the refusal below with a message naming what it found.
+    const std::string properties = tt->wordOr("properties", "");
+    if (properties == "liquid")
+    {
+        thermoRequire(type == "heRhoThermo", "type", type,
+                      "heRhoThermo (the only thermo type OF builds `properties liquid` with)");
+        thermoRequire(mixture == "pureMixture", "mixture", mixture, "pureMixture");
+        thermoRequire(energy == "sensibleInternalEnergy", "energy", energy,
+                      "sensibleInternalEnergy for `properties liquid` (the sensibleEnthalpy variant "
+                      "exists in OpenFOAM but has not been validated here)");
+        const FoamDict* lm = dict.subDict("mixture");
+        const bool isH2O = lm && lm->found("H2O");
+        if (!isH2O)
+            throw std::runtime_error(
+                "brae: `properties liquid` supports the H2O mixture only so far. The NSRDS correlation "
+                "forms are general but each substance carries its own coefficient set, and an unvalidated "
+                "one would run silently wrong rather than fail.");
+        c.model          = ThermoModel::liquidH2O;
+        c.internalEnergy = true;
+        c.rhoThermoType  = true;    // heRhoThermo: rho is the STORED field, lagging the pressure solve
+        // Cp/mu/kappa/rho are per-cell correlations on this path; the scalar members stay at their
+        // defaults and are not read. relaxRho / rhoMin / rhoMax / pMin below still apply.
+        readCommonSolutionControls(c, caseDir, fvSolutionIn);
+        return c;
+    }
+
     thermoRequire(
         type == "hePsiThermo" || (type == "heRhoThermo" && eos == "perfectGas"),
         "type",
@@ -161,25 +223,7 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir, const FoamDict*
             "That is not a gas: it would make gamma negative and the sutherland kappa nonsense.");
     }
 
-    // Bounds are a solver control, not a thermo property, so they come from fvSolution when present.
-    // Absent, the ThermoCoeffs defaults stand.
-    const FoamDict fvSolutionOwn = fvSolutionIn ? FoamDict{} : readDict(caseDir + "/system/fvSolution");
-    const FoamDict& fvSolution = fvSolutionIn ? *fvSolutionIn : fvSolutionOwn;
-    const FoamDict* simple = fvSolution.subDict("SIMPLE");
-    if (simple)
-    {
-        c.rhoMin = simple->scalarOr("rhoMin", c.rhoMin);
-        c.rhoMax = simple->scalarOr("rhoMax", c.rhoMax);
-        c.pMin = simple->scalarOr("pMin", c.pMin);
-    }
-
-    // rho.relax() factor lives under relaxationFactors.fields.rho, as in OF.
-    const FoamDict* relax = fvSolution.subDict("relaxationFactors");
-    if (relax)
-    {
-        const FoamDict* fields = relax->subDict("fields");
-        if (fields) c.relaxRho = fields->scalarOr("rho", c.relaxRho);
-    }
+    readCommonSolutionControls(c, caseDir, fvSolutionIn);
 
     // Prt, exactly where OF looks for it: the turbulence model's own coeffs dict
     // (EddyDiffusivity::correctNut -> Prt_.readIfPresent(this->coeffDict())). Absent, OF's 1.0 stands.

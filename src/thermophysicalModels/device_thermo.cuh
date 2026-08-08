@@ -11,6 +11,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "thermo_types.cuh"
+#include "nsrds_functions.cuh"   // EnergyForm + the liquid inversion
 #include "device_boundary.cuh"
 
 namespace brae {
@@ -105,6 +106,32 @@ void deviceLimitPressure(
 // T -> he, for initialising the enthalpy field from the T that the case actually ships.
 // LIQUID (ThermoModel::liquidH2O): evaluate the NSRDS correlations at every cell, filling Cp/mu/kappa
 // and the THERMO density rhoThermo (not the solver's rho), plus alpha = kappa/Cp. No-op on the gas path.
+// h -> T over a whole field, each cell from its OWN initial guess (so thermo.correct() can later pass
+// the previous cell temperature). `ok` is 1 where the enthalpy residual met `tol` within `maxIter`, 0
+// otherwise -- reported per cell rather than aborting, because the caller is better placed than the
+// kernel to decide whether one bad inversion is fatal. Standalone: nothing in the solver calls this yet.
+// The generic inversion: solves F(p,T) = target for T, where F is h (sensibleEnthalpy) or
+// h - p/rho (sensibleInternalEnergy). `p` may be null for the enthalpy form, which ignores it.
+void deviceH2OEnergyToT(
+    EnergyForm form,
+    const DeviceBuffer<scalar>& target,
+    const DeviceBuffer<scalar>* p,
+    const DeviceBuffer<scalar>& Tguess,
+    DeviceBuffer<scalar>& T,
+    DeviceBuffer<label>& ok,
+    DeviceBuffer<scalar>& residual,
+    scalar tol = 1e-12,
+    int maxIter = 50);
+
+void deviceH2OHToT(
+    const DeviceBuffer<scalar>& hTarget,
+    const DeviceBuffer<scalar>& Tguess,
+    DeviceBuffer<scalar>& T,
+    DeviceBuffer<label>& ok,
+    DeviceBuffer<scalar>& residual,
+    scalar tol = 1e-12,
+    int maxIter = 50);
+
 void deviceThermoLiquidProperties(
     DeviceThermo& th,
     const ThermoCoeffs& c);
@@ -119,9 +146,12 @@ void deviceThermoLiquidBoundary(
     DeviceBuffer<scalar>& kappaB,
     DeviceBuffer<scalar>& rhoB);
 
+// `p` is required for the liquid sensibleInternalEnergy form (e = h(T) - p/rho(T)) and ignored by the
+// gas form, which is a pure function of T. Defaulted to null so gas call sites are unchanged.
 void deviceThermoHeFromT(
     DeviceThermo& th,
-    const ThermoCoeffs& c);
+    const ThermoCoeffs& c,
+    const DeviceBuffer<scalar>* p = nullptr);
 
 // OF's rho.relax(): rho = rhoPrev + relaxRho*(rho - rhoPrev), then rhoPrev = rho.
 //

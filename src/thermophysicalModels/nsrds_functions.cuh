@@ -63,6 +63,14 @@ BRAE_HD inline scalar nsrdsFunc5(
 // Newton inversion cannot detect on its own.
 struct H2OLiquid
 {
+    // Model-valid temperature range, from OF's own liquidProperties construction in H2O.C:
+    //     liquidProperties(W=18.015, Tc=647.13, Pc=2.2055e7, Vc, Zc, Tt=273.16, ...)
+    // Tt is the triple point and Tc the critical point -- outside [Tt, Tc] the substance is not a liquid
+    // and the correlations are extrapolation, not physics. Used to project the Newton iterate, exactly
+    // as OF's inversion applies its `limit()` function to every step.
+    static constexpr scalar Tt = 273.16;    // triple point   [K]
+    static constexpr scalar Tc = 647.13;    // critical point [K]
+
     BRAE_HD static scalar rho(scalar T)   { return nsrdsFunc5(98.343885, 0.30542, 647.13, 0.081, T); }
     BRAE_HD static scalar mu(scalar T)    { return nsrdsFunc1(-51.964, 3670.6, 5.7331, -5.3495e-29, 10, T); }
     BRAE_HD static scalar kappa(scalar T) { return nsrdsFunc0(-0.4267, 0.0056903, -8.0065e-06, 1.815e-09, 0, 0, T); }
@@ -77,5 +85,117 @@ struct H2OLiquid
                           0.150337681561662, -0.000195892311962254, 1.04025534276991e-07, T);
     }
 };
+
+// ---------------------------------------------------------------------------------------------------
+// h -> T INVERSION for the liquid path.
+//
+// h(T) is a 5th-order polynomial, so there is no closed form and OF does not attempt one: it runs Newton
+// (specie/lnInclude/thermoI.H, thermo<...>::T), which is
+//     Tnew = limit(Test - (F(p,Test) - f)/dFdT(p,Test))
+// repeated until it converges, with a maxIter_ cap that raises a FatalError rather than returning a
+// half-solved value. Here F = h and dFdT = Cp, both taken from the correlations above -- NOT
+// re-derived, so there is exactly one definition of h and one of Cp in the code.
+//
+// DELIBERATE DIFFERENCE FROM OF's STOPPING TEST. OF loops `while (mag(Tnew - Test) > T0*tol_)`, i.e. it
+// converges on the TEMPERATURE step. This accepts on the ENTHALPY residual instead:
+//     rh = |h(T) - hTarget| / max(|hTarget|, hScale)
+// A small |dT| only says Newton has stopped moving, which is also what happens if the derivative is
+// wrong -- it converges to the wrong temperature and reports success. Requiring the enthalpy equation
+// itself to be satisfied catches that. |dT| is tracked too, but it is not the acceptance criterion.
+// Which energy the solver transports, i.e. which F(p,T) the inversion has to solve. OF makes this a
+// template parameter on species::thermo (sensibleEnthalpy / sensibleInternalEnergy); an enum is the
+// device-side equivalent -- function pointers would work on the host and cost a great deal on the GPU.
+enum class EnergyForm
+{
+    sensibleEnthalpy,        // he = Hs      -> F = h(T),            dF/dT = Cp
+    sensibleInternalEnergy   // he = Es      -> F = h(T) - p/rho(T), dF/dT = Cv
+};
+
+// F(p,T) -- the energy the inversion solves for. Straight from OF:
+//   liquidProperties::Hs(p,T) = h(p,T)                                  (liquidPropertiesI.H:116)
+//   selector::Es(p,T)         = Hs(p,T) - p/rho(p,T)                    (…SelectorI.H:152)
+BRAE_HD inline scalar h2oEnergy(EnergyForm form, scalar p, scalar T)
+{
+    const scalar hs = H2OLiquid::h(T);
+    return form == EnergyForm::sensibleEnthalpy ? hs : hs - p/H2OLiquid::rho(T);
+}
+
+// dF/dT -- OF's Cpv: Cp for the enthalpy form, Cv for the internal-energy one.
+//
+// AND FOR A LIQUID THOSE ARE THE SAME NUMBER. Read from source, because intuition says otherwise:
+//   liquidProperties::CpMCv(p,T) { return 0; }                          (liquidPropertiesI.H:104)
+//   selector::Cv(p,T) = Cp(p,T) - CpMCv(p,T)                            (…SelectorI.H:140)
+// with the header note "currently it is assumed the liquid is incompressible so CpMCv 0". Verified
+// against OF's own output: Cv and Cp agree to all 17 digits at every tabulated (p,T).
+//
+// NOTE this is deliberately NOT the exact dEs/dT. Differentiating Es = h(T) - p/rho(T) gives
+// Cp(T) + p*rho'(T)/rho(T)^2; OF ignores that second term and uses Cv. Reproducing OF's choice rather
+// than "improving" it matters twice over: it is what fidelity means here, and a wrong derivative moves
+// only the PATH, not the fixed point -- so accepting on the residual (below) still lands on OF's answer.
+BRAE_HD inline scalar h2oCpv(EnergyForm form, scalar /*p*/, scalar T)
+{
+    return H2OLiquid::Cp(T);   // Cp == Cv for a liquid; the branch is in the caller's semantics, not here
+}
+
+struct HeToTResult
+{
+    scalar T          = 0;      // recovered temperature [K]
+    scalar residual   = 0;      // final relative energy residual
+    int    iterations = 0;
+    bool   converged  = false;  // false = the cap was hit without meeting the tolerance
+};
+
+// hScale floors the residual denominator. It only matters if h passes through zero, which it does not
+// for H2O anywhere in [Tt, Tc] (h ~ -1.6e7 J/kg throughout); present so the residual stays finite for a
+// future substance whose enthalpy datum does cross zero.
+// THE one inversion. Both energy forms share this loop, its projection, its residual, its cap and its
+// failure path -- there is no second Newton anywhere, which is the point: a parallel eToT would be a
+// second place for the bounds or the stopping test to drift.
+BRAE_HD inline HeToTResult h2oEnergyToT(
+    EnergyForm form,
+    scalar target,
+    scalar p,
+    scalar T0,
+    scalar tol     = 1e-12,
+    int    maxIter = 50,
+    scalar eScale  = 1e2)
+{
+    HeToTResult r;
+    // Project the STARTING guess as well as every iterate: a caller handing in a temperature from a
+    // diverging outer iteration must not put the first evaluation outside the correlation's range.
+    scalar T = fmin(fmax(T0, H2OLiquid::Tt), H2OLiquid::Tc);
+    const scalar den = fmax(fabs(target), eScale);
+
+    for (int it = 1; it <= maxIter; ++it)
+    {
+        const scalar err = h2oEnergy(form, p, T) - target;
+        r.residual   = fabs(err)/den;
+        r.iterations = it;
+        if (r.residual <= tol) { r.converged = true; break; }
+
+        const scalar cpv = h2oCpv(form, p, T);       // Cp or Cv; verified against OF in test_nsrds.cu
+        const scalar Tn  = fmin(fmax(T - err/cpv, H2OLiquid::Tt), H2OLiquid::Tc);   // OF's limit()
+        if (Tn == T) { break; }                      // projected onto a bound and stuck: report, do not spin
+        T = Tn;
+    }
+    r.T = T;
+    // One last evaluation so `residual` always describes the T being returned, including on the
+    // clamped-and-stuck exit above.
+    r.residual  = fabs(h2oEnergy(form, p, T) - target)/den;
+    r.converged = r.residual <= tol;
+    return r;
+}
+
+// Enthalpy form, kept so the step-3 call sites and their measured numbers are untouched by the
+// generalisation. p is unused on this branch (Hs has no pressure dependence for a liquid).
+BRAE_HD inline HeToTResult h2oHToT(
+    scalar hTarget,
+    scalar T0,
+    scalar tol     = 1e-12,
+    int    maxIter = 50,
+    scalar hScale  = 1e2)
+{
+    return h2oEnergyToT(EnergyForm::sensibleEnthalpy, hTarget, 0.0, T0, tol, maxIter, hScale);
+}
 
 }   // namespace brae

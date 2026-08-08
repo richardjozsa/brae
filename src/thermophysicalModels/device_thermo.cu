@@ -8,6 +8,9 @@
 #include "device_buffer.cuh"
 #include "device_blas.cuh"   // deviceCopy/deviceHadamard, for thermo.rho()
 #include "device_boundary.cuh"
+#include <stdexcept>
+#include <cstdio>
+#include <vector>
 
 namespace brae {
 
@@ -96,12 +99,67 @@ void deviceHeRhoThermoCalculate(
     cudaCheck(cudaGetLastError(), "heRhoThermoCalculate");
 }
 
+// Liquid calculate(): invert the transported energy for T, then evaluate every property from THAT T.
+//
+// ORDER IS THE WHOLE POINT. T must be updated before the properties are, or the correlations are
+// evaluated at the previous iteration's temperature and the whole update lags by one outer iteration --
+// silently, because the fields would still look smooth and plausible.
+//
+// The previous T is Newton's initial guess, per cell, which is the physically natural continuation from
+// the last SIMPLE iteration and is why the inversion takes 3-5 steps rather than restarting cold.
+void deviceThermoLiquidCalculate(
+    DeviceThermo& th,
+    const DeviceBuffer<scalar>& p,
+    const ThermoCoeffs& c)
+{
+    if (th.n == 0) return;
+    const EnergyForm form = c.internalEnergy ? EnergyForm::sensibleInternalEnergy
+                                             : EnergyForm::sensibleEnthalpy;
+    DeviceBuffer<scalar> Tnew, residual;
+    DeviceBuffer<label>  ok;
+    // th.T is BOTH the guess and, after the copy below, the result. Written through a separate buffer so
+    // a cell that fails to converge does not leave a half-updated temperature field behind.
+    deviceH2OEnergyToT(form, th.he, &p, th.T, Tnew, ok, residual);
+
+    // Failure must surface here, not as CFD instability three iterations later. One label copy per
+    // correction; the detailed scan only runs when something actually failed.
+    const std::vector<label> hOk = ok.host();
+    int nBad = 0;
+    for (label v : hOk) if (!v) ++nBad;
+    if (nBad)
+    {
+        const std::vector<scalar> hT0 = th.T.host(), hT = Tnew.host();
+        const std::vector<scalar> hHe = th.he.host(), hP = p.host(), hR = residual.host();
+        int first = 0;
+        while (first < static_cast<int>(hOk.size()) && hOk[first]) ++first;
+        char msg[512];
+        std::snprintf(msg, sizeof msg,
+            "brae: the liquid energy inversion failed to converge in %d of %d cells. First failure at "
+            "cell %d: p = %.9g Pa, %s = %.9g J/kg, initial T = %.9g K, final T = %.9g K, "
+            "relative residual = %.3e. The transported energy is not attainable by this substance "
+            "anywhere in [%.2f, %.2f] K, which usually means the pressure or energy field diverged "
+            "upstream rather than that the inversion is at fault.",
+            nBad, static_cast<int>(hOk.size()), first, (double)hP[first],
+            c.internalEnergy ? "e" : "h", (double)hHe[first],
+            (double)hT0[first], (double)hT[first], (double)hR[first],
+            (double)H2OLiquid::Tt, (double)H2OLiquid::Tc);
+        throw std::runtime_error(msg);
+    }
+
+    deviceCopy(th.T, Tnew);
+    deviceThermoLiquidProperties(th, c);   // Cp, mu, kappa, rhoThermo, alpha -- all from the NEW T
+}
+
 // basicThermo::correct() -> the mixture's calculate(). The virtual dispatch OF does at run time.
 void deviceThermoCorrect(
     DeviceThermo& th,
     const DeviceBuffer<scalar>& p,
     const ThermoCoeffs& c)
 {
+    // The gas path is not routed through the generalised inverter: it has a closed-form he->T and no
+    // reason to run Newton, and leaving it literally untouched is what keeps the nine compressible
+    // gates protected by construction rather than by testing.
+    if (c.model == ThermoModel::liquidH2O) { deviceThermoLiquidCalculate(th, p, c); return; }
     if (c.rhoThermoType) deviceHeRhoThermoCalculate(th, p, c);
     else                 deviceHePsiThermoCalculate(th, p, c);
 }
@@ -421,11 +479,45 @@ void deviceLimitPressure(
     cudaCheck(cudaGetLastError(), "limitPressure");
 }
 
+// Liquid he-from-T: e = h(T) - p/rho(T) for sensibleInternalEnergy, h(T) for sensibleEnthalpy.
+// PRESSURE IS REQUIRED here, which the gas form never needed -- hConstTToHe is a pure function of T.
+__global__
+void liquidHeFromTK(
+    int n,
+    EnergyForm form,
+    const scalar* __restrict__ p,
+    const scalar* __restrict__ T,
+    scalar* __restrict__ he)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    he[i] = h2oEnergy(form, p ? p[i] : scalar(0), T[i]);
+}
+
 void deviceThermoHeFromT(
     DeviceThermo& th,
-    const ThermoCoeffs& c)
+    const ThermoCoeffs& c,
+    const DeviceBuffer<scalar>* p)
 {
     if (th.n == 0) return;
+    // The startup seed of he from the case's T field. It had no liquid branch, so a liquid case seeded
+    // he with the PERFECT GAS hConstTToHe using the unset scalar Cp/R defaults: measured on
+    // squareBendLiq, e came out -84258 J/kg where OF's Es(1e5, 300 K) is -15850730 -- 1005*(300-298.15)
+    // - 287*300 exactly. Every cell then failed the energy inversion on the first correct(), which is
+    // how it was found: the inversion refused rather than quietly returning a clamped temperature.
+    if (c.model == ThermoModel::liquidH2O)
+    {
+        const EnergyForm form = c.internalEnergy ? EnergyForm::sensibleInternalEnergy
+                                                 : EnergyForm::sensibleEnthalpy;
+        if (c.internalEnergy && !p)
+            throw std::runtime_error(
+                "brae: seeding he from T for a liquid with sensibleInternalEnergy needs the pressure "
+                "field (e = h(T) - p/rho(T)); the caller passed none.");
+        liquidHeFromTK<<<nBlocks(th.n), TPB>>>(
+            th.n, form, p ? p->data() : nullptr, th.T.data(), th.he.data());
+        cudaCheck(cudaGetLastError(), "liquidHeFromT");
+        return;
+    }
     heFromTK<<<nBlocks(th.n), TPB>>>(
         th.n,
         c,
@@ -509,6 +601,74 @@ void deviceThermoLiquidBoundary(
         rhoB.data(),
         nullptr);                     // no boundary alpha consumer yet; added when the EEqn needs it
     cudaCheck(cudaGetLastError(), "liquidBoundary");
+}
+
+// h -> T for a whole field. Each cell inverts independently from its OWN initial guess, which is what
+// lets thermo.correct() later pass the previous temperature per cell rather than one global guess.
+//
+// The per-cell convergence flag is returned rather than aborting on the device: a single cell failing to
+// invert is a diagnosable condition (a bad enthalpy from a diverging pressure iterate, say), and the
+// caller is better placed than the kernel to decide whether that is fatal. OF aborts because it is on
+// the host and has one cell in hand; here the whole field is in flight at once.
+__global__
+void h2oEnergyToTK(
+    int n,
+    EnergyForm form,
+    scalar tol,
+    int maxIter,
+    const scalar* __restrict__ target,
+    const scalar* __restrict__ pf,      // null => enthalpy form, where p is unused
+    const scalar* __restrict__ Tguess,
+    scalar* __restrict__ T,
+    label* __restrict__ ok,
+    scalar* __restrict__ residual)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const HeToTResult r = h2oEnergyToT(form, target[i], pf ? pf[i] : scalar(0), Tguess[i], tol, maxIter);
+    T[i] = r.T;
+    if (ok)       ok[i]       = r.converged ? 1 : 0;
+    if (residual) residual[i] = r.residual;
+}
+
+void deviceH2OEnergyToT(
+    EnergyForm form,
+    const DeviceBuffer<scalar>& target,
+    const DeviceBuffer<scalar>* p,
+    const DeviceBuffer<scalar>& Tguess,
+    DeviceBuffer<scalar>& T,
+    DeviceBuffer<label>& ok,
+    DeviceBuffer<scalar>& residual,
+    scalar tol,
+    int maxIter)
+{
+    const int n = static_cast<int>(target.size());
+    if (n == 0) return;
+    T.resize(n);
+    ok.resize(n);
+    residual.resize(n);
+    h2oEnergyToTK<<<nBlocks(n), TPB>>>(
+        n, form, tol, maxIter,
+        target.data(),
+        (p && p->size() == target.size()) ? p->data() : nullptr,
+        Tguess.data(),
+        T.data(),
+        ok.data(),
+        residual.data());
+    cudaCheck(cudaGetLastError(), "h2oEnergyToT");
+}
+
+// Enthalpy form, so the step-3 call sites are untouched by the generalisation.
+void deviceH2OHToT(
+    const DeviceBuffer<scalar>& hTarget,
+    const DeviceBuffer<scalar>& Tguess,
+    DeviceBuffer<scalar>& T,
+    DeviceBuffer<label>& ok,
+    DeviceBuffer<scalar>& residual,
+    scalar tol,
+    int maxIter)
+{
+    deviceH2OEnergyToT(EnergyForm::sensibleEnthalpy, hTarget, nullptr, Tguess, T, ok, residual, tol, maxIter);
 }
 
 } // namespace brae

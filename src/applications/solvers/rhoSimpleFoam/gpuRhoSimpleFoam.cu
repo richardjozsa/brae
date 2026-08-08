@@ -425,7 +425,7 @@ int main(int argc, char** argv)
         // consistent before the first momentum predictor, and rhoPrev so the first relax has a partner.
         DeviceThermo& th = solver.thermo();
         th.T.copyFrom(T.internal);
-        deviceThermoHeFromT(th, tc);
+        deviceThermoHeFromT(th, tc, &solver.pDevice());
         deviceThermoCorrect(th, solver.pDevice(), tc);
         // OF createFields.H: `volScalarField rho(IOobject("rho", ...), thermo.rho())`. rho is initialised
         // from thermo.rho() as its OWN statement, because hePsiThermo::calculate never writes a rho --
@@ -439,6 +439,34 @@ int main(int argc, char** argv)
         // above so the thermo's own rho_ still starts from the correct()ed state -- OF keeps `rho` and
         // `thermo.rho()` as two distinct fields and only the former is read back.
         if (haveRhoFile) th.rho.copyFrom(rhoIO.internal);
+        // BRAE_DUMP_INIT=<dir>: the INITIALIZED thermo state, before any equation is solved. Step 6 of
+        // the liquid bring-up -- "the solver started" is not the same claim as "the solver started from
+        // OpenFOAM's state", and the difference is what decides whether an iteration-1 failure is the
+        // equation or the initial condition.
+        if (const char* initDir = std::getenv("BRAE_DUMP_INIT"))
+        {
+            std::error_code iec;
+            std::filesystem::create_directories(initDir, iec);
+            auto dumpv = [&](const char* nm, const std::vector<scalar>& v)
+            {
+                std::ofstream o(std::string(initDir) + "/" + nm);
+                o.precision(17);
+                o << "n " << v.size() << " 1\n";
+                for (scalar x : v) o << x << '\n';
+            };
+            dumpv("init_T",   th.T.host());
+            dumpv("init_he",  th.he.host());
+            dumpv("init_p",   solver.pDevice().host());
+            dumpv("init_rhoThermo", th.rhoThermo.host());
+            dumpv("init_rhoSolver", th.rho.host());
+            if (th.CpField.size()) dumpv("init_Cp", th.CpField.host());
+            if (th.kappa.size())   dumpv("init_kappa", th.kappa.host());
+            dumpv("init_mu",    th.mu.host());
+            dumpv("init_alpha", th.alpha.host());
+            dumpv("init_Tb",   solver.TBoundary());
+            dumpv("init_rhob", solver.rhoBoundary());
+            std::printf("brae: wrote initialized thermo state to %s\n", initDir);
+        }
         deviceRhoSeedPrev(th);
         // E7: OF validates the turbulence model AFTER the thermo is constructed; brae's solver ctor did it
         // before, so correctNut ran against a placeholder inlet density. Redo it now that rho is real.

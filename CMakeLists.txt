@@ -917,6 +917,31 @@ set_tests_properties(energy_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77)
 
+# INTEGRATION: the real deviceThermoCorrect() liquid path end to end -- inversion wired to property
+# evaluation. Catches the wiring errors the standalone tests structurally cannot: wrong energy
+# semantics, wrong p, properties evaluated before T is updated, solver rho written instead of rhoThermo.
+add_executable(test_liquid_correct tests/test_liquid_correct.cu)
+target_include_directories(test_liquid_correct PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_liquid_correct PRIVATE brae_core)
+add_test(NAME liquid_correct COMMAND test_liquid_correct)
+
+# e -> T inversion (sensibleInternalEnergy), the form squareBendLiq transports. Same generic Newton,
+# different F and dF/dT. 13 temperatures x 4 PRESSURES, because Es = Hs - p/rho and a single pressure
+# cannot distinguish e(T) from e(p,T). Oracle is OF's thermophysicalPropertiesSelector<liquidProperties>.
+add_executable(test_etot tests/test_etot.cu)
+target_include_directories(test_etot PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_etot PRIVATE brae_core)
+add_test(NAME etot COMMAND test_etot)
+
+# Standalone h -> T Newton inversion for the liquid path. Targets are OF-generated enthalpies and the
+# initial guesses are REVERSED (280 K target started from 400 K), so the test exercises inversion rather
+# than a good guess. Accepts on the ENTHALPY residual, not |dT| -- a wrong derivative changes the path,
+# not the fixed point, so |dT| alone would pass it.
+add_executable(test_hetot tests/test_hetot.cu)
+target_include_directories(test_hetot PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_hetot PRIVATE brae_core)
+add_test(NAME hetot COMMAND test_hetot)
+
 # Liquid thermo FIELD POPULATION: given a NONUNIFORM T field (280-400 K, one temperature per cell),
 # does brae fill Cp/mu/kappa/rhoThermo per cell and per boundary face with OF's values? A uniform field
 # cannot tell "evaluated per cell" from "broadcast", which is why the test refuses to use one.
