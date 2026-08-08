@@ -41,6 +41,7 @@
 #include "scheme_parse.cuh"        // parseFvSchemesControls
 #include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
 #include <cstdio>
+#include <filesystem>   // READ_IF_PRESENT probe for rho
 #include <fstream>
 #include <string>
 #include <vector>
@@ -103,16 +104,34 @@ int main(int argc, char** argv)
 
         // Initial density, so the starting flux is a MASS flux like every later one. Without this the
         // first pressure equation sees a volumetric phiHbyA and the first iteration is inconsistent.
-        // Initial density, so the starting flux is a MASS flux like every later one. Without this the
-        // first pressure equation sees a volumetric phiHbyA and the first iteration is inconsistent.
         //
-        // NOT YET OF-FAITHFUL: OF createFields.H builds rho with IOobject::READ_IF_PRESENT, so a restart
-        // resumes the STORED density -- which carries rho.relax()'s history and is not reproducible from
-        // p/(R*T) (measured at the angledDuct outlet: stored rho_b sits 1.9e-03 from p_b/(R*T_b)). Doing
-        // that properly means seeding the SOLVER's rho -- th_.rho AND rhoBndP_, which is what phiHbyA
-        // reads -- not this local vector, which only feeds the inlet seed and the fresh-start flux.
+        // OF createFields.H builds rho with IOobject::READ_IF_PRESENT:
+        //     volScalarField rho(IOobject("rho", runTime.timeName(), mesh, READ_IF_PRESENT, AUTO_WRITE),
+        //                        thermo.rho());
+        // so a restart resumes the STORED density -- which carries rho.relax()'s history and is NOT
+        // reproducible from p/(R*T). Only visible when rho is actually relaxed: with relaxRho = 1 the
+        // stored and recomputed densities are identical, which is why every rho-1.0 duct in validation/
+        // is blind to this. On naca0012 (rho 0.01), 5 iterations restarted from OF's 100/, reading vs
+        // recomputing is worth 4131x on rho, 1381x on p, 583x on U, 155x on T -- validation/
+        // restart_vs_openfoam.sh, which carries that comparison as its own negative control.
+        //
+        // Both HALVES matter: the internal field feeds th.rho (what phiHbyA interpolates) and the
+        // boundary feeds rhoBndP_ (NOT rhoBnd_, which is thermo.rho() at the boundary and stays live).
+        const std::string rhoPath = t0 + "/rho";
+        const bool haveRhoFile = std::filesystem::exists(rhoPath);
+        GeometricField<scalar> rhoIO;
+        if (haveRhoFile) rhoIO = buildField<scalar>(readField<scalar>(rhoPath), fvp, nC);
+
         std::vector<scalar> rho0(nC);
-        for (label i = 0; i < nC; ++i) rho0[i] = p.internal[i] / (tc.R * T.internal[i]);
+        if (haveRhoFile) rho0 = rhoIO.internal;
+        else for (label i = 0; i < nC; ++i) rho0[i] = p.internal[i] / (tc.R * T.internal[i]);
+
+        // Flat boundary half in DeviceBoundary order (patch order = DeviceMesh bndCell order), empty on
+        // a fresh start so revalidateAfterThermo() takes OF's thermo.rho() fallback.
+        std::vector<scalar> rhoBnd0;
+        if (haveRhoFile)
+            for (const auto& pf : rhoIO.boundary)
+                rhoBnd0.insert(rhoBnd0.end(), pf->value().begin(), pf->value().end());
 
         // flowRateInletVelocity, seeded with the REGISTERED density -- OF's ordering, reproduced.
         //
@@ -412,10 +431,14 @@ int main(int argc, char** argv)
         // first correct() above ran before any pressure solve, so both densities start from the same
         // state -- exactly as OF's createFields.H leaves them.
         deviceThermoRho(th, solver.pDevice(), tc, th.rho);
+        // READ_IF_PRESENT: the stored field overrides thermo.rho() on a restart. Written AFTER the call
+        // above so the thermo's own rho_ still starts from the correct()ed state -- OF keeps `rho` and
+        // `thermo.rho()` as two distinct fields and only the former is read back.
+        if (haveRhoFile) th.rho.copyFrom(rhoIO.internal);
         deviceRhoSeedPrev(th);
         // E7: OF validates the turbulence model AFTER the thermo is constructed; brae's solver ctor did it
         // before, so correctNut ran against a placeholder inlet density. Redo it now that rho is real.
-        solver.revalidateAfterThermo();
+        solver.revalidateAfterThermo(haveRhoFile ? &rhoBnd0 : nullptr);
 
         // What brae RESOLVED from the case, not what the dict says. A relaxation factor silently left at
         // 1.0 is invisible in the fields and fatal on a stiff case.

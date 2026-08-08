@@ -60,6 +60,7 @@ validation/*
 !validation/pm_vs_openfoam.sh
 !validation/ctl_vs_openfoam.sh
 !validation/energy_vs_openfoam.sh
+!validation/restart_vs_openfoam.sh
 
 # CTest-generated output (regenerated on every ctest run)
 Testing/

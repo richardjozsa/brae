@@ -863,6 +863,19 @@ set_tests_properties(pm_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 600)
 
+# RESTART fidelity: OF's createFields.H reads phi and rho with IOobject::READ_IF_PRESENT, so a restart
+# resumes the STORED fields. Every other compressible gate starts from 0/, where neither file exists and
+# both codes take the fallback -- which is how brae shipped without either read. This gate restarts both
+# codes from the same OF-written time directory, and carries its own negative control (the same brae run
+# with phi/rho deleted, which must FAIL the tolerance).
+add_test(NAME restart_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/restart_vs_openfoam.sh)
+set_tests_properties(restart_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
 # rhoSimpleFoam phase 2: mass flux reduces exactly to the volumetric flux at constant density
 add_executable(test_rho_flux tests/test_rho_flux.cu)
 target_include_directories(test_rho_flux PRIVATE ${BRAE_HEADER_DIRS})

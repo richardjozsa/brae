@@ -88,7 +88,12 @@ public:
     // nut/(k/omega) came out 0.2477 where OF has 1 -- predicted to six decimals by that arithmetic before
     // any code changed. Invisible with `turbulence on` (the next iteration overwrites the seed), and the
     // answer with `turbulence off`.
-    void revalidateAfterThermo();
+    //
+    // rhoBndSeed, when given, is the BOUNDARY half of a `rho` field read off disk. OF's createFields.H
+    // builds rho with IOobject::READ_IF_PRESENT, so a restart resumes the STORED density rather than
+    // recomputing thermo.rho(); the stored one carries rho.relax()'s history and is NOT reproducible
+    // from p and T. Pass nullptr (or a wrong-sized vector) for OF's fresh-start fallback, thermo.rho().
+    void revalidateAfterThermo(const std::vector<scalar>* rhoBndSeed = nullptr);
     // PIMPLE-foundation composable phase: turbulence transport (k/eps/omega/nuTilda -> nut). Uses only members,
     // so SIMPLE's step() and a future PIMPLE outer loop both call it (once per outer corrector) unchanged.
     void correctTurbulence();

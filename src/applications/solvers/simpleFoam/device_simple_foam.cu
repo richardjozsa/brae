@@ -304,18 +304,28 @@ namespace brae {
         codedBCs_.push_back(std::move(cbc));
     }
 
-    void DeviceSimpleSolver::revalidateAfterThermo()
+    void DeviceSimpleSolver::revalidateAfterThermo(const std::vector<scalar>* rhoBndSeed)
     {
         if (!compressible_) return;
         // Same three steps the outer iteration runs, in the same order, so this is OF's validate() with
         // the state OF has at that point -- not a special startup path that could drift from the real one.
         deviceThermoRhoBoundary(dbP_, dp_, dbHe_, th_.he, tc_, rhoBnd_);
-        // Seed the solver rho field's BOUNDARY half, and its prevIter, from the initial thermo state --
-        // OF's createFields.H does exactly this (`volScalarField rho(..., thermo.rho())`) and the first
-        // rho.relax() then blends toward THAT. Seeding prevIter lazily on first use instead makes the
-        // first relaxation a no-op and leaves the unrelaxed density in place for the whole run.
-        deviceCopy(rhoBndP_, rhoBnd_);
-        deviceCopy(rhoBndPPrev_, rhoBnd_);
+        // Seed the solver rho field's BOUNDARY half, and its prevIter, so the first rho.relax() blends
+        // toward the same state OF's does. Seeding prevIter lazily on first use instead makes the first
+        // relaxation a no-op and leaves the unrelaxed density in place for the whole run.
+        //
+        // OF: `volScalarField rho(IOobject("rho", ..., READ_IF_PRESENT, AUTO_WRITE), thermo.rho())`.
+        // Present on disk -> the stored field wins, boundary included; absent -> thermo.rho().
+        if (rhoBndSeed && rhoBndSeed->size() == static_cast<std::size_t>(dbP_.n))
+        {
+            rhoBndP_.copyFrom(*rhoBndSeed);
+            rhoBndPPrev_.copyFrom(*rhoBndSeed);
+        }
+        else
+        {
+            deviceCopy(rhoBndP_, rhoBnd_);
+            deviceCopy(rhoBndPPrev_, rhoBnd_);
+        }
         for (std::size_t k = 0; k < frPatches_.size(); ++k)
         {
             const scalar sumRhoA = deviceDot(rhoBnd_, frMagSf_[k]);
