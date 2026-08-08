@@ -216,7 +216,9 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir, const FoamDict*
     // Cv = Cp - CpMCv, and perfectGas::CpMCv = R (OF HtoEthermo.H + perfectGasI.H). Guarded because a
     // molWeight/Cp pair giving Cp <= R is not a gas -- it would make gamma negative and the energy
     // equation quietly nonsense rather than obviously broken.
-    if (thermoCv(c) <= 0.0)
+    // Gas-only, and skipped rather than merely harmless on the liquid path: Cv there is Cp(T) from the
+    // correlation, not Cp - R, so this test would be reading gas defaults the liquid case never sets.
+    if (c.model == ThermoModel::perfectGas && thermoCv(c) <= 0.0)
     {
         throw std::runtime_error(
             "brae: Cv = Cp - R must be positive, but the given Cp and molWeight make it <= 0. "

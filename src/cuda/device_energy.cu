@@ -1,6 +1,7 @@
 // device_energy.cu -- alphaEff assembly and the he solve.
 
 #include "device_energy.cuh"
+#include "nsrds_functions.cuh"
 #include "stage_dump.cuh"
 #include "device_scalar_transport.cuh"
 #include "thermo_model.cuh"
@@ -32,10 +33,47 @@ void heBndFromTK(
     if (gradT) gradHe[i] = (c.internalEnergy ? thermoCv(c) : c.Cp) * gradT[i];
 }
 
+// The SAME conversion for a liquid, where both the value and the slope come from the correlations
+// rather than from the perfect-gas scalars.
+//
+// THIS WAS THE ITERATION-1 EXPLOSION. A `fixedValue T` patch had its energy value computed by
+// hConstTToHe, i.e. Cp*(T - Tref) - R*T on ThermoCoeffs' GAS defaults, which the liquid path never
+// populates. squareBendLiq's walls (350 K) therefore carried he = -48361 J/kg where the correct
+// Es(1e5, 350) is -15641742 J/kg -- an error of +1.56e7 J/kg imposed on every temperature boundary,
+// which then diffused into the interior and drove 406 cells to an energy no liquid can attain.
+//
+// The gradient coefficient is d(he)/dT = Cpv, evaluated AT THE FACE TEMPERATURE. For this liquid OF
+// sets CpMCv = 0, so Cpv is Cp(T_b) for both energy forms -- not the gas Cp - R (717.9 vs 4183, a
+// factor of 5.8 on any fixedGradient/heat-flux temperature patch).
+__global__
+void heBndFromTLiquidK(
+    int n,
+    EnergyForm form,
+    const scalar* __restrict__ pBnd,     // null -> 0 Pa; only the internal-energy form reads it
+    const scalar* __restrict__ refT,
+    const scalar* __restrict__ gradT,
+    scalar* __restrict__ refHe,
+    scalar* __restrict__ gradHe)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    // PROJECT into the correlation's valid range before evaluating. refValue is only meaningful on
+    // patches that FIX a value; on zeroGradient/extrapolated patches it is unset, and H2OLiquid::rho
+    // computes pow(1 - T/Tc, 0.081), which is NaN for any T > Tc. Reading an unset refValue therefore
+    // turned the whole he boundary into NaN -- measured: all 112000 cells NaN on the first correct().
+    // The gas formula was a polynomial and silently absorbed the same garbage, which is why this only
+    // appeared on the liquid path.
+    const scalar Tb = fmin(fmax(refT[i], H2OLiquid::Tt), H2OLiquid::Tc);
+    const scalar pb = pBnd ? pBnd[i] : scalar(0);
+    refHe[i] = h2oEnergy(form, pb, Tb);
+    if (gradT) gradHe[i] = h2oCpv(form, pb, Tb) * gradT[i];
+}
+
 void deviceEnergyBoundaryFromT(
     const DeviceBoundary& dbT,
     const ThermoCoeffs& c,
-    DeviceBoundary& dbHe)
+    DeviceBoundary& dbHe,
+    const DeviceBuffer<scalar>* pBnd)
 {
     if (dbT.n == 0) return;
     if (dbHe.n != dbT.n)
@@ -46,6 +84,26 @@ void deviceEnergyBoundaryFromT(
     dbHe.refValue.resize(dbT.n);
     const bool hasGrad = dbT.refGrad.size() == static_cast<std::size_t>(dbT.n);
     if (hasGrad) dbHe.refGrad.resize(dbT.n);
+    if (c.model == ThermoModel::liquidH2O)
+    {
+        const EnergyForm form = c.internalEnergy ? EnergyForm::sensibleInternalEnergy
+                                                 : EnergyForm::sensibleEnthalpy;
+        if (c.internalEnergy && (!pBnd || pBnd->size() != static_cast<std::size_t>(dbT.n)))
+            throw std::runtime_error(
+                "brae: converting a temperature boundary to energy for a liquid with "
+                "sensibleInternalEnergy needs the boundary pressure (e = h(T) - p/rho(T)); the caller "
+                "passed none, or one sized for a different patch set.");
+        heBndFromTLiquidK<<<nBlocks(dbT.n), TPB>>>(
+            dbT.n,
+            form,
+            (c.internalEnergy && pBnd) ? pBnd->data() : nullptr,
+            dbT.refValue.data(),
+            hasGrad ? dbT.refGrad.data() : nullptr,
+            dbHe.refValue.data(),
+            hasGrad ? dbHe.refGrad.data() : nullptr);
+        cudaCheck(cudaGetLastError(), "heBndFromTLiquid");
+        return;
+    }
     heBndFromTK<<<nBlocks(dbT.n), TPB>>>(
         dbT.n,
         c,

@@ -44,10 +44,13 @@ void deviceAlphaEff(
 // per-face inversion here -- another reason the thermo lives behind hConstTToHe rather than inline.
 //
 // dbHe must already have the structure of dbT (same face count and bcType); only refValue is written.
+// pBnd is the BOUNDARY pressure, required by the liquid sensibleInternalEnergy form
+// (e = h(T) - p/rho(T)) and ignored by the gas form. Defaulted to null so gas call sites are unchanged.
 void deviceEnergyBoundaryFromT(
     const DeviceBoundary& dbT,
     const ThermoCoeffs& c,
-    DeviceBoundary& dbHe);
+    DeviceBoundary& dbHe,
+    const DeviceBuffer<scalar>* pBnd = nullptr);
 
 // Solves he in place. Steady, frozen velocity: phi is whatever flux the caller supplies and is not
 // recomputed here.

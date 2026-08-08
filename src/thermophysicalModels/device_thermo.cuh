@@ -67,8 +67,7 @@ void deviceThermoRho(
 // function needs nu_b = mu_b/rho_b (turbulenceModel::nu(patchi)). A constant scalar viscosity is only
 // correct for constant-property incompressible flow.
 void deviceThermoMuBoundary(
-    const DeviceBoundary& dbHe,
-    const DeviceBuffer<scalar>& he,
+    const DeviceBuffer<scalar>& TBnd,
     const ThermoCoeffs& c,
     DeviceBuffer<scalar>& muBnd);
 
@@ -80,8 +79,7 @@ void deviceThermoMuBoundary(
 void deviceThermoNuBoundary(
     const DeviceBoundary& dbP,
     const DeviceBuffer<scalar>& p,
-    const DeviceBoundary& dbHe,
-    const DeviceBuffer<scalar>& he,
+    const DeviceBuffer<scalar>& TBnd,
     const ThermoCoeffs& c,
     DeviceBuffer<scalar>& nuBnd);
 
@@ -93,6 +91,7 @@ void deviceAlphaEffBoundary(
     const DeviceBuffer<scalar>& rhoBnd,
     const DeviceBuffer<scalar>* nutBnd,
     const DeviceBuffer<scalar>* prtBnd,
+    const DeviceBuffer<scalar>& TBnd,
     const ThermoCoeffs& c,
     DeviceBuffer<scalar>& alphaEffBnd);
 
@@ -186,9 +185,29 @@ void deviceAlphat(
 void deviceThermoRhoBoundary(
     const DeviceBoundary& dbP,
     const DeviceBuffer<scalar>& p,
+    const DeviceBuffer<scalar>& TBnd,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& rhoBnd);
+
+// T AT BOUNDARY FACES, from he_b -- and the argument every one of the four functions above now takes.
+//
+// OF's heRhoThermo::calculate walks each patch ONCE: it establishes T_b (from he_b, or directly where the
+// T patch fixes a value) and then evaluates rho/mu/alphah from (p_b, T_b). brae had instead inverted he_b
+// separately inside each property kernel, which was merely redundant on the gas path -- the inversion is
+// closed-form and they all agreed -- but on the liquid path put a perfect-gas formula in four places at
+// once. Deriving T_b here, once, is both OF's structure and the thing that makes those four kernels
+// impossible to get individually wrong.
+//
+// `Tcell` seeds the liquid Newton from each face's owner cell and may be null (it then starts at 300 K);
+// it changes the iteration count only, never the converged answer, which is accepted on the energy
+// residual. Ignored entirely by the gas path, whose inversion is exact.
+void deviceThermoTBoundary(
+    const DeviceBoundary& dbP,
+    const DeviceBuffer<scalar>& p,
     const DeviceBoundary& dbHe,
     const DeviceBuffer<scalar>& he,
     const ThermoCoeffs& c,
-    DeviceBuffer<scalar>& rhoBnd);
+    const DeviceBuffer<scalar>* Tcell,
+    DeviceBuffer<scalar>& TBnd);
 
 } // namespace brae

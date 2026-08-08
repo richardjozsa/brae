@@ -11,6 +11,9 @@
 #include <stdexcept>
 #include <cstdio>
 #include <vector>
+#include <fstream>
+#include <filesystem>
+#include <cstdlib>
 
 namespace brae {
 
@@ -132,6 +135,20 @@ void deviceThermoLiquidCalculate(
         const std::vector<scalar> hHe = th.he.host(), hP = p.host(), hR = residual.host();
         int first = 0;
         while (first < static_cast<int>(hOk.size()) && hOk[first]) ++first;
+        // BRAE_DUMP_EEQN=<dir>: WHICH cells failed, not just how many. Whether the failures form a
+        // recognisable region (one layer against a wall, a plume off the inlet, or scattered) separates
+        // a boundary-coefficient defect from a source/convection one far faster than any global norm.
+        if (const char* dd = std::getenv("BRAE_DUMP_EEQN"))
+        {
+            std::error_code dec;
+            std::filesystem::create_directories(dd, dec);
+            std::ofstream o(std::string(dd) + "/bad_cells");
+            o.precision(17);
+            o << "# cell he p Tguess residual\n";
+            for (std::size_t i = 0; i < hOk.size(); ++i)
+                if (!hOk[i])
+                    o << i << ' ' << hHe[i] << ' ' << hP[i] << ' ' << hT0[i] << ' ' << hR[i] << '\n';
+        }
         char msg[512];
         std::snprintf(msg, sizeof msg,
             "brae: the liquid energy inversion failed to converge in %d of %d cells. First failure at "
@@ -279,42 +296,127 @@ void deviceAlphat(
     cudaCheck(cudaGetLastError(), "alphat");
 }
 
-// rho_b = p_b/(R*T_b), face by face. Same EOS as the cell update, so a boundary and its cell agree
-// whenever their p and T do.
+// ---------------------------------------------------------------------------------------------------
+// BOUNDARY TEMPERATURE -- the one place he_b becomes T_b, and the argument every boundary property is
+// then evaluated from.
+//
+// THIS MIRRORS OF's STRUCTURE, WHICH BRAE HAD LOST. heRhoThermo::calculate walks the patches ONCE and,
+// per face, establishes T_b and then evaluates psi/rho/mu/alphah from (p_b, T_b). brae had split that
+// into four independent kernels which each re-derived T_b from he_b by the perfect-gas formula. On the
+// gas path the four agreed, so it merely cost three redundant divisions; on the liquid path every one
+// of them was wrong, and identically wrong, which is the worst kind: consistent enough to look right.
+//
+// Measured, once the he boundary was corrected to the liquid value: hConstHeToT(-1.5641742e7) returned
+// T_b = -21369.6 K, from which transportMu took sqrt of a negative and produced NaN in all 112000 cells.
+// The gas inversion is exact and closed-form; the liquid one is Newton, and OF runs Newton at the
+// boundary too (mixture_.THE(phe, pp, pT) is the same thermo::T as the cell path).
 __global__
-void rhoBoundaryK(
+void TBoundaryGasK(
     int n,
     ThermoCoeffs c,
-    const scalar* __restrict__ pBnd,
     const scalar* __restrict__ heBnd,
-    scalar* __restrict__ rhoBnd)
+    scalar* __restrict__ TBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const scalar Tb = hConstHeToT(heBnd[i], c);
-    const scalar pb = fmax(pBnd[i], c.pMin);
-    rhoBnd[i] = fmin(fmax(pb / (c.R * Tb), c.rhoMin), c.rhoMax);
+    TBnd[i] = hConstHeToT(heBnd[i], c);
 }
 
-void deviceThermoRhoBoundary(
+// The liquid inversion, one Newton per face. The GUESS is the owner cell's temperature -- OF starts from
+// the patch's own previous T_b, and the adjacent cell is the same quality of warm start while keeping
+// this function stateless. It only sets the iteration count in any case: acceptance is on the energy
+// residual (see nsrds_functions.cuh), so the answer does not depend on where the iteration started, and
+// tests/test_hetot.cu proves recovery from the opposite end of the valid range.
+__global__
+void TBoundaryLiquidK(
+    int n,
+    EnergyForm form,
+    const scalar* __restrict__ pBnd,     // null -> 0 Pa; only the internal-energy form reads it
+    const scalar* __restrict__ heBnd,
+    const label*  __restrict__ faceCell,
+    const scalar* __restrict__ Tcell,
+    scalar* __restrict__ TBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const scalar T0 = (faceCell && Tcell) ? Tcell[faceCell[i]] : scalar(300);
+    const scalar pb = pBnd ? pBnd[i] : scalar(0);
+    TBnd[i] = h2oEnergyToT(form, heBnd[i], pb, T0).T;
+}
+
+void deviceThermoTBoundary(
     const DeviceBoundary& dbP,
     const DeviceBuffer<scalar>& p,
     const DeviceBoundary& dbHe,
     const DeviceBuffer<scalar>& he,
     const ThermoCoeffs& c,
+    const DeviceBuffer<scalar>* Tcell,
+    DeviceBuffer<scalar>& TBnd)
+{
+    if (dbHe.n == 0) return;
+    DeviceBuffer<scalar> heBnd;
+    deviceBCValue(dbHe, he, heBnd);
+    TBnd.resize(dbHe.n);
+    if (c.model == ThermoModel::liquidH2O)
+    {
+        DeviceBuffer<scalar> pBnd;
+        const bool needP = c.internalEnergy && dbP.n == dbHe.n;
+        if (needP) deviceBCValue(dbP, p, pBnd);
+        const bool haveGuess = Tcell && Tcell->size() && dbHe.faceCell.size();
+        TBoundaryLiquidK<<<nBlocks(dbHe.n), TPB>>>(
+            dbHe.n,
+            c.internalEnergy ? EnergyForm::sensibleInternalEnergy : EnergyForm::sensibleEnthalpy,
+            needP ? pBnd.data() : nullptr,
+            heBnd.data(),
+            haveGuess ? dbHe.faceCell.data() : nullptr,
+            haveGuess ? Tcell->data() : nullptr,
+            TBnd.data());
+        cudaCheck(cudaGetLastError(), "TBoundaryLiquid");
+        return;
+    }
+    TBoundaryGasK<<<nBlocks(dbHe.n), TPB>>>(dbHe.n, c, heBnd.data(), TBnd.data());
+    cudaCheck(cudaGetLastError(), "TBoundaryGas");
+}
+
+// rho_b, face by face -- OF mixture_.rho(p_b, T_b). Perfect gas: p/(R T), clamped as the cell update
+// clamps. Liquid: the NSRDS rho(T) correlation, which has no pressure dependence at all and is NOT
+// clamped, because rhoMin/rhoMax exist to keep a compressible EOS away from its singularity at T -> 0
+// and a liquid correlation has none.
+__global__
+void rhoBoundaryK(
+    int n,
+    ThermoCoeffs c,
+    const scalar* __restrict__ pBnd,
+    const scalar* __restrict__ TBnd,
+    scalar* __restrict__ rhoBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (c.model == ThermoModel::liquidH2O)
+    {
+        rhoBnd[i] = H2OLiquid::rho(fmin(fmax(TBnd[i], H2OLiquid::Tt), H2OLiquid::Tc));
+        return;
+    }
+    const scalar pb = fmax(pBnd[i], c.pMin);
+    rhoBnd[i] = fmin(fmax(pb / (c.R * TBnd[i]), c.rhoMin), c.rhoMax);
+}
+
+void deviceThermoRhoBoundary(
+    const DeviceBoundary& dbP,
+    const DeviceBuffer<scalar>& p,
+    const DeviceBuffer<scalar>& TBnd,
+    const ThermoCoeffs& c,
     DeviceBuffer<scalar>& rhoBnd)
 {
     if (dbP.n == 0) return;
     DeviceBuffer<scalar> pBnd;
-    DeviceBuffer<scalar> heBnd;
     deviceBCValue(dbP, p, pBnd);
-    deviceBCValue(dbHe, he, heBnd);
     rhoBnd.resize(dbP.n);
     rhoBoundaryK<<<nBlocks(dbP.n), TPB>>>(
         dbP.n,
         c,
         pBnd.data(),
-        heBnd.data(),
+        TBnd.data(),
         rhoBnd.data());
     cudaCheck(cudaGetLastError(), "rhoBoundary");
 }
@@ -328,28 +430,30 @@ __global__
 void muBoundaryK(
     int n,
     ThermoCoeffs c,
-    const scalar* __restrict__ heBnd,
+    const scalar* __restrict__ TBnd,
     scalar* __restrict__ muBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    muBnd[i] = transportMu(hConstHeToT(heBnd[i], c), c);
+    // Sutherland is sqrt(T)-based, so a liquid reaching it with the gas-inverted T_b took the square
+    // root of a negative number: this branch is what turned the whole field into NaN.
+    muBnd[i] = (c.model == ThermoModel::liquidH2O)
+                 ? H2OLiquid::mu(fmin(fmax(TBnd[i], H2OLiquid::Tt), H2OLiquid::Tc))
+                 : transportMu(TBnd[i], c);
 }
 
 void deviceThermoMuBoundary(
-    const DeviceBoundary& dbHe,
-    const DeviceBuffer<scalar>& he,
+    const DeviceBuffer<scalar>& TBnd,
     const ThermoCoeffs& c,
     DeviceBuffer<scalar>& muBnd)
 {
-    if (dbHe.n == 0) return;
-    DeviceBuffer<scalar> heBnd;
-    deviceBCValue(dbHe, he, heBnd);
-    muBnd.resize(dbHe.n);
-    muBoundaryK<<<nBlocks(dbHe.n), TPB>>>(
-        dbHe.n,
+    const int n = static_cast<int>(TBnd.size());
+    if (n == 0) return;
+    muBnd.resize(n);
+    muBoundaryK<<<nBlocks(n), TPB>>>(
+        n,
         c,
-        heBnd.data(),
+        TBnd.data(),
         muBnd.data());
     cudaCheck(cudaGetLastError(), "muBoundary");
 }
@@ -363,36 +467,38 @@ void nuBoundaryK(
     int n,
     ThermoCoeffs c,
     const scalar* __restrict__ pBnd,
-    const scalar* __restrict__ heBnd,
+    const scalar* __restrict__ TBnd,
     scalar* __restrict__ nuBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const scalar Tb = hConstHeToT(heBnd[i], c);
+    if (c.model == ThermoModel::liquidH2O)
+    {
+        const scalar Tb = fmin(fmax(TBnd[i], H2OLiquid::Tt), H2OLiquid::Tc);
+        nuBnd[i] = H2OLiquid::mu(Tb) / H2OLiquid::rho(Tb);
+        return;
+    }
     const scalar pb = fmax(pBnd[i], c.pMin);
-    const scalar rb = fmin(fmax(pb / (c.R * Tb), c.rhoMin), c.rhoMax);
-    nuBnd[i] = transportMu(Tb, c) / rb;
+    const scalar rb = fmin(fmax(pb / (c.R * TBnd[i]), c.rhoMin), c.rhoMax);
+    nuBnd[i] = transportMu(TBnd[i], c) / rb;
 }
 
 void deviceThermoNuBoundary(
     const DeviceBoundary& dbP,
     const DeviceBuffer<scalar>& p,
-    const DeviceBoundary& dbHe,
-    const DeviceBuffer<scalar>& he,
+    const DeviceBuffer<scalar>& TBnd,
     const ThermoCoeffs& c,
     DeviceBuffer<scalar>& nuBnd)
 {
     if (dbP.n == 0) return;
     DeviceBuffer<scalar> pBnd;
-    DeviceBuffer<scalar> heBnd;
     deviceBCValue(dbP, p, pBnd);
-    deviceBCValue(dbHe, he, heBnd);
     nuBnd.resize(dbP.n);
     nuBoundaryK<<<nBlocks(dbP.n), TPB>>>(
         dbP.n,
         c,
         pBnd.data(),
-        heBnd.data(),
+        TBnd.data(),
         nuBnd.data());
     cudaCheck(cudaGetLastError(), "nuBoundary");
 }
@@ -415,12 +521,22 @@ void alphaEffBoundaryK(
     const scalar* __restrict__ rhoBnd,
     const scalar* __restrict__ nutBnd,
     const scalar* __restrict__ prtBnd,
+    const scalar* __restrict__ TBnd,
     scalar* __restrict__ alphaEffBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     // transportAlpha, not mu/Pr: under sutherland OF uses the Eucken kappa/Cp and there is no Pr at all.
-    const scalar alphaLam = transportAlpha(muBnd[i], c);
+    // A LIQUID TAKES NEITHER. OF's alphah for these substances is kappa(T)/Cp(T) from the two NSRDS
+    // correlations (liquidPropertiesI.H); the Eucken relation is a dilute-gas result and c.Pr is a gas
+    // scalar the liquid path never sets, so both gas routes are unreachable here by construction.
+    scalar alphaLam;
+    if (c.model == ThermoModel::liquidH2O)
+    {
+        const scalar Tb = fmin(fmax(TBnd[i], H2OLiquid::Tt), H2OLiquid::Tc);
+        alphaLam = H2OLiquid::kappa(Tb) / H2OLiquid::Cp(Tb);
+    }
+    else alphaLam = transportAlpha(muBnd[i], c);
     const scalar alphaTur = (nutBnd && prtBnd) ? rhoBnd[i] * nutBnd[i] / prtBnd[i] : scalar(0);
     // CpByCpv, as on the cell path (heThermo::alphaEff) -- gamma for sensibleInternalEnergy, 1 for h.
     alphaEffBnd[i] = thermoCpByCpv(c) * (alphaLam + alphaTur);
@@ -431,11 +547,18 @@ void deviceAlphaEffBoundary(
     const DeviceBuffer<scalar>& rhoBnd,
     const DeviceBuffer<scalar>* nutBnd,
     const DeviceBuffer<scalar>* prtBnd,
+    const DeviceBuffer<scalar>& TBnd,
     const ThermoCoeffs& c,
     DeviceBuffer<scalar>& alphaEffBnd)
 {
     const int n = static_cast<int>(muBnd.size());
     if (n == 0) return;
+    if (c.model == ThermoModel::liquidH2O && static_cast<int>(TBnd.size()) != n)
+    {
+        throw std::runtime_error(
+            "brae: the liquid alphaEff boundary needs a boundary temperature field sized for the same "
+            "faces as mu -- alphah is kappa(T)/Cp(T) for a liquid and cannot be recovered from mu.");
+    }
     alphaEffBnd.resize(n);
     alphaEffBoundaryK<<<nBlocks(n), TPB>>>(
         n,
@@ -444,6 +567,7 @@ void deviceAlphaEffBoundary(
         rhoBnd.data(),
         (nutBnd && nutBnd->size() == muBnd.size()) ? nutBnd->data() : nullptr,
         (prtBnd && prtBnd->size() == muBnd.size()) ? prtBnd->data() : nullptr,
+        TBnd.data(),
         alphaEffBnd.data());
     cudaCheck(cudaGetLastError(), "alphaEffBoundary");
 }

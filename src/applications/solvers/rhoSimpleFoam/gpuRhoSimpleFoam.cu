@@ -399,7 +399,17 @@ int main(int argc, char** argv)
         // never asks a user to write one.
         DeviceBoundary dbT = buildDeviceBoundary(T, fvp, g);
         DeviceBoundary dbHe = buildDeviceBoundary(T, fvp, g);
-        deviceEnergyBoundaryFromT(dbT, tc, dbHe);
+        // The liquid energy form needs p at the FACES (e = h(T) - p/rho(T)); the gas form ignores it.
+        // Flattened in DeviceBoundary order (patch order = DeviceMesh bndCell order), as for rhoBnd0.
+        DeviceBuffer<scalar> pBndD;
+        if (tc.model == ThermoModel::liquidH2O)
+        {
+            std::vector<scalar> pb;
+            for (const auto& pf : p.boundary)
+                pb.insert(pb.end(), pf->value().begin(), pf->value().end());
+            pBndD.copyFrom(pb);
+        }
+        deviceEnergyBoundaryFromT(dbT, tc, dbHe, pBndD.size() ? &pBndD : nullptr);
         // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face
         // masks so it refreshes them each iteration instead of freezing the set-up value.
         solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
@@ -465,6 +475,13 @@ int main(int argc, char** argv)
             dumpv("init_alpha", th.alpha.host());
             dumpv("init_Tb",   solver.TBoundary());
             dumpv("init_rhob", solver.rhoBoundary());
+            {   // cell centres, so a failing-cell list can be located in space without another tool
+                const std::vector<vector>& CC = g.C();
+                std::ofstream o(std::string(initDir) + "/init_C");
+                o.precision(17);
+                o << "n " << CC.size() << " 3\n";
+                for (const vector& v : CC) o << v.x << ' ' << v.y << ' ' << v.z << '\n';
+            }
             std::printf("brae: wrote initialized thermo state to %s\n", initDir);
         }
         deviceRhoSeedPrev(th);

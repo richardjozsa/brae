@@ -247,12 +247,37 @@ public:
     }
     // T on the boundary. he is the solved variable, so the boundary T is T(he_b) -- evaluating he's own
     // BC (which now resolves inletOutlet per iteration) and converting, rather than echoing 0/T.
+    // T at boundary faces, for the field WRITER and the initialisation dumps.
+    //
+    // This inverts he_b for the same reason the solver's own boundary path does, and it must use the same
+    // thermodynamics -- it did not. On the liquid path it ran the perfect-gas closed form over a liquid
+    // he_b of ~-1.56e7 J/kg and wrote nonsense into every `T` boundaryField brae produced, including the
+    // init_Tb dump that step 6's "boundary matches OF" check was read from. The solve was unaffected
+    // (nothing reads this back), which is precisely why it survived: a wrong number on an output path
+    // that no assertion covered.
     std::vector<scalar> TBoundary() const
     {
         if (!compressible_ || !dbHe_.n || !th_.he.size()) return {};
         DeviceBuffer<scalar> heB;
         deviceBCValue(dbHe_, th_.he, heB);
-        std::vector<scalar> h = heB.host(), t(h.size());
+        const std::vector<scalar> h = heB.host();
+        std::vector<scalar> t(h.size());
+        if (tc_.model == ThermoModel::liquidH2O)
+        {
+            // e = h(T) - p/rho(T) needs p at the same faces; Hs does not, and passes 0.
+            std::vector<scalar> pb;
+            if (tc_.internalEnergy && dbP_.n == dbHe_.n)
+            {
+                DeviceBuffer<scalar> pB;
+                deviceBCValue(dbP_, dp_, pB);
+                pb = pB.host();
+            }
+            const EnergyForm form = tc_.internalEnergy ? EnergyForm::sensibleInternalEnergy
+                                                       : EnergyForm::sensibleEnthalpy;
+            for (std::size_t i = 0; i < h.size(); ++i)
+                t[i] = h2oEnergyToT(form, h[i], i < pb.size() ? pb[i] : scalar(0), 300.0).T;
+            return t;
+        }
         for (std::size_t i = 0; i < h.size(); ++i) t[i] = hConstHeToT(h[i], tc_);
         return t;
     }
@@ -422,6 +447,10 @@ private:
     scalar eTol_ = 1e-10, eRelTol_ = 0.0;
     bool   eUseGS_ = false;
     DeviceBuffer<scalar> rhoBnd_, muBnd_, nuWallBnd_;
+    // T at boundary faces, refreshed from he_b immediately before the boundary properties that consume
+    // it -- OF heRhoThermo::calculate establishes T_b once per patch and then evaluates rho/mu/alphah
+    // from it, rather than re-inverting he_b inside each one.
+    DeviceBuffer<scalar> TBnd_;
     // The BOUNDARY half of the solver's own `rho` field -- the one OF relaxes. rhoBnd_ above is
     // thermo.rho() at the boundary, recomputed fresh from p_b and T_b every time it is asked for, which
     // is right for everything that reads thermo.rho() (nu(patchi), alphaEff(patchi), the turbulence

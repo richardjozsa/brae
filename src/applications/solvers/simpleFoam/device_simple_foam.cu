@@ -309,7 +309,8 @@ namespace brae {
         if (!compressible_) return;
         // Same three steps the outer iteration runs, in the same order, so this is OF's validate() with
         // the state OF has at that point -- not a special startup path that could drift from the real one.
-        deviceThermoRhoBoundary(dbP_, dp_, dbHe_, th_.he, tc_, rhoBnd_);
+        deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, TBnd_);
+        deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBnd_);
         // Seed the solver rho field's BOUNDARY half, and its prevIter, so the first rho.relax() blends
         // toward the same state OF's does. Seeding prevIter lazily on first use instead makes the first
         // relaxation a no-op and leaves the unrelaxed density in place for the whole run.
@@ -1123,7 +1124,11 @@ namespace brae {
             // pressure LEVEL by tens of kPa per iteration and pinned p at the pMax ceiling.
             DeviceBuffer<scalar> rhoB;
             if (rhoBndP_.size() == static_cast<std::size_t>(dbP_.n)) deviceCopy(rhoB, rhoBndP_);
-            else deviceThermoRhoBoundary(dbP_, dp_, dbHe_, th_.he, tc_, rhoB);
+            else
+            {
+                deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, TBnd_);
+                deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoB);
+            }
             if (stageDumpActive() && stageDumpFirstOnly("rhoBphi")) stageDump("stage_rhoBphi", rhoB);
             DeviceBuffer<scalar> tmpB;
             deviceHadamard(tmpB, rhoB, phiHb);
@@ -1649,9 +1654,11 @@ namespace brae {
         // must be refreshed here rather than seeded once. nuBndConst_ becomes mu_b, which turns the boundary
         // expression nuEffBnd = nuBndConst_ + nut_b into muEff_b = mu_b + rho_b*nut_b once the wall nut is
         // rho_b-weighted (see addWallNutToMuEff).
-        deviceThermoRhoBoundary(dbP_, dp_, dbHe_, th_.he, tc_, rhoBnd_);
-        deviceThermoMuBoundary(dbHe_, th_.he, tc_, muBnd_);
-        deviceThermoNuBoundary(dbP_, dp_, dbHe_, th_.he, tc_, nuWallBnd_);   // OF nu(patchi), for the wall functions
+        // One T_b for all three, as in OF's single boundary loop -- not three separate inversions of he_b.
+        deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, TBnd_);
+        deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBnd_);
+        deviceThermoMuBoundary(TBnd_, tc_, muBnd_);
+        deviceThermoNuBoundary(dbP_, dp_, TBnd_, tc_, nuWallBnd_);   // OF nu(patchi), for the wall functions
         deviceGatherWallNu(wfBndIdx_, nuWallBnd_, wfNu_);   // same nu, in the wall-face ordering omega/G0 uses
         deviceCopy(nuBndConst_, muBnd_);
 
@@ -1726,7 +1733,7 @@ namespace brae {
             deviceAlphaEffBoundary(muBnd_, rhoBnd_,
                                    ctl_.turbulent ? &nutBndAll_ : nullptr,
                                    prtBnd_.size() ? &prtBnd_ : nullptr,
-                                   tc_, alphaEffBnd);
+                                   TBnd_, tc_, alphaEffBnd);
         deviceSolveEnergy(
             dm,
             dbHe_,
@@ -1836,7 +1843,8 @@ namespace brae {
         // one on the patches.
         if (compressible_)
         {
-            deviceThermoRhoBoundary(dbP_, dp_, dbHe_, th_.he, tc_, rhoBndP_);
+            deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, TBnd_);
+            deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBndP_);
             if (rhoBndPPrev_.size() != rhoBndP_.size()) deviceCopy(rhoBndPPrev_, rhoBndP_);   // never on the
             deviceRhoRelaxBuffer(rhoBndP_, rhoBndPPrev_, tc_);                                 // seeded path
         }
@@ -1950,6 +1958,25 @@ namespace brae {
             // the "second" turbulence scalar: epsilon on kEpsilon, omega on kOmegaSST -- brae holds both in de_
             auto ite = fo.fixScaVals.find(ctl_.sst ? "omega" : "epsilon");
             if (ite != fo.fixScaVals.end()) { fixScaE_ = true; fixScaEVal_.copyFrom(std::vector<scalar>(nC_, ite->second)); }
+        }
+        // BOTH fvOptions below turn a TEMPERATURE into an ENERGY with hConstTToHe, and both then keep the
+        // result as a SCALAR. That is exact for a perfect gas, where he is a linear, pressure-independent
+        // function of T. It is wrong twice over for a liquid: the correlation is a 5th-order polynomial,
+        // and under sensibleInternalEnergy e = h(T) - p/rho(T) varies with pressure, so a single scalar
+        // cannot represent the limit across the field at all.
+        //
+        // REFUSED RATHER THAN APPROXIMATED. Converting properly means carrying per-cell energy limits
+        // recomputed against the live p, which is a real change and one no case in the suite exercises
+        // yet (squareBendLiq sets no fvOptions). Silently converting with the gas formula is what the
+        // rest of this fix exists to eliminate -- a plausible number from an inapplicable equation.
+        if (tc_.model == ThermoModel::liquidH2O && (fo.fixTActive || fo.limTActive))
+        {
+            throw std::runtime_error(
+                "brae: fvOptions limitTemperature/fixedTemperatureConstraint are not supported on the "
+                "liquid thermo path yet. Both convert a temperature limit into a single energy scalar "
+                "using the perfect-gas relation; for a liquid the energy is a polynomial in T and, under "
+                "sensibleInternalEnergy, also depends on p, so the limit is a field rather than a "
+                "constant. Remove the source, or run this case on the perfect-gas path.");
         }
         if (fo.fixTActive)
         {
