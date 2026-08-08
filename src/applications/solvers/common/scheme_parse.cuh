@@ -181,6 +181,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (ln.find("linearUpwind") != std::string::npos) ctl.linearUpwind = true;   // linearUpwindV contains this -> upwind matrix + gradients
                     if (ln.find("linearUpwindV") != std::string::npos) ctl.linearUpwindV = true; // + OF vector direction limiter
                     if (ln.find("LUST") != std::string::npos)         ctl.lust = true;   // 0.75 linear + 0.25 linearUpwind
+                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradULimitK = g; }   // EXPERIMENT
                 }
                 // grad(U) cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>): k is the first number after
                 // "cellLimited" (the basicScheme between has no digits). 0 = unlimited. cellMDLimited not yet handled.
@@ -220,6 +221,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
                     if (hasWord(ln, "bounded")) ctl.boundedK = true;
+                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradKLimitK = g; }   // EXPERIMENT
                 }
                 if (inDiv && (ln.find("div(phi,epsilon)") != std::string::npos || ln.find("div(phi,omega)") != std::string::npos))
                 {
@@ -228,6 +230,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (t > 0.0) { ctl.limitedEps = true; ctl.twoBykEps = t; }   // 2nd turb scalar (eps|omega)
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luEps = true;
                     if (hasWord(ln, "bounded")) ctl.boundedEps = true;
+                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradKLimitK = g; }   // EXPERIMENT
                 }
                 // Energy: OF names the field "h" for sensibleEnthalpy and "e" for sensibleInternalEnergy,
                 // and the kinetic term "K" or "Ekp" to match. Any of them sets the same flags.
