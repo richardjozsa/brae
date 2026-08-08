@@ -33,9 +33,12 @@
 # it neither reflects the defect nor holds a tolerance. "p stays inside the limiter window" is likewise
 # NOT an invariant on this case: OF violates it too. Convergence is the honest discriminator.
 #
-# WHAT IT DOES NOT ASSERT: the exact inlet-flux invariant |sum(phi_inlet)| == mdot, which is the
-# cleanest statement of the fix. brae does not WRITE phi (it reads it -- see restart_vs_openfoam.sh),
-# so the flux is not observable from the case output. Recorded as a gap rather than approximated.
+# IT ALSO ASSERTS THE INVARIANT DIRECTLY, on every time directory brae writes:
+#     |sum_{f in inlet} phi_f| == massFlowRate
+# This is the exact statement of the fix and it is exact arithmetic, not a tuned tolerance -- the two
+# densities cancel or they do not. It goes red the moment someone feeds thermo.rho() back into the
+# velocity BC, instead of waiting for the pressure to diverge hundreds of iterations later. (Measured on
+# brae's own output after the fix: sum(phi_inlet) = -1.000000000000e-01 against mdot 0.1, |sum|-mdot = 0.)
 set -e
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 BUILD=${BUILD:-$(cd "$(dirname "$0")/../build" && pwd)}
@@ -44,7 +47,8 @@ WORK=${WORK:-/tmp/brae_flowrate_vs_of}
 #     p 1.53e-03   T 7.91e-04   U 4.87e-03   rho 4.10e-03
 # 2e-2 keeps ~4x margin on the worst field (U) on a case with isoCd ~1e6, where the implicit diagonal
 # and the explicit deviatoric source are both ~1e6 and nearly cancel. The pre-fix run does not reach
-# this comparison at all -- it fails the convergence assertion first -- and its p was 5.10e-01.
+# this comparison at all -- it fails the INVARIANT first (checked below, before convergence, precisely
+# so the diagnostic fires on a run that never converges) -- and its p was 5.10e-01.
 TOL=${TOL:-2e-2}
 
 if [ ! -f "$OFBASHRC" ]; then echo "OpenFOAM not found at $OFBASHRC -- skipping"; exit 77; fi
@@ -67,6 +71,48 @@ cp -r "$WORK" "$WORK.br"
 
 rhoSimpleFoam > log.of 2>&1 || true
 "$BUILD/brae_rhoSimpleFoam" -case "$WORK.br" > "$WORK.br/log.brae" 2>&1 || true
+
+# ---------------------------------------------------------------- the invariant, on brae's own phi
+python3 - "$WORK.br" <<'PY'
+import re, sys, os, math
+work = sys.argv[1]
+
+def inlet_flux(path):
+    s = open(path).read()
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+    b = s[s.index('boundaryField'):]
+    m = re.search(r'\binlet\b\s*\{.*?value\s+nonuniform\s+List<scalar>\s*\n?\s*(\d+)\s*\((.*?)\)', b, re.S)
+    if not m:
+        return None, None
+    v = [float(x) for x in m.group(2).split()]
+    return sum(v), len(v)
+
+# massFlowRate as the case states it, so the gate cannot drift from the input it is checking
+u = open(os.path.join(work, '0', 'U')).read()
+m = re.search(r'massFlowRate\s+(?:constant\s+)?([-\d.eE+]+)\s*;', u)
+if not m:
+    print("  invariant: case has no massFlowRate to check against"); sys.exit(1)
+mdot = float(m.group(1))
+
+times = sorted((d for d in os.listdir(work) if re.fullmatch(r'[0-9]+', d) and d != '0'), key=int)
+phis = [t for t in times if os.path.exists(os.path.join(work, t, 'phi'))]
+if not phis:
+    print("  invariant: brae wrote no phi -- the flux is not observable, gate is weaker than it claims")
+    sys.exit(1)
+
+bad = 0
+for t in phis:
+    flux, n = inlet_flux(os.path.join(work, t, 'phi'))
+    if flux is None:
+        print(f"  t={t}: no inlet entry in phi"); bad += 1; continue
+    rel = abs(abs(flux) - mdot) / mdot
+    ok = rel <= 1e-9      # exact arithmetic; this is round-off headroom on a 400-face sum, not a fit
+    print(f"  t={t:<5} sum(phi_inlet) {flux:+.12e}  mdot {mdot:g}  rel err {rel:.2e}  ({n} faces)  {'OK' if ok else 'FAIL'}")
+    if not ok:
+        bad += 1
+print(f"flowrate_vs_openfoam(invariant): {bad} failures")
+sys.exit(1 if bad else 0)
+PY
 
 grep -q "SIMPLE solution converged" log.of || {
     echo "flowrate_vs_openfoam: OF did NOT converge -- the oracle is not a converged field"; exit 1; }

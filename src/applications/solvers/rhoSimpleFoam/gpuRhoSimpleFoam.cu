@@ -501,7 +501,17 @@ int main(int argc, char** argv)
                 writeVolField(wsrc + second, outDir + "/" + second, solver.eps(), fvp, 12, solver.epsBoundary());
                 writeVolField(wsrc + "nut", outDir + "/nut", solver.nut(), fvp, 12, solver.nutBoundary());
             }
-            std::printf("written %s/{U,p,T,rho%s}\n", outDir.c_str(),
+            // phi, so a restart RESUMES the conservative mass flux instead of rebuilding it. OF's
+            // compressibleCreatePhi.H pairs READ_IF_PRESENT with AUTO_WRITE; brae read it (see
+            // read_surface_field.cuh) but never wrote it, so a brae->brae restart always fell back to
+            // interpolate(rho*U)&Sf -- a DIFFERENT field from the corrected phi, which is exactly the
+            // discrepancy the phi read was added to remove. Dimensions are the compressible MASS flux
+            // [1 0 -1 0 0 0 0] (kg/s), not the incompressible volumetric default.
+            // 17 digits, not the 12 the vol fields use: this field is read back to seed a restart, so it
+            // wants an exact double round-trip rather than display precision.
+            writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp,
+                              17, "[1 0 -1 0 0 0 0]");
+            std::printf("written %s/{U,p,T,rho,phi%s}\n", outDir.c_str(),
                         ctl.turbulent ? (ctl.sst ? ",k,omega,nut" : ",k,epsilon,nut") : "");
             wc.recordWritten(caseDir, tname);
         };

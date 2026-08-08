@@ -77,6 +77,18 @@ inline void writePatchEntry(
         os << "        gradient        ";
         writeFieldValue(os, d.gradientUniform, d.gradientUniformValue, d.gradientValues);
     }
+    // flowRateInletVelocity: OF REQUIRES one of volumetricFlowRate/massFlowRate and aborts without it,
+    // and so does brae ("has neither 'volumetricFlowRate' nor 'massFlowRate'"). Dropping it made brae's
+    // own output unrestartable -- by brae OR by OpenFOAM -- which only surfaced once brae started
+    // writing phi and a brae->brae restart was attempted at all. Same class as the `gradient` entry
+    // above: an INPUT the solve does not change, so echo what was read. OF's own output writes the
+    // Function1 in its "constant <v>" form.
+    if (d.hasFlowRate)
+    {
+        os << "        " << (d.flowRateIsMass ? "massFlowRate" : "volumetricFlowRate")
+           << "    constant " << d.flowRate << ";\n";
+        if (d.rhoInlet >= 0) os << "        rhoInlet        " << d.rhoInlet << ";\n";
+    }
     if (computed && nComputed)
     {
         // The SOLVED boundary values, not the ones the case was started from. Echoing the input made
@@ -248,14 +260,20 @@ inline void writeSurfaceField(
     const std::vector<scalar>& phiInternal,   // nInternalFaces
     const std::vector<scalar>& phiBoundary,   // flat, patch order, EXCLUDING cyclic/cyclicAMI
     const std::vector<Patch>& patches,
-    int precision = 16)
+    int precision = 16,
+    // phi's dimensions differ by solver and OF writes the real ones: the incompressible solvers carry a
+    // VOLUMETRIC flux [0 3 -1 0 0 0 0] (m3/s), the compressible ones a MASS flux [1 0 -1 0 0 0 0] (kg/s).
+    // Defaulted to the volumetric form so the incompressible callers are unchanged. Getting this wrong
+    // still loads, but every downstream tool that checks dimensions (postProcess, funkySetFields, a
+    // restart into OF) then sees a field that claims to be something it is not.
+    const std::string& dimensions = "[0 3 -1 0 0 0 0]")
 {
     std::ofstream out(outPath);
     if (!out) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
     out << std::setprecision(precision);
     out << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       surfaceScalarField;\n"
            "    location    \"" << outPath << "\";\n    object      phi;\n}\n\n";
-    out << "dimensions      [0 3 -1 0 0 0 0];\n\n";
+    out << "dimensions      " << dimensions << ";\n\n";
     out << "internalField   nonuniform List<scalar> \n" << phiInternal.size() << "\n(\n";
     for (scalar v : phiInternal) out << v << '\n';
     out << ")\n;\n\n";
