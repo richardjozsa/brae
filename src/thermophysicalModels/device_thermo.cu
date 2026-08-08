@@ -1,6 +1,7 @@
 // device_thermo.cu -- kernels behind deviceThermoCorrect / deviceThermoRho.
 
 #include "device_thermo.cuh"
+#include "nsrds_functions.cuh"   // liquid property correlations (properties liquid)
 #include "equation_of_state.cuh"
 #include "thermo_model.cuh"
 #include "transport_model.cuh"
@@ -431,6 +432,83 @@ void deviceThermoHeFromT(
         th.T.data(),
         th.he.data());
     cudaCheck(cudaGetLastError(), "heFromT");
+}
+
+// ---------------------------------------------------------------------------------------------------
+// LIQUID PROPERTIES. One evaluation point for the whole NSRDS family, so there is exactly one place
+// where T maps to (Cp, mu, kappa, rho) and the internal and boundary paths cannot drift apart.
+//
+// alpha for a liquid is kappa/Cp, NOT the gas path's mu/Pr: the liquid correlations give the thermal
+// conductivity directly, so deriving it from a Prandtl number would discard kappa(T) and substitute a
+// constant-Pr assumption that is not what the case asked for. (OF: thermophysicalProperties' alpha is
+// kappa/Cp for these mixtures; the Pr route belongs to the const/sutherland transport models.)
+__global__
+void liquidPropsK(
+    int n,
+    const scalar* __restrict__ T,
+    scalar* __restrict__ Cp,
+    scalar* __restrict__ mu,
+    scalar* __restrict__ kappa,
+    scalar* __restrict__ rho,
+    scalar* __restrict__ alpha)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const scalar t  = T[i];
+    const scalar cp = H2OLiquid::Cp(t);
+    const scalar k  = H2OLiquid::kappa(t);
+    Cp[i]    = cp;
+    mu[i]    = H2OLiquid::mu(t);
+    kappa[i] = k;
+    rho[i]   = H2OLiquid::rho(t);
+    if (alpha) alpha[i] = k/cp;      // OF alpha = kappa/Cp  [kg/(m s)]
+}
+
+void deviceThermoLiquidProperties(
+    DeviceThermo& th,
+    const ThermoCoeffs& c)
+{
+    if (th.n == 0) return;
+    if (c.model != ThermoModel::liquidH2O)
+        return;   // the gas path owns its own scalars; silently doing nothing here would hide a miswire
+    if (th.CpField.size() != static_cast<std::size_t>(th.n)) th.allocateLiquid();
+    liquidPropsK<<<nBlocks(th.n), TPB>>>(
+        th.n,
+        th.T.data(),
+        th.CpField.data(),
+        th.mu.data(),
+        th.kappa.data(),
+        th.rhoThermo.data(),          // the THERMO density; the solver's rho is assigned separately
+        th.alpha.size() == static_cast<std::size_t>(th.n) ? th.alpha.data() : nullptr);
+    cudaCheck(cudaGetLastError(), "liquidProperties");
+}
+
+// The same correlations at boundary FACES, from a boundary temperature field. Takes T_b directly rather
+// than deriving it, so this stays independent of the he->T inversion (which is a later step) and can be
+// tested on a temperature field alone.
+void deviceThermoLiquidBoundary(
+    const DeviceBuffer<scalar>& Tb,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& CpB,
+    DeviceBuffer<scalar>& muB,
+    DeviceBuffer<scalar>& kappaB,
+    DeviceBuffer<scalar>& rhoB)
+{
+    const int n = static_cast<int>(Tb.size());
+    if (n == 0 || c.model != ThermoModel::liquidH2O) return;
+    CpB.resize(n);
+    muB.resize(n);
+    kappaB.resize(n);
+    rhoB.resize(n);
+    liquidPropsK<<<nBlocks(n), TPB>>>(
+        n,
+        Tb.data(),
+        CpB.data(),
+        muB.data(),
+        kappaB.data(),
+        rhoB.data(),
+        nullptr);                     // no boundary alpha consumer yet; added when the EEqn needs it
+    cudaCheck(cudaGetLastError(), "liquidBoundary");
 }
 
 } // namespace brae

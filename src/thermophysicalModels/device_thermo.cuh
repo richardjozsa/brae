@@ -103,6 +103,22 @@ void deviceLimitPressure(
     scalar pMax);
 
 // T -> he, for initialising the enthalpy field from the T that the case actually ships.
+// LIQUID (ThermoModel::liquidH2O): evaluate the NSRDS correlations at every cell, filling Cp/mu/kappa
+// and the THERMO density rhoThermo (not the solver's rho), plus alpha = kappa/Cp. No-op on the gas path.
+void deviceThermoLiquidProperties(
+    DeviceThermo& th,
+    const ThermoCoeffs& c);
+
+// The same correlations at boundary faces, from a boundary temperature field. Takes T_b directly so it
+// stays independent of the he->T inversion and is testable on a temperature field alone.
+void deviceThermoLiquidBoundary(
+    const DeviceBuffer<scalar>& Tb,
+    const ThermoCoeffs& c,
+    DeviceBuffer<scalar>& CpB,
+    DeviceBuffer<scalar>& muB,
+    DeviceBuffer<scalar>& kappaB,
+    DeviceBuffer<scalar>& rhoB);
+
 void deviceThermoHeFromT(
     DeviceThermo& th,
     const ThermoCoeffs& c);

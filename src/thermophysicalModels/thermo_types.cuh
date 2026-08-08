@@ -16,9 +16,23 @@
 
 namespace brae {
 
+// Which property model the case selected. The perfectGas path is the ONLY one the scalar coefficients
+// below describe; the liquid path replaces Cp/mu/kappa/rho with per-cell correlations and leaves those
+// scalars unused. Kept as an explicit enum rather than inferred from a combination of flags, because
+// "which model is this" is a question every consumer asks and none of them should re-derive the answer.
+enum class ThermoModel
+{
+    perfectGas,   // perfectGas + hConst + (const | sutherland). Cp/mu are the scalars in ThermoCoeffs.
+    liquidH2O     // OF `properties liquid` + `mixture { H2O; }`. Cp/mu/kappa/rho are NSRDS(T) fields.
+};
+
 // Constants from constant/thermophysicalProperties. Passed to kernels by value.
 struct ThermoCoeffs
 {
+    // perfectGas is the default so every existing case, test and hand-constructed ThermoCoeffs keeps
+    // exactly the behaviour it has today without naming the field.
+    ThermoModel model = ThermoModel::perfectGas;
+
     scalar R = 287.058;      // specific gas constant, R_universal/molWeight  [J/(kg K)]
     scalar Cp = 1005.0;      // heat capacity at constant pressure (hConst)   [J/(kg K)]
     scalar Hf = 0.0;         // heat of formation (OF hConstThermo Hc()). It belongs to the ABSOLUTE
@@ -111,6 +125,18 @@ struct DeviceThermo
     // momentum predictor makes the outer loop oscillate. OF relaxes rho for exactly this reason.
     DeviceBuffer<scalar> rhoPrev;
 
+    // ---------------------------------------------------------------------------------------------
+    // LIQUID PATH ONLY (ThermoModel::liquidH2O). Empty and unallocated on the perfectGas path, which
+    // keeps its scalar ThermoCoeffs::Cp and its Pr-derived alpha untouched -- a gas case must not carry
+    // nCells identical copies of 1005.0 for the sake of a uniform architecture.
+    //
+    // mu and rhoThermo are NOT here because they are already per-cell fields above and the liquid path
+    // simply writes different values into them. Only Cp and kappa are genuinely new: the gas path holds
+    // Cp as a scalar and never forms kappa at all (it goes straight to alpha = mu/Pr, whereas a liquid
+    // has kappa(T) as its own correlation and alpha = kappa/Cp).
+    DeviceBuffer<scalar> CpField;    // Cp(T)    [J/(kg K)]
+    DeviceBuffer<scalar> kappa;      // kappa(T) [W/(m K)]
+
     void allocate(int nCells)
     {
         n = nCells;
@@ -123,6 +149,14 @@ struct DeviceThermo
         rhoThermo.resize(n);
         alphat.resize(n);
         rhoPrev.resize(n);
+    }
+
+    // Called only when the case selected a liquid. Separate from allocate() so the gas path cannot
+    // acquire these buffers by accident.
+    void allocateLiquid()
+    {
+        CpField.resize(n);
+        kappa.resize(n);
     }
 };
 
