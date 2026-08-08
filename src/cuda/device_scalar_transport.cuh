@@ -235,9 +235,41 @@ void deviceSolveScalarTransport(
     bool wantGS = useGS;
     if (const char* e = std::getenv("BRAE_SCALAR_GS")) wantGS = (std::atoi(e) != 0);
     const bool gs = wantGS && !(ami && ami->n) && !(cyc && cyc->n);
+    // OF lduMatrix::solver::normFactor, NOT sum|b|.
+    //
+    //     sumA   = row sums of A            (matrix_.sumA(...))
+    //     xRef   = average(psi)             (gAverage(psi))
+    //     normF  = sum(|A.psi - sumA*xRef| + |b - sumA*xRef|) + small
+    //
+    // This scales EVERY residual the solver reports and tests, so getting it wrong changes what the
+    // absolute `tolerance` means (relTol is a ratio and cancels it, but `tol` does not) and makes brae's
+    // "Solving for epsilon" lines incomparable with OF's. brae already had the correct formula in
+    // pcg.cu, gamg.cu and parallel_pbicgstab.cuh -- this path alone used sum|b|, which for the epsilon
+    // equation is dominated by the production source and the near-wall setValues rows and so runs far
+    // larger than OF's, making the normalised residual look converged sooner than it is.
+    //
+    // sumA comes from A applied to a field of ones, which is the row sum by definition, so the interface
+    // off-diagonals are included exactly as deviceAmul accounts for them -- no second traversal to keep
+    // in step with the LDU layout.
+    const scalar normF = [&]{
+        const int n = static_cast<int>(field.size());
+        if (n == 0) return scalar(1);
+        DeviceBuffer<scalar> ones, sumA, Apsi, t, w;
+        ones.copyFrom(std::vector<scalar>(static_cast<std::size_t>(n), scalar(1)));
+        deviceAmul(sv, ones, sumA);                     // sumA = A * 1 = row sums
+        deviceAmul(sv, field, Apsi);                    // A.psi
+        const scalar xRef = deviceDot(field, ones) / static_cast<scalar>(n);
+        deviceCopy(t, sumA);
+        deviceScale(t, xRef);                           // t = sumA*xRef
+        deviceCopy(w, Apsi); deviceAxpy(-1.0, t, w);    // w = A.psi - t
+        scalar nf = deviceSumMag(w);
+        deviceCopy(w, B);    deviceAxpy(-1.0, t, w);    // w = b - t
+        nf += deviceSumMag(w);                          // sum|..| + sum|..| == sum(|..|+|..|)
+        return nf + scalar(1e-20);                      // solverPerformance::small_
+    }();
     DeviceSolverPerf perf;                                        // OF-style report: init/final/nIter for this scalar
-    if (gs) deviceSymGaussSeidel(sv, B, field, deviceSumMag(B) + 1e-20, tol, relTolKE, 3000, &perf);
-    else    perf = deviceJacobiBiCGStab(sv, B, field, deviceSumMag(B) + 1e-20, tol, relTolKE, 3000, keCheckEvery);  // loose (relTol); interface in the Amul
+    if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf);
+    else    perf = deviceJacobiBiCGStab(sv, B, field, normF, tol, relTolKE, 3000, keCheckEvery);  // loose (relTol); interface in the Amul
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
     if (boundPositive) deviceBoundField(dm, field, 1e-15);        // OF bound(field): neg -> local avg, not floor
 }
