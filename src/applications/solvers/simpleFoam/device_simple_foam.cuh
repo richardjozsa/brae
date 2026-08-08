@@ -428,6 +428,9 @@ private:
     // model). It is WRONG for `phiHbyA = fvc::interpolate(rho)*fvc::flux(HbyA)`, which reads the solver's
     // rho field, and that field is assigned once per outer iteration and then relaxed.
     DeviceBuffer<scalar> rhoBndP_, rhoBndPPrev_;
+    // BRAE_PTRACE: which SIMPLE iteration the pressure stage trace is on. Advanced once per call to
+    // correctPressureVelocity, read by the pre-limit dump, so P0..P6 of one iteration share an index.
+    int pTraceIt_ = 0;
     // pEqn.relax() source (D - D0)*p. Absolute, so it is added to bp_ AFTER deviceFoldPressure (which
     // multiplies divPhi by the cell volume); a member so the fold site can see it.
     DeviceBuffer<scalar> pRelaxSrc_;

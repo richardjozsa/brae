@@ -88,6 +88,69 @@ inline void stageDump3(
 // first site to run consumes it and every other site silently dumps nothing. That happened -- adding a
 // second dump point made the first one stop writing, and the comparison reported "missing" for stages that
 // were being computed perfectly well.
+// ---------------------------------------------------------------------------------------------------
+// PRESSURE STAGE TRACE. BRAE_PTRACE=<dir> writes <dir>/<name>_it<N> for iterations 1..BRAE_PTRACE_N
+// (default 4). Deliberately separate from stageDump's single-iteration latch above.
+//
+// WHY A SECOND MECHANISM. stageDumpFirstOnly answers "does stage X match OF at iteration 1", which is
+// the right question for a term that is either right or wrong. It is the WRONG question for a solver
+// that agrees at iteration 1 and diverges at iteration 3 -- there the answer is a column index, not a
+// number, and one latched iteration cannot produce it.
+//
+// WHY ONE RUN, not N runs with BRAE_DUMP_STAGE_ITER=1..N. brae's compressible path is not run-to-run
+// reproducible (~1e-3, see the nondeterminism note in the rhoSimpleFoam validation log). Stitching
+// iteration 3 from one process and iteration 4 from another compares that noise, not the trajectory.
+inline const std::string& pTraceDir()
+{
+    static const std::string d = []() -> std::string
+    {
+        const char* e = std::getenv("BRAE_PTRACE");
+        if (!e || !*e) return {};
+        std::error_code ec;
+        std::filesystem::create_directories(e, ec);
+        return std::string(e);
+    }();
+    return d;
+}
+
+inline bool pTraceActive() { return !pTraceDir().empty(); }
+
+inline int pTraceN()
+{
+    static const int n = []() {
+        const char* e = std::getenv("BRAE_PTRACE_N");
+        const int v = (e && *e) ? std::atoi(e) : 4;
+        return v > 0 ? v : 4;
+    }();
+    return n;
+}
+
+inline void pTraceDump(const std::string& name, int it, const std::vector<scalar>& v)
+{
+    if (!pTraceActive() || it < 1 || it > pTraceN()) return;
+    std::ofstream out(pTraceDir() + "/" + name + "_it" + std::to_string(it));
+    if (!out) { std::fprintf(stderr, "brae: ptrace could not open %s\n", name.c_str()); return; }
+    out.precision(17);
+    out << "n " << v.size() << " 1\n";
+    for (scalar x : v) out << x << '\n';
+}
+
+inline void pTraceDump(const std::string& name, int it, const DeviceBuffer<scalar>& b)
+{
+    if (!pTraceActive() || it < 1 || it > pTraceN()) return;
+    pTraceDump(name, it, b.host());
+}
+
+// Scalars that describe the solve rather than a field (residuals, iteration counts).
+inline void pTraceNote(int it, const std::string& key, double value)
+{
+    if (!pTraceActive() || it < 1 || it > pTraceN()) return;
+    std::ofstream out(pTraceDir() + "/notes_it" + std::to_string(it), std::ios::app);
+    if (!out) return;
+    out.precision(17);
+    out << key << ' ' << value << '\n';
+}
+
 inline bool stageDumpFirstOnly(const char* site)
 {
     // Which visit to dump. Iteration 1 is the default because it is the only one both sides reach with

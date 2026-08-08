@@ -326,9 +326,12 @@ namespace brae {
             deviceCopy(rhoBndP_, rhoBnd_);
             deviceCopy(rhoBndPPrev_, rhoBnd_);
         }
+        // Same density rule as the per-iteration update in rhoSimpleStep (see the long note there): OF's
+        // flowRateInletVelocity looks up the REGISTERED rho, which createFields.H has already built by the
+        // time U's patches evaluate, so seed avgU from the solver rho -- rhoBndP_, just set above.
         for (std::size_t k = 0; k < frPatches_.size(); ++k)
         {
-            const scalar sumRhoA = deviceDot(rhoBnd_, frMagSf_[k]);
+            const scalar sumRhoA = deviceDot(rhoBndP_, frMagSf_[k]);
             if (sumRhoA <= 0.0) continue;
             deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -frPatches_[k].mdot / sumRhoA, frNx_, frNy_, frNz_);
         }
@@ -940,6 +943,17 @@ namespace brae {
     void DeviceSimpleSolver::correctPressureVelocity(DeviceSimpleResidual& res)
     {
         const DeviceMesh& dm = dm_;
+        // P0 of the pressure stage trace (BRAE_PTRACE): p as it ENTERS the pressure correction. The
+        // counter advances once per SIMPLE iteration here and is read (not advanced) by the pre-limit
+        // dump in rhoSimpleStep, so every stage of one iteration carries the same index.
+        if (pTraceActive())
+        {
+            ++pTraceIt_;
+            pTraceDump("P0_pEnter", pTraceIt_, dp_);
+            DeviceBuffer<scalar> pb0;
+            deviceBCValue(dbP_, dp_, pb0);
+            pTraceDump("P0_pEnterB", pTraceIt_, pb0);
+        }
         // Non-orth pressure-correction limiter (OF fv::limitedSnGrad), read by the pressure phase below: per-face caps the
         // lagged corrVec.grad(p) correction to (psi/(1-psi))*|orthogonal snGrad| on pathological high-non-orth meshes
         // (T3A: AR 3232, 43.8deg), where the once-lagged correction outruns the over-relaxed diagonal and diverges. Only
@@ -1323,6 +1337,13 @@ namespace brae {
             // Stage harness: div(phiHbyA) BEFORE the pEqn relaxation adds (D-D0)*p to it. The two were
             // cancelling, so only the pre-relax value shows whether div(phiHbyA) itself is wrong.
             if (stageDumpActive() && stageDumpFirstOnly("divPhiH")) stageDump("stage_divPhiH", divPhiH);
+            // P1: the pressure RHS before assembly -- div(phiHbyA), internal and boundary kept apart.
+            if (pTraceActive() && nonOrthPass == 0)
+            {
+                pTraceDump("P1_divPhiHbyA", pTraceIt_, divPhiH);
+                pTraceDump("P1_phiHbyAi",   pTraceIt_, phiHi);
+                pTraceDump("P1_phiHbyAb",   pTraceIt_, phiHb);
+            }
             if (stageDumpActive() && stageDumpFirstOnly("pcoeff"))
             {
                 stageDump("stage_pIC", pIC);
@@ -1388,6 +1409,17 @@ namespace brae {
             {
                 stageDump("stage_pD", diagCp_);
                 stageDump("stage_pSrc", bp_);
+            }
+            // P2: the assembled linear system. diagCp_ includes the boundary internalCoeffs and bp_ the
+            // full RHS including boundaryCoeffs -- the counterparts of OF's D() and source()+boundary.
+            // brae's pressure matrix is the NEGATIVE of OF's, so the comparison flips the sign rather
+            // than assuming it. pIC/pBC go out separately so a boundary-only defect is visible as one.
+            if (pTraceActive() && nonOrthPass == 0)
+            {
+                pTraceDump("P2_pD",   pTraceIt_, diagCp_);
+                pTraceDump("P2_pSrc", pTraceIt_, bp_);
+                pTraceDump("P2_pIC",  pTraceIt_, pIC);
+                pTraceDump("P2_pBC",  pTraceIt_, pBC);
             }
             // cyclic pressure Laplacian laplacian(rAtU,p): fold the interface diagonal into diagCp_ + set cyc_.ifCoeff.
             if (hasCyclic_) interfaceAssembleLaplacian(cyc_, rAtU, diagCp_, /*addToDiag*/true);
@@ -1472,11 +1504,24 @@ namespace brae {
             stageDump("stage_phiSolved", phiInt_);
         }
         if (stageDumpActive() && stageDumpFirstOnly("pSolved")) stageDump("stage_pSolved", dp_);   // pre-relax, pre-limit
+        // P3: straight out of the linear solve, BEFORE field relaxation -- the decisive quantity. If the
+        // RHS and matrix still agree here and this does not, the defect is in the solve path (reference
+        // handling, AMG-PCG, the boundary contribution in Amul, initial guess or stopping criterion)
+        // rather than anywhere in the SIMPLE assembly upstream of it.
+        if (pTraceActive())
+        {
+            pTraceDump("P3_pSolved", pTraceIt_, dp_);
+            pTraceNote(pTraceIt_, "p_initialResidual", pp0.initialResidual);
+            pTraceNote(pTraceIt_, "p_finalResidual",   pp.finalResidual);
+            pTraceNote(pTraceIt_, "p_nIterations",     pp.nIterations);
+        }
         deviceScale(dp_, ctl_.relaxP);
         deviceAxpy(1.0 - ctl_.relaxP, pPrev, dp_);
         if (stageDumpActive() && stageDumpFirstOnly("pRelaxed")) stageDump("stage_pRelaxed", dp_);
+        if (pTraceActive()) pTraceDump("P4_pRelaxed", pTraceIt_, dp_);   // after p.relax()
         DeviceBuffer<scalar> pbv2;
         deviceBCValue(dbP_, dp_, pbv2);
+        if (pTraceActive()) pTraceDump("P5_pBoundary", pTraceIt_, pbv2);   // after BC evaluation
         DeviceBuffer<scalar> gnx,gny,gnz;
         deviceGaussGrad(dm, dp_, pbv2, gnx,gny,gnz);
         if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gnx,gny,gnz);   // + cyclic-face contribution to grad(p)
@@ -1613,9 +1658,28 @@ namespace brae {
         // flowRateInletVelocity (massFlowRate): OF recomputes avgU = -mdot/gSum(rho*magSf) every time the
         // U boundary is updated, so it tracks the inlet density as the solution develops. Done here, before
         // the momentum predictor, so the predictor sees the same inlet OF's does.
+        //
+        // THE DENSITY HERE MUST BE THE SOLVER'S rho, NOT thermo.rho(). OF's
+        // flowRateInletVelocityFvPatchVectorField::updateCoeffs does
+        //     patch().lookupPatchField<volScalarField>(rhoName_)   // rhoName_ defaults to "rho"
+        // which resolves to the REGISTERED rho -- the relaxed field createFields.H built -- and that is
+        // the same field `phiHbyA = fvc::interpolate(rho)*fvc::flux(HbyA)` weights the flux with. Using
+        // one density for both is what makes the inlet flux telescope exactly:
+        //     sum_i rho_i|Sf|_i * (-mdot / sum_j rho_j|Sf|_j)  ==  -mdot
+        // Feed avgU a DIFFERENT density from the one weighting the flux and the cancellation breaks, so
+        // the inlet no longer delivers the prescribed mass flow. Measured on angledDuct (relaxRho 0.01):
+        // OF's inlet flux is pinned at exactly -1.00000e-01 kg/s every iteration, brae's ran
+        // -0.100024 -> -0.099690 -> -0.104411 -> -0.068195, and that net mass imbalance is what drove the
+        // pressure level to -300 kPa by iteration 4.
+        //
+        // Invisible on every other compressible case in validation/: they all set rho 1.0, where the
+        // relaxed and thermo densities are identical. angledDuct is the one case with BOTH a relaxed rho
+        // and a flowRateInletVelocity inlet.
+        const DeviceBuffer<scalar>& frRho =
+            (rhoBndP_.size() == static_cast<std::size_t>(dbP_.n)) ? rhoBndP_ : rhoBnd_;
         for (std::size_t k = 0; k < frPatches_.size(); ++k)
         {
-            const scalar sumRhoA = deviceDot(rhoBnd_, frMagSf_[k]);
+            const scalar sumRhoA = deviceDot(frRho, frMagSf_[k]);
             if (sumRhoA <= 0.0) continue;
             deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -frPatches_[k].mdot / sumRhoA, frNx_, frNy_, frNz_);
         }
@@ -1719,6 +1783,10 @@ namespace brae {
         deviceThermoCorrect(th_, dp_, tc_);
 
         correctPressureVelocity(res);
+
+        // P6: p as pressureControl sees it, before any clamping. Dumped unconditionally (not inside the
+        // limiter branch) so the trace has the same six stages whether or not limits are configured.
+        if (pTraceActive()) pTraceDump("P6_pPreLimit", pTraceIt_, dp_);
 
         // pressureControl::limit(p), in OF's position: after the pressure solve and the U correction,
         // BEFORE rho is recomputed. Clamping after rho would let one NaN density through per iteration.

@@ -863,6 +863,17 @@ set_tests_properties(pm_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 600)
 
+# flowRateInletVelocity must be fed the SOLVER's rho (the relaxed one OF registers), not thermo.rho().
+# Needs a case with BOTH a relaxed rho and a flow-rate inlet; angledDuct is the only one, which is why
+# this defect survived every other gate and left the case unable to converge at all.
+add_test(NAME flowrate_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/flowrate_vs_openfoam.sh)
+set_tests_properties(flowrate_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
 # RESTART fidelity: OF's createFields.H reads phi and rho with IOobject::READ_IF_PRESENT, so a restart
 # resumes the STORED fields. Every other compressible gate starts from 0/, where neither file exists and
 # both codes take the fallback -- which is how brae shipped without either read. This gate restarts both
