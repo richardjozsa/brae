@@ -41,6 +41,7 @@
 #include "scheme_parse.cuh"        // parseFvSchemesControls
 #include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
 #include <cstdio>
+#include <chrono>
 #include <filesystem>   // READ_IF_PRESENT probe for rho
 #include <fstream>
 #include <string>
@@ -57,6 +58,18 @@ int main(int argc, char** argv)
 {
     try
     {
+        // BRAE_SETUP_TIMING=1: elapsed seconds at each set-up milestone. Set-up is a long sequence of
+        // one-off steps and when one hangs there is nothing in the log between the dictionary notices and
+        // the first iteration to say which -- measured on gasMixing/injectorPipe, which sat in set-up for
+        // over 12 minutes on a 74650-cell snappyHexMesh with no output at all.
+        const auto t0__ = std::chrono::steady_clock::now();
+        const bool timeSetup__ = (std::getenv("BRAE_SETUP_TIMING") != nullptr);
+        auto mark__ = [&](const char* what)
+        {
+            if (!timeSetup__) return;
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0__).count();
+            std::fprintf(stderr, "  [setup %7.2fs] %s\n", dt, what);
+        };
         std::string caseDir = ".";
         for (int i = 1; i < argc; ++i)
         {
@@ -65,7 +78,9 @@ int main(int argc, char** argv)
         }
 
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+        mark__("controlDict read");
         const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");
+        mark__("fvSolution read");
         // Read here rather than at its point of use so the audit guard below can outlive it -- the guard
         // holds pointers and must be destroyed BEFORE the dicts it reports on.
         const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
@@ -78,19 +93,24 @@ int main(int argc, char** argv)
         audit.add(fvSolution, "system/fvSolution");
         audit.add(turbProps, "constant/turbulenceProperties");
 
-        const ThermoCoeffs tc = readThermoCoeffs(caseDir, &fvSolution);   // share the dict so dict_audit sees these lookups
+        mark__("turbulenceProperties read");
+        const ThermoCoeffs tc = readThermoCoeffs(caseDir, &fvSolution);
+        mark__("thermo read");   // share the dict so dict_audit sees these lookups
         const RhoSimpleControls rc = readRhoSimpleControls(fvSolution, tc.internalEnergy);
 
         PrimitiveMesh m;
         m.read(caseDir + "/constant/polyMesh");
+        mark__("mesh read");
         FvGeometry g;
         g.build(m);
+        mark__("geometry built");
         const std::vector<FvPatch> fvp = buildPatches(m, g);
         const label nC = m.nCells();
 
         // C6: startFrom was ignored here -- the start directory was hardcoded to "0", so `startFrom
         // latestTime` (the standard way to CONTINUE a compressible run) silently restarted from scratch
         // and then converged to a perfectly good answer, having discarded the restart.
+        mark__("patches built");
         const std::string startName = resolveStartTime(
             caseDir,
             controlDict.wordOr("startFrom", "startTime"),
@@ -402,6 +422,7 @@ int main(int argc, char** argv)
 
         const int endTime = static_cast<int>(controlDict.scalarOr("endTime", 1000));
 
+        mark__("fields+controls read");
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                                   ctl.turbulent ? &tf.k : nullptr,
                                   ctl.turbulent ? &tf.eps : nullptr,
@@ -446,7 +467,9 @@ int main(int argc, char** argv)
                 solver.setFixedBoundaryT(fixMask, tRef);
             }
         }
+        mark__("solver constructed");
         solver.setCompressible(tc, rc, std::move(dbHe));
+        mark__("setCompressible done");
         solver.setAlphatPrt(prtFace);
         // Hand the parsed options to the solver. Reading them and NOT doing this is precisely the silent
         // drop the old refusal existed to prevent -- and it is what happened on the first attempt here:
@@ -541,6 +564,7 @@ int main(int argc, char** argv)
         deviceRhoSeedPrev(th);
         // E7: OF validates the turbulence model AFTER the thermo is constructed; brae's solver ctor did it
         // before, so correctNut ran against a placeholder inlet density. Redo it now that rho is real.
+        mark__("pre-revalidate");
         solver.revalidateAfterThermo(haveRhoFile ? &rhoBnd0 : nullptr);
 
         // What brae RESOLVED from the case, not what the dict says. A relaxation factor silently left at
@@ -554,6 +578,7 @@ int main(int argc, char** argv)
         std::printf("brae_rhoSimpleFoam: relax  p=%g U=%g e|h=%g k=%g %s=%g rho=%g   pLimit=[%g, %g]\n",
                     ctl.relaxP, ctl.relaxU, rc.relaxHe, ctl.relaxK, second.c_str(), ctl.relaxEps, tc.relaxRho,
                     rc.limitMinP ? rc.pMinLimit : -1.0, rc.limitMaxP ? rc.pMaxLimit : -1.0);
+        mark__("revalidate done");
         std::printf("brae_rhoSimpleFoam: %ld cells, subsonic %s, R=%.3f Cp=%.1f\n",
                     (long)nC, ctl.turbulent ? (ctl.sst ? "kOmegaSST" : "kEpsilon") : "laminar", tc.R, tc.Cp);
 

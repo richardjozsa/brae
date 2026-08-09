@@ -255,8 +255,15 @@ inline std::string expandDictVariables(const std::string& rawIn)
     // 3. build the variable map: a "name value... ;" entry whose key is a plain identifier and value isn't a subdict
     auto isIdent = [](const std::string& s)
     {
+        // Same character set the $name scanner below accepts, and for the same reason: OF's word::valid
+        // (wordI.H:59) permits '-' and '.', and cases use them as dictionary keys --
+        // `relaxationFactors-SIMPLE`, `sampled.plane-0.25`. Rejecting them here meant such a block was
+        // never registered as a variable, so `$relaxationFactors-SIMPLE` had nothing to expand to and
+        // resolved to nothing at all. The two rules MUST agree: a name accepted at the use site but
+        // refused at the definition site is silently unresolvable.
         if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
-        for (char c : s) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+        for (char c : s)
+            if (!(std::isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.')) return false;
         return true;
     };
     std::map<std::string, std::string> vars;
@@ -319,7 +326,24 @@ inline std::string expandDictVariables(const std::string& rawIn)
                 bool brace = false;
                 if (j < text.size() && text[j] == '{') { brace = true; ++j; }
                 const std::size_t s = j;
-                while (j < text.size() && (std::isalnum((unsigned char)text[j]) || text[j] == '_')) ++j;
+                // WHICH CHARACTERS BELONG TO THE NAME. OF's word::valid (wordI.H:59) rejects only
+                // whitespace and " ' / ; { }, so a macro name may contain '-' and '.' -- and real cases
+                // use both: gasMixing/injectorPipe selects its relaxation with
+                //     relaxationFactors-SIMPLE { fields { p 0.3; rho 0.05; } equations { U 0.7; ... } }
+                //     relaxationFactors { $relaxationFactors-SIMPLE }
+                // Stopping the name at '-' read that as $relaxationFactors (the dictionary being defined)
+                // followed by the literal text "-SIMPLE", so the expansion silently produced nothing and
+                // every factor fell back to 1.0 -- an UNRELAXED SIMPLE against OF's p 0.3 / rho 0.05 /
+                // U 0.7 / e 0.5. The banner printed the fallbacks, so the case looked configured.
+                //
+                // DELIBERATELY NARROWER THAN word::valid. OF reads a token with a real lexer, where '('
+                // and ')' terminate a word before word::valid is ever consulted; this is a text
+                // substitution with no such lexer, so accepting every word::valid character would let a
+                // name swallow trailing punctuation. alnum/_/-/. covers the names OF cases actually use
+                // and cannot run past a delimiter.
+                while (j < text.size()
+                       && (std::isalnum((unsigned char)text[j]) || text[j] == '_'
+                           || text[j] == '-' || text[j] == '.')) ++j;
                 const std::string name = text.substr(s, j - s);
                 if (brace && j < text.size() && text[j] == '}') ++j;
                 const auto it = vars.find(name);

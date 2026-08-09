@@ -7,6 +7,18 @@
 
 namespace brae {
 
+    // BRAE_SETUP_TIMING: same milestone trace as the driver, inside the constructor. The ctor is the
+    // longest silent stretch of set-up (mesh upload, AMG hierarchy, wall distance, validate) and a hang
+    // in it looks identical to a hang in the driver from the outside.
+    static inline void ctorMark(const char* what)
+    {
+        static const bool on = (std::getenv("BRAE_SETUP_TIMING") != nullptr);
+        if (!on) return;
+        static const auto t0 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "  [ctor  %7.2fs] %s\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), what);
+    }
+
     DeviceSimpleSolver::DeviceSimpleSolver(
         const PrimitiveMesh& m,
         const FvGeometry& g,
@@ -31,7 +43,9 @@ namespace brae {
         const std::vector<AMIInterface> amis = buildAMIInterfaces(m, g, fvp);
         hasAMI_ = !amis.empty();
         if (hasCyclic_ || hasAMI_) ctl_.useGraph = false;   // V-cycle graph replay not interface-safe; minor perf only.
+        ctorMark("enter");
         dm_   = buildDeviceMesh(m, g, fvp);
+        ctorMark("deviceMesh built");
         cyc_  = buildDeviceCyclic(cyclics, g, fvp);
         ami_  = buildDeviceAMI(amis);
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
@@ -211,6 +225,7 @@ namespace brae {
             for (label f = 0; f < nIf_; ++f)
                 fwAMG[f] *= dcg[f];                  // strong-face filter sees the true anisotropy
         }
+        ctorMark("pre-AMG");
         amg_ = buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
 
         // initial device state.
@@ -264,6 +279,7 @@ namespace brae {
                 if (ctl_.sst || ctl_.sa)
                 {
                     std::vector<vector> wallOrigin;                              // nearest wall-face centre (IDDES wall-normal source)
+                    ctorMark("pre-wallDist");
                     y_.copyFrom(cellWallDist(m, g, fvp, ctl_.iddes ? &wallOrigin : nullptr));   // wall distance (SST F1/F2/F3; SA dTilda)
                     if (ctl_.iddes)   // IDDES filter widths (maxDeltaxyz + wall-normal spacing), uploaded once at setup
                     {
