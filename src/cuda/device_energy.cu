@@ -282,7 +282,8 @@ void deviceEnergyKineticSource(
     bool limited,
     scalar twoByk,
     bool linearUpwind,
-    scalar gradLimitK)
+    scalar gradLimitK,
+    bool bounded)
 {
     const bool ekp = (p && rho && p->size() && rho->size());
     const int nC = dm.nCells;
@@ -361,13 +362,27 @@ void deviceEnergyKineticSource(
         kineticBoundaryK<<<nBlocks(nB), TPB>>>(nB, dbU.comp[0].faceCell.data(), phiBnd.data(), Kb.data(),
                                                src.data(), sumPhi.data());
         cudaCheck(cudaGetLastError(), "kineticBoundary");
-        // internal faces contribute to sum_f phi_f too -- same gather, same negation as above so the
-        // internal and boundary halves of sumPhi carry the SAME sign.
-        DeviceBuffer<scalar> divPhiInt;
-        deviceFaceDivSource(dm, phiInt, divPhiInt);
-        deviceAxpy(-1.0, divPhiInt, sumPhi);
-        kineticBoundedK<<<nBlocks(nC), TPB>>>(nC, K.data(), sumPhi.data(), src.data());
-        cudaCheck(cudaGetLastError(), "kineticBounded");
+        // THE bounded CORRECTION IS PART OF THE SCHEME, NOT OF fvc::div. OF writes
+        //     fvc::div(phi, Ekp)
+        // and looks div(phi,Ekp) up in fvSchemes; only if that entry says `bounded` does
+        // boundedConvectionScheme::fvcDiv subtract fvc::surfaceIntegrate(phi)*vf. Applying it
+        // unconditionally adds a spurious source of -Ekp*div(phi) wherever the flux is not yet
+        // conservative -- which is precisely the inlet region during the transient, and Ekp there is
+        // dominated by p/rho ~ 86 kJ/kg. Measured on gasMixing/injectorPipe (div(phi,Ekp) NOT bounded):
+        // the energy source in the affected cells ran 8600x the rest of the field at iteration 1 and the
+        // temperature bled from 300 K to 178 K over 1200 iterations while OpenFOAM held 300 K. squareBend
+        // is `bounded Gauss upwind`, so it saw the correct term and matched OF to 1e-6 -- which is why
+        // this survived: the flag was parsed into ctl.boundedKin and then never read.
+        if (bounded)
+        {
+            // internal faces contribute to sum_f phi_f too -- same gather, same negation as above so the
+            // internal and boundary halves of sumPhi carry the SAME sign.
+            DeviceBuffer<scalar> divPhiInt;
+            deviceFaceDivSource(dm, phiInt, divPhiInt);
+            deviceAxpy(-1.0, divPhiInt, sumPhi);
+            kineticBoundedK<<<nBlocks(nC), TPB>>>(nC, K.data(), sumPhi.data(), src.data());
+            cudaCheck(cudaGetLastError(), "kineticBounded");
+        }
     }
 }
 

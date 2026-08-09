@@ -105,6 +105,7 @@ void deviceEnergyKineticSource(
     scalar twoByk = 2.0,
     bool linearUpwind = false,              // div(phi,K|Ekp) Gauss linearUpwind (explicit term, so the
                                             // correction goes straight into the face value)
-    scalar gradLimitK = 0.0);               // cellLimited coeff of grad(K|Ekp); 0 = unlimited
+    scalar gradLimitK = 0.0,               // cellLimited coeff of grad(K|Ekp); 0 = unlimited
+    bool bounded = false);                 // div(phi,K|Ekp) `bounded` -> subtract surfaceIntegrate(phi)*Ekp
 
 } // namespace brae

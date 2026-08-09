@@ -1789,7 +1789,8 @@ namespace brae {
                                   // asking for `div(phi,Ekp) bounded Gauss linearUpwind` silently ran upwind
                                   // on a term that is a large share of the energy under sensibleInternalEnergy
                                   // (Ekp = 0.5|U|^2 + p/rho, and p/rho is order 40% of e).
-                                  &dbHe_, ctl_.limitedKin, ctl_.twoBykKin, ctl_.luKin, ctl_.gradKinLimitK);
+                                  &dbHe_, ctl_.limitedKin, ctl_.twoBykKin, ctl_.luKin, ctl_.gradKinLimitK,
+                                  ctl_.boundedKin);   // parsed since the scheme work, but never forwarded until now
         // alphaEff on the PATCHES, so the alphatWallFunction actually reaches the wall heat flux.
         // ALWAYS when compressible, not just when turbulent. OF's laplacian uses the PATCH diffusivity,
         // alpha_b = alphah(p_b, T_b) evaluated at the BOUNDARY temperature. With transport const that
