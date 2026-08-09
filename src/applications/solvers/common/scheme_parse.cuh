@@ -181,7 +181,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (ln.find("linearUpwind") != std::string::npos) ctl.linearUpwind = true;   // linearUpwindV contains this -> upwind matrix + gradients
                     if (ln.find("linearUpwindV") != std::string::npos) ctl.linearUpwindV = true; // + OF vector direction limiter
                     if (ln.find("LUST") != std::string::npos)         ctl.lust = true;   // 0.75 linear + 0.25 linearUpwind
-                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradULimitK = g; }   // EXPERIMENT
+                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradULULimitK = g; }   // linearUpwind's named grad(U)
                 }
                 // grad(U) cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>): k is the first number after
                 // "cellLimited" (the basicScheme between has no digits). 0 = unlimited. cellMDLimited not yet handled.
@@ -221,7 +221,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
                     if (hasWord(ln, "bounded")) ctl.boundedK = true;
-                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradKLimitK = g; }   // EXPERIMENT
+                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradKLULimitK = g; }   // linearUpwind's named grad(k|eps)
                 }
                 if (inDiv && (ln.find("div(phi,epsilon)") != std::string::npos || ln.find("div(phi,omega)") != std::string::npos))
                 {

@@ -90,6 +90,13 @@ struct DeviceSimpleControls
     scalar relaxPEqn = 1.0;
     // grad(<turbulence scalar>) / grad(energy) cellLimited coefficients. Separate from gradULimitK: OF takes
     // one gradScheme entry per field, and aerofoilNACA0012 limits grad(U), grad(k) and grad(omega) alike.
+    // The cellLimited coeff of the gradient the linearUpwind DIV STATEMENT names -- distinct from
+    // gradULimitK/gradKLimitK, which come from an explicit gradSchemes `grad(U)`/`grad(k)` entry.
+    // OF keeps these apart: linearUpwind.C takes mesh.gradScheme(gradSchemeName_), while kEpsilon.C's
+    // production uses plain fvc::grad(U) -> gradSchemes `default`. Conflating them limits the production
+    // gradient on a case that never asked for it, which collapses GbyNu and with it epsilon.
+    scalar gradULULimitK = 0.0;                    // linearUpwind's own grad(U)
+    scalar gradKLULimitK = 0.0;                    // linearUpwind's own grad(k)/grad(epsilon)
     scalar gradKLimitK = 0.0;                      // grad(k) / grad(omega) / grad(epsilon) / grad(nuTilda)
     scalar gradHeLimitK = 0.0;                     // grad(h) / grad(e)
     // The cellLimited coefficient of the gradient the KINETIC term's linearUpwind uses. Separate from

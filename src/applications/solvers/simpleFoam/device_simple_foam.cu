@@ -458,7 +458,7 @@ namespace brae {
                                        // (3.1e-5 -> 3.2e-3). Enabled only now that nut_b is evaluated.
                                        nutBndAll_.size() ? &nutBndAll_ : nullptr,
                                        compressible_ ? &muBnd_ : nullptr,
-                                       ctl_.gradKLimitK,
+                                       ctl_.gradKLULimitK,   // linearUpwind's named grad(k|eps), not gradSchemes grad(k)
                                        // fvOptions scalarFixedValueConstraint (k / omega)
                                        fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                        fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);   // grad(k)/grad(omega) cellLimited (C2)
@@ -482,7 +482,7 @@ namespace brae {
                                       (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr,   // nu at wall faces (OF nu(patchi))
                                       nutBndAll_.size() ? &nutBndAll_ : nullptr,   // nut_b -> DkEff/DepsEff(patchi)
                                       compressible_ ? &muBnd_ : nullptr,
-                                      ctl_.gradKLimitK,   // grad(k)/grad(epsilon) cellLimited (C2)
+                                      ctl_.gradKLULimitK,   // linearUpwind's named grad(k|eps)
                                       // fvOptions scalarFixedValueConstraint (OF eqn.setValues per field)
                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);
@@ -794,7 +794,12 @@ namespace brae {
         // point, none solved yet), cyclic-inclusive: the cyclic linearUpwind reconstruction rotates gradU[nbr], so it
         // needs every component from a consistent field (computing per-kk inside the loop would read freshly-solved
         // earlier components -> the same sequencing leak as the deferred mixing).
+        // gU* = gradSchemes `default` (unlimited), for the non-orthogonal laplacian correction.
+        // gLU* = the gradient the linearUpwind div statement names, limited when that name resolves to a
+        // cellLimited scheme. LUx/LUy/LUz below select between them so the unlimited path costs nothing.
         DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
+        DeviceBuffer<scalar> gLUx[3], gLUy[3], gLUz[3];
+        const bool limitLU = (ctl_.gradULULimitK > 0.0);
         DeviceBuffer<scalar> amiURot[3];   // rotated AMI-interp of the CURRENT U (gradient face value + linearUpwind/non-orth nbr)
         if ((ctl_.linearUpwind || ctl_.lust || ctl_.nonOrth) && hasAMI_ && ami_.rotational)
             deviceAmiInterpolateVec(ami_, Uk_[0], Uk_[1], Uk_[2], amiURot[0], amiURot[1], amiURot[2]);
@@ -814,10 +819,23 @@ namespace brae {
                     if (ami_.rotational) deviceAmiAddGradRot(ami_, Uk_[l], amiURot[l], dm.V, gUx[l], gUy[l], gUz[l]);
                     else interfaceAddGrad(ami_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]);
                 }
-                // grad(U) cellLimited Gauss linear <k>: clamp this component's gradient so the linearUpwind/non-orth
-                // reconstruction stays bounded, OF's primary stabiliser on skewed (snappy) meshes. (min/max gather is
-                // over internal + non-cyclic boundary neighbours; interface neighbours not included, fine off-interface.)
-                if (ctl_.gradULimitK > 0.0) deviceCellLimitGrad(dm, Uk_[l], ubv, gUx[l], gUy[l], gUz[l], ctl_.gradULimitK);
+                // grad(U) cellLimited Gauss linear <k>, into a SEPARATE buffer.
+                //
+                // TWO CONSUMERS, TWO SCHEMES. OF does not have "the" grad(U) here: linearUpwind takes the
+                // gradient its own div statement NAMES (`linearUpwind limited` -> cellLimited Gauss linear 1,
+                // via mesh.gradScheme(gradSchemeName_) in linearUpwind.C), while the non-orthogonal laplacian
+                // correction takes gradSchemes `default`, which in this case is plain Gauss linear. Limiting
+                // one buffer in place gave BOTH the same gradient and so had to be wrong for one of them:
+                // unlimited was wrong for linearUpwind (the converged squareBendLiq U was 24x off), and
+                // limiting it in place then fed an over-limited gradient into the non-orth correction and
+                // produced a transient nut excursion. Keeping them apart is the only way both match OF.
+                if (limitLU)
+                {
+                    deviceCopy(gLUx[l], gUx[l]);
+                    deviceCopy(gLUy[l], gUy[l]);
+                    deviceCopy(gLUz[l], gUz[l]);
+                    deviceCellLimitGrad(dm, Uk_[l], ubv, gLUx[l], gLUy[l], gLUz[l], ctl_.gradULULimitK);
+                }
             }
         // actuationDiskSource (Froude): T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), Uref = mean U over the monitor cells
         // (lagged). Computed once per iter; distributed over the disk cells (V[c]/Vtot) into relaxSrc below.
@@ -834,7 +852,12 @@ namespace brae {
         // linearUpwindV: the V-limiter couples the 3 velocity components, so compute all 3 correction sources once
         // here (the plain per-component linearUpwind path stays inside the kk loop below).
         DeviceBuffer<scalar> corrV[3];
-        if (ctl_.linearUpwindV) deviceLinearUpwindVCorr(dm, phiInt_, gUx, gUy, gUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
+        // The linearUpwind family reads the NAMED (possibly limited) gradient; the non-orth laplacian
+        // correction below keeps gU* (gradSchemes `default`). See the split at the gradient build above.
+        const DeviceBuffer<scalar>* LUx = limitLU ? gLUx : gUx;
+        const DeviceBuffer<scalar>* LUy = limitLU ? gLUy : gUy;
+        const DeviceBuffer<scalar>* LUz = limitLU ? gLUz : gUz;
+        if (ctl_.linearUpwindV) deviceLinearUpwindVCorr(dm, phiInt_, LUx, LUy, LUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
         for (int kk = 0; kk < 3; ++kk)   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136x SLOWER, reverted)
         {
             DeviceBuffer<scalar> dIC,dBC,lIC,lBC;
@@ -866,9 +889,9 @@ namespace brae {
             {
                 DeviceBuffer<scalar> corr;
                 if (ctl_.linearUpwindV) corr = std::move(corrV[kk]);                          // vector-limited (computed once above)
-                else                    deviceLinearUpwindCorr(dm, phiInt_, gUx[kk], gUy[kk], gUz[kk], corr);
-                if (hasCyclic_) interfaceAddLinUpwindCorr(cyc_, kk, gUx, gUy, gUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
-                if (hasAMI_)    interfaceAddLinUpwindCorr(ami_, kk, gUx, gUy, gUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
+                else                    deviceLinearUpwindCorr(dm, phiInt_, LUx[kk], LUy[kk], LUz[kk], corr);
+                if (hasCyclic_) interfaceAddLinUpwindCorr(cyc_, kk, LUx, LUy, LUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
+                if (hasAMI_)    interfaceAddLinUpwindCorr(ami_, kk, LUx, LUy, LUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
                 if (ctl_.lust)   // OF LUST.H = 0.75*linear + 0.25*linearUpwind: scale the lU corr 0.25, add 0.75*linear corr
                 {
                     deviceScale(corr, 0.25);

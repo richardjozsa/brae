@@ -255,6 +255,17 @@ public:
     // init_Tb dump that step 6's "boundary matches OF" check was read from. The solve was unaffected
     // (nothing reads this back), which is precisely why it survived: a wrong number on an output path
     // that no assertion covered.
+    // grad(U) on the CURRENT U, for comparing brae's gradient operator against OF's `postProcess -func
+    // grad(U)` on byte-identical input. Called at set-up (before any equation is solved) so both sides
+    // see the same field -- a diff taken inside turbulence.correct() compares a post-momentum-predictor
+    // U against OF's untouched initial one and measures the solve, not the operator.
+    std::vector<scalar> gradUField()
+    {
+        DeviceBuffer<scalar> g;
+        deviceGradU(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], g,
+                    hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+        return g.host();
+    }
     std::vector<scalar> TBoundary() const
     {
         if (!compressible_ || !dbHe_.n || !th_.he.size()) return {};

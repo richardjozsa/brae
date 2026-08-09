@@ -493,6 +493,13 @@ int main(int argc, char** argv)
             if (th.kappa.size())   dumpv("init_kappa", th.kappa.host());
             dumpv("init_mu",    th.mu.host());
             dumpv("init_alpha", th.alpha.host());
+            {   // grad(U) on the initial U: same input OF's `postProcess -func grad(U) -time 0` sees.
+                const std::vector<scalar> gu = solver.gradUField();
+                std::ofstream o(std::string(initDir) + "/init_gradU");
+                o.precision(17);
+                o << "n " << gu.size() << " 1\n";
+                for (scalar x : gu) o << x << '\n';
+            }
             dumpv("init_Tb",   solver.TBoundary());
             dumpv("init_rhob", solver.rhoBoundary());
             // THE PATCH MANIFEST, without which the boundary dumps above are just a flat list of numbers.

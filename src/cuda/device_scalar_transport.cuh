@@ -17,6 +17,10 @@
 #include "device_ddt.cuh"         // ScalarDdt + deviceFvmDdtDiag/Source (transient turbulence)
 #include <cuda_runtime.h>
 #include <vector>
+#include <fstream>
+#include <filesystem>
+#include <cstdlib>
+#include <cstdio>
 
 namespace brae {
 
@@ -151,19 +155,30 @@ void deviceSolveScalarTransport(
     DeviceBuffer<scalar> Df;
     deviceInterpolate(dm, D, Df);
     DeviceBuffer<scalar> aD, aU, aL, lD, lU, lL, luCorr, lapCorr;   // luCorr/lapCorr = linearUpwind / non-orth deferred sources (empty otherwise)
-    DeviceBuffer<scalar> gx, gy, gz;                               // grad(field): shared by limitedLinear / linearUpwind / non-orth
+    DeviceBuffer<scalar> gx, gy, gz;         // gradSchemes `default`: limitedLinear's limiter + non-orth
+    DeviceBuffer<scalar> lgx, lgy, lgz;      // the gradient linearUpwind NAMES (limited when that name is cellLimited)
+    // ONE GRADIENT CANNOT SERVE ALL THREE. Only linearUpwind takes a named gradient
+    // (linearUpwind.C: mesh.gradScheme(gradSchemeName_)); limitedLinear's limiter and the non-orthogonal
+    // laplacian correction both resolve gradSchemes `default`, which is plain Gauss linear here. Limiting
+    // the shared buffer in place therefore over-limited the other two -- measured on squareBendLiq as a
+    // transient nut excursion to 1.5e+01 against OF's 1.4e-03.
+    const bool limitLU = (gradLimitK > 0.0) && linearUpwind;
     if (limited || linearUpwind || nonOrth)
     {
         DeviceBuffer<scalar> bv;
         deviceBCValue(db, field, bv);
         deviceGaussGrad(dm, field, bv, gx, gy, gz);
-        if (gradLimitK > 0.0) deviceCellLimitGrad(dm, field, bv, gx, gy, gz, gradLimitK);
+        if (limitLU)
+        {
+            deviceCopy(lgx, gx); deviceCopy(lgy, gy); deviceCopy(lgz, gz);
+            deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK);
+        }
     }
     if (limited) deviceDivLimitedCoeffs(dm, phiInt, field, gx, gy, gz, twoByk, aD, aU, aL);   // Gauss limitedLinear: implicit limited weight
     else
     {
         deviceDivUpwindCoeffs(dm, phiInt, aD, aU, aL);
-        if (linearUpwind) deviceLinearUpwindCorr(dm, phiInt, gx, gy, gz, luCorr);             // Gauss linearUpwind: upwind matrix + deferred corr
+        if (linearUpwind) deviceLinearUpwindCorr(dm, phiInt, limitLU ? lgx : gx, limitLU ? lgy : gy, limitLU ? lgz : gz, luCorr);             // Gauss linearUpwind: upwind matrix + deferred corr
     }
     // laplacian "corrected": nonOrthDeltaCoeffs implicit (in deviceLaplacianCoeffs) + corrVec.grad(field) explicit (deviceLaplacianCorr).
     deviceLaplacianCoeffs(dm, Df, lD, lU, lL, nonOrth);
@@ -172,7 +187,33 @@ void deviceSolveScalarTransport(
     if (bounded) { DeviceBuffer<scalar> bt; deviceHadamard(bt, divU, dm.V); deviceAxpy(-1.0, bt, aD); }   // -Sp(div(phi),f)
     DeviceBuffer<scalar> src(static_cast<std::size_t>(nC));
     cudaCheck(cudaMemsetAsync(src.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "src zero");
+    // BRAE_DUMP_TERMS=<dir>: every contribution to this field's equation, separately, per cell, per call.
+    // A global norm cannot say WHICH term drives a localised excursion -- the deferred linearUpwind source
+    // and the reaction production are added to the same RHS and are indistinguishable afterwards. Captured
+    // here, before they are folded together.
+    DeviceBuffer<scalar> dgConv, dgReact, srcReact;
+    const char* termDir = std::getenv("BRAE_DUMP_TERMS");
+    if (termDir) { deviceCopy(dgConv, aD); }
     reaction(aD, src);                                            // model reaction: adds to diag + source
+    if (termDir)
+    {
+        deviceCopy(dgReact, aD); deviceCopy(srcReact, src);
+        static int callNo = 0;
+        const int myCall = callNo++;
+        std::error_code tec;
+        std::filesystem::create_directories(termDir, tec);
+        char fn[512];
+        std::snprintf(fn, sizeof fn, "%s/%s_%04d", termDir, fieldName, myCall);
+        std::ofstream o(fn);
+        o.precision(10);
+        const std::vector<scalar> hF = field.host(), hDc = dgConv.host(), hDr = dgReact.host(), hSr = srcReact.host();
+        const std::vector<scalar> hLU = luCorr.size()  ? luCorr.host()  : std::vector<scalar>(nC, 0.0);
+        const std::vector<scalar> hLC = lapCorr.size() ? lapCorr.host() : std::vector<scalar>(nC, 0.0);
+        o << "# cell field diagConvLap diagAfterReact srcReact luCorr lapCorr\n";
+        for (int c = 0; c < nC; ++c)
+            o << c << ' ' << hF[c] << ' ' << hDc[c] << ' ' << hDr[c] << ' '
+              << hSr[c] << ' ' << hLU[c] << ' ' << hLC[c] << '\n';
+    }
     if (luCorr.size())  deviceAxpy(-1.0, luCorr, src);           // linearUpwind deferred correction (explicit RHS)
     if (lapCorr.size()) deviceAxpy(-1.0, lapCorr, src);          // non-orth laplacian correction (explicit RHS, mirrors momentum)
     DeviceBuffer<scalar> aIC, aBC, lIC, lBC; deviceBCDivCoeffs(db, phiBnd, aIC, aBC);

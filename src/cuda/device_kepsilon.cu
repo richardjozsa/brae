@@ -665,6 +665,31 @@ void deviceKEpsilonCorrect(
     else deviceGbyNu(dm, dbU, Ux, Uy, Uz, gByNu, ami, cyc);   // interface-aware grad(U) for production
     DeviceBuffer<scalar> G;
     deviceHadamard(G, nut, gByNu);
+    // BRAE_DUMP_TERMS: GbyNu and its factors, before the wall override. Production is C1*Cmu*k*GbyNu,
+    // and the term dump showed it collapsing two orders in one iteration while k held -- so GbyNu is the
+    // suspect and it has to be looked at directly rather than inferred from the product.
+    if (const char* td = std::getenv("BRAE_DUMP_TERMS"))
+    {
+        static int gCall = 0;
+        const int gi = gCall++;
+        std::error_code gec; std::filesystem::create_directories(td, gec);
+        char gfn[512]; std::snprintf(gfn, sizeof gfn, "%s/gbynu_%04d", td, gi);
+        std::ofstream go(gfn); go.precision(10);
+        const std::vector<scalar> hG = gByNu.host(), hK = k.host(), hE = eps.host(), hN = nut.host();
+        // The full gradU tensor too: GbyNu is a contraction, so a low value can mean either a small
+        // gradient or a gradient that is nearly antisymmetric (pure rotation contracts to ~0 legitimately).
+        // Only the components separate those two.
+        DeviceBuffer<scalar> gradUd;
+        deviceGradU(dm, dbU, Ux, Uy, Uz, gradUd, ami, cyc);
+        const std::vector<scalar> hT = gradUd.host();
+        go << "# cell gByNu k eps nut g0..g8 (OF-convention gradU, column i = grad(U_i))\n";
+        for (int c = 0; c < nC; ++c)
+        {
+            go << c << ' ' << hG[c] << ' ' << hK[c] << ' ' << hE[c] << ' ' << hN[c];
+            for (int q = 0; q < 9; ++q) go << ' ' << hT[q*nC + c];   // 9*nC, component-major
+            go << '\n';
+        }
+    }
     // TWO divergences, as in the SST. "bounded" subtracts div of the flux the CONVECTION carries (the
     // MASS flux when compressible); the reactions' dilatation term is div of the VOLUMETRIC flux, which
     // OF builds from compressibleTurbulenceModel::phi() = phi/fvc::interpolate(rho). Equal at constant
