@@ -95,6 +95,10 @@ struct DeviceSimpleControls
     // OF keeps these apart: linearUpwind.C takes mesh.gradScheme(gradSchemeName_), while kEpsilon.C's
     // production uses plain fvc::grad(U) -> gradSchemes `default`. Conflating them limits the production
     // gradient on a case that never asked for it, which collapses GbyNu and with it epsilon.
+    // OF laminarModels::generalizedNewtonian + powerLaw viscosity (simulationType laminar, laminar{}).
+    // Replaces the molecular viscosity with a strain-rate-dependent one; see device_generalized_newtonian.
+    bool   gnPowerLaw = false;
+    scalar gnNuMin = 0.0, gnNuMax = 0.0, gnN = 1.0;
     scalar gradULULimitK = 0.0;                    // linearUpwind's own grad(U)
     scalar gradKLULimitK = 0.0;                    // linearUpwind's own grad(k)/grad(epsilon)
     scalar gradKLimitK = 0.0;                      // grad(k) / grad(omega) / grad(epsilon) / grad(nuTilda)

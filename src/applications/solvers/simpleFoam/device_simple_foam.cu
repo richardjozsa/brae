@@ -678,6 +678,14 @@ namespace brae {
                 addWallNutToMuEff(nutBnd, nuEffBnd);
             }
         }
+        else if (compressible_ && ctl_.gnPowerLaw)
+            // generalizedNewtonian: OF's nuEff(patchi) is nu_.boundaryField()[patchi] -- the SAME
+            // strain-rate viscosity as the interior, NOT the molecular mu. Taking mu_b = thermo mu here put
+            // 1100x too little viscosity on every wall face (interior 0.9945 Pa.s vs thermo 8.9e-4), and the
+            // wall shear is where a duct's entire pressure drop comes from: the profile came out flat
+            // (U min 1.26 against OF's 0.031), the pressure drop 5x low, and the dissipation heating with it.
+            // The face value is the adjacent cell's, as the incompressible laminar branch below does.
+            deviceBCValue(dbExtrap_, nuEff, nuEffBnd);
         else if (compressible_)
             deviceCopy(nuEffBnd, muBnd_);   // laminar compressible: mu_b = Sutherland(T_b), OF transport_.mu(patchi)
         else
@@ -1672,6 +1680,27 @@ namespace brae {
         // it must be refreshed every outer iteration, not seeded once. dnut_ is zero while the solve is
         // laminar; phase 4 fills it with mut and this line keeps working unchanged.
         deviceCopy(nuConst_, th_.mu);
+        // laminar generalizedNewtonian: nuEff() RETURNS nu_, it does not add to the molecular nu, so this
+        // overwrites nuConst_ (= muEff's laminar part) rather than adding to it. Placed straight after the
+        // thermo copy because nu0 = mu/rho must be the CURRENT thermo viscosity, as OF's
+        // `nu_ = viscosityModel_->nu(this->nu(), strainRate())` re-evaluates it every correct().
+        if (ctl_.gnPowerLaw)
+        {
+            DeviceBuffer<scalar> gradU, S2;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU,
+                        hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            deviceS2(gradU, nC_, S2);            // 2*magSqr(symm(gradU)); sqrt(S2) = OF's strainRate
+            deviceGeneralizedNewtonianPowerLawMu(S2, th_.rho, ctl_.gnNuMin, ctl_.gnNuMax, ctl_.gnN, nuConst_);
+            if (std::getenv("BRAE_GN_DEBUG"))
+            {
+                const std::vector<scalar> hm = nuConst_.host(), hr = th_.rho.host(), hs = S2.host();
+                double mn=1e300,mx=-1e300,rn=1e300,rx=-1e300,sn=1e300,sx=-1e300;
+                for (std::size_t q=0;q<hm.size();++q){ mn=std::min(mn,(double)hm[q]); mx=std::max(mx,(double)hm[q]);
+                    rn=std::min(rn,(double)hr[q]); rx=std::max(rx,(double)hr[q]);
+                    sn=std::min(sn,std::sqrt(std::max(0.0,(double)hs[q]))); sx=std::max(sx,std::sqrt(std::max(0.0,(double)hs[q]))); }
+                std::printf("  [gn] mu %.4e..%.4e  rho %.4e..%.4e  strainRate %.4e..%.4e\n", mn,mx,rn,rx,sn,sx);
+            }
+        }
 
         // Boundary rho and mu for this iteration. Both are T-dependent, so they move with the solution and
         // must be refreshed here rather than seeded once. nuBndConst_ becomes mu_b, which turns the boundary
