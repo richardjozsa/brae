@@ -126,8 +126,20 @@ int main(int argc, char** argv)
         GeometricField<scalar> rhoIO;
         if (haveRhoFile) rhoIO = buildField<scalar>(readField<scalar>(rhoPath), fvp, nC);
 
+        // OF createFields.H: `volScalarField rho(IOobject(..., READ_IF_PRESENT, ...), thermo.rho())`.
+        // thermo.rho() -- NOT p/(R*T). They coincide only for a perfect gas; for `properties liquid` the
+        // thermo density is the NSRDS rho(T) correlation and has no pressure dependence at all.
+        //
+        // THIS SEEDS TWO THINGS, AND BOTH WERE WRONG ON THE LIQUID PATH: the flowRateInletVelocity patch
+        // (gSum(rho*magSf) below) and the initial mass flux fvc::rhoFlux(rho0, U, ...). squareBendLiq
+        // ships no 0/rho, so rho0 fell back to the gas EOS and gave 1e5/(287.058*300) = 1.1612 kg/m3 --
+        // air -- against water's 994.51. Measured as an inlet velocity, and hence a grad(U) at the 400
+        // inlet cells, exactly 861.174x OF's, which is 1000/1.1612 to seven digits.
         std::vector<scalar> rho0(nC);
         if (haveRhoFile) rho0 = rhoIO.internal;
+        else if (tc.model == ThermoModel::liquidH2O)
+            for (label i = 0; i < nC; ++i)
+                rho0[i] = H2OLiquid::rho(std::min(std::max(T.internal[i], H2OLiquid::Tt), H2OLiquid::Tc));
         else for (label i = 0; i < nC; ++i) rho0[i] = p.internal[i] / (tc.R * T.internal[i]);
 
         // Flat boundary half in DeviceBoundary order (patch order = DeviceMesh bndCell order), empty on
