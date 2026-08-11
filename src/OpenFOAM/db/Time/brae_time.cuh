@@ -35,8 +35,12 @@
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"   // noticeIgnored: the established "never drop an input silently" channel
+#include "write_control.cuh"   // OF writeControl/writeInterval cadence, which Time owns   // noticeIgnored: the established "never drop an input silently" channel
+#include <functional>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace brae {
@@ -106,12 +110,18 @@ public:
         for (const auto& s : functions->subs)
         {
             const std::string type = s.second.wordOr("type", "");
+            const bool haveFactory = factories_.count(type) != 0;
             std::unique_ptr<FunctionObject> fo = create(s.first, type, s.second);
             if (fo)
             {
                 objects_.push_back(std::move(fo));
                 continue;
             }
+            // A REGISTERED factory that returns null has declined for a reason of its own and has
+            // already said so (e.g. an unsupported diffusivity form, or a missing field). Falling
+            // through to the generic "type is not implemented" here would contradict it -- the type IS
+            // implemented; this instance of it was declined.
+            if (haveFactory) { ++missed; continue; }
             if (listed(appliedOutside, type))
             {
                 noticeApplied(
@@ -144,15 +154,26 @@ public:
 
     std::size_t size() const { return objects_.size(); }
 
+    // OF selects functionObjects through a runtime selection table (addToRunTimeSelectionTable), which
+    // lets a type live next to its dependencies rather than inside Time. Same idea here: a concrete
+    // functionObject that needs the DEVICE solver cannot be constructed in this file without dragging
+    // DeviceSimpleSolver into OpenFOAM/db, so the owning solver registers a factory before read().
+    //
+    // Register BEFORE read() -- read() is what consults the table.
+    using Factory = std::function<std::unique_ptr<FunctionObject>(const std::string&, const FoamDict&)>;
+
+    void registerType(const std::string& type, Factory f) { factories_[type] = std::move(f); }
+
 private:
-    // The registry. Empty for now BY DESIGN: this file is step 1 and adopts no solver, so it ships with
-    // no concrete types. scalarTransport and forceCoeffs land here once the three solvers are migrated,
-    // so they are written once rather than three times -- which is the duplication this class removes.
     std::unique_ptr<FunctionObject> create(
-        const std::string& /*name*/, const std::string& /*type*/, const FoamDict& /*dict*/)
+        const std::string& name, const std::string& type, const FoamDict& dict)
     {
-        return nullptr;
+        auto it = factories_.find(type);
+        if (it == factories_.end()) return nullptr;
+        return it->second(name, dict);
     }
+
+    std::map<std::string, Factory> factories_;
 
     bool all(bool (FunctionObject::*fn)())
     {
@@ -162,6 +183,103 @@ private:
     }
 
     std::vector<std::unique_ptr<FunctionObject>> objects_;
+};
+
+// brae::Time -- OF's Foam::Time, reduced to what brae's solvers actually need.
+//
+// THE POINT. In OF a solver writes `while (simple.loop())` and `runTime.write()` and gets
+// functionObjects for free, because the chain is
+//
+//     simple.loop()  ->  runTime.loop()             simpleControl.C:160
+//     Time::loop()   ->  run() then operator++()    Time.C:863
+//     Time::run()    ->  functionObjects_.execute() Time.C:797
+//
+// Not one of simpleFoam.C / pimpleFoam.C / rhoSimpleFoam.C contains a single functionObject call. That
+// is the property being reproduced: a solver cannot forget to run them, because running them is not
+// its job. Adding execute()/write()/end() to each brae solver by hand would have reproduced the
+// duplication this class exists to remove.
+//
+// Time owns the run bookkeeping -- iteration index, time value, write cadence, functionObjects -- and
+// NOTHING about how an equation is assembled or solved. Each solver keeps its own loop BODY (SIMPLE and
+// PIMPLE have genuinely different shapes) and its own convergence test; it just stops owning the
+// scaffolding around it. Device work never enters here: this is host code running once per time step
+// against device work of milliseconds per iteration, and the moment it touches per-iteration device
+// state it becomes a synchronisation point in a deliberately asynchronous loop.
+class Time
+{
+public:
+    // WriteControl is OPTIONAL. gpuSimpleFoam carries its own isWriteTime lambda rather than
+    // WriteControl -- a separate duplication, and not one to fix by quietly changing a validated
+    // solver's write cadence. A solver without WriteControl drives the write side itself by calling
+    // write() at its own write point; the LIFECYCLE (start/execute/end) is Time's either way, which is
+    // the part that must not be per-solver.
+    Time(const FoamDict& controlDict, WriteControl* wc, int nSteps,
+         const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
+         const std::vector<std::string>& approximatedOutside = {},
+         const std::vector<std::string>& appliedOutside = {})
+      : wc_(wc), nSteps_(nSteps)
+    {
+        for (const auto& t : types) functionObjects_.registerType(t.first, t.second);
+        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside);
+    }
+
+    // OF Time::loop(): test run(), advance, fire functionObjects. The solver writes
+    //     while (time.loop()) { ...its own iteration... }
+    // and never mentions functionObjects, exactly as OF's solvers do not.
+    bool loop()
+    {
+        if (iter_ >= nSteps_) return false;
+        ++iter_;
+        if (iter_ == 1) functionObjects_.start();   // OF Time.C:820
+        else            functionObjects_.execute(); // OF Time.C:797,825
+        return true;
+    }
+
+    int    timeIndex() const { return iter_; }
+    scalar timeValue() const { return wc_ ? wc_->timeValue(iter_) : scalar(iter_); }
+    std::string timeName() const { return WriteControl::timeName(timeValue()); }
+
+    // OF runTime.write(): true when this step is a write time. functionObjects_.write() fires here and
+    // not in loop(), because OF splits them -- scalarTransport solves every step, writes on cadence.
+    bool writeTime()
+    {
+        if (iter_ >= nSteps_) return false;   // the final write is the solver's own, as in OF writeAndEnd
+        if (!wc_ || !wc_->isWriteTime(iter_, timeValue())) return false;
+        functionObjects_.write();
+        return true;
+    }
+
+    // OF Time.C:790-802, the "Ensure functionObjects execute on last time step" block. run() fires
+    // execute() BEFORE the increment, so the top-of-loop firing always sees the PREVIOUS body's
+    // results and the final body would otherwise never be seen at all. OF therefore does one more
+    // execute() on the way out, then end(). Omitting it silently drops the last time step from every
+    // functionObject -- for scalarTransport that is one whole transport step missing from the answer.
+    void end()
+    {
+        if (iter_ > 0) functionObjects_.execute();
+        functionObjects_.end();
+    }
+
+    // Lets a solver stop early (residualControl) without Time thinking the run was truncated.
+    void stop() { nSteps_ = iter_; }
+
+    // The functionObject REPORT must happen at start-up, so a case that refuses on an unsupported model
+    // still learns which of its functionObjects brae would not have honoured. But the step count is only
+    // known once endTime/startTime/deltaT have been resolved, which is later. So Time is constructed
+    // early (reporting fires) and told the count here, before the loop.
+    void setSteps(int n) { nSteps_ = n; }
+
+    // For a solver that owns its own write cadence: fire the write side at its write point.
+    void write() { functionObjects_.write(); }
+
+    FunctionObjectList&       functionObjects()       { return functionObjects_; }
+    const FunctionObjectList& functionObjects() const { return functionObjects_; }
+
+private:
+    WriteControl*      wc_;
+    FunctionObjectList functionObjects_;
+    int                nSteps_;
+    int                iter_ = 0;
 };
 
 }   // namespace brae

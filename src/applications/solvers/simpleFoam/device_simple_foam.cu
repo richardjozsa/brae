@@ -3,6 +3,7 @@
 // the class declaration (members + method signatures) stays in the header. Prerequisite for the PIMPLE solver,
 // which reuses solveMomentumPredictor / correctPressureVelocity / correctTurbulence under a transient loop.
 #include "device_simple_foam.cuh"
+#include "device_scalar_transport.cuh"   // deviceSolveScalarTransport: shared with k/epsilon/omega/energy
 #include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
 
 namespace brae {
@@ -1661,6 +1662,36 @@ namespace brae {
         dbHe_ = std::move(dbHe);
         th_.allocate(dm_.nCells);
         compressible_ = true;
+    }
+
+    void DeviceSimpleSolver::solvePassiveScalar(
+        DeviceBuffer<scalar>& field,
+        const DeviceBoundary& db,
+        const char* fieldName,
+        const DeviceBuffer<scalar>& D,
+        scalar relax,
+        scalar tol)
+    {
+        const int nC = dm_.nCells;
+        if (static_cast<int>(field.size()) != nC) return;
+
+        // The bounded-convection correction term needs div(phi); build it the same way every other
+        // caller of deviceSolveScalarTransport does.
+        DeviceBuffer<scalar> divPhi;
+        deviceFaceDivSource(dm_, phiInt_, divPhi);
+
+        // No reaction: a passive scalar has no source. OF's fvOptions_(rho, s) is not applied -- brae
+        // refuses unsupported fvOptions at start-up, so there is nothing here to drop silently.
+        deviceSolveScalarTransport(
+            dm_, db, field, fieldName, D, phiInt_, phiBnd_, divPhi,
+            ctl_.bounded, false, false, ctl_.nonOrth, scalar(0),
+            relax, tol, ctl_.relTolKE, ctl_.bicgCheckEvery, false,
+            [](DeviceBuffer<scalar>&, DeviceBuffer<scalar>&){},   // passive: no reaction
+            nullptr, nullptr,
+            hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
+            ScalarDdt{},          // steady: fvm::ddt(s) drops out
+            nullptr, scalar(0),
+            false);               // OF's scalarTransport does NOT bound; a tracer is not positive-definite
     }
 
     void DeviceSimpleSolver::setAlphatPrt(const std::vector<scalar>& prtFace)

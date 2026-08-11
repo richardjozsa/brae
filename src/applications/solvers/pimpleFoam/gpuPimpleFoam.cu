@@ -374,10 +374,10 @@ try
     // APPLIED here (not approximated as in gpuSimpleFoam): this driver samples on the write cadence and
     // writes postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
     // Anything else is reported as ignored instead of being silently passed over.
-    {
-        FunctionObjectList functionObjects;
-        functionObjects.read(fcFuncs, {}, {"forceCoeffs"});
-    }
+    // Time owns the functionObject lifecycle (OF Foam::Time). forceCoeffs is declared APPLIED here, not
+    // approximated: this driver samples on the write cadence and writes
+    // postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
+    Time time(controlDict, nullptr, 0, {}, {}, {"forceCoeffs"});
     const FoamDict* fcDict = nullptr;
     if (fcFuncs)
         for (const auto& s : fcFuncs->subs)
@@ -438,7 +438,11 @@ try
     const scalar tEnd = endTime + 0.5 * deltaT;
     long timeIndex = 0;
     std::string lastWritten;
-    for (scalar t = startTime + deltaT; t <= tEnd; t += deltaT) {
+    // Time drives the functionObject lifecycle; the transient loop keeps its own time-valued
+    // advancement, which is a genuinely different shape from the steady solvers' iteration index and is
+    // not worth restructuring for this. loop() fires start()/execute() at OF's points.
+    time.setSteps(static_cast<int>(std::lround((tEnd - (startTime + deltaT)) / deltaT)) + 1);
+    for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
         const DeviceSimpleResidual r = solver.pimpleStep(deltaT, nOuter, nCorr);
@@ -449,10 +453,11 @@ try
             && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
         const bool isWrite = isWriteTime(timeIndex, t);
-        if (isWrite) { writeTimeDir(tn); lastWritten = tn; }
+        if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
         // Sample Cd on the write cadence, or on BRAE_FORCE_INTERVAL when set (see the cost note above).
         if (forceInterval > 0 ? (timeIndex % forceInterval == 0) : isWrite) sampleForces(t);
     }
+    time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
     {
         const std::string tn = timeName(startTime + deltaT * (scalar)timeIndex);
         if (tn != lastWritten) { writeTimeDir(tn); sampleForces(startTime + deltaT * (scalar)timeIndex); }

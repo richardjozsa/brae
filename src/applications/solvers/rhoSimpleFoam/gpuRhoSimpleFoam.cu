@@ -36,6 +36,7 @@
 #include "dict_audit.cuh"   // name every dict entry brae read and then ignored
 #include "write_control.cuh"   // OF writeControl/writeInterval/purgeWrite cadence (shared with simpleFoam)
 #include "brae_time.cuh"   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
+#include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux
 #include "mrf_read.cuh"          // readCellZones (shared with the incompressible driver)
 #include "fv_options.cuh"       // OF fv::options: the SAME framework the incompressible driver uses
 #include "of_residual_log.cuh"   // BRAE_OF_LOG=1: OF-format per-solve residuals, for iteration-by-iteration diffing
@@ -607,8 +608,44 @@ int main(int argc, char** argv)
         // so on gasMixing/injectorPipe (which ships scalarTransport, sampling and abort) every
         // functionObject was silently skipped. Adopted here first because rhoSimpleFoam had no support
         // to regress; simpleFoam and pimpleFoam migrate onto the same class next.
-        FunctionObjectList functionObjects;
-        functionObjects.read(controlDict.subDict("functions"));
+        // OF's runtime selection table, brae's equivalent: the factory is handed to Time, which
+        // registers it before read() -- so read() builds what it recognises and reports only what
+        // genuinely has no implementation.
+        std::vector<ScalarTransportFO*> scalarTransports;
+        std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
+        foTypes.emplace_back(
+            "scalarTransport",
+            [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+            {
+                // OF picks D from constantD_ / nutName_ / alphaD*nu + alphaDt*nut. Only the constant
+                // branch is implemented; the others are REFUSED by name rather than quietly replaced by
+                // a constant, which would change the answer while appearing to work.
+                if (!fd.found("D"))
+                {
+                    noticeIgnored("functions/" + foName,
+                                  "scalarTransport without a constant `D` (nut-based or alphaD/alphaDt "
+                                  "diffusivity) is not implemented, so this tracer is NOT solved.");
+                    return nullptr;
+                }
+                const std::string fld = fd.wordOr("field", foName);
+                const std::string fpath = t0 + "/" + fld;
+                if (!std::filesystem::exists(fpath))
+                {
+                    noticeIgnored("functions/" + foName,
+                                  "scalarTransport field '" + fld + "' is not present in " + t0 +
+                                  ", so this tracer is NOT solved.");
+                    return nullptr;
+                }
+                GeometricField<scalar> sf = buildField<scalar>(readField<scalar>(fpath), fvp, nC);
+                sf.evaluateBoundary();
+                DeviceBuffer<scalar> dsf;
+                dsf.copyFrom(sf.internal);
+                auto fo = std::make_unique<ScalarTransportFO>(
+                    foName, fld, solver, std::move(dsf), buildDeviceBoundary(sf, fvp, g),
+                    fd.scalarOr("D", 0.0), fd.scalarOr("relaxCoeff", 1.0), fd.scalarOr("tol", 1e-6), nC);
+                scalarTransports.push_back(fo.get());
+                return fo;
+            });
         // Time values are measured from where this run actually STARTS, which `startFrom latestTime`
         // can make different from controlDict's startTime.
         wc.setStartTime(tStart);
@@ -617,6 +654,15 @@ int main(int argc, char** argv)
         {
             const std::string outDir = caseDir + "/" + tname;
             std::filesystem::create_directories(outDir);
+            // scalarTransport tracers. OF constructs its transported field with AUTO_WRITE
+            // (scalarTransport.C transportedField()), so it appears in every written time directory
+            // alongside the solved fields. Pulled from the device only HERE -- on the write cadence,
+            // not every iteration.
+            for (ScalarTransportFO* st : scalarTransports)
+            {
+                writeVolField(wsrc + st->fieldName(), outDir + "/" + st->fieldName(),
+                              st->hostField(), fvp, 12);
+            }
             writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, 12, solver.UBoundary());
             writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, 12, solver.pBoundary());
             {
@@ -669,11 +715,18 @@ int main(int argc, char** argv)
                 "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
                 + startName + "): there is nothing to run. endTime is an ABSOLUTE time, not a number of "
                 "iterations -- on a restart set it past the time you are restarting from.");
+        // Time owns the run bookkeeping and the functionObject lifecycle, as OF's Foam::Time does.
+        // The loop below never mentions functionObjects again -- which is the property that stops a
+        // solver from being able to forget them (OF's simpleFoam.C/pimpleFoam.C/rhoSimpleFoam.C contain
+        // no functionObject call at all).
+        Time time(controlDict, &wc, static_cast<int>(nSteps), foTypes);
+
         int nIter = static_cast<int>(nSteps);
         bool converged = false;
         scalar cumulativeCont = 0;   // OF's "cumulative =" in the continuity-error line
-        for (int iter = 1; iter <= nSteps; ++iter)
+        while (time.loop())
         {
+            const int iter = time.timeIndex();
             clearTurbulenceReport();
             const DeviceSimpleResidual r = solver.rhoSimpleStep();
             // OF prints a cumulative continuity error; brae's residual carries the per-step one.
@@ -684,7 +737,6 @@ int main(int argc, char** argv)
                 std::printf("Time = %d   Ux %.4e  p %.4e  contGlobal %.4e\n",
                             iter, r.Ux, r.p, r.contGlobal);
             }
-            functionObjects.execute();   // OF Time.C:797,825 -- every time step
             resControl.beginIteration();
             // U is gated on Ux alone, matching gpuSimpleFoam: brae tracks no solved-directions mask, so the
             // out-of-plane component of a 2D/empty or wedge case carries a degenerate residual that would
@@ -706,16 +758,12 @@ int main(int argc, char** argv)
             achieved      = resControl.ok(r.he, heName) && achieved;
             for (const auto& e : turbulenceReport())
                 achieved = resControl.ok(e.perf.initialResidual, e.field == "he" ? heName : e.field) && achieved;
-            if (resControl.converged(achieved)) { converged = true; nIter = iter; break; }
+            if (resControl.converged(achieved)) { converged = true; nIter = iter; time.stop(); break; }
             // Intermediate write. Skipped on the last iteration, which the final write below covers.
             const scalar tval = wc.timeValue(iter);
-            if (iter != nSteps && wc.isWriteTime(iter, tval))
-            {
-                writeTimeDir(WriteControl::timeName(tval));
-                functionObjects.write();   // OF splits write() from execute(): write cadence, not every step
-            }
+            if (time.writeTime()) writeTimeDir(WriteControl::timeName(tval));
         }
-        functionObjects.end();   // OF Time.C:801 -- final time step
+        time.end();   // OF Time.C:801 -- final time step
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
 

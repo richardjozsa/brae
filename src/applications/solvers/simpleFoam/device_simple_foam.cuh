@@ -154,6 +154,27 @@ public:
     // construction, exactly as it already owns U/p.
     // Per-boundary-face Prt from 0/alphat: alphatWallFunction patches carry their own (OF default 0.85),
     // every other face uses the turbulence model's (OF default 1.0). Optional -- absent, the model's is used.
+    // OF functionObjects::scalarTransport (scalarTransport.C). Solves ONE passive scalar on the
+    // device against the flux this solver already holds:
+    //
+    //     fvm::div(phi, s) - fvm::laplacian(D, s) == 0        (steady; ddt drops out)
+    //
+    // PASSIVE means passive: nothing here writes back into U, p, T, rho or the turbulence, so a case
+    // that carries a tracer solves identically with and without it. That is also why it is safe to run
+    // from a functionObject rather than from inside the SIMPLE loop proper.
+    //
+    // Reuses deviceSolveScalarTransport -- the same routine k, epsilon, omega and the energy already go
+    // through -- so the tracer gets the case's own div/laplacian schemes rather than a private
+    // discretisation. boundPositive is FALSE: OF's scalarTransport does not bound, and a tracer is not a
+    // positive-definite turbulence quantity.
+    void solvePassiveScalar(
+        DeviceBuffer<scalar>& field,
+        const DeviceBoundary& db,
+        const char* fieldName,
+        const DeviceBuffer<scalar>& D,   // built ONCE by the caller; a per-step H2D fill would be waste
+        scalar relax,
+        scalar tol);
+
     void setAlphatPrt(const std::vector<scalar>& prtFace);
     // Energy linear solver from fvSolution solvers.(h|e). Was hardcoded tol=1e-10, relTol=0, BiCGStab.
     void setEnergySolver(scalar tol, scalar relTol, bool useGS)

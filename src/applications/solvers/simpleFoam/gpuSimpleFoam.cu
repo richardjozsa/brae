@@ -175,10 +175,12 @@ int main(int argc, char** argv)
         // driver prints it once at the end, whereas OF's runs every time step and writes a history
         // (forceCoeffs.H:547,550) -- gpuPimpleFoam declares the same type APPLIED, because it does
         // sample on the write cadence.
-        {
-            FunctionObjectList functionObjects;
-            functionObjects.read(controlDict.subDict("functions"), {"forceCoeffs"});
-        }
+        // Time owns the functionObject lifecycle, as OF's Foam::Time does: the loop below never mentions
+        // functionObjects, which is what stops a solver from being able to forget them. Constructed here
+        // so the report fires even if the run refuses later; the step count arrives via setSteps().
+        // forceCoeffs is APPROXIMATED in this driver (a single post-run print) -- gpuPimpleFoam declares
+        // the same type APPLIED, because it samples on the write cadence as OF does.
+        Time time(controlDict, nullptr, 0, {}, {"forceCoeffs"});
 
         std::string startStr = controlDict.wordOr("startTime", "0");
         // OF startFrom: 'latestTime' restarts from the newest numeric time directory, 'firstTime' from the earliest
@@ -565,8 +567,10 @@ int main(int argc, char** argv)
         bool converged = false;
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
-        for (iter = 1; iter <= nSteps && !converged; ++iter)
+        time.setSteps(static_cast<int>(nSteps));
+        while (!converged && time.loop())
         {
+            iter = time.timeIndex();
             const DeviceSimpleResidual r = solver.step();
             {
                 // OpenFOAM-style per-iteration report: Time, per-field solver residuals, continuity, turbulence, ExecutionTime.
@@ -635,9 +639,15 @@ int main(int argc, char** argv)
             // a plausible-looking field set (simpleControl.C:51-57).
             converged = converged && rcChecked > 0;
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
-            if (!converged && iter != nSteps && isWriteTime(iter, tval)) writeTimeDir(timeName(tval));  // intermediate writes
+            if (!converged && iter != nSteps && isWriteTime(iter, tval))
+            {
+                writeTimeDir(timeName(tval));
+                time.write();   // OF splits write() from execute(); this driver owns its own cadence
+            }
         }
-        const int nIter = converged ? iter - 1 : static_cast<int>(nSteps);
+        time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
+        // timeIndex() is the iteration that ran, so no -1: the for-loop this replaced incremented past it.
+        const int nIter = converged ? time.timeIndex() : static_cast<int>(nSteps);
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
 
