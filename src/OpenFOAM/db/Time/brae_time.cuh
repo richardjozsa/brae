@@ -34,6 +34,7 @@
 
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
+#include "brae_notice.cuh"   // noticeIgnored: the established "never drop an input silently" channel
 #include <memory>
 #include <string>
 #include <vector>
@@ -70,20 +71,32 @@ class FunctionObjectList
 {
 public:
     // OF functionObjectList::read(). Walks controlDict.functions and builds what it recognises.
-    // Returns the number of entries it could NOT build, so the caller can report or refuse.
-    int read(const FoamDict* functions, std::vector<std::string>& unrecognised)
+    //
+    // Anything it cannot build goes through noticeIgnored -- the SAME convention the rest of brae uses
+    // for "never drop an input silently". Reporting here rather than in each solver is the entire point
+    // of centralising: a solver that adopts Time cannot forget to report, in the same way an OF solver
+    // cannot forget to run functionObjects. Returns the number not built.
+    int read(const FoamDict* functions)
     {
         objects_.clear();
-        unrecognised.clear();
         if (!functions) return 0;
+        int missed = 0;
         for (const auto& s : functions->subs)
         {
             const std::string type = s.second.wordOr("type", "");
             std::unique_ptr<FunctionObject> fo = create(s.first, type, s.second);
-            if (fo) objects_.push_back(std::move(fo));
-            else    unrecognised.push_back(s.first + " (type " + type + ")");
+            if (fo)
+            {
+                objects_.push_back(std::move(fo));
+                continue;
+            }
+            ++missed;
+            noticeIgnored(
+                "functions/" + s.first,
+                "type '" + type + "' is not implemented, so this functionObject is NOT run. "
+                "OpenFOAM would execute it every time step.");
         }
-        return static_cast<int>(unrecognised.size());
+        return missed;
     }
 
     bool start()   { return all(&FunctionObject::execute); }   // OF calls execute() on the first step

@@ -719,48 +719,6 @@ namespace brae {
             deviceCopy(nuEffBnd, muBnd_);   // laminar compressible: mu_b = Sutherland(T_b), OF transport_.mu(patchi)
         else
             deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
-        // BRAE_DUMP_MUEFFB=<file>: the ASSEMBLED boundary momentum diffusivity, in DeviceBoundary face
-        // order. This is what OF's turbulence->muEff()(patchi) returns, and it is the one momentum input
-        // that has only ever run on near-orthogonal hex walls -- every validated compressible case has a
-        // blockMesh wall. Dumped after all the wall-function branches so it is the value the laplacian
-        // and divDevReff actually consume, not an intermediate.
-        if (const char* mf = std::getenv("BRAE_DUMP_MUEFFB"))
-        {
-            static bool once = false;
-            if (!once)
-            {
-                once = true;
-                const std::vector<scalar> h = nuEffBnd.host();
-                std::ofstream o(mf);
-                o.precision(17);
-                o << "n " << h.size() << " 1\n";
-                for (scalar x : h) o << x << '\n';
-                // Alongside it: the near-wall distance the wall functions use, and the boundary
-                // deltaCoeffs. For a wall face 1/deltaCoeffs is the normal cell-centre-to-face distance,
-                // which is what y should reduce to; a large disagreement means the wall-distance field is
-                // wrong rather than the wall function. isWall marks which faces the wall functions act on.
-                const std::vector<scalar> hy = bndY_.host();
-                const std::vector<scalar> hd = dbU_.comp[0].deltaCoeffs.host();
-                const std::vector<label>  hw = bndIsWall_.host();
-                std::ofstream o2(std::string(mf) + ".y");
-                o2.precision(17);
-                // and the wall-function's own nu (compressible override = mu_b/rho_b), plus mu_b and
-                // rho_b so the two can be checked against each other: nutkWallFunction divides by this nu
-                // to form yPlus, so a wrong value silently disables the wall function.
-                const std::vector<scalar> hnw = nuWallBnd_.host();
-                const std::vector<scalar> hmb = muBnd_.host();
-                const std::vector<scalar> hrb = rhoBnd_.host();
-                const std::vector<label> hfc = dbU_.comp[0].faceCell.host();
-                o2 << "# face isWall bndY invDeltaCoeffs nuWall mu_b rho_b faceCell\n";
-                for (std::size_t i = 0; i < hy.size(); ++i)
-                    o2 << i << ' ' << (i < hw.size() ? (int)hw[i] : -1) << ' ' << hy[i] << ' '
-                       << (i < hd.size() && hd[i] != 0 ? 1.0/hd[i] : 0.0) << ' '
-                       << (i < hnw.size() ? hnw[i] : -1.0) << ' '
-                       << (i < hmb.size() ? hmb[i] : -1.0) << ' '
-                       << (i < hrb.size() ? hrb[i] : -1.0) << ' '
-                       << (i < hfc.size() ? (long)hfc[i] : -1L) << '\n';
-            }
-        }
         // explicit divDevReff stress (uses the incoming U; coupled across the 3 components)
         DeviceBuffer<scalar> ddrX, ddrY, ddrZ;
         deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEff, nuEffBnd, ddrX, ddrY, ddrZ, hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
@@ -770,27 +728,6 @@ namespace brae {
         deviceBCValue(dbP_, dp_, pbv);
         // gx/gy/gz are members (shared with the pressure phase).
         deviceGaussGrad(dm, dp_, pbv, gx, gy, gz);
-        // BRAE_DUMP_GRADP=<file>: grad(p) as the momentum source sees it. With p uniform this MUST be
-        // zero in every interior cell -- a uniform field has no gradient. brae folds -V*grad(p) into the
-        // momentum RHS, so a non-zero value here is a body force applied to the whole domain.
-        if (const char* gf = std::getenv("BRAE_DUMP_GRADP"))
-        {
-            static bool onceG = false;
-            if (!onceG)
-            {
-                onceG = true;
-                const std::vector<scalar> a = gx.host(), b2 = gy.host(), c2 = gz.host();
-                const std::vector<scalar> hp = dp_.host(), hpb = pbv.host();
-                std::ofstream o(gf);
-                o.precision(17);
-                o << "# cell gradpx gradpy gradpz p\n";
-                for (std::size_t i = 0; i < a.size(); ++i)
-                    o << i << ' ' << a[i] << ' ' << b2[i] << ' ' << c2[i] << ' ' << hp[i] << '\n';
-                std::ofstream o2(std::string(gf) + ".pb");
-                o2.precision(17); o2 << "# bface p_b\n";
-                for (std::size_t i = 0; i < hpb.size(); ++i) o2 << i << ' ' << hpb[i] << '\n';
-            }
-        }
         if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);   // cyclic-face contribution to grad(p) in the momentum source
         if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);       // AMI-face contribution to grad(p)
         DeviceBuffer<scalar> mDiag, lD, lU, lL;   // mUp/mLo are now members (shared with the pressure phase)
@@ -1035,47 +972,7 @@ namespace brae {
             if (hasCyclic_ && cyc_.rotational) interfaceAddDeferredRot(cyc_, Usnap[0], Usnap[1], Usnap[2], kk, s);
             if (hasAMI_ && ami_.rotational)    interfaceAddDeferredRot(ami_, Uint[0], Uint[1], Uint[2], kk, s);
             DeviceBuffer<scalar> diagC,b;
-            // BRAE_DUMP_BC=<file>: the per-component boundary coefficients feeding the momentum matrix,
-            // in DeviceBoundary face order. iC goes to the diagonal (OF internalCoeffs), bCb to the source
-            // (OF boundaryCoeffs). At iteration 1 with U=0 these are the ONLY non-zero contributions to
-            // H(), so HbyA = rAU*bCb/V and the pair is checkable by hand against
-            // muEff*magSf*deltaCoeff (laplacian) and phi_b (convection) at a fixedValue inlet.
-            if (const char* bf = std::getenv("BRAE_DUMP_BC"))
-            {
-                static int nd = 0;
-                if (nd < 3)
-                {
-                    const std::vector<scalar> hi = iC[kk].host(), hb = bCb[kk].host();
-                    std::ofstream o(std::string(bf) + "." + char('x' + kk));
-                    o.precision(17);
-                    o << "# face iC bCb\n";
-                    for (std::size_t i = 0; i < hi.size(); ++i) o << i << ' ' << hi[i] << ' ' << hb[i] << '\n';
-                    ++nd;
-                }
-            }
             deviceFold(dm, mDiagR, s, iC[kk], bCb[kk], diagC, b);
-            // BRAE_DUMP_UEQN=<file>: brae's assembled momentum system at the same point OF's
-            // UEqn.H dumps it -- after relax(), with boundary iC folded into the diagonal and bCb into
-            // the source. diagC/b are the FOLDED per-component system the predictor actually solves.
-            if (const char* qf = std::getenv("BRAE_DUMP_UEQN"))
-            {
-                static int nq = 0;
-                if (nq < 3)
-                {
-                    const std::vector<scalar> hd = diagC.host(), hb = b.host();
-                    const std::vector<scalar> hu = mUp.host(), hl = mLo.host();
-                    std::ofstream o(std::string(qf) + "." + char('x' + kk) + ".cell");
-                    o.precision(17); o << "# cell diag source\n";
-                    for (std::size_t i = 0; i < hd.size(); ++i) o << i << ' ' << hd[i] << ' ' << hb[i] << '\n';
-                    if (nq == 0)
-                    {
-                        std::ofstream o2(std::string(qf) + ".face");
-                        o2.precision(17); o2 << "# face upper lower\n";
-                        for (std::size_t i = 0; i < hu.size(); ++i) o2 << i << ' ' << hu[i] << ' ' << hl[i] << '\n';
-                    }
-                    ++nq;
-                }
-            }
             // rotational: the implicit off-diagonal for component kk is scaled by forwardT[kk][kk] (OF transformCoupleField).
             const scalar* mIfc = !hasCyclic_ ? nullptr : (cyc_.rotational ? cyc_.ifCoeffC[kk].data() : cyc_.ifCoeff.data());
             const DeviceLduView mv = hasCyclic_
@@ -1222,25 +1119,6 @@ namespace brae {
             if (hasCyclic_ && cyc_.rotational) deviceCyclicAddHRot(cyc_, Uk_[0], Uk_[1], Uk_[2], dm.V, Hk[0], Hk[1], Hk[2]);
             for (int kk = 0; kk < 3; ++kk)
                 deviceHadamard(HbyA[kk], rAU, Hk[kk]);
-        }
-        // BRAE_DUMP_RAU=<file>: rAU and HbyA after the corrector has built them, at the point phiHbyA is
-        // about to be formed. Placed here (not inside the H() scope) so both buffers are guaranteed
-        // populated. At iteration 1 the incoming U is uniform zero, so H() carries only boundary sources
-        // and rAU is 1/A with A the relaxed viscous diagonal -- both checkable by hand.
-        if (const char* rf = std::getenv("BRAE_DUMP_RAU"))
-        {
-            static bool onceR = false;
-            if (!onceR && rAU.size() && HbyA[0].size())
-            {
-                onceR = true;
-                const std::vector<scalar> hr = rAU.host();
-                const std::vector<scalar> h0 = HbyA[0].host(), h1 = HbyA[1].host(), h2 = HbyA[2].host();
-                std::ofstream o(rf);
-                o.precision(17);
-                o << "# cell rAU HbyAx HbyAy HbyAz\n";
-                for (std::size_t i = 0; i < hr.size(); ++i)
-                    o << i << ' ' << hr[i] << ' ' << h0[i] << ' ' << h1[i] << ' ' << h2[i] << '\n';
-            }
         }
         DeviceBuffer<scalar> phiHi;
         deviceVectorFlux(dm, HbyA[0], HbyA[1], HbyA[2], phiHi);   // flux of the ORIGINAL HbyA
@@ -1427,39 +1305,11 @@ namespace brae {
             // correction added, which is what OF keeps too -- zeroing it outright would discard that term.
             deviceAxpy(-1.0, phiHb0, phiHb);
 
-            // BRAE_DUMP_PEQN: one-shot summary of the transonic pressure equation's INPUTS, to compare
-            // against tools/dumpPEqn (which writes OF's phid/phiHbyA at its own iteration 1). Summary
-            // statistics rather than a field dump: min/max/sum over the internal faces is enough to tell
-            // "these are the same field" from "these differ", and it needs no file format agreement.
             if (stageDumpActive())
             {
                 stageDump("stage_phiHbyA0", phiHi0);   // pre-SIMPLEC, pre-subtraction: what phid is built from
                 stageDump("stage_phid", phidI);
                 stageDump("stage_phidB", phidB);
-            }
-            if (std::getenv("BRAE_DUMP_PEQN"))
-            {
-                static bool dumped = false;
-                if (!dumped)
-                {
-                    dumped = true;
-                    const std::vector<scalar> hd = phidI.host();
-                    const std::vector<scalar> hh = phiHi.host();
-                    auto stat = [](const char* nm, const std::vector<scalar>& v)
-                    {
-                        scalar mn = 1e300, mx = -1e300, sm = 0;
-                        for (scalar x : v) { mn = std::min(mn, x); mx = std::max(mx, x); sm += x; }
-                        std::printf("[peqn] %-8s n=%zu  min %.6g  max %.6g  sum %.6g\n", nm, v.size(),
-                                    (double)mn, (double)mx, (double)sm);
-                    };
-                    stat("phid", hd);
-                    stat("phiHbyA", hh);
-                    stat("phiHbyA0", phiHi0.host());   // pre-SIMPLEC, pre-subtraction: what phid is built from
-                    stat("rAtU", rAtU.host());
-                    stat("rhorAtUf", rAUf.host());
-                    stat("phidB", phidB.host());     // boundary phid: carries the INLET MASS once phiHbyA -> 0
-                    stat("phiHbyA0B", phiHb0.host());
-                }
             }
         }
 
@@ -1895,23 +1745,6 @@ namespace brae {
         }
 
         solveMomentumPredictor(res);
-        // BRAE_DUMP_UPRED=<file>: U straight out of the momentum predictor, BEFORE the pressure
-        // corrector touches it. This is the only way to tell whether momentum hands off a bad U or
-        // hands off a good one that pEqn then wrecks -- the final U conflates the two.
-        if (const char* uf = std::getenv("BRAE_DUMP_UPRED"))
-        {
-            static bool onceU = false;
-            if (!onceU)
-            {
-                onceU = true;
-                const std::vector<scalar> a = Uk_[0].host(), b2 = Uk_[1].host(), c2 = Uk_[2].host();
-                std::ofstream o(uf);
-                o.precision(17);
-                o << "# cell Ux Uy Uz\n";
-                for (std::size_t i = 0; i < a.size(); ++i)
-                    o << i << ' ' << a[i] << ' ' << b2[i] << ' ' << c2[i] << '\n';
-            }
-        }
         // Stage harness: U straight out of the MOMENTUM PREDICTOR. OF's UEqn.H() uses THIS U (not the
         // initial field), so it is its own stage between rAU and HbyA. Missing it was why the first
         // Phase 1 pass could not explain a 4% HbyA error on a case whose 0/U is uniform zero.
@@ -2020,16 +1853,6 @@ namespace brae {
         // BEFORE rho is recomputed. Clamping after rho would let one NaN density through per iteration.
         if (rc_.limitMaxP || rc_.limitMinP)
         {
-            // BRAE_DUMP_PLIMIT: report the PRE-clamp extrema, which is what OF's pressureControl prints
-            // ("pressureControl: p max ..."). Comparable line-for-line against OF's log, and the only way
-            // to compare a pressure field that both codes then saturate at the same limits.
-            if (std::getenv("BRAE_DUMP_PLIMIT"))
-            {
-                const std::vector<scalar> ph = dp_.host();
-                scalar lo = ph.empty() ? 0.0 : ph[0], hi = lo;
-                for (scalar v : ph) { lo = std::min(lo, v); hi = std::max(hi, v); }
-                std::fprintf(stderr, "pressureControl(brae): p max %g  p min %g\n", hi, lo);
-            }
             deviceLimitPressure(dp_,
                                 rc_.limitMinP ? rc_.pMinLimit : -1e300,
                                 rc_.limitMaxP ? rc_.pMaxLimit : 1e300);

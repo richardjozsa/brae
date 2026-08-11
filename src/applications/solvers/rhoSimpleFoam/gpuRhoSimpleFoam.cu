@@ -35,6 +35,7 @@
 #include "residual_control.cuh"   // OF simpleControl::criteriaSatisfied (shared with simpleFoam)
 #include "dict_audit.cuh"   // name every dict entry brae read and then ignored
 #include "write_control.cuh"   // OF writeControl/writeInterval/purgeWrite cadence (shared with simpleFoam)
+#include "brae_time.cuh"   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include "mrf_read.cuh"          // readCellZones (shared with the incompressible driver)
 #include "fv_options.cuh"       // OF fv::options: the SAME framework the incompressible driver uses
 #include "of_residual_log.cuh"   // BRAE_OF_LOG=1: OF-format per-solve residuals, for iteration-by-iteration diffing
@@ -599,6 +600,15 @@ int main(int argc, char** argv)
         // so a case asking to write every N iterations silently got nothing until convergence. The policy
         // is shared with gpuSimpleFoam (write_control.cuh); only the payload below is solver-specific.
         WriteControl wc(controlDict);
+
+        // OF owns functionObjects in Time (Time.C:469) and drives read/start/execute/end itself, so a
+        // solver cannot forget them. brae had no such class: gpuSimpleFoam.cu:744 hand-searched
+        // `functions` for forceCoeffs and nothing else, and THIS driver never read `functions` at all --
+        // so on gasMixing/injectorPipe (which ships scalarTransport, sampling and abort) every
+        // functionObject was silently skipped. Adopted here first because rhoSimpleFoam had no support
+        // to regress; simpleFoam and pimpleFoam migrate onto the same class next.
+        FunctionObjectList functionObjects;
+        functionObjects.read(controlDict.subDict("functions"));
         // Time values are measured from where this run actually STARTS, which `startFrom latestTime`
         // can make different from controlDict's startTime.
         wc.setStartTime(tStart);
@@ -674,6 +684,7 @@ int main(int argc, char** argv)
                 std::printf("Time = %d   Ux %.4e  p %.4e  contGlobal %.4e\n",
                             iter, r.Ux, r.p, r.contGlobal);
             }
+            functionObjects.execute();   // OF Time.C:797,825 -- every time step
             resControl.beginIteration();
             // U is gated on Ux alone, matching gpuSimpleFoam: brae tracks no solved-directions mask, so the
             // out-of-plane component of a 2D/empty or wedge case carries a degenerate residual that would
@@ -698,8 +709,13 @@ int main(int argc, char** argv)
             if (resControl.converged(achieved)) { converged = true; nIter = iter; break; }
             // Intermediate write. Skipped on the last iteration, which the final write below covers.
             const scalar tval = wc.timeValue(iter);
-            if (iter != nSteps && wc.isWriteTime(iter, tval)) writeTimeDir(WriteControl::timeName(tval));
+            if (iter != nSteps && wc.isWriteTime(iter, tval))
+            {
+                writeTimeDir(WriteControl::timeName(tval));
+                functionObjects.write();   // OF splits write() from execute(): write cadence, not every step
+            }
         }
+        functionObjects.end();   // OF Time.C:801 -- final time step
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
 
