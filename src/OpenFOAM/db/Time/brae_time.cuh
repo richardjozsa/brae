@@ -35,6 +35,7 @@
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"   // noticeIgnored: the established "never drop an input silently" channel
+#include "object_registry.cuh"   // OF: class Time : public objectRegistry (Time.H:74-80)
 #include "write_control.cuh"   // OF writeControl/writeInterval cadence, which Time owns   // noticeIgnored: the established "never drop an input silently" channel
 #include <functional>
 #include <map>
@@ -272,11 +273,18 @@ public:
     // For a solver that owns its own write cadence: fire the write side at its write point.
     void write() { functionObjects_.write(); }
 
+    // OF has `class Time : public objectRegistry`. Composition rather than inheritance here, but the
+    // property that matters is the same: a functionObject reaches the solver and its fields BY NAME and
+    // LATE, so Time can be constructed before the things its functionObjects will need.
+    ObjectRegistry&       registry()       { return registry_; }
+    const ObjectRegistry& registry() const { return registry_; }
+
     FunctionObjectList&       functionObjects()       { return functionObjects_; }
     const FunctionObjectList& functionObjects() const { return functionObjects_; }
 
 private:
     WriteControl*      wc_;
+    ObjectRegistry     registry_;
     FunctionObjectList functionObjects_;
     int                nSteps_;
     int                iter_ = 0;

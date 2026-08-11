@@ -95,6 +95,11 @@ int main(int argc, char** argv)
         audit.add(fvSolution, "system/fvSolution");
         audit.add(turbProps, "constant/turbulenceProperties");
 
+        // Time at START-UP, before anything can refuse: the functionObject report must reach a user
+        // whose case dies on an unsupported thermo or turbulence model. This placement is only possible
+        // because the objects resolve their dependencies from the registry LATE (OF's arrangement) --
+        // while they captured DeviceSimpleSolver& at construction, Time had to follow the solver.
+        ObjectRegistry timeRegistry;
         mark__("turbulenceProperties read");
         const ThermoCoeffs tc = readThermoCoeffs(caseDir, &fvSolution);
         mark__("thermo read");   // share the dict so dict_audit sees these lookups
@@ -108,6 +113,9 @@ int main(int argc, char** argv)
         mark__("geometry built");
         const std::vector<FvPatch> fvp = buildPatches(m, g);
         const label nC = m.nCells();
+        timeRegistry.store("mesh", &m);
+        timeRegistry.store("geometry", &g);
+        timeRegistry.store("patches", &fvp);
 
         // C6: startFrom was ignored here -- the start directory was hardcoded to "0", so `startFrom
         // latestTime` (the standard way to CONTINUE a compressible run) silently restarted from scratch
@@ -429,6 +437,7 @@ int main(int argc, char** argv)
                                   ctl.turbulent ? &tf.k : nullptr,
                                   ctl.turbulent ? &tf.eps : nullptr,
                                   ctl.turbulent ? &tf.nut : nullptr);
+        timeRegistry.store("solver", &solver);   // from here the functionObjects can resolve
 
         // he boundary: built from the case's 0/T, then converted. brae never reads a 0/he, exactly as OF
         // never asks a user to write one.
@@ -628,21 +637,11 @@ int main(int argc, char** argv)
                     return nullptr;
                 }
                 const std::string fld = fd.wordOr("field", foName);
-                const std::string fpath = t0 + "/" + fld;
-                if (!std::filesystem::exists(fpath))
-                {
-                    noticeIgnored("functions/" + foName,
-                                  "scalarTransport field '" + fld + "' is not present in " + t0 +
-                                  ", so this tracer is NOT solved.");
-                    return nullptr;
-                }
-                GeometricField<scalar> sf = buildField<scalar>(readField<scalar>(fpath), fvp, nC);
-                sf.evaluateBoundary();
-                DeviceBuffer<scalar> dsf;
-                dsf.copyFrom(sf.internal);
+                // No field read here: the object resolves mesh, patches, geometry and solver from the
+                // registry on its first execute(), so Time need not be constructed after the solver.
                 auto fo = std::make_unique<ScalarTransportFO>(
-                    foName, fld, solver, std::move(dsf), buildDeviceBoundary(sf, fvp, g),
-                    fd.scalarOr("D", 0.0), fd.scalarOr("relaxCoeff", 1.0), fd.scalarOr("tol", 1e-6), nC);
+                    foName, fld, t0 + "/" + fld, timeRegistry,
+                    fd.scalarOr("D", 0.0), fd.scalarOr("relaxCoeff", 1.0), fd.scalarOr("tol", 1e-6));
                 scalarTransports.push_back(fo.get());
                 return fo;
             });
@@ -715,10 +714,6 @@ int main(int argc, char** argv)
                 "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
                 + startName + "): there is nothing to run. endTime is an ABSOLUTE time, not a number of "
                 "iterations -- on a restart set it past the time you are restarting from.");
-        // Time owns the run bookkeeping and the functionObject lifecycle, as OF's Foam::Time does.
-        // The loop below never mentions functionObjects again -- which is the property that stops a
-        // solver from being able to forget them (OF's simpleFoam.C/pimpleFoam.C/rhoSimpleFoam.C contain
-        // no functionObject call at all).
         Time time(controlDict, &wc, static_cast<int>(nSteps), foTypes);
 
         int nIter = static_cast<int>(nSteps);
