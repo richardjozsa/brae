@@ -467,6 +467,7 @@ private:
     // kEpsilon: 1 on boundary faces whose 0/nut BC is 'calculated'. OF fills those by field assignment
     // (Cmu*k_b^2/eps_b) rather than extrapolating the cell, and the two differ by >12x at a fixed-k inlet.
     DeviceBuffer<label>  nutCalcMask_;
+    DeviceBuffer<scalar> nutBndFile_;   // nut's own boundaryField (OF reads nut_b from here, not cells)
     bool hasNutCalc_ = false;
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces
     // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the

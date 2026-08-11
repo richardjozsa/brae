@@ -601,11 +601,39 @@ add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoS
 target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 
+# brae_rhoSimpleFoam_legacy: frozen snapshot of the GPU-first solver, kept runnable so the CPU-first
+# ground-truth rewrite always has a reference to diff against. See rhosimplefoam-ground-truth-port.md.
+# brae_rhoSimpleFoam keeps pointing at the current implementation until the new path passes every gate
+# below that this one passes; only then does the name move.
+add_executable(brae_rhoSimpleFoam_legacy
+               src/applications/solvers/rhoSimpleFoam/legacy/gpuRhoSimpleFoamLegacy.cu)
+target_include_directories(brae_rhoSimpleFoam_legacy PRIVATE ${BRAE_HEADER_DIRS}
+                           src/applications/solvers/rhoSimpleFoam)
+target_link_libraries(brae_rhoSimpleFoam_legacy PRIVATE brae_core)
+
 # rhoSimpleFoam phase 4.3: alphat wall conditions load, Jayatilleke refused by name
 add_executable(test_alphat_bc tests/test_alphat_bc.cu)
 target_include_directories(test_alphat_bc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_alphat_bc PRIVATE brae_core)
 add_test(NAME alphat_bc COMMAND test_alphat_bc ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox)
+
+# Host boundary muEff: OF takes nut_b from the patch's own boundaryField, the legacy device path
+# extrapolates the adjacent cell. Verified against nut as OpenFOAM itself wrote it -- no instrumentation.
+# The test self-reports as vacuous on a case where the two candidates coincide, so the case matters.
+add_executable(test_boundary_mu_eff tests/test_boundary_mu_eff.cu)
+target_include_directories(test_boundary_mu_eff PRIVATE ${BRAE_HEADER_DIRS}
+                           src/applications/solvers/rhoSimpleFoam/cpu)
+target_link_libraries(test_boundary_mu_eff PRIVATE brae_core)
+#
+# THE CASE IS PART OF THE TEST. Measured over the checked-in cases, discriminating faces (where the
+# patch nut and the adjacent cell nut actually differ, i.e. where the two implementations can be told
+# apart) are: backwardFacingStep2D 0/41746, channel 0/20500, duct3d_cf 0/11400, airfoil 78/21812.
+# rhoBox has no nut at all. So airfoil is the ONLY checked-in case that can go red here, and even it
+# is weak at 0.36%. That measurement IS the explanation for how the 607x boundary-muEff defect
+# survived every gate: on a blockMesh duct the extrapolated cell nut and the patch nut coincide.
+# A stronger gate needs a case with a `calculated` inlet nut against a turbulent interior.
+add_test(NAME boundary_mu_eff COMMAND test_boundary_mu_eff
+         ${CMAKE_CURRENT_SOURCE_DIR}/validation/airfoil 0)
 
 # rhoSimpleFoam phase 3 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam on a heated duct.
 # Needs an OF install; skipped (77) if absent.

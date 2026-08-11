@@ -489,7 +489,8 @@ void deviceWallEpsG0(
     int nutWall,
     scalar atmZ0,
     bool   atmBoundNut,
-    const DeviceBuffer<scalar>* nuFace)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
+    const DeviceBuffer<scalar>* nuFace,
+    const DeviceBuffer<scalar>* nutFile)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
 {
     const int nC = static_cast<int>(k.size());
     eps0.resize(nC);
@@ -788,13 +789,16 @@ void spaldingNutKernel(
     scalar kappa,
     scalar E,
     scalar* __restrict__ nutBnd,
-    const scalar* __restrict__ nuFace)   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
+    const scalar* __restrict__ nuFace,   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
+    const scalar* __restrict__ nutFile)  // the patch's OWN nut boundaryField, null -> extrapolate
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     const int c = fc[i];
-    if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
+    // OF evaluates nut on a non-wall patch from that patch's OWN boundaryField; extrapolating the
+    // adjacent cell is 607x wrong at a `calculated` inlet (see rhosimplefoam-ground-truth-port.md).
+    if (!isWall[i]) { nutBnd[i] = nutFile ? nutFile[i] : nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
     const scalar magGradU = magUp * dc[i];
     const scalar nuw = nuFace ? nuFace[i] : nu;
@@ -822,13 +826,16 @@ void blendedNutKernel(
     scalar kappa,
     scalar E,
     scalar* __restrict__ nutBnd,
-    const scalar* __restrict__ nuFace)   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
+    const scalar* __restrict__ nuFace,   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
+    const scalar* __restrict__ nutFile)  // the patch's OWN nut boundaryField, null -> extrapolate
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     const int c = fc[i];
-    if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
+    // OF evaluates nut on a non-wall patch from that patch's OWN boundaryField; extrapolating the
+    // adjacent cell is 607x wrong at a `calculated` inlet (see rhosimplefoam-ground-truth-port.md).
+    if (!isWall[i]) { nutBnd[i] = nutFile ? nutFile[i] : nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
     const scalar magGradU = magUp * dc[i];
     const scalar nuw = nuFace ? nuFace[i] : nu;
@@ -848,7 +855,8 @@ void deviceBoundaryNutSpalding(
     scalar nu,
     const SpalartAllmarasCoeffs& co,
     DeviceBuffer<scalar>& nutBnd,
-    const DeviceBuffer<scalar>* nuFace)
+    const DeviceBuffer<scalar>* nuFace,
+    const DeviceBuffer<scalar>* nutFile)
 {
     // OF turbulenceModel::nu(patchi) = mu(patchi)/rho.boundaryField()[patchi] -- a per-FACE kinematic
     // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
@@ -863,7 +871,8 @@ void deviceBoundaryNutSpalding(
     spaldingNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                            dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                            nutCell.data(), nu, co.kappa, co.E, nutBnd.data(),
-                                           nuFace ? nuFace->data() : nullptr);
+                                           nuFace ? nuFace->data() : nullptr,
+                                           nutFile ? nutFile->data() : nullptr);
     cudaCheck(cudaGetLastError(), "spaldingNut");
 }
 
@@ -882,7 +891,8 @@ void deviceBoundaryNutBlended(
     scalar kappa,
     scalar E,
     DeviceBuffer<scalar>& nutBnd,
-    const DeviceBuffer<scalar>* nuFace)
+    const DeviceBuffer<scalar>* nuFace,
+    const DeviceBuffer<scalar>* nutFile)
 {
     // OF turbulenceModel::nu(patchi) = mu(patchi)/rho.boundaryField()[patchi] -- a per-FACE kinematic
     // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
@@ -897,7 +907,8 @@ void deviceBoundaryNutBlended(
     blendedNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                           dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                           nutCell.data(), nu, kappa, E, nutBnd.data(),
-                                          nuFace ? nuFace->data() : nullptr);
+                                          nuFace ? nuFace->data() : nullptr,
+                                          nutFile ? nutFile->data() : nullptr);
     cudaCheck(cudaGetLastError(), "blendedNut");
 }
 
@@ -914,12 +925,15 @@ void nutUWallKernel(
     const scalar* __restrict__ y, const scalar* __restrict__ dc,
     const scalar* __restrict__ Ux, const scalar* __restrict__ Uy, const scalar* __restrict__ Uz,
     const scalar* __restrict__ nutCell, scalar nu, scalar kappa, scalar E, scalar yPlusLam,
-    scalar* __restrict__ nutBnd, const scalar* __restrict__ nuFace)
+    scalar* __restrict__ nutBnd, const scalar* __restrict__ nuFace,
+    const scalar* __restrict__ nutFile)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int c = fc[i];
-    if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
+    // OF evaluates nut on a non-wall patch from that patch's OWN boundaryField; extrapolating the
+    // adjacent cell is 607x wrong at a `calculated` inlet (see rhosimplefoam-ground-truth-port.md).
+    if (!isWall[i]) { nutBnd[i] = nutFile ? nutFile[i] : nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);   // wall is stationary
     const scalar nuw = nuFace ? nuFace[i] : nu;
     nutBnd[i] = nutUWallValue(magUp, y[i], nuw, kappa, E, yPlusLam);
@@ -937,7 +951,8 @@ void deviceBoundaryNutU(
     const DeviceBuffer<scalar>& nutCell,
     scalar nu, scalar kappa, scalar E,
     DeviceBuffer<scalar>& nutBnd,
-    const DeviceBuffer<scalar>* nuFace)
+    const DeviceBuffer<scalar>* nuFace,
+    const DeviceBuffer<scalar>* nutFile)
 {
     const int n = dbU.comp[0].n;
     if (!n) return;
@@ -945,7 +960,8 @@ void deviceBoundaryNutU(
     nutUWallKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                         dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                         nutCell.data(), nu, kappa, E, yPlusLamHost(kappa, E), nutBnd.data(),
-                                        nuFace ? nuFace->data() : nullptr);
+                                        nuFace ? nuFace->data() : nullptr,
+                                        nutFile ? nutFile->data() : nullptr);
     cudaCheck(cudaGetLastError(), "nutUWall");
 }
 

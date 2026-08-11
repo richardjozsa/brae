@@ -122,7 +122,8 @@ void deviceWallEpsG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, con
                      const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                      DeviceBuffer<scalar>& eps0, DeviceBuffer<scalar>& G0, const KEpsilonCoeffs& co = {}, int nutWall = 0,
                      scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
-                     const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+                     const DeviceBuffer<scalar>* nuFace = nullptr,
+    const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
 
 // add the eps / k reaction (Sp/Su) + SuSp(divU) terms to a matrix's diag/source (in place).
 void deviceEpsReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,
@@ -320,14 +321,16 @@ void deviceBoundaryNutU(const DeviceVectorBoundary& dbU, const DeviceBuffer<labe
                         const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                         const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
                         DeviceBuffer<scalar>& nutBnd,
-                        const DeviceBuffer<scalar>* nuFace = nullptr);
+                        const DeviceBuffer<scalar>* nuFace = nullptr,
+    const DeviceBuffer<scalar>* nutFile = nullptr);
 
 void deviceBoundaryNutSpalding(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
                                const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
                                const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                const DeviceBuffer<scalar>& nutCell, scalar nu, const SpalartAllmarasCoeffs& co,
                                DeviceBuffer<scalar>& nutBnd,
-                               const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
+                               const DeviceBuffer<scalar>* nuFace = nullptr,
+    const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 // nutUBlendedWallFunction wall nut (velocity-based binomial n=4 blend); kappa/E explicit (any RAS model).
 void deviceBoundaryNutBlended(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
@@ -335,6 +338,7 @@ void deviceBoundaryNutBlended(const DeviceVectorBoundary& dbU, const DeviceBuffe
                               const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                               const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
                               DeviceBuffer<scalar>& nutBnd,
-                              const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
+                              const DeviceBuffer<scalar>* nuFace = nullptr,
+    const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 } // namespace brae
