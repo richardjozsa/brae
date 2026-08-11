@@ -26,6 +26,7 @@
 #include "foam_dict.cuh"
 #include "mrf_read.cuh"             // readMRFProperties: only to REFUSE an MRF case (not applied transient yet)
 #include "linear_solver_setup.cuh"   // readLinearSolverControls: shared with gpuSimpleFoam/gpuRhoSimpleFoam
+#include "dict_audit.cuh"
 #include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
@@ -33,7 +34,8 @@
 #include "forces.cuh"               // wallForces + forceCoeffs (shared with gpuSimpleFoam)
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"       // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuSimpleFoam)
-#include "brae_time.cuh"   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
+#include "brae_time.cuh"
+#include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -301,9 +303,61 @@ try
         }
         return false;
     };
+    // Everything a functionObject can need already exists at this point in this driver, so the registry
+    // is populated immediately. The lookups still happen on first execute() -- that indirection is what
+    // lets the steady drivers build Time at start-up, and costs nothing here.
+    ObjectRegistry timeRegistry;
+    timeRegistry.store("mesh", &m);
+    timeRegistry.store("geometry", &g);
+    timeRegistry.store("patches", &fvp);
+    timeRegistry.store("solver", &solver);
+    std::vector<ScalarTransportFO*> scalarTransports;
+    std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
+    foTypes.emplace_back(
+        "scalarTransport",
+        [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+        {
+            // Only OF's constant-D branch is implemented; nut-based and alphaD/alphaDt are refused by
+            // name rather than quietly replaced by a constant (scalarTransport.C D()).
+            if (!fd.found("D"))
+            {
+                noticeIgnored("functions/" + foName,
+                              "scalarTransport without a constant `D` (nut-based or alphaD/alphaDt "
+                              "diffusivity) is not implemented, so this tracer is NOT solved.");
+                return nullptr;
+            }
+            const std::string fld = fd.wordOr("field", foName);
+            // OF: schemesField defaults to the field name, and the scheme is looked up as
+            // div(phi,<schemesField>). Absent under `default none` is fatal in OF, so it is here too --
+            // reported and declined rather than run with a substituted discretisation.
+            const std::string schemesField = fd.wordOr("schemesField", fld);
+            FieldDivScheme scheme;
+            try { scheme = parseFieldDivScheme(caseDir, schemesField); }
+            catch (const std::exception& e)
+            {
+                noticeIgnored("functions/" + foName, std::string(e.what()) + " -- this tracer is NOT solved.");
+                return nullptr;
+            }
+            auto fo = std::make_unique<ScalarTransportFO>(
+                foName, fld, fieldDir + "/" + fld, timeRegistry,
+                fd.scalarOr("D", 0.0), fd.scalarOr("relaxCoeff", 1.0), fd.scalarOr("tol", 1e-6),
+                scheme);
+            scalarTransports.push_back(fo.get());
+            return fo;
+        });
+    Time time(controlDict, nullptr, 0, foTypes, {}, {"forceCoeffs"});
+
     auto writeTimeDir = [&](const std::string& tname) {
         const std::string outDir = caseDir + "/" + tname;
         std::filesystem::create_directories(outDir);
+        // scalarTransport tracers: OF's transported field is AUTO_WRITE (scalarTransport.C
+        // transportedField()), so it appears in every written time directory. AFTER the directory
+        // exists, and pulled from the device only here -- on the write cadence, which is the reason OF
+        // splits write() from execute().
+        for (ScalarTransportFO* st : scalarTransports)
+            if (st->ready())
+                writeVolField(fieldDir + "/" + st->fieldName(), outDir + "/" + st->fieldName(),
+                              st->hostField(), fvp, 12);
         std::error_code ec;
         if (std::filesystem::exists(fieldDir + "/include"))
             std::filesystem::copy(fieldDir + "/include", outDir + "/include",
@@ -377,7 +431,7 @@ try
     // Time owns the functionObject lifecycle (OF Foam::Time). forceCoeffs is declared APPLIED here, not
     // approximated: this driver samples on the write cadence and writes
     // postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
-    Time time(controlDict, nullptr, 0, {}, {}, {"forceCoeffs"});
+
     const FoamDict* fcDict = nullptr;
     if (fcFuncs)
         for (const auto& s : fcFuncs->subs)

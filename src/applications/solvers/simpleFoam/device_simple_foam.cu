@@ -1670,7 +1670,15 @@ namespace brae {
         const char* fieldName,
         const DeviceBuffer<scalar>& D,
         scalar relax,
-        scalar tol)
+        scalar tol,
+        bool   schemeBounded,
+        bool   schemeLimited,
+        bool   schemeLinearUpwind,
+        scalar schemeTwoByk,
+        bool   schemeNonOrth,
+        DeviceBuffer<scalar>* old,
+        DeviceBuffer<scalar>* old2,
+        DeviceBuffer<scalar>* ddt0)
     {
         const int nC = dm_.nCells;
         if (static_cast<int>(field.size()) != nC) return;
@@ -1680,16 +1688,45 @@ namespace brae {
         DeviceBuffer<scalar> divPhi;
         deviceFaceDivSource(dm_, phiInt_, divPhi);
 
+        // fvm::ddt(s), from the solver's own time scheme. Old levels are advanced HERE, with the same
+        // two-level rule advanceTime() uses: backward needs the coefft00 term and CrankNicolson the ddt0
+        // recurrence, so both carry t-2; Euler does not.
+        // A TRANSIENT solver whose deltaT_ is still 0 has not advanced yet: this solver learns deltaT
+        // inside advanceTime(), and a functionObject fires BEFORE the first one. Solving here would drop
+        // fvm::ddt(s) and solve a STEADY convection-diffusion problem instead -- not an approximation of
+        // the transient one but a different, badly-conditioned equation, whose error then persists in
+        // the field. Measured on pitzDaily: a tracer bounded by 1.0 reached 6.32. Skipping this single
+        // step leaves the tracer at its initial value for one step, which is strictly smaller error.
+        if (old && ddtScheme_ != DdtScheme::steadyState && deltaT_ <= scalar(0)) return;
+
+        ScalarDdt sDdt{};
+        if (old && ddtScheme_ != DdtScheme::steadyState)
+        {
+            const bool cn  = (ddtScheme_ == DdtScheme::CrankNicolson);
+            const bool two = (ddtScheme_ == DdtScheme::backward) || cn;
+            if (old->size() != static_cast<std::size_t>(nC)) { old->resize(nC); deviceCopy(*old, field); }
+            if (two && old2)
+            {
+                if (old2->size() != static_cast<std::size_t>(nC)) old2->resize(nC);
+                deviceCopy(*old2, *old);       // t-2 <- t-1
+            }
+            deviceCopy(*old, field);           // t-1 <- current
+            const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
+            sDdt = ScalarDdt{ ddtc, old,
+                              (two && old2 && old2->size()) ? old2 : nullptr,
+                              (ddtc.cn && ddt0) ? ddt0 : nullptr };
+        }
+
         // No reaction: a passive scalar has no source. OF's fvOptions_(rho, s) is not applied -- brae
         // refuses unsupported fvOptions at start-up, so there is nothing here to drop silently.
         deviceSolveScalarTransport(
             dm_, db, field, fieldName, D, phiInt_, phiBnd_, divPhi,
-            ctl_.bounded, false, false, ctl_.nonOrth, scalar(0),
+            schemeBounded, schemeLimited, schemeLinearUpwind, schemeNonOrth, schemeTwoByk,
             relax, tol, ctl_.relTolKE, ctl_.bicgCheckEvery, false,
             [](DeviceBuffer<scalar>&, DeviceBuffer<scalar>&){},   // passive: no reaction
             nullptr, nullptr,
             hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
-            ScalarDdt{},          // steady: fvm::ddt(s) drops out
+            sDdt,                 // steady -> default-constructed, so fvm::ddt(s) drops out
             nullptr, scalar(0),
             false);               // OF's scalarTransport does NOT bound; a tracer is not positive-definite
     }

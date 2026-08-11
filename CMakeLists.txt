@@ -632,6 +632,19 @@ target_link_libraries(test_boundary_mu_eff PRIVATE brae_core)
 # is weak at 0.36%. That measurement IS the explanation for how the 607x boundary-muEff defect
 # survived every gate: on a blockMesh duct the extrapolated cell nut and the patch nut coincide.
 # A stronger gate needs a case with a `calculated` inlet nut against a turbulent interior.
+# scalarTransport gate. Until this existed NOTHING in the suite carried a tracer, and three separate
+# defects lived behind that: the field solved but was never written; the convection scheme was hardcoded
+# instead of read from div(phi,<field>); and a transient tracer bounded by 1.0 reached 6.32 because the
+# functionObject ran before the solver knew deltaT. All three were green on the full suite throughout.
+# Carries its own negative control (scheme removed under `default none` must be REFUSED), so the gate
+# is proven able to fail rather than merely passing.
+add_test(NAME tracer_transport
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/validation/tracer_transport.sh
+                 $<TARGET_FILE:brae_rhoSimpleFoam>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/tracerBox
+                 ${CMAKE_CURRENT_BINARY_DIR}/tracer_transport_work)
+set_tests_properties(tracer_transport PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 add_test(NAME boundary_mu_eff COMMAND test_boundary_mu_eff
          ${CMAKE_CURRENT_SOURCE_DIR}/validation/airfoil 0)
 

@@ -92,6 +92,7 @@ int main(int argc, char** argv)
         // fvOptions, so before this they were the only cases never audited.
         DictAuditScope audit;
         audit.add(controlDict, "system/controlDict");
+        audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
         audit.add(fvSolution, "system/fvSolution");
         audit.add(turbProps, "constant/turbulenceProperties");
 
@@ -637,11 +638,24 @@ int main(int argc, char** argv)
                     return nullptr;
                 }
                 const std::string fld = fd.wordOr("field", foName);
+                // OF: schemesField defaults to the field name, and the scheme is looked up as
+                // div(phi,<schemesField>). Absent under `default none` is fatal in OF, so it is here
+                // too -- reported and declined rather than run with a substituted discretisation.
+                const std::string schemesField = fd.wordOr("schemesField", fld);
+                FieldDivScheme scheme;
+                try { scheme = parseFieldDivScheme(caseDir, schemesField); }
+                catch (const std::exception& e)
+                {
+                    noticeIgnored("functions/" + foName, std::string(e.what()) +
+                                  " -- this tracer is NOT solved.");
+                    return nullptr;
+                }
                 // No field read here: the object resolves mesh, patches, geometry and solver from the
                 // registry on its first execute(), so Time need not be constructed after the solver.
                 auto fo = std::make_unique<ScalarTransportFO>(
                     foName, fld, t0 + "/" + fld, timeRegistry,
-                    fd.scalarOr("D", 0.0), fd.scalarOr("relaxCoeff", 1.0), fd.scalarOr("tol", 1e-6));
+                    fd.scalarOr("D", 0.0), fd.scalarOr("relaxCoeff", 1.0), fd.scalarOr("tol", 1e-6),
+                    scheme);
                 scalarTransports.push_back(fo.get());
                 return fo;
             });

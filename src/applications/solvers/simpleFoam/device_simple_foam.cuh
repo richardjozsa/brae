@@ -173,7 +173,24 @@ public:
         const char* fieldName,
         const DeviceBuffer<scalar>& D,   // built ONCE by the caller; a per-step H2D fill would be waste
         scalar relax,
-        scalar tol);
+        scalar tol,
+        // The FIELD'S OWN convection scheme, from the case's div(phi,<field>) entry
+        // (OF scalarTransport.C:249). Borrowing the momentum's flags instead ran a tracer through an
+        // unbounded central scheme and reached 5.59 against a bound of 1.0.
+        bool   schemeBounded,
+        bool   schemeLimited,
+        bool   schemeLinearUpwind,
+        scalar schemeTwoByk,
+        bool   schemeNonOrth,   // from laplacian(D<field>,<field>), not the solver's global setting
+        // TRANSIENT support. OF's scalarTransport carries fvm::ddt(s), which needs the field's own old
+        // time levels. Pass them and this builds the ddt from the SOLVER's own scheme and deltaT (there
+        // is exactly one time scheme in a case, and it is not the functionObject's to choose) and
+        // advances them here, mirroring advanceTime(). Omit them and the term drops out, which is
+        // correct for a steady solver and WRONG for a transient one -- so a transient caller must pass
+        // them or not register scalarTransport at all.
+        DeviceBuffer<scalar>* old  = nullptr,
+        DeviceBuffer<scalar>* old2 = nullptr,
+        DeviceBuffer<scalar>* ddt0 = nullptr);
 
     void setAlphatPrt(const std::vector<scalar>& prtFace);
     // Energy linear solver from fvSolution solvers.(h|e). Was hardcoded tol=1e-10, relTol=0, BiCGStab.
