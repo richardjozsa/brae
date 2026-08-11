@@ -33,6 +33,7 @@
 #include "forces.cuh"               // wallForces + forceCoeffs (shared with gpuSimpleFoam)
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"       // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuSimpleFoam)
+#include "brae_time.cuh"   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -369,6 +370,14 @@ try
     for (const auto& q : fvp)
         if (q.type == "wall") forceWalls.push_back(q.name);
     const FoamDict* fcFuncs = controlDict.subDict("functions");
+    // Account for EVERY controlDict.functions entry through the shared list. forceCoeffs is declared
+    // APPLIED here (not approximated as in gpuSimpleFoam): this driver samples on the write cadence and
+    // writes postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
+    // Anything else is reported as ignored instead of being silently passed over.
+    {
+        FunctionObjectList functionObjects;
+        functionObjects.read(fcFuncs, {}, {"forceCoeffs"});
+    }
     const FoamDict* fcDict = nullptr;
     if (fcFuncs)
         for (const auto& s : fcFuncs->subs)

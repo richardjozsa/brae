@@ -26,6 +26,7 @@
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
+#include "brae_time.cuh"   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 
 #include <algorithm>
 #include <cctype>
@@ -167,6 +168,17 @@ int main(int argc, char** argv)
         const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
         const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
         const FoamDict turbProps   = readDict(caseDir + "/constant/turbulenceProperties");
+
+        // Account for controlDict.functions at STARTUP, not after the run: a case that refuses on an
+        // unsupported model, or that never reaches the post-run forces block, must still be told which
+        // of its functionObjects brae will not honour. forceCoeffs is declared APPROXIMATED because this
+        // driver prints it once at the end, whereas OF's runs every time step and writes a history
+        // (forceCoeffs.H:547,550) -- gpuPimpleFoam declares the same type APPLIED, because it does
+        // sample on the write cadence.
+        {
+            FunctionObjectList functionObjects;
+            functionObjects.read(controlDict.subDict("functions"), {"forceCoeffs"});
+        }
 
         std::string startStr = controlDict.wordOr("startTime", "0");
         // OF startFrom: 'latestTime' restarts from the newest numeric time directory, 'firstTime' from the earliest
@@ -740,7 +752,12 @@ int main(int argc, char** argv)
                 std::printf("forces (walls, rhoInf=1):  pressure=(%.5e %.5e %.5e)  viscous=(%.5e %.5e %.5e)  total=(%.5e %.5e %.5e)\n",
                             F.pressure.x, F.pressure.y, F.pressure.z, F.viscous.x, F.viscous.y, F.viscous.z, F.total().x, F.total().y, F.total().z);
 
-                // forceCoeffs (Cd/Cl/Cm) if the case defines a forceCoeffs functionObject (controlDict.functions).
+                // controlDict.functions. Every entry is now ACCOUNTED FOR through the shared
+                // FunctionObjectList: forceCoeffs is computed just below (reported as approximated,
+                // because brae prints it once here while OF's forceCoeffs runs every time step and
+                // writes a history -- forceCoeffs.H:547,550), and anything else is reported as ignored
+                // rather than silently skipped. Before this, a case could carry any number of
+                // functionObjects and the only one even looked at was forceCoeffs.
                 const FoamDict* funcs = controlDict.subDict("functions");
                 const FoamDict* fcd = nullptr;
                 if (funcs)

@@ -76,11 +76,33 @@ public:
     // for "never drop an input silently". Reporting here rather than in each solver is the entire point
     // of centralising: a solver that adopts Time cannot forget to report, in the same way an OF solver
     // cannot forget to run functionObjects. Returns the number not built.
-    int read(const FoamDict* functions)
+    // `handledOutside` names types the CALLING SOLVER computes on its own, outside this lifecycle.
+    // They are reported as APPROXIMATED rather than ignored, because that is what they are: brae's
+    // forceCoeffs, for example, is a single post-run print, whereas OF's forceCoeffs is a per-time-step
+    // functionObject (execute()/write(), forceCoeffs.H:547,550) that writes a coefficient HISTORY under
+    // postProcessing/. Reporting those as "ignored" would be false; reporting nothing would hide a real
+    // difference from OF. Neither is acceptable, so they get their own category.
+    // The two "outside" lists exist because the SAME type can be faithful in one solver and an
+    // approximation in another, and saying so accurately matters more than saying it uniformly:
+    //
+    //   pimpleFoam  forceCoeffs -> samples on the write cadence and writes
+    //                              postProcessing/forceCoeffs/<time>/coefficient.dat, i.e. what OF does
+    //   simpleFoam  forceCoeffs -> a single post-run print; OF's runs every step and writes a history
+    //
+    // Calling both "approximated" would understate pimpleFoam; calling both "applied" would overstate
+    // simpleFoam. Each solver declares which it is.
+    int read(const FoamDict* functions,
+             const std::vector<std::string>& approximatedOutside = {},
+             const std::vector<std::string>& appliedOutside = {})
     {
         objects_.clear();
         if (!functions) return 0;
         int missed = 0;
+        auto listed = [](const std::vector<std::string>& v, const std::string& t)
+        {
+            for (const std::string& h : v) if (h == t) return true;
+            return false;
+        };
         for (const auto& s : functions->subs)
         {
             const std::string type = s.second.wordOr("type", "");
@@ -88,6 +110,22 @@ public:
             if (fo)
             {
                 objects_.push_back(std::move(fo));
+                continue;
+            }
+            if (listed(appliedOutside, type))
+            {
+                noticeApplied(
+                    "functions/" + s.first,
+                    "type '" + type + "' is implemented by the solver outside the functionObject "
+                    "lifecycle, on OpenFOAM's own write cadence.");
+                continue;
+            }
+            if (listed(approximatedOutside, type))
+            {
+                noticeApproximated(
+                    "functions/" + s.first,
+                    "type '" + type + "' is computed by the solver outside the functionObject "
+                    "lifecycle, so it is reported once rather than per time step as OpenFOAM does.");
                 continue;
             }
             ++missed;
