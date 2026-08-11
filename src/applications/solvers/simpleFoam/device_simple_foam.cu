@@ -3,8 +3,21 @@
 // the class declaration (members + method signatures) stays in the header. Prerequisite for the PIMPLE solver,
 // which reuses solveMomentumPredictor / correctPressureVelocity / correctTurbulence under a transient loop.
 #include "device_simple_foam.cuh"
+#include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
 
 namespace brae {
+
+    // BRAE_SETUP_TIMING: same milestone trace as the driver, inside the constructor. The ctor is the
+    // longest silent stretch of set-up (mesh upload, AMG hierarchy, wall distance, validate) and a hang
+    // in it looks identical to a hang in the driver from the outside.
+    static inline void ctorMark(const char* what)
+    {
+        static const bool on = (std::getenv("BRAE_SETUP_TIMING") != nullptr);
+        if (!on) return;
+        static const auto t0 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "  [ctor  %7.2fs] %s\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), what);
+    }
 
     DeviceSimpleSolver::DeviceSimpleSolver(
         const PrimitiveMesh& m,
@@ -30,12 +43,40 @@ namespace brae {
         const std::vector<AMIInterface> amis = buildAMIInterfaces(m, g, fvp);
         hasAMI_ = !amis.empty();
         if (hasCyclic_ || hasAMI_) ctl_.useGraph = false;   // V-cycle graph replay not interface-safe; minor perf only.
+        ctorMark("enter");
         dm_   = buildDeviceMesh(m, g, fvp);
+        ctorMark("deviceMesh built");
         cyc_  = buildDeviceCyclic(cyclics, g, fvp);
         ami_  = buildDeviceAMI(amis);
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
         dbP_  = buildDeviceBoundary(p, fvp, g);
         wall_ = buildDeviceWallData(m, g, fvp, U);
+        if (nut)
+        {
+            std::vector<label> cm;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                const bool calc = (fvp[pi].type != "wall") && (nut->boundary[pi]->bcCategory() == 2);
+                if (calc) hasNutCalc_ = true;
+                for (label i = 0; i < fvp[pi].size; ++i) cm.push_back(calc ? 1 : 0);
+            }
+            if (hasNutCalc_) nutCalcMask_.copyFrom(cm);
+        }
+        {
+            // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping type=="wall" patches;
+            // DeviceBoundary walks the same fvp skipping cyclic/cyclicAMI (a wall is neither), so the wall
+            // faces are a subsequence of the boundary faces and this map is just the running count.
+            std::vector<label> wfb;
+            label bi = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                for (label i = 0; i < fvp[pi].size; ++i, ++bi)
+                    if (fvp[pi].type == "wall") wfb.push_back(bi);
+            }
+            if (!wfb.empty()) wfBndIdx_.copyFrom(wfb);
+        }
         // all-extrapolated boundary -> gathers a cell field to boundary faces (nuEff_bnd = adjacent cell value)
         {
             std::vector<label> ty, fc;
@@ -82,6 +123,40 @@ namespace brae {
                 hasSym_ = true;
                 break;
             }
+        // flowRateInletVelocity (massFlowRate): one masked-magSf buffer per such patch, plus the outward
+        // normals over all boundary faces. Both are geometric and built once.
+        {
+            std::vector<scalar> nx, ny, nz;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    nx.push_back(fvp[pi].nf[i].x);
+                    ny.push_back(fvp[pi].nf[i].y);
+                    nz.push_back(fvp[pi].nf[i].z);
+                }
+            }
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (U.boundary[pi]->bcCategory() != 9) continue;
+                hasFlowRate_ = true;
+                std::vector<scalar> mask(nx.size(), 0.0);
+                label bi = 0;
+                for (std::size_t pj = 0; pj < fvp.size(); ++pj)
+                {
+                    if (fvp[pj].type == "cyclic" || fvp[pj].type == "cyclicAMI") continue;
+                    for (label i = 0; i < fvp[pj].size; ++i, ++bi)
+                        if (pj == pi) mask[bi] = fvp[pj].magSf[i];
+                }
+                frMagSf_.emplace_back();
+                frMagSf_.back().copyFrom(mask);
+                // OF re-reads flowRate_->value(t) each call; steady + constant -> the seeded value. It is
+                // recovered from the seeded BC rather than re-parsed: avgU*sum(rho_seed*magSf) = -mdot.
+                frPatches_.push_back(FlowRatePatch{U.boundary[pi]->flowRateValue()});
+            }
+            if (hasFlowRate_) { frNx_.copyFrom(nx); frNy_.copyFrom(ny); frNz_.copyFrom(nz); }
+        }
         // any totalPressure p patch -> recompute its fixedValue refValue each step from the patch velocity + flux.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             if (p.boundary[pi]->bcCategory() == 7)
@@ -150,6 +225,7 @@ namespace brae {
             for (label f = 0; f < nIf_; ++f)
                 fwAMG[f] *= dcg[f];                  // strong-face filter sees the true anisotropy
         }
+        ctorMark("pre-AMG");
         amg_ = buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
 
         // initial device state.
@@ -203,6 +279,7 @@ namespace brae {
                 if (ctl_.sst || ctl_.sa)
                 {
                     std::vector<vector> wallOrigin;                              // nearest wall-face centre (IDDES wall-normal source)
+                    ctorMark("pre-wallDist");
                     y_.copyFrom(cellWallDist(m, g, fvp, ctl_.iddes ? &wallOrigin : nullptr));   // wall distance (SST F1/F2/F3; SA dTilda)
                     if (ctl_.iddes)   // IDDES filter widths (maxDeltaxyz + wall-normal spacing), uploaded once at setup
                     {
@@ -226,6 +303,7 @@ namespace brae {
         zeroSrc_.copyFrom(std::vector<scalar>(nC_, 0.0));
         zeroBndU_.copyFrom(std::vector<scalar>(dbU_.n, 0.0));
         ones_.copyFrom(std::vector<scalar>(nC_, 1.0));            // unit vector for the OF normFactor
+        if (stageDumpActive() && y_.size()) stageDump("stage_y", y_);   // wall distance (SST F1/F2)
         validateTurbulence();                                    // OF turbulenceModel ctor bound() + simpleFoam.C:92 validate()
     }
 
@@ -242,6 +320,41 @@ namespace brae {
         codedBCs_.push_back(std::move(cbc));
     }
 
+    void DeviceSimpleSolver::revalidateAfterThermo(const std::vector<scalar>* rhoBndSeed)
+    {
+        if (!compressible_) return;
+        // Same three steps the outer iteration runs, in the same order, so this is OF's validate() with
+        // the state OF has at that point -- not a special startup path that could drift from the real one.
+        deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, &TFixMask_, &TFixBnd_, TBnd_);
+        deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBnd_);
+        // Seed the solver rho field's BOUNDARY half, and its prevIter, so the first rho.relax() blends
+        // toward the same state OF's does. Seeding prevIter lazily on first use instead makes the first
+        // relaxation a no-op and leaves the unrelaxed density in place for the whole run.
+        //
+        // OF: `volScalarField rho(IOobject("rho", ..., READ_IF_PRESENT, AUTO_WRITE), thermo.rho())`.
+        // Present on disk -> the stored field wins, boundary included; absent -> thermo.rho().
+        if (rhoBndSeed && rhoBndSeed->size() == static_cast<std::size_t>(dbP_.n))
+        {
+            rhoBndP_.copyFrom(*rhoBndSeed);
+            rhoBndPPrev_.copyFrom(*rhoBndSeed);
+        }
+        else
+        {
+            deviceCopy(rhoBndP_, rhoBnd_);
+            deviceCopy(rhoBndPPrev_, rhoBnd_);
+        }
+        // Same density rule as the per-iteration update in rhoSimpleStep (see the long note there): OF's
+        // flowRateInletVelocity looks up the REGISTERED rho, which createFields.H has already built by the
+        // time U's patches evaluate, so seed avgU from the solver rho -- rhoBndP_, just set above.
+        for (std::size_t k = 0; k < frPatches_.size(); ++k)
+        {
+            const scalar sumRhoA = deviceDot(rhoBndP_, frMagSf_[k]);
+            if (sumRhoA <= 0.0) continue;
+            deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -frPatches_[k].mdot / sumRhoA, frNx_, frNy_, frNz_);
+        }
+        validateTurbulence();
+    }
+
     void DeviceSimpleSolver::validateTurbulence()
     {
         if (!ctl_.turbulent) return;
@@ -251,6 +364,7 @@ namespace brae {
             DeviceBuffer<scalar> gradU;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
             deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);   // nut = Ck*delta*sqrt(k_sgs)
+            deviceAlphat(th_, dnut_, tc_);                                    // EddyDiffusivity::correctNut() tail
             return;
         }
         deviceBoundField(dm, dk_, 1e-15);                              // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
@@ -276,12 +390,50 @@ namespace brae {
         {
             deviceNut(dk_, de_, dnut_, ctl_.keCoeffs);               // nut = Cmu*k^2/eps
         }
+        // The tail of OF's correctNut() for a COMPRESSIBLE model: EddyDiffusivity::correctNut() sets
+        // alphat_ = rho*nut/Prt right after nut, so alphat is already turbulent before the FIRST energy
+        // equation -- rhoSimpleFoam.C:64 calls turbulence->validate() before the time loop.
+        //
+        // brae used to update alphat only at the END of the outer iteration, so iteration 1 solved the
+        // energy equation with alphat = 0, i.e. alphaEff = laminar alpha alone. On a slow case that is a
+        // small error that the next iteration repairs. On NACA0012 the turbulent part is 65x the laminar
+        // one (alphaEff 1.67e-03 vs 3.59e-05): the first energy solve had 1/46th of the real thermal
+        // diffusivity, T fell 68 K in the first cell off the aerofoil, and the run diverged from there.
+        deviceAlphat(th_, dnut_, tc_);
     }
 
     void DeviceSimpleSolver::correctTurbulence()
     {
         const DeviceMesh& dm = dm_;
         clearTurbulenceReport();   // OF-style report: collect this step's turbulence solves (Solving for k/omega/...)
+        // OF RASModel `turbulence off` -> correct() returns before anything is solved or updated, so k,
+        // epsilon/omega and nut stay at the values they were read with and momentum keeps using them
+        // (kEpsilon.C:216, and every other model does the same). The report stays empty, which is also
+        // what OF prints: no "Solving for k" lines.
+        if (!ctl_.turbulenceOn) return;
+        // TURBULENT INLETS, refreshed HERE and not in the momentum predictor.
+        //
+        // OF's rule is structural, not per-case: a boundary condition updates when ITS OWN equation is
+        // assembled. `turbulentIntensityKineticEnergyInlet` and `turbulentMixingLengthDissipationRateInlet`
+        // are k/epsilon BCs, so their updateCoeffs() fires inside kEqn/epsEqn -- which live in
+        // kEpsilon::correct() (kEpsilon.C:252,273), called LAST in the outer iteration
+        // (rhoSimpleFoam.C:86, after UEqn/EEqn/pEqn). Momentum therefore always sees the PREVIOUS
+        // iteration's k, epsilon and nut boundary values.
+        //
+        // brae refreshed them at the top of solveMomentumPredictor, one phase early. Measured cost on
+        // squareBend at iteration 1: the inlet `calculated` nut is built as Cmu*k_b^2/eps_b, so an inlet
+        // k already recomputed from THIS iteration's U (1026, = 1.5*(0.05*523.087)^2) made the inlet
+        // boundary diffusivity 3.36e-02 against OF's 2.14e-04 -- 157x. That fed the inlet's momentum
+        // internalCoeffs (157x), hence Upred (4.76e-02), hence HbyA, phiHbyA, phid, p and U. The 22400
+        // WALL faces and the outlet matched OF exactly throughout; only the 400 inlet faces were wrong.
+        //
+        // A3 fixed these inlets being FROZEN at set-up. This is that fix landing one phase too early.
+        if (hasTurbInlet_)
+        {
+            deviceUpdateTurbulentInletK(dbU_, tiMask_, tiIntensity_, dbK_);
+            deviceUpdateTurbulentInletSecond(dbK_, mlMask_, mlLength_,
+                                             ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+        }
         if (ctl_.les)   // pure LES Smagorinsky: algebraic sub-grid nut = Ck*delta*sqrt(k_sgs) from the current U. No
         {              // transport solve (report stays empty -> no "Solving for k/omega" lines), so no ddt(k/omega) either.
             DeviceBuffer<scalar> gradU;
@@ -300,20 +452,32 @@ namespace brae {
             const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr, ddtc.cn ? &gammaIntddt0_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
-                                             ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.bounded, ctl_.limitedK, ctl_.twoBykK,
+                                             ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
+                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.boundedEps,
                                        ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
                                        static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
                                        ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
-                                       kDdt, sDdt, ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // ddt(k)/ddt(omega) + kOmegaSSTDDES/IDDES DES limiter (no-op for RANS)
+                                       kDdt, sDdt, ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr,   // ddt(k)/ddt(omega) + kOmegaSSTDDES/IDDES DES limiter (no-op for RANS)
+                                       compressible_ ? &th_.rho : nullptr,   // rho-weight every k/omega term, as OF's alpha*rho* does
+                                       compressible_ ? &th_.mu : nullptr,   // laminar dynamic mu; F1/F2 get nu = mu/rho from it
+                                       (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr,   // nu at WALL faces for omegaWallFunction/G0
+                                       compressible_ ? &rhoBnd_ : nullptr,   // rho_b: divU is div of the VOLUMETRIC flux, not the mass flux
+                                       // Order matters: with an EXTRAPOLATED nut_b this made omega worse
+                                       // (3.1e-5 -> 3.2e-3). Enabled only now that nut_b is evaluated.
+                                       nutBndAll_.size() ? &nutBndAll_ : nullptr,
+                                       compressible_ ? &muBnd_ : nullptr,
+                                       ctl_.gradKLULimitK,   // linearUpwind's named grad(k|eps), not gradSchemes grad(k)
+                                       // fvOptions scalarFixedValueConstraint (k / omega)
+                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
+                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);   // grad(k)/grad(omega) cellLimited (C2)
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
@@ -322,17 +486,31 @@ namespace brae {
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
-                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.bounded,
+                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.boundedEps,
                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
                                       ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
-                                      kDdt, sDdt);   // transient fvm::ddt(k)/ddt(epsilon)  (sDdt = the 2nd-scalar bundle)
+                                      kDdt, sDdt,   // transient fvm::ddt(k)/ddt(epsilon)  (sDdt = the 2nd-scalar bundle)
+                                      compressible_ ? &th_.rho : nullptr,   // alpha*rho on every k/eps RHS term + diffusivity
+                                      compressible_ ? &th_.mu : nullptr,    // laminar dynamic mu
+                                      compressible_ ? &rhoBnd_ : nullptr,   // rho_b: divU from the VOLUMETRIC flux
+                                      (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr,   // nu at wall faces (OF nu(patchi))
+                                      nutBndAll_.size() ? &nutBndAll_ : nullptr,   // nut_b -> DkEff/DepsEff(patchi)
+                                      compressible_ ? &muBnd_ : nullptr,
+                                      ctl_.gradKLULimitK,   // linearUpwind's named grad(k|eps)
+                                      // fvOptions scalarFixedValueConstraint (OF eqn.setValues per field)
+                                      fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
+                                      fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);
         }
     }
 
     void DeviceSimpleSolver::solveMomentumPredictor(DeviceSimpleResidual& res)
     {
+        // The flux this outer iteration INHERITS. OF's dumpPEqn writes the same quantity at the top of
+        // pEqn.H, and the momentum predictor does not touch phi, so the two are directly comparable.
+        if (stageDumpActive() && stageDumpFirstOnly("phiIn")) stageDump("stage_phiIn", phiInt_);
+        if (stageDumpActive() && stageDumpFirstOnly("phiInB")) stageDump("stage_phiInB", phiBnd_);
         const DeviceMesh& dm = dm_;
         const scalar tol = ctl_.tolU;
         // Transient fvm::ddt(U): the ONE term steady SIMPLE lacks. steadyState (SIMPLE) -> ddtc.active==false -> the two
@@ -346,6 +524,16 @@ namespace brae {
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);
         deviceUpdateInletOutlet(dbP_, phiBnd_);
+        // The ENERGY boundary too. dbHe_ inherits T's BC types, so an `inletOutlet` T outlet -- which
+        // every stock rhoSimpleFoam tutorial has -- arrives here masked as inletOutlet and MUST be
+        // resolved per iteration like the others. It was omitted: the mask was set at build time and
+        // never consulted, so the outlet enthalpy stayed clamped at fixedValue(inletValue) with full
+        // convection AND laplacian coupling, where OF switches to zeroGradient on outflow. It propagated
+        // straight into rhoBnd_ (built from dbHe_), hence the outlet density, the outlet mass flux and
+        // the pressure field.
+        if (compressible_ && dbHe_.n) deviceUpdateInletOutlet(dbHe_, phiBnd_);
+        // NOTE: the turbulent-inlet refresh does NOT belong here. It moved into correctTurbulence(),
+        // which is where OF updates it -- see the comment there.
         if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
         {
             deviceUpdateInletOutlet(dbK_, phiBnd_);
@@ -357,7 +545,8 @@ namespace brae {
             }
         }
         // mixed freestreamVelocity/Pressure: recompute the per-face valueFraction from the (lagged) flow angle.
-        if (hasMixed_) deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
+        if (hasMixed_) deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
+                                                  compressible_ ? &rhoBnd_ : nullptr);   // phiBnd_ is a MASS flux
         if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         // totalPressure p: recompute refValue = p0 - 0.5*neg(phi)|U_b|^2 from the boundary velocity (deviceBCValue
@@ -368,7 +557,8 @@ namespace brae {
             deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
             deviceBCValue(dbU_.comp[1], Uk_[1], uby);
             deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
-            deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz);
+            deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz,
+                                      compressible_ ? &rhoBnd_ : nullptr);   // p in Pa -> rho-weighted dynamic head
         }
         // NVRTC device-coded BCs (codedFixedValue): run each compiled snippet over its patch faces, overwriting the
         // target field's refValue on the device from position/time/adjacent-cell value. Same updateCoeffs point as the
@@ -399,12 +589,41 @@ namespace brae {
         }
 
         DeviceBuffer<scalar> nuEff;
-        deviceCopy(nuEff, dnut_);
-        deviceAxpy(1.0, nuConst_, nuEff);   // nuEff = nu + nut
+        if (compressible_)
+            // muEff = mu + rho*nut. OF assembles the stress as rho*nuEff() (linearViscousStress.C), and for a
+            // compressible model nuEff() = nut() + mu/rho, so rho*nuEff() = rho*nut + mu = mut + mu
+            // (CompressibleTurbulenceModel::muEff). dnut_ stays KINEMATIC -- the SST solves for it, every wall
+            // function compares it against nu, and alphat = rho*nut/Prt reads it -- so the rho belongs here.
+            deviceHadamard(nuEff, th_.rho, dnut_);
+        else
+            deviceCopy(nuEff, dnut_);
+        deviceAxpy(1.0, nuConst_, nuEff);   // + nu (incompressible) / + mu (compressible, nuConst_ = th_.mu)
+        // Stage harness: the ASSEMBLED momentum diffusivity, which is what OF's turbulence->muEff() returns.
+        // Dumped here rather than at the predictor because this is where it exists; comparing nuConst_
+        // (the laminar part alone) against OF's muEff is not a comparison, it is two different quantities.
+        if (compressible_ && stageDumpActive() && stageDumpFirstOnly("muEff")) stageDump("stage_muEff", nuEff);
         DeviceBuffer<scalar> nuEff_f;
         deviceInterpolate(dm, nuEff, nuEff_f);
         // nuEff at boundary FACES: turbulent uses the TRUE wall nut (nutkWallFunction), not the cell value, so the
         // wall shear matches OpenFOAM; laminar/non-wall faces use the adjacent cell value.
+        // Boundary turbulent viscosity into muEff_b. OF: mut(patchi) = rho.boundaryField()[patchi]*nut(patchi),
+        // so the wall nut -- which every wall function returns KINEMATIC -- is rho_b-weighted here, exactly as
+        // the cell value is above. Incompressible keeps the plain sum.
+        auto addWallNutToMuEff =
+            [&](const DeviceBuffer<scalar>& nutB,
+                DeviceBuffer<scalar>& muEffB)
+            {
+                deviceCopy(nutBndAll_, nutB);   // same nut: alphat_b (compressible) + DkEff/DepsEff(patchi)
+                if (!compressible_)
+                {
+                    deviceAxpy(1.0, nutB, muEffB);
+                    return;
+                }
+                DeviceBuffer<scalar> mutB;
+                deviceHadamard(mutB, rhoBnd_, nutB);
+                deviceAxpy(1.0, mutB, muEffB);
+            };
+
         DeviceBuffer<scalar> nuEffBnd;
         if (ctl_.turbulent && ctl_.les)
         {
@@ -415,7 +634,8 @@ namespace brae {
             if (ctl_.nutWall == NutWall::Spalding)
             {
                 deviceCopy(nuEffBnd, nuBndConst_);
-                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
+                                          compressible_ ? &nuWallBnd_ : nullptr);
                 deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
             }
             else
@@ -428,20 +648,62 @@ namespace brae {
             if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA always, or the BC on any model
             {
                 deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_);
-                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
+            }
+            else if (ctl_.nutWall == NutWall::NutU)   // nutUWallFunction (log-law yPlus, stepwise blend)
+            {
+                deviceBoundaryNutU(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                                   ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
+                                   compressible_ ? &nuWallBnd_ : nullptr);
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else if (ctl_.nutWall == NutWall::Blended)   // nutUBlendedWallFunction (velocity-based binomial n=4 blend) on kEps/kOmegaSST
             {
-                deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_);
-                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
+                deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
+                                         compressible_ ? &nuWallBnd_ : nullptr);
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else   // k-based wall nut: nutkWallFunction (smooth), or atmNutkWallFunction (rough) when ctl_.atmZ0>0
             {
                 DeviceBuffer<scalar> nutBnd;
-                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs, ctl_.atmZ0, ctl_.atmBoundNut);
-                deviceAxpy(1.0, nutBnd, nuEffBnd);
+                // kEpsilon only: the 'calculated' nut patches carry Cmu*k_b^2/eps_b. The SST's nut has a
+                // different expression (a1*k/max(a1*omega, b1*F2*sqrt(S2))) that needs boundary F2 and S2,
+                // so it keeps the extrapolated value until that is measured and built.
+                DeviceBuffer<scalar> kB, eB;
+                const bool keNut = hasNutCalc_ && !ctl_.sst && !ctl_.sa && !ctl_.keCoeffs.realizable;
+                if (keNut) { deviceBCValue(dbK_, dk_, kB); deviceBCValue(dbEps_, de_, eB); }
+                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs, ctl_.atmZ0, ctl_.atmBoundNut,
+                                  compressible_ ? &nuWallBnd_ : nullptr,
+                                  keNut ? &nutCalcMask_ : nullptr,
+                                  keNut ? &kB : nullptr,
+                                  keNut ? &eB : nullptr);
+                // SST: the 'calculated' patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
+                // expression from kEpsilon's, needing boundary F2 and S2. Overwrites those faces only.
+                if (hasNutCalc_ && ctl_.sst)
+                {
+                    DeviceBuffer<scalar> kBs, omBs, gradUs;
+                    deviceBCValue(dbK_, dk_, kBs);
+                    deviceBCValue(dbEps_, de_, omBs);
+                    deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs,
+                                hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                    deviceSSTNutBoundary(dbU_, kBs, omBs, y_,   // CELL wall distance (bndY_ is 0 off-wall)
+                                         compressible_ ? &nuWallBnd_ : nullptr, ctl_.nu,
+                                         gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
+                                         nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
+                }
+                addWallNutToMuEff(nutBnd, nuEffBnd);
             }
         }
+        else if (compressible_ && ctl_.gnPowerLaw)
+            // generalizedNewtonian: OF's nuEff(patchi) is nu_.boundaryField()[patchi] -- the SAME
+            // strain-rate viscosity as the interior, NOT the molecular mu. Taking mu_b = thermo mu here put
+            // 1100x too little viscosity on every wall face (interior 0.9945 Pa.s vs thermo 8.9e-4), and the
+            // wall shear is where a duct's entire pressure drop comes from: the profile came out flat
+            // (U min 1.26 against OF's 0.031), the pressure drop 5x low, and the dissipation heating with it.
+            // The face value is the adjacent cell's, as the incompressible laminar branch below does.
+            deviceBCValue(dbExtrap_, nuEff, nuEffBnd);
+        else if (compressible_)
+            deviceCopy(nuEffBnd, muBnd_);   // laminar compressible: mu_b = Sutherland(T_b), OF transport_.mu(patchi)
         else
             deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
         // explicit divDevReff stress (uses the incoming U; coupled across the 3 components)
@@ -506,7 +768,7 @@ namespace brae {
         // slip/symmetry: the boundary diagonal differs per component (vf_k=|n_k|), so the SHARED relax/rAU diagonal
         // must use OF's cmptMax(cmptMag(iC0,iC1,iC2)), not comp[0] alone (== comp[0] when components are equal, so
         // every other BC is unaffected). Compute the per-component boundary iC and the per-face max magnitude.
-        DeviceBuffer<scalar> iCmaxMag;
+        DeviceBuffer<scalar> iCmaxMag, iCmin;
         if (hasSym_)
         {
             DeviceBuffer<scalar> r1IC,r1BC,r1lIC,r1lBC, r2IC,r2BC,r2lIC,r2lBC;
@@ -517,6 +779,7 @@ namespace brae {
             deviceBCLaplacianCoeffsFace(dbU_.comp[2], nuEffBnd, r2lIC, r2lBC);
             deviceAxpy(-1.0,r2lIC,r2IC);
             deviceCmptMaxMag3(r0IC, r1IC, r2IC, iCmaxMag);   // OF fvMatrix::relax adds cmptMax(cmptMag(iC)) to the diagonal
+            deviceCmptMin3(r0IC, r1IC, r2IC, iCmin);         // ... and REMOVES cmptMin(iC), a different quantity
         }
         // + implicit fvm::ddt(U) DIAGONAL (rho=1 incompressible): coefft*rDeltaT*V, shared by all 3 components, added
         // to the assembled diagonal BEFORE relax -- OF assembles fvm::ddt into UEqn, then UEqn.relax(). No-op for SIMPLE.
@@ -524,7 +787,13 @@ namespace brae {
         DeviceBuffer<scalar> delta;   // mDiagR is now a member
         deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.relaxU, mDiagR, delta,
                         hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
-                        hasSym_ ? iCmaxMag.data() : nullptr);
+                        hasSym_ ? iCmaxMag.data() : nullptr,
+                        hasSym_ ? iCmin.data() : nullptr);
+        if (stageDumpActive() && stageDumpFirstOnly("mommat"))
+        {
+            stageDump("stage_mDiag0", mDiag);     // assembled momentum diagonal BEFORE relax (OF D0)
+            stageDump("stage_mDiagR", mDiagR);    // ... and AFTER relax (OF D)
+        }
         // velocityDampingConstraint: OF fvOptions.constrain(UEqn) runs AFTER UEqn.relax() and adds an implicit diagonal
         // sink (no source) where |U|>UMax. Add to the relaxed diagonal so it feeds the predictor AND rAU/HbyA (= OF A()).
         if (vdcActive_) deviceFvoVelocityDamping(vdcCells_, vdcUMax_, vdcC_, dm.V, Uk_[0], Uk_[1], Uk_[2], mDiagR);
@@ -549,7 +818,12 @@ namespace brae {
         // point, none solved yet), cyclic-inclusive: the cyclic linearUpwind reconstruction rotates gradU[nbr], so it
         // needs every component from a consistent field (computing per-kk inside the loop would read freshly-solved
         // earlier components -> the same sequencing leak as the deferred mixing).
+        // gU* = gradSchemes `default` (unlimited), for the non-orthogonal laplacian correction.
+        // gLU* = the gradient the linearUpwind div statement names, limited when that name resolves to a
+        // cellLimited scheme. LUx/LUy/LUz below select between them so the unlimited path costs nothing.
         DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
+        DeviceBuffer<scalar> gLUx[3], gLUy[3], gLUz[3];
+        const bool limitLU = (ctl_.gradULULimitK > 0.0);
         DeviceBuffer<scalar> amiURot[3];   // rotated AMI-interp of the CURRENT U (gradient face value + linearUpwind/non-orth nbr)
         if ((ctl_.linearUpwind || ctl_.lust || ctl_.nonOrth) && hasAMI_ && ami_.rotational)
             deviceAmiInterpolateVec(ami_, Uk_[0], Uk_[1], Uk_[2], amiURot[0], amiURot[1], amiURot[2]);
@@ -569,10 +843,23 @@ namespace brae {
                     if (ami_.rotational) deviceAmiAddGradRot(ami_, Uk_[l], amiURot[l], dm.V, gUx[l], gUy[l], gUz[l]);
                     else interfaceAddGrad(ami_, Uk_[l], dm.V, gUx[l], gUy[l], gUz[l]);
                 }
-                // grad(U) cellLimited Gauss linear <k>: clamp this component's gradient so the linearUpwind/non-orth
-                // reconstruction stays bounded, OF's primary stabiliser on skewed (snappy) meshes. (min/max gather is
-                // over internal + non-cyclic boundary neighbours; interface neighbours not included, fine off-interface.)
-                if (ctl_.gradULimitK > 0.0) deviceCellLimitGrad(dm, Uk_[l], ubv, gUx[l], gUy[l], gUz[l], ctl_.gradULimitK);
+                // grad(U) cellLimited Gauss linear <k>, into a SEPARATE buffer.
+                //
+                // TWO CONSUMERS, TWO SCHEMES. OF does not have "the" grad(U) here: linearUpwind takes the
+                // gradient its own div statement NAMES (`linearUpwind limited` -> cellLimited Gauss linear 1,
+                // via mesh.gradScheme(gradSchemeName_) in linearUpwind.C), while the non-orthogonal laplacian
+                // correction takes gradSchemes `default`, which in this case is plain Gauss linear. Limiting
+                // one buffer in place gave BOTH the same gradient and so had to be wrong for one of them:
+                // unlimited was wrong for linearUpwind (the converged squareBendLiq U was 24x off), and
+                // limiting it in place then fed an over-limited gradient into the non-orth correction and
+                // produced a transient nut excursion. Keeping them apart is the only way both match OF.
+                if (limitLU)
+                {
+                    deviceCopy(gLUx[l], gUx[l]);
+                    deviceCopy(gLUy[l], gUy[l]);
+                    deviceCopy(gLUz[l], gUz[l]);
+                    deviceCellLimitGrad(dm, Uk_[l], ubv, gLUx[l], gLUy[l], gLUz[l], ctl_.gradULULimitK);
+                }
             }
         // actuationDiskSource (Froude): T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), Uref = mean U over the monitor cells
         // (lagged). Computed once per iter; distributed over the disk cells (V[c]/Vtot) into relaxSrc below.
@@ -589,16 +876,30 @@ namespace brae {
         // linearUpwindV: the V-limiter couples the 3 velocity components, so compute all 3 correction sources once
         // here (the plain per-component linearUpwind path stays inside the kk loop below).
         DeviceBuffer<scalar> corrV[3];
-        if (ctl_.linearUpwindV) deviceLinearUpwindVCorr(dm, phiInt_, gUx, gUy, gUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
+        // The linearUpwind family reads the NAMED (possibly limited) gradient; the non-orth laplacian
+        // correction below keeps gU* (gradSchemes `default`). See the split at the gradient build above.
+        const DeviceBuffer<scalar>* LUx = limitLU ? gLUx : gUx;
+        const DeviceBuffer<scalar>* LUy = limitLU ? gLUy : gUy;
+        const DeviceBuffer<scalar>* LUz = limitLU ? gLUz : gUz;
+        if (ctl_.linearUpwindV) deviceLinearUpwindVCorr(dm, phiInt_, LUx, LUy, LUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
         for (int kk = 0; kk < 3; ++kk)   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136x SLOWER, reverted)
         {
             DeviceBuffer<scalar> dIC,dBC,lIC,lBC;
             deviceBCDivCoeffs(dbU_.comp[kk],phiBnd_,dIC,dBC);
             deviceBCLaplacianCoeffsFace(dbU_.comp[kk],nuEffBnd,lIC,lBC);
+            if (kk == 0 && stageDumpActive() && stageDumpFirstOnly("nuEffBnd")) stageDump("stage_nuEffBnd", nuEffBnd);
             deviceAxpy(-1.0,lIC,dIC);
             deviceAxpy(-1.0,lBC,dBC);
             iC[kk]=std::move(dIC);
             bCb[kk]=std::move(dBC);
+            // Stage harness: the MOMENTUM boundary coefficients, at the same point OF's UEqn has them
+            // (after div + laplacian, before the solve). Per component, flattened in patch order -- the
+            // comparison tool sums them per patch against OF's stage_UIC/stage_UBC.
+            if (stageDumpActive() && stageDumpFirstOnly(kk == 0 ? "mombc0" : (kk == 1 ? "mombc1" : "mombc2")))
+            {
+                stageDump(std::string("stage_UIC") + char('0' + kk), iC[kk]);
+                stageDump(std::string("stage_UBC") + char('0' + kk), bCb[kk]);
+            }
             deviceHadamard(relaxSrc[kk], delta, Uk_[kk]);
             deviceAxpy(1.0, *ddr[kk], relaxSrc[kk]);                                  // += explicit divDevReff stress
             // + fvm::ddt(U) SOURCE for this component: rDeltaT*V*(coefft0*Uold - coefft00*Uold2). Into relaxSrc so it
@@ -612,9 +913,9 @@ namespace brae {
             {
                 DeviceBuffer<scalar> corr;
                 if (ctl_.linearUpwindV) corr = std::move(corrV[kk]);                          // vector-limited (computed once above)
-                else                    deviceLinearUpwindCorr(dm, phiInt_, gUx[kk], gUy[kk], gUz[kk], corr);
-                if (hasCyclic_) interfaceAddLinUpwindCorr(cyc_, kk, gUx, gUy, gUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
-                if (hasAMI_)    interfaceAddLinUpwindCorr(ami_, kk, gUx, gUy, gUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
+                else                    deviceLinearUpwindCorr(dm, phiInt_, LUx[kk], LUy[kk], LUz[kk], corr);
+                if (hasCyclic_) interfaceAddLinUpwindCorr(cyc_, kk, LUx, LUy, LUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
+                if (hasAMI_)    interfaceAddLinUpwindCorr(ami_, kk, LUx, LUy, LUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
                 if (ctl_.lust)   // OF LUST.H = 0.75*linear + 0.25*linearUpwind: scale the lU corr 0.25, add 0.75*linear corr
                 {
                     deviceScale(corr, 0.25);
@@ -644,6 +945,8 @@ namespace brae {
             // which mirrors meanVelocityForce's eqn += Su) -> relaxSrc -= (V/Vtot)*T*diskDir (a momentum sink/turbine).
             if (adActive_) deviceAxpy(-adT*(kk==0?adDiskDir_.x:kk==1?adDiskDir_.y:adDiskDir_.z)/adVtot_, adMaskVDisk_, relaxSrc[kk]);
             if (rotor_.active) deviceAxpy(-1.0, *rotorF[kk], relaxSrc[kk]);   // rotorDiskSource: relaxSrc -= force (OF eqn -= force)
+            if (stageDumpActive() && stageDumpFirstOnly(kk==0?"msrc0":(kk==1?"msrc1":"msrc2")))
+                stageDump(std::string("stage_mSrc") + char('0'+kk), relaxSrc[kk]);   // OF UEqn.source() minus -V*grad(p)
             DeviceBuffer<scalar> s;
             deviceHadamard(s, dm.V, *gg[kk]);
             deviceScale(s,-1.0);
@@ -688,6 +991,17 @@ namespace brae {
     void DeviceSimpleSolver::correctPressureVelocity(DeviceSimpleResidual& res)
     {
         const DeviceMesh& dm = dm_;
+        // P0 of the pressure stage trace (BRAE_PTRACE): p as it ENTERS the pressure correction. The
+        // counter advances once per SIMPLE iteration here and is read (not advanced) by the pre-limit
+        // dump in rhoSimpleStep, so every stage of one iteration carries the same index.
+        if (pTraceActive())
+        {
+            ++pTraceIt_;
+            pTraceDump("P0_pEnter", pTraceIt_, dp_);
+            DeviceBuffer<scalar> pb0;
+            deviceBCValue(dbP_, dp_, pb0);
+            pTraceDump("P0_pEnterB", pTraceIt_, pb0);
+        }
         // Non-orth pressure-correction limiter (OF fv::limitedSnGrad), read by the pressure phase below: per-face caps the
         // lagged corrVec.grad(p) correction to (psi/(1-psi))*|orthogonal snGrad| on pathological high-non-orth meshes
         // (T3A: AR 3232, 43.8deg), where the once-lagged correction outruns the over-relaxed diagonal and diverges. Only
@@ -727,6 +1041,18 @@ namespace brae {
             deviceSimplecRAtU(dm, rowSum, diagA, rAtU);
             deviceCopy(drAtU, rAtU);
             deviceAxpy(-1.0, rAU, drAtU);
+            // OF rhoSimpleFoam/pcEqn.H weights the SIMPLEC flux correction by density:
+            //     phiHbyA += fvc::interpolate(rho*(rAtU - rAU))*fvc::snGrad(p)*magSf
+            // (incompressible simpleFoam/pEqn.H has no rho and is the expression below without this).
+            // The HbyA correction on the other hand is NOT weighted in either: HbyA -= (rAU - rAtU)*grad(p),
+            // so only drAtU used for the FLUX is scaled -- keep an unscaled copy for that.
+            if (compressible_)
+            {
+                DeviceBuffer<scalar> t;
+                deviceHadamard(t, th_.rho, drAtU);
+                deviceCopy(drAtUFlux_, t);
+            }
+            else deviceCopy(drAtUFlux_, drAtU);
         }
         else
             deviceCopy(rAtU, rAU);
@@ -783,6 +1109,15 @@ namespace brae {
         }
         DeviceBuffer<scalar> phiHi;
         deviceVectorFlux(dm, HbyA[0], HbyA[1], HbyA[2], phiHi);   // flux of the ORIGINAL HbyA
+        // Phase 0 stage harness: the MOMENTUM stage's outputs, at the same point OF's pcEqn.H writes them
+        // (rAU/rAtU/HbyA constructed, flux taken, nothing from the pressure step applied yet).
+        if (stageDumpActive() && stageDumpFirstOnly("momentum"))
+        {
+            stageDump("stage_rAU", rAU);
+            stageDump("stage_rAtU", ctl_.consistent ? rAtU : rAU);
+            stageDump3("stage_HbyA", HbyA[0], HbyA[1], HbyA[2]);
+            stageDump("stage_fluxHbyA", phiHi);   // fvc::flux(HbyA), BEFORE the interpolate(rho) weighting
+        }
         if (hasCyclic_)
         {
             if (cyc_.rotational) deviceCyclicFluxRot(cyc_, HbyA[0], HbyA[1], HbyA[2]);   // rotate the neighbour HbyA
@@ -799,17 +1134,76 @@ namespace brae {
         // non-assignable patch, NOT the projected HbyA. Project the cell U (HbyA_b = U_c - n(n.U_c) = U_b), matching
         // OF byte-for-byte and the mixed path above (both use U_b). Wall flux is still exactly 0 (normal removed).
         if (hasSym_) deviceConstrainSymmetryHbyA(dbU_, Uk_[0], Uk_[1], Uk_[2], hxb, hyb, hzb);
+        if (stageDumpActive() && stageDumpFirstOnly("HbyAb")) stageDump3("stage_HbyAb", hxb, hyb, hzb);
         DeviceBuffer<scalar> phiHb;
         deviceBoundaryFlux(dm,hxb,hyb,hzb,phiHb);
+        // OF pcEqn.H line 1: `rho = thermo.rho();` -- the SIMPLEC/transonic path REFRESHES the solver's
+        // rho at the TOP, before phiHbyA is built, and again at the bottom. pEqn.H (subsonic) does NOT:
+        // it only assigns rho at the end. Counted directly in the two files: pcEqn.H has the statement in
+        // its first three lines, pEqn.H has none.
+        //
+        // brae had no top-of-file refresh on either path, so phiHbyA was weighted with the PREVIOUS
+        // iteration's rho. That was masked while thermo.correct() happened to overwrite rho mid-iteration;
+        // separating the solver and thermo densities exposed it. Measured on squareBend at iteration 1 with
+        // every linear system at machine tolerance: HbyA exact to 7.5e-07 but phiHbyA 1.68e-02 -- the only
+        // quantity that would not come down with solver tolerance.
+        if (ctl_.consistent) deviceThermoRho(th_, dp_, tc_, th_.rho);
+        if (compressible_)
+        {
+            // OF rhoSimpleFoam pEqn.H: phiHbyA = fvc::interpolate(rho)*fvc::flux(HbyA), i.e. a MASS flux.
+            // Both halves must be weighted: deviceInterpolate covers internal faces only, and the boundary
+            // rho comes from the boundary p and T rather than the adjacent cell -- see
+            // deviceThermoRhoBoundary for why extrapolating there is silently wrong at a fixed-T inlet.
+            DeviceBuffer<scalar> rhoF;
+            deviceInterpolate(dm, th_.rho, rhoF);
+            DeviceBuffer<scalar> tmp;
+            deviceHadamard(tmp, rhoF, phiHi);
+            deviceCopy(phiHi, tmp);
+
+            // OF: fvc::interpolate(rho) on a patch is rho.boundaryField()[patchi] -- the SOLVER's rho
+            // field, assigned once per outer iteration at the end of pEqn.H and then RELAXED. Rebuilding
+            // it here from the current p_b and T_b bypasses that relaxation exactly as the cell-side
+            // thermo.correct() did. Measured on aerofoilNACA0012 (rho relax 0.01) at iteration 2: the
+            // unweighted boundary flux(HbyA) matched OF to 1.7e-04, but the flux-weighted density was
+            // 1.313 against OF's 1.168, making the inlet mass influx 12.4% too large. That imbalance is
+            // the pressure equation's compatibility condition, and this system is nearly pure Neumann
+            // (the whole boundary anchors it with sum|iC| ~ 2e-3), so a 7% error in sum(pSrc) moved the
+            // pressure LEVEL by tens of kPa per iteration and pinned p at the pMax ceiling.
+            DeviceBuffer<scalar> rhoB;
+            if (rhoBndP_.size() == static_cast<std::size_t>(dbP_.n)) deviceCopy(rhoB, rhoBndP_);
+            else
+            {
+                deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, &TFixMask_, &TFixBnd_, TBnd_);
+                deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoB);
+            }
+            if (stageDumpActive() && stageDumpFirstOnly("rhoBphi")) stageDump("stage_rhoBphi", rhoB);
+            DeviceBuffer<scalar> tmpB;
+            deviceHadamard(tmpB, rhoB, phiHb);
+            deviceCopy(phiHb, tmpB);
+        }
+        // The REAL phiHbyA = interpolate(rho)*flux(HbyA), i.e. OF's phiHbyA at the top of pEqn.H. The
+        // separate stage_fluxHbyA above is the UNWEIGHTED flux -- comparing that against OF's phiHbyA
+        // shows a clean 1/rho scale factor and looks exactly like a defect. It is not one.
+        if (stageDumpActive() && stageDumpFirstOnly("phiHbyA")) stageDump("stage_phiHbyA", phiHi);
+        if (stageDumpActive() && stageDumpFirstOnly("phiHbyAb")) stageDump("stage_phiHbyAb", phiHb);
         if (mrf_.active) deviceMrfApplyFrameFlux(mrf_, +1.0, phiHi, phiHb);   // MRF.makeRelative(phiHbyA) before pressure
         // adjustPhi (OF order: after flux(HbyA), before the SIMPLEC correction): enforce global continuity by
         // scaling the adjustable outflow when there is no pressure reference (closed/all-velocity domains).
         if (ctl_.needRef) deviceAdjustPhi(adjustMask_, phiHb);
+        // B1 + SIMPLEC: OF's pcEqn.H builds phid from the ORIGINAL phiHbyA and subtracts
+        // interp(psi*p)*phiHbyA/interp(rho) using that ORIGINAL too -- the SIMPLEC term is ADDED beside it,
+        // not folded in first:
+        //     phiHbyA += interp(rho*(rAtU-rAU))*snGrad(p)*magSf - interp(psi*p)*phiHbyA/interp(rho);
+        // brae applies its SIMPLEC correction to phiHi below, so without this snapshot both the phid and
+        // the subtraction would use the already-corrected flux. That is exactly why squareBend (consistent
+        // yes) diverged with contGlobal -283 at iteration 1 while a non-SIMPLEC duct was fine.
+        DeviceBuffer<scalar> phiHi0, phiHb0;
+        if (compressible_ && ctl_.transonic) { deviceCopy(phiHi0, phiHi); deviceCopy(phiHb0, phiHb); }
         if (ctl_.consistent)
         {
             // phiHbyA += interpolate(rAtU-rAU)*snGrad(p)*magSf = laplacian(interp(drAtU), p).flux()  (NOT via HbyA flux)
             DeviceBuffer<scalar> drAtUf;
-            deviceInterpolate(dm, drAtU, drAtUf);
+            deviceInterpolate(dm, drAtUFlux_, drAtUf);   // rho*(rAtU-rAU) when compressible
             DeviceBuffer<scalar> ld, lu, ll;
             deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
             DeviceBuffer<scalar> fInt;
@@ -825,7 +1219,7 @@ namespace brae {
                 deviceAxpy(1.0, ffcS, phiHi);
             }
             DeviceBuffer<scalar> dIC, dBC;
-            deviceBCLaplacianCoeffs(dbP_, drAtU, dIC, dBC);
+            deviceBCLaplacianCoeffs(dbP_, drAtUFlux_, dIC, dBC);
             DeviceBuffer<scalar> fBnd;
             deviceMatrixFluxBoundary(dbP_, dIC, dBC, dp_, fBnd);
             deviceAxpy(1.0, fBnd, phiHb);
@@ -838,7 +1232,102 @@ namespace brae {
             }
         }
         DeviceBuffer<scalar> rAUf;
-        deviceInterpolate(dm,rAtU,rAUf);
+        // rho*rAtU. Needed BOTH for the internal laplacian coefficient and for the BOUNDARY ones, so it
+        // is built outside the branch rather than local to it -- see the boundary call below.
+        DeviceBuffer<scalar> rhoRAtU_p;
+        if (compressible_)
+        {
+            // OF rhoSimpleFoam pEqn.H: rhorAUf = fvc::interpolate(rho*rAU). The laplacian coefficient is
+            // the ONLY change the subsonic pressure equation needs -- there is no psi*p term outside the
+            // transonic branch, so the system stays symmetric and the AMG-PCG path is unchanged.
+            deviceHadamard(rhoRAtU_p, th_.rho, rAtU);
+            deviceInterpolate(dm, rhoRAtU_p, rAUf);
+        }
+        else
+        {
+            deviceInterpolate(dm,rAtU,rAUf);
+        }
+        // The pressure laplacian's FACE diffusivity, OF's rhorAUf = fvc::interpolate(rho*rAU).
+        if (stageDumpActive() && stageDumpFirstOnly("rhorAUf")) stageDump("stage_rhorAUf", rAUf);
+        if (stageDumpActive() && stageDumpFirstOnly("rhorAU"))
+        {
+            if (compressible_) stageDump("stage_rhorAU", rhoRAtU_p);
+            stageDump("stage_rhoP", th_.rho);
+            stageDump("stage_rAUp", rAtU);
+        }
+        // B1 TRANSONIC (OF rhoSimpleFoam pEqn.H). Computed ONCE, before the non-orthogonal loop, exactly
+        // where OF computes it -- phid is built from the ORIGINAL phiHbyA, before the subtraction below.
+        //
+        //     phid     = (interp(psi)/interp(rho)) * phiHbyA
+        //     phiHbyA -= interp(psi*p) * phiHbyA / interp(rho)
+        //
+        // For perfectGas rho IS psi*p cell-wise, so that second line drives phiHbyA to zero and the whole
+        // mass flux is carried implicitly by fvm::div(phid,p). It is written as the general expression
+        // anyway, because rho is bounded (rhoMin/rhoMax) and relaxed, and under either of those rho and
+        // psi*p genuinely differ -- taking the shortcut would be right only until someone set rhoMax.
+        DeviceBuffer<scalar> phidI, phidB;
+        if (compressible_ && ctl_.transonic)
+        {
+            DeviceBuffer<scalar> psiF, rhoF, ratio;
+            deviceInterpolate(dm, th_.psi, psiF);
+            deviceInterpolate(dm, th_.rho, rhoF);
+            deviceDivide(ratio, psiF, rhoF);              // psi_f / rho_f
+            deviceHadamard(phidI, ratio, phiHi0);         // phid = (psi_f/rho_f) * phiHbyA_ORIGINAL
+
+            // Boundary: psi_b/rho_b = 1/p_b exactly, because deviceThermoRhoBoundary builds
+            // rho_b = p_b/(R T_b) from that same relation -- no second boundary thermo evaluation.
+            // Computed BEFORE phiHb is zeroed below, matching OF's ordering (phid uses the original flux).
+            DeviceBuffer<scalar> pBndV;
+            deviceBCValue(dbP_, dp_, pBndV);
+            deviceDivide(phidB, phiHb0, pBndV);
+
+            DeviceBuffer<scalar> psip, psipF, fac, tmp;
+            deviceHadamard(psip, th_.psi, dp_);
+            deviceInterpolate(dm, psip, psipF);
+            deviceDivide(fac, psipF, rhoF);               // interp(psi*p)/interp(rho)
+            deviceHadamard(tmp, phiHi0, fac);             // the subtraction also uses the ORIGINAL flux
+            deviceAxpy(-1.0, tmp, phiHi);                 // phiHbyA -= interp(psi*p)*phiHbyA_orig/interp(rho)
+            // At a boundary face psi_b*p_b IS rho_b, so that factor is exactly 1 and the ORIGINAL boundary
+            // flux cancels itself: phiHb -= phiHb0. Under SIMPLEC that leaves whatever the SIMPLEC boundary
+            // correction added, which is what OF keeps too -- zeroing it outright would discard that term.
+            deviceAxpy(-1.0, phiHb0, phiHb);
+
+            // BRAE_DUMP_PEQN: one-shot summary of the transonic pressure equation's INPUTS, to compare
+            // against tools/dumpPEqn (which writes OF's phid/phiHbyA at its own iteration 1). Summary
+            // statistics rather than a field dump: min/max/sum over the internal faces is enough to tell
+            // "these are the same field" from "these differ", and it needs no file format agreement.
+            if (stageDumpActive())
+            {
+                stageDump("stage_phiHbyA0", phiHi0);   // pre-SIMPLEC, pre-subtraction: what phid is built from
+                stageDump("stage_phid", phidI);
+                stageDump("stage_phidB", phidB);
+            }
+            if (std::getenv("BRAE_DUMP_PEQN"))
+            {
+                static bool dumped = false;
+                if (!dumped)
+                {
+                    dumped = true;
+                    const std::vector<scalar> hd = phidI.host();
+                    const std::vector<scalar> hh = phiHi.host();
+                    auto stat = [](const char* nm, const std::vector<scalar>& v)
+                    {
+                        scalar mn = 1e300, mx = -1e300, sm = 0;
+                        for (scalar x : v) { mn = std::min(mn, x); mx = std::max(mx, x); sm += x; }
+                        std::printf("[peqn] %-8s n=%zu  min %.6g  max %.6g  sum %.6g\n", nm, v.size(),
+                                    (double)mn, (double)mx, (double)sm);
+                    };
+                    stat("phid", hd);
+                    stat("phiHbyA", hh);
+                    stat("phiHbyA0", phiHi0.host());   // pre-SIMPLEC, pre-subtraction: what phid is built from
+                    stat("rAtU", rAtU.host());
+                    stat("rhorAtUf", rAUf.host());
+                    stat("phidB", phidB.host());     // boundary phid: carries the INLET MASS once phiHbyA -> 0
+                    stat("phiHbyA0B", phiHb0.host());
+                }
+            }
+        }
+
         // pressure matrix buffers are PERSISTENT members: their addresses stay fixed across SIMPLE steps (only the
         // values change), so the V-cycle CUDA graph (keyed on diagCp_) is captured once and replayed every step.
         DeviceBuffer<scalar> pPrev;
@@ -865,12 +1354,125 @@ namespace brae {
                 if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
             }
             deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth);
-            deviceBCLaplacianCoeffs(dbP_, rAtU, pIC, pBC);
+            // OF: `- fvm::laplacian(rhorAtU, p)` with `rhorAtU = rho*rAtU` (pcEqn.H:13), and an fvMatrix's
+            // internalCoeffs/boundaryCoeffs are built from the SAME diffusivity as its internal
+            // coefficients. brae passed the unweighted rAtU here while the internal coefficients used
+            // interpolate(rho*rAtU) -- so every pressure boundary coefficient was too large by 1/rho.
+            // Measured on squareBend's fixedValue outlet: iC and bC both 2.6154x OF's, against
+            // 1/rho = 1/0.3823 = 2.6157. The inlet (zeroGradient, coefficients ~0) and the walls hid it.
+            deviceBCLaplacianCoeffs(dbP_, compressible_ ? rhoRAtU_p : rAtU, pIC, pBC);
+            // Stage harness: the PRESSURE boundary coefficients. Dumped AFTER the transonic div term is
+            // folded in below (that is where the dump call sits), on the first non-orthogonal pass only.
+            // brae's pressure matrix is the NEGATIVE of OF's (brae solves laplacian(p) = div(phiHbyA),
+            // OF solves div(phiHbyA) + div(phid,p) - laplacian(p) == 0), so these compare against OF's
+            // with a sign flip -- the comparison reports both so the flip is visible rather than assumed.
+            // B1: + fvm::div(phid, p) in OF's arrangement. brae solves laplacian(p) = div(phiHbyA), which
+            // is OF's equation multiplied by -1, so the div coefficients SUBTRACT here. Folding them into
+            // pU_/pL_/pIC/pBC (rather than a side channel) also makes the flux reconstruction below correct
+            // for free: deviceMatrixFluxInternal is lduMatrix::faceH over the ASSEMBLED off-diagonals,
+            // exactly as OF's fvMatrix::flux() is.
+            if (compressible_ && ctl_.transonic)
+            {
+                DeviceBuffer<scalar> dD, dU, dL, dIC, dBC;
+                deviceDivUpwindCoeffs(dm, phidI, dD, dU, dL);   // fvSchemes: div(phid,p) Gauss upwind
+                deviceBCDivCoeffs(dbP_, phidB, dIC, dBC);
+                deviceAxpy(-1.0, dD, pD_);
+                deviceAxpy(-1.0, dU, pU_);
+                deviceAxpy(-1.0, dL, pL_);
+                deviceAxpy(-1.0, dIC, pIC);
+                deviceAxpy(-1.0, dBC, pBC);
+            }
             DeviceBuffer<scalar> divPhiH;
             deviceDiv(dm, phiHi, phiHb, divPhiH);
             if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, divPhiH);            // + cyclic-face flux into continuity div(phiHbyA)
             if (hasAMI_)    interfaceAddDiv(ami_, dm.V, divPhiH);               // + AMI-face flux into continuity div(phiHbyA)
+            // Stage harness: div(phiHbyA) BEFORE the pEqn relaxation adds (D-D0)*p to it. The two were
+            // cancelling, so only the pre-relax value shows whether div(phiHbyA) itself is wrong.
+            if (stageDumpActive() && stageDumpFirstOnly("divPhiH")) stageDump("stage_divPhiH", divPhiH);
+            // P1: the pressure RHS before assembly -- div(phiHbyA), internal and boundary kept apart.
+            if (pTraceActive() && nonOrthPass == 0)
+            {
+                pTraceDump("P1_divPhiHbyA", pTraceIt_, divPhiH);
+                pTraceDump("P1_phiHbyAi",   pTraceIt_, phiHi);
+                pTraceDump("P1_phiHbyAb",   pTraceIt_, phiHb);
+            }
+            if (stageDumpActive() && stageDumpFirstOnly("pcoeff"))
+            {
+                stageDump("stage_pIC", pIC);
+                stageDump("stage_pBC", pBC);
+            }
+            // B1: OF relaxes the pEqn in the TRANSONIC branch only ("Relax the pressure equation to
+            // ensure diagonal-dominance"); the subsonic branch relaxes only the FIELD. fvMatrix::relax()
+            // enforces D = max(|D|, sumOff)/alpha and adds (D - D0)*psi to the source -- not a no-op even
+            // at alpha = 1, because the dominance clamp still applies, and that clamp is the point:
+            // fvm::div(phid,p) is an upwind term whose off-diagonals can otherwise swamp the laplacian.
+            //
+            // ORDER MATTERS. It relaxes the RAW diagonal with the boundary internalCoeffs passed
+            // SEPARATELY, then folds -- exactly as deviceSolveScalarTransport does. Relaxing the already-
+            // folded diagCp_ while also passing pIC counts the boundary diagonal TWICE in the dominance
+            // clamp, which is what this code did at first.
+            // SIGN CONVENTION, which cost two wrong attempts before it was measured. brae's pressure
+            // matrix is A = +laplacian: deviceLaplacianCoeffs gives upper = lower = +c and diag = -sum(c),
+            // OF's native fvm::laplacian orientation, so brae's diagonal is NEGATIVE. OF's pEqn matrix is
+            // -fvm::laplacian, POSITIVE diagonal, and relaxKernel (like fvMatrix::relax) computes
+            // fmax(fabs(d0), sumOff)/alpha -- which FORCES the diagonal positive. Applied straight to
+            // brae's matrix it FLIPS the sign: measured iteration-1 contGlobal -9.8e+06 against -18.5 with
+            // the relaxation off entirely.
+            //
+            // So relax in OF's orientation and transform back. A = -M, so negate the diagonal, relax,
+            // negate the result and delta. The off-diagonals are left alone because sumOff uses |.| only,
+            // and delta negates the same way, which keeps the source update in the scalar transport's own
+            // form (b += delta*psi).
+            if (compressible_ && ctl_.transonic && ctl_.hasRelaxPEqn)
+            {
+                DeviceBuffer<scalar> negD, negIC, rdM, deltaM;
+                DeviceBuffer<scalar>& dTerm = pRelaxSrc_;
+                deviceCopy(negD, pD_);   deviceScale(negD, -1.0);
+                deviceCopy(negIC, pIC);  deviceScale(negIC, -1.0);
+                deviceRelaxDiag(deviceLduView(dm, negD, pU_, pL_), dm, negIC, ctl_.relaxPEqn, rdM, deltaM);
+                deviceScale(rdM, -1.0);        // back to brae's orientation
+                deviceScale(deltaM, -1.0);
+                deviceHadamard(dTerm, deltaM, dp_);
+                // dTerm is applied to bp_ AFTER the fold, NOT to divPhiH before it. foldPressureKernel
+                // computes b = V*divPhi + boundaryCoeffs -- divPhiH is a PER-VOLUME divergence that the
+                // fold integrates. The relaxation source (D - D0)*p is already absolute, so adding it here
+                // scaled it by the cell volume and it vanished: -0.0025 * 1.5625e-08 = -3.906e-11, exactly
+                // what bp_ measured at every inlet cell against OF's 0.0025.
+                if (stageDumpActive() && stageDumpFirstOnly("prelax"))
+                {
+                    stageDump("stage_pRelaxDelta", deltaM);   // the (D - D0) the relax produced
+                    stageDump("stage_pRelaxTerm", dTerm);     // and its source contribution, delta*p
+                }
+                deviceCopy(pD_, rdM);
+            }
+            // WHAT THE SIGN FIX DID, AND DID NOT, DO. It removed the divergence: squareBend (Mach 0.958,
+            // transonic + SIMPLEC) went NaN by iteration 50 before, and now runs 500 stable iterations at
+            // Ux ~1e-2. But the ANSWER IS STILL WRONG -- p 72% and U 264% off OF, residuals STALLING at
+            // 7e-2 where OF reaches 1e-3 in 156 iterations. A stalling residual means the assembled
+            // equation is not consistent with the flux/thermo update around it, so at least one defect
+            // remains in this branch. Stable-and-wrong is the worst state this project has a name for,
+            // which is exactly why transonic stays REFUSED by default.
             deviceFoldPressure(dm, pD_, divPhiH, pIC, pBC, diagCp_, bp_);
+            if (pRelaxSrc_.size()) deviceAxpy(1.0, pRelaxSrc_, bp_);   // pEqn.relax() source, absolute -> post-fold
+            // Stage harness: the assembled LINEAR SYSTEM. diagCp_ is the diagonal including the boundary
+            // internalCoeffs and bp_ the full RHS -- the like-for-like counterparts of OF's D() and
+            // source()+boundary. brae's matrix is the NEGATIVE of OF's, so expect a sign flip.
+            if (stageDumpActive() && stageDumpFirstOnly("psystem"))
+            {
+                stageDump("stage_pD", diagCp_);
+                stageDump("stage_pSrc", bp_);
+            }
+            // P2: the assembled linear system. diagCp_ includes the boundary internalCoeffs and bp_ the
+            // full RHS including boundaryCoeffs -- the counterparts of OF's D() and source()+boundary.
+            // brae's pressure matrix is the NEGATIVE of OF's, so the comparison flips the sign rather
+            // than assuming it. pIC/pBC go out separately so a boundary-only defect is visible as one.
+            if (pTraceActive() && nonOrthPass == 0)
+            {
+                pTraceDump("P2_pD",   pTraceIt_, diagCp_);
+                pTraceDump("P2_pSrc", pTraceIt_, bp_);
+                pTraceDump("P2_pIC",  pTraceIt_, pIC);
+                pTraceDump("P2_pBC",  pTraceIt_, pBC);
+            }
             // cyclic pressure Laplacian laplacian(rAtU,p): fold the interface diagonal into diagCp_ + set cyc_.ifCoeff.
             if (hasCyclic_) interfaceAssembleLaplacian(cyc_, rAtU, diagCp_, /*addToDiag*/true);
             if (hasAMI_)    interfaceAssembleLaplacian(ami_, rAtU, diagCp_, /*addToDiag*/true);   // AMI pressure laplacian
@@ -909,6 +1511,18 @@ namespace brae {
                 const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
                 pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000);
             }
+            else if (compressible_ && ctl_.transonic)
+            {
+                // B1: the transonic pressure matrix is NOT SYMMETRIC. fvm::div(phid,p) is an upwind
+                // convection term, so pU_ != pL_ -- and AMG-PCG (like any CG) requires symmetry. Left on
+                // the PCG path it does not merely lose efficiency: it fails to converge and every SIMPLE
+                // step burns the full 3000-iteration cap, which is how this first showed up (squareBend
+                // stalled before printing iteration 1). BiCGStab handles the asymmetry; it is the same
+                // solver brae already uses for every asymmetric scalar transport.
+                const DeviceLduView pv = deviceLduView(dm, diagCp_, pU_, pL_);
+                const scalar nfp = deviceNormFactor(pv, dp_, bp_, ones_);
+                pp = deviceJacobiBiCGStab(pv, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000, ctl_.pcgCheckEvery);
+            }
             else
             {
                 const scalar nfp = deviceNormFactor(deviceLduView(dm,diagCp_,pU_,pL_), dp_, bp_, ones_);
@@ -921,7 +1535,7 @@ namespace brae {
         res.pFinal = pp.finalResidual;
         res.pIters = pp.nIterations;
         if (std::getenv("BRAE_SOLVER_DEBUG")) std::printf("    p %s iters=%d  init=%.2e final=%.2e\n",
-                                                        (hasCyclic_||hasAMI_)?"Jacobi-PCG":"AMG-PCG", pp.nIterations, pp.initialResidual, pp.finalResidual);
+                                                        (hasCyclic_||hasAMI_) ? "Jacobi-PCG" : ((compressible_ && ctl_.transonic) ? "Jacobi-BiCGStab" : "AMG-PCG"), pp.nIterations, pp.initialResidual, pp.finalResidual);
         const DeviceLduView pview = deviceLduView(dm,diagCp_,pU_,pL_);
         DeviceBuffer<scalar> pfi;
         deviceMatrixFluxInternal(pview, dp_, pfi);
@@ -936,10 +1550,30 @@ namespace brae {
         if (hasAMI_)    interfaceCorrectFlux(ami_, dp_);       // ami_.phi -= ifCoeff*(interp(p_nbr) - p_own)
         if (hasCyclic_ && ctl_.nonOrth && ffcPcyc.size()) deviceAxpy(-1.0, ffcPcyc, cyc_.phi);   // cyclic-face non-orth flux correction (matches phiInt_ -= ffcP)
         if (hasAMI_ && ctl_.nonOrth && ffcPami.size()) deviceAxpy(-1.0, ffcPami, ami_.phi);       // AMI-face non-orth flux correction
+        if (stageDumpActive() && stageDumpFirstOnly("pSolved"))
+        {
+            stageDump("stage_pSolved", dp_);         // straight out of the linear solver
+            stageDump("stage_phiSolved", phiInt_);
+        }
+        if (stageDumpActive() && stageDumpFirstOnly("pSolved")) stageDump("stage_pSolved", dp_);   // pre-relax, pre-limit
+        // P3: straight out of the linear solve, BEFORE field relaxation -- the decisive quantity. If the
+        // RHS and matrix still agree here and this does not, the defect is in the solve path (reference
+        // handling, AMG-PCG, the boundary contribution in Amul, initial guess or stopping criterion)
+        // rather than anywhere in the SIMPLE assembly upstream of it.
+        if (pTraceActive())
+        {
+            pTraceDump("P3_pSolved", pTraceIt_, dp_);
+            pTraceNote(pTraceIt_, "p_initialResidual", pp0.initialResidual);
+            pTraceNote(pTraceIt_, "p_finalResidual",   pp.finalResidual);
+            pTraceNote(pTraceIt_, "p_nIterations",     pp.nIterations);
+        }
         deviceScale(dp_, ctl_.relaxP);
         deviceAxpy(1.0 - ctl_.relaxP, pPrev, dp_);
+        if (stageDumpActive() && stageDumpFirstOnly("pRelaxed")) stageDump("stage_pRelaxed", dp_);
+        if (pTraceActive()) pTraceDump("P4_pRelaxed", pTraceIt_, dp_);   // after p.relax()
         DeviceBuffer<scalar> pbv2;
         deviceBCValue(dbP_, dp_, pbv2);
+        if (pTraceActive()) pTraceDump("P5_pBoundary", pTraceIt_, pbv2);   // after BC evaluation
         DeviceBuffer<scalar> gnx,gny,gnz;
         deviceGaussGrad(dm, dp_, pbv2, gnx,gny,gnz);
         if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gnx,gny,gnz);   // + cyclic-face contribution to grad(p)
@@ -1032,6 +1666,280 @@ namespace brae {
     // outer (momentum<->pressure<->turbulence) + inner (pressure) corrector loops, with fvm::ddt(U) folded into the
     // predictor (active once setDdtScheme() set ddtScheme_ != steadyState). The momentum matrix is re-assembled each
     // outer corrector from the latest U/phi, exactly as OF's while(pimple.loop()) re-forms UEqn.
+    void DeviceSimpleSolver::setCompressible(
+        const ThermoCoeffs& tc,
+        const RhoSimpleControls& rc,
+        DeviceBoundary dbHe)
+    {
+        tc_ = tc;
+        rc_ = rc;
+        dbHe_ = std::move(dbHe);
+        th_.allocate(dm_.nCells);
+        compressible_ = true;
+    }
+
+    void DeviceSimpleSolver::setAlphatPrt(const std::vector<scalar>& prtFace)
+    {
+        if (!prtFace.empty()) prtBnd_.copyFrom(prtFace);
+    }
+
+
+    // See the header for why the phases are ordered UEqn -> EEqn -> pEqn -> thermo -> turbulence.
+    DeviceSimpleResidual DeviceSimpleSolver::rhoSimpleStep()
+    {
+        const DeviceMesh& dm = dm_;
+        DeviceSimpleResidual res;
+
+        // muEff. The momentum assembly builds nuEff = dnut_ + nuConst_ and nuConst_ has exactly two uses
+        // (seeded from ctl_.nu at construction, added here), so handing it the DYNAMIC viscosity turns the
+        // same expression into muEff without touching the assembly. mu is T-dependent under Sutherland, so
+        // it must be refreshed every outer iteration, not seeded once. dnut_ is zero while the solve is
+        // laminar; phase 4 fills it with mut and this line keeps working unchanged.
+        deviceCopy(nuConst_, th_.mu);
+        // laminar generalizedNewtonian: nuEff() RETURNS nu_, it does not add to the molecular nu, so this
+        // overwrites nuConst_ (= muEff's laminar part) rather than adding to it. Placed straight after the
+        // thermo copy because nu0 = mu/rho must be the CURRENT thermo viscosity, as OF's
+        // `nu_ = viscosityModel_->nu(this->nu(), strainRate())` re-evaluates it every correct().
+        if (ctl_.gnPowerLaw)
+        {
+            DeviceBuffer<scalar> gradU, S2;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU,
+                        hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            deviceS2(gradU, nC_, S2);            // 2*magSqr(symm(gradU)); sqrt(S2) = OF's strainRate
+            deviceGeneralizedNewtonianPowerLawMu(S2, th_.rho, ctl_.gnNuMin, ctl_.gnNuMax, ctl_.gnN, nuConst_);
+            if (std::getenv("BRAE_GN_DEBUG"))
+            {
+                const std::vector<scalar> hm = nuConst_.host(), hr = th_.rho.host(), hs = S2.host();
+                double mn=1e300,mx=-1e300,rn=1e300,rx=-1e300,sn=1e300,sx=-1e300;
+                for (std::size_t q=0;q<hm.size();++q){ mn=std::min(mn,(double)hm[q]); mx=std::max(mx,(double)hm[q]);
+                    rn=std::min(rn,(double)hr[q]); rx=std::max(rx,(double)hr[q]);
+                    sn=std::min(sn,std::sqrt(std::max(0.0,(double)hs[q]))); sx=std::max(sx,std::sqrt(std::max(0.0,(double)hs[q]))); }
+                std::printf("  [gn] mu %.4e..%.4e  rho %.4e..%.4e  strainRate %.4e..%.4e\n", mn,mx,rn,rx,sn,sx);
+            }
+        }
+
+        // Boundary rho and mu for this iteration. Both are T-dependent, so they move with the solution and
+        // must be refreshed here rather than seeded once. nuBndConst_ becomes mu_b, which turns the boundary
+        // expression nuEffBnd = nuBndConst_ + nut_b into muEff_b = mu_b + rho_b*nut_b once the wall nut is
+        // rho_b-weighted (see addWallNutToMuEff).
+        // One T_b for all three, as in OF's single boundary loop -- not three separate inversions of he_b.
+        deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, &TFixMask_, &TFixBnd_, TBnd_);
+        deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBnd_);
+        deviceThermoMuBoundary(TBnd_, tc_, muBnd_);
+        deviceThermoNuBoundary(dbP_, dp_, TBnd_, tc_, nuWallBnd_);   // OF nu(patchi), for the wall functions
+        deviceGatherWallNu(wfBndIdx_, nuWallBnd_, wfNu_);   // same nu, in the wall-face ordering omega/G0 uses
+        deviceCopy(nuBndConst_, muBnd_);
+
+        // flowRateInletVelocity (massFlowRate): OF recomputes avgU = -mdot/gSum(rho*magSf) every time the
+        // U boundary is updated, so it tracks the inlet density as the solution develops. Done here, before
+        // the momentum predictor, so the predictor sees the same inlet OF's does.
+        //
+        // THE DENSITY HERE MUST BE THE SOLVER'S rho, NOT thermo.rho(). OF's
+        // flowRateInletVelocityFvPatchVectorField::updateCoeffs does
+        //     patch().lookupPatchField<volScalarField>(rhoName_)   // rhoName_ defaults to "rho"
+        // which resolves to the REGISTERED rho -- the relaxed field createFields.H built -- and that is
+        // the same field `phiHbyA = fvc::interpolate(rho)*fvc::flux(HbyA)` weights the flux with. Using
+        // one density for both is what makes the inlet flux telescope exactly:
+        //     sum_i rho_i|Sf|_i * (-mdot / sum_j rho_j|Sf|_j)  ==  -mdot
+        // Feed avgU a DIFFERENT density from the one weighting the flux and the cancellation breaks, so
+        // the inlet no longer delivers the prescribed mass flow. Measured on angledDuct (relaxRho 0.01):
+        // OF's inlet flux is pinned at exactly -1.00000e-01 kg/s every iteration, brae's ran
+        // -0.100024 -> -0.099690 -> -0.104411 -> -0.068195, and that net mass imbalance is what drove the
+        // pressure level to -300 kPa by iteration 4.
+        //
+        // Invisible on every other compressible case in validation/: they all set rho 1.0, where the
+        // relaxed and thermo densities are identical. angledDuct is the one case with BOTH a relaxed rho
+        // and a flowRateInletVelocity inlet.
+        const DeviceBuffer<scalar>& frRho =
+            (rhoBndP_.size() == static_cast<std::size_t>(dbP_.n)) ? rhoBndP_ : rhoBnd_;
+        for (std::size_t k = 0; k < frPatches_.size(); ++k)
+        {
+            const scalar sumRhoA = deviceDot(frRho, frMagSf_[k]);
+            if (sumRhoA <= 0.0) continue;
+            deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -frPatches_[k].mdot / sumRhoA, frNx_, frNy_, frNz_);
+        }
+
+        solveMomentumPredictor(res);
+        // Stage harness: U straight out of the MOMENTUM PREDICTOR. OF's UEqn.H() uses THIS U (not the
+        // initial field), so it is its own stage between rAU and HbyA. Missing it was why the first
+        // Phase 1 pass could not explain a 4% HbyA error on a case whose 0/U is uniform zero.
+        if (stageDumpActive() && stageDumpFirstOnly("Upred"))
+        {
+            stageDump3("stage_Upred", Uk_[0], Uk_[1], Uk_[2]);
+        }
+
+        // EEqn, with OF's kinetic-energy term: EEqn.H is div(phi,he) + div(phi,K) - laplacian(alphaEff,he).
+        // K is built from the velocity the momentum predictor just produced, matching OF's ordering.
+        // sensibleInternalEnergy convects Ekp = 0.5|U|^2 + p/rho, sensibleEnthalpy just K = 0.5|U|^2.
+        // p_b comes from the pressure BC and rho_b from the boundary p and T, so the boundary half of
+        // div(phi,Ekp) is evaluated on the patch exactly as OF's fvc::div does, not extrapolated.
+        // div(phi) for the energy equation's "bounded" term. Was passed as zeros, which silently
+        // disabled the term even when fvSchemes asked for it.
+        DeviceBuffer<scalar> divPhiHe;
+        deviceDiv(dm, phiInt_, phiBnd_, divPhiHe);
+        DeviceBuffer<scalar> kineticSrc;
+        DeviceBuffer<scalar> pBndK;
+        if (tc_.internalEnergy) deviceBCValue(dbP_, dp_, pBndK);
+        deviceEnergyKineticSource(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], phiInt_, phiBnd_, kineticSrc,
+                                  tc_.internalEnergy ? &dp_ : nullptr,
+                                  tc_.internalEnergy ? &th_.rho : nullptr,
+                                  tc_.internalEnergy ? &pBndK : nullptr,
+                                  tc_.internalEnergy ? &rhoBnd_ : nullptr,
+                                  // div(phi,K|Ekp) scheme. luHe was parsed but never forwarded, so a case
+                                  // asking for `div(phi,Ekp) bounded Gauss linearUpwind` silently ran upwind
+                                  // on a term that is a large share of the energy under sensibleInternalEnergy
+                                  // (Ekp = 0.5|U|^2 + p/rho, and p/rho is order 40% of e).
+                                  &dbHe_, ctl_.limitedKin, ctl_.twoBykKin, ctl_.luKin, ctl_.gradKinLimitK,
+                                  ctl_.boundedKin);   // parsed since the scheme work, but never forwarded until now
+        // alphaEff on the PATCHES, so the alphatWallFunction actually reaches the wall heat flux.
+        // ALWAYS when compressible, not just when turbulent. OF's laplacian uses the PATCH diffusivity,
+        // alpha_b = alphah(p_b, T_b) evaluated at the BOUNDARY temperature. With transport const that
+        // equals the adjacent cell value and the distinction is invisible; under sutherland a 700 K wall
+        // against a 370 K first cell makes mu_b ~1.6x the cell mu, and using the cell value understates
+        // the wall heat flux by that much while converging perfectly.
+        DeviceBuffer<scalar> alphaEffBnd;
+        if (compressible_)
+            deviceAlphaEffBoundary(muBnd_, rhoBnd_,
+                                   ctl_.turbulent ? &nutBndAll_ : nullptr,
+                                   prtBnd_.size() ? &prtBnd_ : nullptr,
+                                   TBnd_, tc_, alphaEffBnd);
+        deviceSolveEnergy(
+            dm,
+            dbHe_,
+            th_,
+            tc_,
+            phiInt_,
+            phiBnd_,
+            divPhiHe,
+            ctl_.boundedHe,
+            ctl_.limitedHe,   // div(phi,h|e) limitedLinear, from fvSchemes -- was hardcoded false
+            ctl_.luHe,        // div(phi,h|e) linearUpwind,   from fvSchemes -- was hardcoded false
+            ctl_.nonOrth,
+            ctl_.twoBykHe,
+            rc_.relaxHe,
+            eTol_,              // fvSolution solvers.(h|e).tolerance -- was hardcoded 1e-10
+            eRelTol_,           //                        .relTol     -- was hardcoded 0.0
+            ctl_.bicgCheckEvery,
+            eUseGS_,            //                        .solver smoothSolver -- was hardcoded false
+            nullptr,
+            nullptr,
+            &kineticSrc,
+            alphaEffBnd.size() ? &alphaEffBnd : nullptr,
+            ctl_.gradHeLimitK,
+            fixTActive_ ? &fixTMask_ : nullptr,   // fvOptions fixedTemperatureConstraint (OF eqn.setValues)
+            fixTActive_ ? &fixTHe_   : nullptr);   // grad(he) cellLimited coeff, from the gradient linearUpwind names
+
+        // Capture the energy solve's residuals before correctTurbulence() clears the shared report store.
+        for (const ScalarSolveEntry& se : turbulenceReport())
+            if (se.field == "he")
+            { res.he = se.perf.initialResidual; res.heFinal = se.perf.finalResidual; res.heIters = se.perf.nIterations; }
+
+        // OF EEqn.H: `EEqn.solve(); fvOptions.correct(he); thermo.correct();` -- the constraint is applied
+        // to he BEFORE the thermo update, so T and every property derived from it come out of the clamped
+        // energy. Clamping after thermo.correct() would leave T and he disagreeing for the rest of the step.
+        if (limTActive_)
+        {
+            deviceFvoLimitEnergy(limTCells_, limTMin_, limTMax_, th_.he);
+            // OF clamps the he boundary too, but only for selectionMode all (`!cellSetOption::useSubMesh()`).
+            if (limTAllCells_ && dbHe_.n > 0)
+            {
+                DeviceBuffer<scalar> heB;
+                deviceBCValue(dbHe_, th_.he, heB);
+                deviceFvoLimitEnergyBoundary(dbHe_, limTMin_, limTMax_, heB);
+            }
+        }
+
+        // OF EEqn.H ends with thermo.correct(), so the PRESSURE equation sees psi/mu/alpha from the
+        // just-solved he. brae used to update thermo only after the pressure step, leaving the pEqn on
+        // the previous iteration's psi; doing it here is OF's ordering.
+        //
+        // WHICH FIELDS THIS MOVES IS OF'S DEFINITION, not a decision taken here. hePsiThermo::calculate
+        // writes T/psi/mu/alpha and has no rho argument at all; heRhoThermo::calculate writes those AND
+        // rho. deviceThermoCorrect dispatches exactly as OF's virtual call does.
+        deviceThermoCorrect(th_, dp_, tc_);
+
+        correctPressureVelocity(res);
+
+        // P6: p as pressureControl sees it, before any clamping. Dumped unconditionally (not inside the
+        // limiter branch) so the trace has the same six stages whether or not limits are configured.
+        if (pTraceActive()) pTraceDump("P6_pPreLimit", pTraceIt_, dp_);
+
+        // pressureControl::limit(p), in OF's position: after the pressure solve and the U correction,
+        // BEFORE rho is recomputed. Clamping after rho would let one NaN density through per iteration.
+        if (rc_.limitMaxP || rc_.limitMinP)
+        {
+            // BRAE_DUMP_PLIMIT: report the PRE-clamp extrema, which is what OF's pressureControl prints
+            // ("pressureControl: p max ..."). Comparable line-for-line against OF's log, and the only way
+            // to compare a pressure field that both codes then saturate at the same limits.
+            if (std::getenv("BRAE_DUMP_PLIMIT"))
+            {
+                const std::vector<scalar> ph = dp_.host();
+                scalar lo = ph.empty() ? 0.0 : ph[0], hi = lo;
+                for (scalar v : ph) { lo = std::min(lo, v); hi = std::max(hi, v); }
+                std::fprintf(stderr, "pressureControl(brae): p max %g  p min %g\n", hi, lo);
+            }
+            deviceLimitPressure(dp_,
+                                rc_.limitMinP ? rc_.pMinLimit : -1e300,
+                                rc_.limitMaxP ? rc_.pMaxLimit : 1e300);
+        }
+
+        // End of pEqn.H/pcEqn.H. OF does exactly `rho = thermo.rho()` here -- NO thermo.correct() -- so
+        // T, psi, mu and alpha keep the values EEqn's thermo.correct() gave them, and only rho moves.
+        // Re-running the full update is harmless for those four (he has not changed since the energy
+        // solve, so T/psi/mu/alpha come out identical), but NOT for rho, which depends on the p the
+        // pressure equation just changed. And what OF's `thermo.rho()` returns depends on the thermo type:
+        //
+        //     hePsiThermo:  p_*psi_   -> recomputed with the JUST-SOLVED p    (what this line does)
+        //     heRhoThermo:  rho_      -> the STORED field, from BEFORE the solve
+        //
+        // brae accepted heRhoThermo on the grounds that rho == psi*p exactly for perfectGas. That is true
+        // of the arithmetic and false of the timing: a heRhoThermo case must carry a rho that LAGS the
+        // pressure by one outer iteration. squareBend is heRhoThermo, and its rho was 7.0e-02 off OF at
+        // iteration 1 -- which then propagates into phid (+5%) and the whole transonic pressure equation.
+        // OF pEqn.H tail: `rho = thermo.rho(); rho.relax();`. deviceThermoRho IS thermo.rho() --
+        // p*psi for hePsiThermo, the stored rho_ for heRhoThermo -- so the one-iteration lag a
+        // heRhoThermo case carries falls out of OF's own definition instead of a copy-restore dance.
+        deviceThermoRho(th_, dp_, tc_, th_.rho);
+        // OF pEqn.H: `rho = thermo.rho(); if (!simple.transonic()) { rho.relax(); }` -- the transonic
+        // branch does NOT relax rho, because its pressure equation already carries psi*p implicitly and
+        // relaxing rho on top of that lags the two against each other. brae relaxed unconditionally; that
+        // was invisible while thermo.correct() was overwriting rho anyway, and became a divergence
+        // (squareBend -> NaN) the moment the solver rho was separated and the relaxation started working.
+        if (!ctl_.transonic) deviceRhoRelax(th_, tc_);
+        // ...and the BOUNDARY half of the same field, with the same factor. OF's rho.relax() relaxes the
+        // internal and boundary values of one field together; brae keeps them in two buffers, so both
+        // have to be stepped here or the pressure equation reads a relaxed rho inside and an unrelaxed
+        // one on the patches.
+        if (compressible_)
+        {
+            deviceThermoTBoundary(dbP_, dp_, dbHe_, th_.he, tc_, &th_.T, &TFixMask_, &TFixBnd_, TBnd_);
+            deviceThermoRhoBoundary(dbP_, dp_, TBnd_, tc_, rhoBndP_);
+            if (rhoBndPPrev_.size() != rhoBndP_.size()) deviceCopy(rhoBndPPrev_, rhoBndP_);   // never on the
+            deviceRhoRelaxBuffer(rhoBndP_, rhoBndPPrev_, tc_);                                 // seeded path
+        }
+
+        correctTurbulence();
+
+        // alphat = mut/Prt, for the NEXT iteration's energy equation. Must follow correctTurbulence(),
+        // which is what makes nut valid. No-op while laminar (nut empty -> alphat stays zero), so the
+        // energy equation is unaffected until phase 4.1 gives the SST a compressible nut.
+        deviceAlphat(th_, dnut_, tc_);
+
+        // Continuity. NOTE: with a mass flux this is a MASS residual, not a volumetric one -- the number
+        // means something different from the incompressible report even though the code is identical.
+        // Flagged in phi-audit.md as an INTERPRET site.
+        {
+            DeviceBuffer<scalar> divPhi;
+            deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            DeviceBuffer<scalar> R;
+            deviceHadamard(R, divPhi, dm.V);
+            const scalar sumV = deviceDot(dm.V, ones_) + 1e-300;
+            res.contLocal = deviceSumMag(R) / sumV;
+            res.contGlobal = deviceDot(R, ones_) / sumV;
+        }
+        return res;
+    }
+
     DeviceSimpleResidual DeviceSimpleSolver::pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors)
     {
         const DeviceMesh& dm = dm_;
@@ -1090,6 +1998,9 @@ namespace brae {
             por_.active = true;
             por_.d = fo.porD;
             por_.f = fo.porF;
+            por_.fixed = fo.porFixed;                                  // porosityModels::fixedCoeff
+            por_.rhoRef = fo.porRhoRef;
+            for (int k = 0; k < 9; ++k) { por_.fa[k] = fo.porAlphaT[k]; por_.fb[k] = fo.porBetaT[k]; }
             por_.cells.copyFrom(fo.porCells);
         }
         if (fo.mvfActive)
@@ -1105,6 +2016,63 @@ namespace brae {
             mvfMask01_.copyFrom(m01);
             deviceHadamard(mvfMaskV_, dm_.V, mvfMask01_);                     // maskV = V in the selection (0 else)
             mvfVtot_ = deviceSumMag(mvfMaskV_);                               // total selection volume
+        }
+        if (!fo.fixScaVals.empty() && !fo.fixScaCells.empty())
+        {
+            std::vector<label> mask(nC_, 0);
+            for (label c : fo.fixScaCells) if (c >= 0 && c < nC_) mask[c] = 1;
+            fixScaMask_.copyFrom(mask);
+            const auto itk = fo.fixScaVals.find("k");
+            if (itk != fo.fixScaVals.end()) { fixScaK_ = true; fixScaKVal_.copyFrom(std::vector<scalar>(nC_, itk->second)); }
+            // the "second" turbulence scalar: epsilon on kEpsilon, omega on kOmegaSST -- brae holds both in de_
+            auto ite = fo.fixScaVals.find(ctl_.sst ? "omega" : "epsilon");
+            if (ite != fo.fixScaVals.end()) { fixScaE_ = true; fixScaEVal_.copyFrom(std::vector<scalar>(nC_, ite->second)); }
+        }
+        // BOTH fvOptions below turn a TEMPERATURE into an ENERGY with hConstTToHe, and both then keep the
+        // result as a SCALAR. That is exact for a perfect gas, where he is a linear, pressure-independent
+        // function of T. It is wrong twice over for a liquid: the correlation is a 5th-order polynomial,
+        // and under sensibleInternalEnergy e = h(T) - p/rho(T) varies with pressure, so a single scalar
+        // cannot represent the limit across the field at all.
+        //
+        // REFUSED RATHER THAN APPROXIMATED. Converting properly means carrying per-cell energy limits
+        // recomputed against the live p, which is a real change and one no case in the suite exercises
+        // yet (squareBendLiq sets no fvOptions). Silently converting with the gas formula is what the
+        // rest of this fix exists to eliminate -- a plausible number from an inapplicable equation.
+        if (tc_.model == ThermoModel::liquidH2O && (fo.fixTActive || fo.limTActive))
+        {
+            throw std::runtime_error(
+                "brae: fvOptions limitTemperature/fixedTemperatureConstraint are not supported on the "
+                "liquid thermo path yet. Both convert a temperature limit into a single energy scalar "
+                "using the perfect-gas relation; for a liquid the energy is a polynomial in T and, under "
+                "sensibleInternalEnergy, also depends on p, so the limit is a field rather than a "
+                "constant. Remove the source, or run this case on the perfect-gas path.");
+        }
+        if (fo.fixTActive)
+        {
+            // OF: eqn.setValues(cells_, thermo.he(thermo.p(), Tuni, cells_)). The temperature is converted
+            // ONCE with the case thermo, exactly as limitTemperature's limits are.
+            fixTActive_ = true;
+            std::vector<label> mask(nC_, 0);
+            for (label c : fo.fixTCells) if (c >= 0 && c < nC_) mask[c] = 1;
+            fixTMask_.isWallCell.copyFrom(mask);
+            fixTHe_.copyFrom(std::vector<scalar>(nC_, hConstTToHe(fo.fixTTemp, tc_)));
+        }
+        if (fo.limTActive)
+        {
+            limTActive_ = true;
+            limTAllCells_ = fo.limTAllCells;
+            // OF converts the two TEMPERATURE limits into ENERGY limits once, with the case's own thermo
+            // (limitTemperature.C: heMin = thermo.he(p, Tmin, cells)), and clamps he. With hConst the
+            // conversion is exact and p-independent, so the two limits are scalars rather than fields.
+            limTMin_ = hConstTToHe(fo.limTMin, tc_);
+            limTMax_ = hConstTToHe(fo.limTMax, tc_);
+            std::vector<label> tc = fo.limTCells;
+            if (tc.empty())   // selectionMode all
+            {
+                tc.resize(nC_);
+                for (label c = 0; c < nC_; ++c) tc[c] = c;
+            }
+            limTCells_.copyFrom(tc);
         }
         if (fo.limUActive)
         {

@@ -10,6 +10,7 @@
 // Gradients are produced by deviceGaussGrad (k,omega) / deviceGbyNu-style gradU in the model driver; here the
 // kernels are pointwise on flat fields. Validated vs OF on a frozen state (ctest gpu_komega_sst).
 #include "device_buffer.cuh"
+#include "device_boundary.cuh"   // DeviceVectorBoundary (SST nut boundary)
 #include "komega_sst_coeffs.cuh"
 
 namespace brae {
@@ -26,11 +27,13 @@ void deviceCDkOmega(const DeviceBuffer<scalar>& gKx, const DeviceBuffer<scalar>&
 
 // F1 = tanh(arg1^4) (CD = raw CDkOmega; the max(.,1e-10) is applied inside).
 void deviceF1(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
-              const DeviceBuffer<scalar>& CD, scalar nu, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& F1, bool lm = false);
+              const DeviceBuffer<scalar>& CD, scalar nu, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& F1, bool lm = false,
+    const DeviceBuffer<scalar>* nuCell = nullptr);
 
 // F2 = tanh(arg2^2).
 void deviceF2(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
-              scalar nu, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& F2);
+              scalar nu, const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& F2,
+    const DeviceBuffer<scalar>* nuCell = nullptr);
 
 // out = F1*(psi1-psi2)+psi2 (gamma/beta/alphaK/alphaOmega blends).
 void deviceBlend(const DeviceBuffer<scalar>& F1, scalar psi1, scalar psi2, DeviceBuffer<scalar>& out);
@@ -60,14 +63,24 @@ void deviceDEff(const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& nut,
 void deviceOmegaReaction(const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& beta,
                          const DeviceBuffer<scalar>& GbyNu0lim, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& CD,
                          const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& divU,
-                         DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
+                         DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source,
+    const DeviceBuffer<scalar>* rho = nullptr);
 
 // omega wall function (BINOMIAL n=2): omega0 = sqrt(omegaVis^2 + omegaLog^2) scattered to wall cells (cornerWeight
 // invNw), G0 identical to the epsilon wall function. Zeroes omega0/G0 then scatters. (Validated end-to-end at C7.)
 void deviceWallOmegaG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& Ux,
                        const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                        DeviceBuffer<scalar>& omega0, DeviceBuffer<scalar>& G0, const KOmegaSSTCoeffs& co, int nutWall = 0,
-                       scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
+                       scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
+                       const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+
+// nut at boundary faces for the SST, evaluated as OF's field assignment fills it (see the .cu).
+void deviceSSTNutBoundary(const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& kBnd,
+                          const DeviceBuffer<scalar>& omBnd, const DeviceBuffer<scalar>& yCell,
+                          const DeviceBuffer<scalar>* nuB, scalar nu, const DeviceBuffer<scalar>& gradU, int nC,
+                          const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                          const DeviceBuffer<label>& calcMask, const KOmegaSSTCoeffs& co,
+                          const DeviceBuffer<scalar>& nutCell, DeviceBuffer<scalar>& nutBnd);
 
 // C6 k equation
 // k reaction (adds to diag + source). Mirrors the k block of kOmegaSSTBase::correct() (incompressible):
@@ -79,7 +92,8 @@ void deviceKReactionSST(const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar
                         const DeviceBuffer<scalar>& G, const DeviceBuffer<scalar>& divU,
                         const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source,
                         const scalar* gammaIntEff = nullptr,
-                        const DeviceBuffer<scalar>* FDES = nullptr);   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr=RANS)
+                        const DeviceBuffer<scalar>* FDES = nullptr,
+    const DeviceBuffer<scalar>* rho = nullptr);   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr=RANS)
 
 // kOmegaSST-DDES DES factor FDES = max((sqrt(k)/(betaStar*omega))/(CDES*cubeRootVol(V))*(1-F2), 1), CDES=F1-blended.
 void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,

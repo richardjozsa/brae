@@ -40,6 +40,33 @@ struct PatchFieldData
     std::string    name;
     std::string    type;
     bool           hasValue     = false;
+    // uniformFixedValue whose uniformValue is a Function1 (table / polynomial / coded / expression)
+    // rather than a constant. brae cannot evaluate those, and the danger is that the entry ALSO carries a
+    // stale `value` from an overridden fixedValue entry, so the field silently takes that constant
+    // instead. Recorded here and refused at construction rather than guessed at.
+    std::string    unsupportedFunction1;
+    // pressureInletOutletVelocity's optional `tangentialVelocity`. OF sets
+    // refValue = tv - n*(n & tv) (pressureInletOutletVelocityFvPatchVectorField.C:135); brae leaves the
+    // tangential refValue at zero, so honouring the key would need per-face storage it does not have.
+    // Recorded so it can be refused instead of quietly changing the boundary condition.
+    bool           hasTangentialVelocity = false;
+    // fixedGradient (and the heat-flux BCs derived from it): the prescribed normal gradient.
+    // Plain `mixed` (Robin) carries refValue + refGradient + valueFraction. refGradient shares the
+    // gradient* slots below; these two are its own. Distinct from inletValue*, which inletOutlet and the
+    // freestream family use for a refValue whose blend the DEVICE recomputes each step.
+    bool           hasRefValue      = false;
+    bool           refValueUniform  = false;
+    T              refValueUniformValue{};
+    std::vector<T> refValues;
+    bool           hasValueFraction = false;
+    bool           vfUniform        = false;
+    scalar         vfUniformValue   = 0;
+    std::vector<scalar> vfValues;
+
+    bool           hasGradient    = false;
+    bool           gradientUniform = false;
+    T              gradientUniformValue{};
+    std::vector<T> gradientValues;
     bool           valueUniform = false;
     T              uniformValue{};
     std::vector<T> values;
@@ -50,6 +77,24 @@ struct PatchFieldData
     std::vector<T> inletValues;
     // turbulent-inlet BCs: k = 1.5*(intensity*|U|)^2; eps = Cmu^0.75 k^1.5/mixingLength; omega = sqrt(k)/(Cmu^0.25 mixingLength).
     scalar         intensity    = 0;
+    // compressible::alphatWallFunction: alphat_w = rho_w*nut_w/Prt. OF's default here is 0.85
+    // (alphatWallFunctionFvPatchScalarField.C: dict.getOrDefault<scalar>("Prt", 0.85)) and is NOT the
+    // turbulence model's own Prt, whose default is 1.0. Two different numbers in the same case.
+    scalar         Prt          = 0.85;
+    // totalPressure: OF picks its formula from these. psi "none" (the default) -> the low-speed form
+    // p0 - 0.5*rho*neg(phi)*|U|^2; a NAMED psi -> the isentropic high-speed form with gamma, which brae
+    // does not implement. Recorded so it can be refused by name instead of silently running low-speed.
+    std::string    psiName      = "none";
+    scalar         gammaTP      = 1.0;
+    // flowRateInletVelocity (OF flowRateInletVelocityFvPatchVectorField). OF selects the branch by which
+    // key is present: "volumetricFlowRate" -> volumetric_ = true; otherwise "massFlowRate" (default
+    // rhoName "rho"). rhoInlet is only the FALLBACK used when the rho field is not registered -- in
+    // rhoSimpleFoam it is, so the real patch rho is used and rhoInlet is ignored, exactly as OF does.
+    bool           hasFlowRate  = false;
+    bool           flowRateIsMass = false;
+    scalar         flowRate     = 0.0;
+    scalar         rhoInlet     = -1.0;   // OF default -VGREAT ("not given")
+    bool           extrapolateProfile = false;
     scalar         mixingLength = 0;
     // surfaceNormalFixedValue / uniformNormalFixedValue: SCALAR refValue; the BC builds U_b = refValue * face_normal.
     bool                hasNormalRef     = false;
@@ -107,6 +152,14 @@ inline void readUniformOrList(
 
 // Read "uniform <v>" / "nonuniform List<...>" OR the OF self-reference "$internalField" (copy the internalField
 // entry). Used by value / inletValue / freestreamValue, any of which may be written as $internalField.
+// Does this token start a numeric literal? Used to spot a bare (keyword-less) value entry.
+inline bool isFoamNumber(const std::string& t)
+{
+    if (t.empty()) return false;
+    const char c = t[0];
+    return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
+}
+
 template <typename T>
 inline void readValueOrInternal(
     TokenStream& ts,
@@ -121,6 +174,18 @@ inline void readValueOrInternal(
         uniform = fd.internalUniform;
         uval = fd.internalUniformValue;
         vals = fd.internalField;
+    }
+    // A BARE value, i.e. no `uniform`/`nonuniform` keyword: `inletValue (0 0 0);`. OpenFOAM tolerates
+    // these because a boundary condition only reads the entries it cares about -- gasMixing's
+    // pressureInletOutletVelocity carries an `inletValue` that OF's implementation never looks at, so OF
+    // runs the case fine. brae parsed every known key unconditionally and died with
+    // "TokenStream: expected '(' got '0'", failing on a file OpenFOAM accepts and, worse, failing BEFORE
+    // reaching its own legitimate refusal (nutUWallFunction), so the message pointed at the wrong thing.
+    else if (ts.peek() == "(" || isFoamNumber(ts.peek()))
+    {
+        uniform = true;
+        uval = readFoamValue<T>(ts);
+        vals.clear();
     }
     else readUniformOrList(ts, uniform, uval, vals);
 }
@@ -313,8 +378,25 @@ inline FieldData<T> readField(const std::string& path)
                             p.valueUniform = true;
                             p.hasValue = true;
                         }
-                        else   // table/coded/Function1 -> skip (paren-aware); dispatch will throw if no value
+                        else   // table / polynomial / coded / expression: skip the entry, then REFUSE.
                         {
+                            // Relying on "dispatch throws when there is no value" is not enough: a case
+                            // that overrides an earlier `type fixedValue; value uniform X;` still has
+                            // hasValue == true, so the Function1 silently degrades to the constant X.
+                            // squareBendLiq does exactly that (T walls: expression, stale value 350).
+                            // A dict form ({ type expression; ... }) names its Function1 inside, so peek
+                            // the `type` keyword -- "a dictionary" is a much worse error message than
+                            // "expression".
+                            p.unsupportedFunction1 = m;
+                            if (m == "{")
+                            {
+                                const std::string t1 = ts.peek();
+                                if (t1 == "type")
+                                {
+                                    ts.next();
+                                    p.unsupportedFunction1 = ts.peek();
+                                }
+                            }
                             skipToSemicolon(ts, m == "(" ? 1 : 0);
                         }
                         ts.expect(";");
@@ -328,6 +410,47 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "intensity")   // turbulentIntensityKineticEnergyInlet
                     {
                         p.intensity = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    // OF takes a Function1 here; "constant <v>" and a bare "<v>" are the steady forms.
+                    // Anything else (table/polynomial/...) is refused by name rather than approximated.
+                    else if (key == "volumetricFlowRate" || key == "massFlowRate")
+                    {
+                        p.hasFlowRate = true;
+                        p.flowRateIsMass = (key == "massFlowRate");
+                        std::string w = ts.next();
+                        if (w == "constant") w = ts.next();
+                        else if (w == "{")
+                            throw std::runtime_error(
+                                "brae: flowRateInletVelocity '" + key + "' given as a Function1 dictionary on patch "
+                                + p.name + "; only 'constant <value>' (or a bare value) is supported.");
+                        p.flowRate = std::stod(w);
+                        ts.expect(";");
+                    }
+                    else if (key == "rhoInlet")
+                    {
+                        p.rhoInlet = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "extrapolateProfile")
+                    {
+                        const std::string w = ts.next();
+                        p.extrapolateProfile = (w == "true" || w == "yes" || w == "on" || w == "1");
+                        ts.expect(";");
+                    }
+                    else if (key == "psi")    // totalPressure: selects OF's isentropic branch when != none
+                    {
+                        p.psiName = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (key == "gamma")   // totalPressure isentropic exponent
+                    {
+                        p.gammaTP = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "Prt")   // compressible::alphatWallFunction turbulent Prandtl number
+                    {
+                        p.Prt = ts.nextScalar();
                         ts.expect(";");
                     }
                     else if (key == "mixingLength")   // turbulentMixingLength*Inlet
@@ -344,6 +467,50 @@ inline FieldData<T> readField(const std::string& path)
                         p.inletValues = p.values;
                         p.hasInletValue = true;
                         ts.expect(";");
+                    }
+                    // `gradient` is fixedGradient's key, `refGradient` is mixed's. They fill the same slot
+                    // because they mean the same thing to the discretisation -- the difference is the (1-vf)
+                    // weight the kernels apply on a mixed patch (OF mixedFvPatchField.C:279-310).
+                    else if (key == "gradient" || key == "refGradient")
+                    {
+                        readValueOrInternal(ts, fd, p.gradientUniform, p.gradientUniformValue, p.gradientValues);
+                        p.hasGradient = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "refValue" && p.type == "mixed")
+                    {
+                        readValueOrInternal(ts, fd, p.refValueUniform, p.refValueUniformValue, p.refValues);
+                        p.hasRefValue = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "valueFraction")
+                    {
+                        // Always a SCALAR field, even on a vector patch (OF blends component-wise with one
+                        // fraction), so it cannot go through readValueOrInternal<T>.
+                        const std::string w = ts.peek();
+                        if (w == "uniform")
+                        {
+                            ts.next();
+                            p.vfUniform = true;
+                            p.vfUniformValue = std::stod(ts.next());
+                        }
+                        else
+                        {
+                            ts.next();                      // nonuniform
+                            if (ts.peek() == "List<scalar>") ts.next();
+                            const int n = std::stoi(ts.next());
+                            ts.expect("(");
+                            p.vfValues.resize(static_cast<std::size_t>(n));
+                            for (int i = 0; i < n; ++i) p.vfValues[static_cast<std::size_t>(i)] = std::stod(ts.next());
+                            ts.expect(")");
+                        }
+                        p.hasValueFraction = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "tangentialVelocity")   // pressureInletOutletVelocity, optional
+                    {
+                        p.hasTangentialVelocity = true;
+                        skipToSemicolon(ts);
                     }
                     else
                     {

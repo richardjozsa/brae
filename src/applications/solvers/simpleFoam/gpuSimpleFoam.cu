@@ -17,7 +17,8 @@
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
 #include "foam_dict.cuh"
-#include "scheme_parse.cuh"   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
+#include "scheme_parse.cuh"
+#include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
@@ -25,7 +26,6 @@
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
-#include "parallel_device_foam.cuh"   // brae ... -parallel: the distributed DEVICE path (one rank per GPU)
 
 #include <algorithm>
 #include <cctype>
@@ -131,8 +131,15 @@ int main(int argc, char** argv)
         //   mpirun -np N brae -case <dir> -parallel
         // Gated on the flag rather than on Pstream::nProcs() so a plain `brae -case ...` never initialises
         // MPI -- which also keeps the -cases fork orchestrator above clear of it.
+        // -parallel (multi-GPU) is OUT OF SCOPE; the distributed solver lives in legacy/ and is not built.
+        // REFUSE rather than fall through to the single-GPU path: under `mpirun -np N` that would run N
+        // redundant identical solves, each writing over the others' time directories.
         for (int i = 1; i < argc; ++i)
-            if (std::string(argv[i]) == "-parallel") return runParallelDeviceFoam(argc, argv);
+            if (std::string(argv[i]) == "-parallel")
+                throw std::runtime_error(
+                    "brae: -parallel (multi-GPU) is not supported in this build. The distributed solver was "
+                    "moved to legacy/ and is out of scope; see legacy/README.md. Run brae single-GPU without "
+                    "-parallel (and without mpirun).");
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
         for (int i = 1; i < argc; ++i)
@@ -240,123 +247,65 @@ int main(int argc, char** argv)
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' (RAS or laminar)");
         readTurbulenceModel(turbProps, ctl);
 
-        // Scalar linearUpwind (deferred correction) is implemented in the scalar scaffold but currently DEGRADES
-        // turbulence accuracy (explicit lagged correction + loose under-relaxed turb solve + steep near-wall
-        // gradients): airFoil2D SA overshoots nuTilda (Cd worse), pitzDaily SST k/p worse than the upwind baseline.
-        // Default OFF -> scalars use upwind (the validated behavior). BRAE_SCALAR_LINEARUPWIND=1 honours the scheme (A/B).
-        if (!std::getenv("BRAE_SCALAR_LINEARUPWIND"))
+        // Scalar linearUpwind is gated OFF here as a COLD-START STABILITY guard, not for accuracy. The
+        // original comment claimed it "degrades turbulence accuracy vs OF"; that was measured with the old
+        // line-based fvSchemes parser (the one that leaked schemes between statements) and is wrong. What
+        // the re-measurement actually shows:
+        //   - discretisation is CORRECT: one iteration from OF's own converged pitzDaily state, tight
+        //     solvers, linearUpwind on k -> k agrees with OF to 1.6e-06 (omega 3.3e-05, p exact).
+        //   - the compressible duct converges to OF at k 2.0e-06 / nut 8.1e-07 with it honoured, and is
+        //     1.6e-02 off on nut with it downgraded -- so rhoSimpleFoam now HONOURS it.
+        //   - but from a COLD start pitzDaily SST diverges where OF converges. Bisected cleanly, with the
+        //     `div(phi,epsilon)` line pinned so it cannot leak into luEps (an earlier bisect was
+        //     contaminated by exactly that and wrongly blamed k alone):
+        //         luK=1 luEps=0  converges     luK=0 luEps=1  converges
+        //         luK=0 luEps=0  converges     luK=1 luEps=1  NaN
+        //     So it is a COUPLED k-omega instability -- neither correction destabilises anything by
+        //     itself. Ruled out by measurement: SIMPLEC, gradient limiting, regex relaxation, the Pk
+        //     limiter, k/omega bounding, constant preservation, the matrix assembly (diagonal and source
+        //     match OF's fvScalarMatrix to 1.8e-06), and the near-wall matrix manipulation.
+        //
+        // SPALART-ALLMARAS IS EXEMPT, and the reason is structural rather than empirical: SA transports ONE
+        // scalar. deviceSpalartAllmarasCorrect takes luK only and never reads luEps, so the luK=1,luEps=1
+        // state the divergence requires is unreachable. Downgrading SA was protecting it from a
+        // two-equation failure mode it cannot have, and the cost was large: airFoil2D nuTilda 1.67 upwind
+        // vs 3.6e-03 honoured, a factor of 460. gpuPimpleFoam never had this guard, so the same SA-IDDES
+        // case already ran linearUpwind there -- the steady path was giving a different answer to the
+        // transient one for identical input.
+        //
+        // The two-equation guard stays until the coupled divergence is understood.
+        if (!std::getenv("BRAE_SCALAR_LINEARUPWIND") && !ctl.sa)
         {
-            // Detect-the-route: if fvSchemes ASKED for linearUpwind on a turbulence scalar, say loudly that cf is
-            // running upwind instead (do not silently honour-then-ignore). The gating is deliberate (accuracy), but
-            // the user must see that the requested scheme is not the one being applied.
+            // Never silently honour-then-ignore: if fvSchemes asked for it, say that upwind is running.
             if (ctl.luK || ctl.luEps)
-                std::fprintf(stderr, "brae WARNING: div(phi,<turbulence scalar>) requested 'linearUpwind' but cf is running "
-                             "UPWIND (default: the scalar linearUpwind deferred correction degrades turbulence accuracy vs "
-                             "OF). Set BRAE_SCALAR_LINEARUPWIND=1 to honour the requested scheme.\n");
+                std::fprintf(stderr, "brae WARNING: div(phi,k|epsilon|omega) requested 'linearUpwind' but brae is "
+                             "running UPWIND on the TWO-equation models (cold-start guard against a coupled "
+                             "k-omega divergence; the discretisation itself matches OF to 1.6e-06, and SA is "
+                             "unaffected and honours it). Set BRAE_SCALAR_LINEARUPWIND=1 to honour it anyway.\n");
             ctl.luK = false;
             ctl.luEps = false;
         }
 
-        const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
-        const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
-        const FoamDict* fld = rf ? rf->subDict("fields") : nullptr;
-        // OF accepts BOTH the modern nested {equations{} fields{}} and the legacy FLAT {p ..; U ..;} form. Fall back
-        // to the flat keys (read from rf itself) when a sub-dict is absent, so a legacy case isn't silently left
-        // un-relaxed (all factors 1.0 -> the steady SIMPLE loop typically diverges).
-        const FoamDict* eqSrc  = eqs ? eqs : rf;
-        const FoamDict* fldSrc = fld ? fld : rf;
-        ctl.relaxU   = eqSrc  ? eqSrc->scalarOr("U", 1.0) : 1.0;
-        ctl.relaxK   = eqSrc  ? eqSrc->scalarOr(ctl.sa ? "nuTilda" : "k", 1.0) : 1.0;   // SA: relaxK carries the nuTilda relax
-        ctl.relaxEps = eqSrc  ? eqSrc->scalarOr(ctl.sst ? "omega" : "epsilon", 1.0) : 1.0;
-        ctl.relaxP   = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
-        // A relaxation factor <= 0 divides by zero in the diagonal-relaxation kernel (Inf diag -> NaN). OF's
-        // fvMatrix::relax skips relaxation for alpha <= 0; match that (treat as 1.0 = no under-relaxation) + warn.
-        auto fixRelax = [](scalar& a, const char* nm) {
-            if (a <= 0.0) { std::fprintf(stderr, "brae WARNING: relaxationFactors %s = %g <= 0; using 1.0 (no under-relaxation)\n", nm, a); a = 1.0; }
-        };
-        fixRelax(ctl.relaxU, "U");
-        fixRelax(ctl.relaxK, ctl.sa ? "nuTilda" : "k");
-        fixRelax(ctl.relaxEps, ctl.sst ? "omega" : "epsilon");
-        fixRelax(ctl.relaxP, "p");
+        readRelaxationFactors(fvSolution, ctl);   // shared: solvers/common/linear_solver_setup.cuh
 
-        const FoamDict* solvers = fvSolution.subDict("solvers");
-        auto solverTol = [&](const std::string& f, scalar def)
-        {
-            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-            return s ? s->scalarOr("tolerance", def) : def;
-        };
-        auto solverRelTol = [&](const std::string& f)   // SIMPLE only needs a loose per-step solve
-        {
-            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-            return s ? s->scalarOr("relTol", 0.0) : 0.0;
-        };
-        ctl.tolP = solverTol("p", 1e-6);
-        ctl.tolU = solverTol("U", 1e-8);
+        // fvSolution -> ctl, through the SHARED reader in solvers/common/linear_solver_setup.cuh.
+        // This used to be an inline copy here; the compressible driver was ported from it and silently
+        // dropped fifteen of these controls. One reader means a new driver gets the whole set or none.
         const std::string second = ctl.sst ? "omega" : "epsilon";
-        ctl.tolKE = ctl.sa ? solverTol("nuTilda", 1e-8) : std::fmin(solverTol("k", 1e-8), solverTol(second, 1e-8));
-        ctl.relTolP = solverRelTol("p");
-        ctl.relTolU = solverRelTol("U");
-        ctl.relTolKE = ctl.sa ? solverRelTol("nuTilda")                     // SA: single nuTilda solve
-                              : std::fmin(solverRelTol("k"), solverRelTol(second));   // OF solves k/(eps|omega) loosely per SIMPLE step
-        // Per-field scalar linear solver from fvSolution, EXACTLY as OF selects it: solver smoothSolver +
-        // smoother symGaussSeidel -> cf's deviceSymGaussSeidel. Any other (PBiCG[Stab]/GAMG/...) keeps BiCGStab.
-        // OF smoothSolver with a GaussSeidel-family smoother (GaussSeidel = forward sweep, symGaussSeidel = fwd+bwd);
-        // cf maps BOTH to its symmetric multicolor deviceSymGaussSeidel (a superset of forward GaussSeidel). Other
-        // solvers (PBiCG[Stab]/GAMG/...) keep BiCGStab. motorBike uses "GaussSeidel" for U/k/omega; pitzDaily "symGaussSeidel".
-        auto useSymGS = [&](const std::string& f)
-        {
-            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-            if (!s || s->wordOr("solver", "") != "smoothSolver") return false;
-            const std::string sm = s->wordOr("smoother", "");
-            return sm == "symGaussSeidel" || sm == "GaussSeidel";
-        };
-        ctl.gsK   = useSymGS(ctl.sa ? "nuTilda" : "k");
-        ctl.gsEps = ctl.sa ? false : useSymGS(second);
-        // Momentum solver READ FROM fvSolution exactly like OF (fvVectorMatrix::solveSegregated solves each U component
-        // with the U solver) and like cf already does for the scalars above. OF uses smoothSolver+symGaussSeidel for U
-        // on most tutorials; cf's default Jacobi-preconditioned BiCGStab STALLS on the ill-conditioned high-aspect-ratio
-        // viscous momentum matrix (backwardFacingStep2D AR~7600: the iter-1 predictor came out ~half of OF's, seeding the
-        // divergence, divDevReff and rAU are OF-exact, the gap was purely the linear solve), whereas GS is robust like
-        // OF's smoothSolver. BRAE_GS_U=0 forces BiCGStab (perf escape: GS is slower over the 3 components).
-        const char* gsuEnv = std::getenv("BRAE_GS_U");
-        ctl.gsU   = gsuEnv ? (std::atoi(gsuEnv) != 0 && useSymGS("U")) : useSymGS("U");
-        // BiCGStab batched convergence DEFAULT OFF: measured net-NEGATIVE once relTol makes the solves few-iter
-        // (overshoot to the K-boundary costs more than the saved syncs). Kept behind the env for tight-tol cases
-        // (many inner iters), where it would help like the pressure pcgCheckEvery does.
-        if (const char* be = std::getenv("BRAE_BICG_CHECK_EVERY"))
-        {
-            const int k = std::atoi(be);
-            if (k >= 1) ctl.bicgCheckEvery = k;
-        }
-        ctl.pcgCheckEvery = 4;   // application default: batched PCG residual read (1.30x; OF-validated identical to K=1).
-        if (const char* ce = std::getenv("BRAE_PCG_CHECK_EVERY"))
-        {
-            const int k = std::atoi(ce);
-            if (k >= 1) ctl.pcgCheckEvery = k;   // override (1 = exact)
-        }
-        if (const char* cs = std::getenv("BRAE_CORR_SCALING")) ctl.corrScaling = (std::atoi(cs) != 0);   // AMG corr-scaling + flexible CG
-        if (const char* ug = std::getenv("BRAE_USE_GRAPH")) ctl.useGraph = (std::atoi(ug) != 0);          // V-cycle graph replay toggle (debug)
+        readLinearSolverControls(fvSolution, second, ctl);
 
         const FoamDict* simple = fvSolution.subDict("SIMPLE");
         const FoamDict* resCtl = simple ? simple->subDict("residualControl") : nullptr;
         const bool hasRC = (resCtl != nullptr);
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1, rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
-        {
-            const std::string cons = simple ? simple->wordOr("consistent", "no") : "no";
-            ctl.consistent = (cons == "yes" || cons == "true" || cons == "on" || cons == "1");   // SIMPLEC
-        }
-        ctl.nNonOrth = simple ? simple->intOr("nNonOrthogonalCorrectors", 0) : 0;   // extra pressure passes on non-orthogonal meshes
-        {
-            const std::vector<scalar> bf = simple ? simple->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
-            if (bf.size() >= 3) ctl.bodyForce = vector{bf[0], bf[1], bf[2]};   // constant momentum source (drives cyclic/periodic channels)
-        }
+        // consistent / nNonOrthogonalCorrectors / bodyForce are read by readLinearSolverControls above.
 
         std::printf("brae (device-resident) | case=%s | %s%s | nu=%.3g\n", caseDir.c_str(),
                     simType.c_str(), ctl.turbulent ? (ctl.sst ? " (kOmegaSST)" : " (kEpsilon)") : "", ctl.nu);
         std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s\n",
                     ctl.relaxU, ctl.relaxP, ctl.tolP, ctl.tolU, endTime, hasRC ? "on" : "off");
-        std::printf("  schemes: bounded=%d linearUpwind(U)=%d nonOrth(corrected)=%d nonOrthLimit=%.3g consistent(SIMPLEC)=%d limitedLinear(k=%d,eps=%d) linearUpwind(k=%d,eps=%d)\n",
-                    ctl.bounded, ctl.linearUpwind, ctl.nonOrth, ctl.nonOrthLimit, ctl.consistent, ctl.limitedK, ctl.limitedEps, ctl.luK, ctl.luEps);
+        std::printf("  schemes: bounded(U=%d,k=%d,eps=%d) linearUpwind(U)=%d nonOrth(corrected)=%d nonOrthLimit=%.3g consistent(SIMPLEC)=%d limitedLinear(k=%d,eps=%d) linearUpwind(k=%d,eps=%d)\n",
+                    ctl.bounded, ctl.boundedK, ctl.boundedEps, ctl.linearUpwind, ctl.nonOrth, ctl.nonOrthLimit, ctl.consistent, ctl.limitedK, ctl.limitedEps, ctl.luK, ctl.luEps);
         std::printf("  grad(U) cellLimited k=%.3g (0=unlimited)\n", ctl.gradULimitK);
         std::printf("  linear solver (GaussSeidel from fvSolution; else BiCGStab): U=%d k|nuTilda=%d eps|omega=%d\n", ctl.gsU, ctl.gsK, ctl.gsEps);
 
@@ -486,6 +435,10 @@ int main(int argc, char** argv)
         }
         if (!fvo.empty())
         {
+            // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face
+            // masks so it refreshes them each iteration instead of freezing the set-up value.
+            solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
+                                      tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
             solver.setFvOptions(fvo);
             if (fvo.rotor.active)   // build the BEM rotor geometry from the mesh (cell centres + face areas) and hand it over
                 solver.setRotorDisk(buildDeviceRotorDisk(fvo.rotor, g.C(), g.Sf(), m.owner(), m.neighbour(), m.nInternalFaces()));
@@ -499,13 +452,20 @@ int main(int argc, char** argv)
         {
             std::printf("  No finite volume options present\n");   // OF createFvOptions.H message
         }
-        auto ok = [](scalar res, scalar ctlv) { return ctlv < 0 || res < ctlv; };
+        // OF simpleControl::criteriaSatisfied: an unlisted field is not a criterion, and a run only
+        // converges if at least one criterion was ACTUALLY checked (see solvers/common/residual_control.cuh).
+        int rcChecked = 0;
+        scalar turbMag0 = 0;   // sum|turb| at iteration 1; baseline for the blow-up tripwire
+        auto ok = [&](scalar res, scalar ctlv) { if (ctlv < 0) return true; ++rcChecked; return res < ctlv; };
         // OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time)
         const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
         const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);   // OF default GREAT -> only the final state
         const int    purgeWrite    = std::max(0, controlDict.intOr("purgeWrite", 0));
         const scalar deltaT        = controlDict.scalarOr("deltaT", 1.0);
-        const scalar startTimeVal  = controlDict.scalarOr("startTime", 0.0);
+        // The RESOLVED start, not controlDict's startTime: `startFrom latestTime` can make them differ,
+        // and every time value below is measured from the start. Taking the dict's value made a run
+        // restarted from 10 name its output 1, 2, 3... -- overwriting the case's own early history.
+        const scalar startTimeVal  = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
         long writeTimeIndex = 0;
         auto timeName = [](scalar t) -> std::string   // integer name for whole times (deltaT=1), else %g
         {
@@ -545,18 +505,18 @@ int main(int argc, char** argv)
                     std::filesystem::copy(fieldDir + "/include", outDir + "/include",
                         std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec2);
             }
-            writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, precision);
-            writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, precision);
+            writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, precision, solver.UBoundary());
+            writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, precision, solver.pBoundary());
             if (ctl.sa)   // one-equation: the k slot holds nuTilda
             {
-                writeVolField(wsrc + "nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
-                writeVolField(wsrc + "nut",     outDir + "/nut",     solver.nut(), fvp, precision);
+                writeVolField(wsrc + "nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision, solver.nuTildaBoundary());
+                writeVolField(wsrc + "nut",     outDir + "/nut",     solver.nut(), fvp, precision, solver.nutBoundary());
             }
             else if (ctl.turbulent)
             {
-                writeVolField(wsrc + "k", outDir + "/k", solver.k(), fvp, precision);
-                writeVolField(wsrc + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision);
-                writeVolField(wsrc + "nut", outDir + "/nut", solver.nut(), fvp, precision);
+                writeVolField(wsrc + "k", outDir + "/k", solver.k(), fvp, precision, solver.kBoundary());
+                writeVolField(wsrc + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision, solver.epsBoundary());
+                writeVolField(wsrc + "nut", outDir + "/nut", solver.nut(), fvp, precision, solver.nutBoundary());
                 if (ctl.lm)   // kOmegaSSTLM transition fields
                 {
                     writeVolField(wsrc + "ReThetat", outDir + "/ReThetat", solver.ReThetat(), fvp, precision);
@@ -577,11 +537,23 @@ int main(int argc, char** argv)
             }
         };
 
+        // endTime is ABSOLUTE, not a run length. OF's Time::run() tests `value() < endTime - 0.5*deltaT`,
+        // so a case restarted at 10 with endTime 20 runs TEN more steps and finishes at 20. Looping
+        // `iter <= endTime` from 1 ran TWENTY and finished at 30 -- silently changing the iteration
+        // count, the write times, and any comparison of a restarted run against a continuous one. Only
+        // correct when startTime is 0, which is why every fresh-start case hid it.
+        const long nSteps = std::lround((static_cast<double>(endTime) - static_cast<double>(startTimeVal))
+                                        / static_cast<double>(deltaT));
+        if (nSteps < 1)
+            throw std::runtime_error(
+                "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
+                + startStr + "): there is nothing to run. endTime is an ABSOLUTE time, not a number of "
+                "iterations -- on a restart set it past the time you are restarting from.");
         int iter = 0;
         bool converged = false;
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
-        for (iter = 1; iter <= endTime && !converged; ++iter)
+        for (iter = 1; iter <= nSteps && !converged; ++iter)
         {
             const DeviceSimpleResidual r = solver.step();
             {
@@ -614,23 +586,61 @@ int main(int argc, char** argv)
                     + " Uy=" + std::to_string(r.Uy) + " Uz=" + std::to_string(r.Uz) + "). Likely causes:"
                     + " too-loose relaxation, a high-non-orthogonality mesh, a singular pressure system, or"
                     + " turbulence blow-up. No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+            // Turbulence blow-up that stays FINITE. The check above only catches NaN/Inf, and a diverging
+            // k-omega pair need not get there: measured on pitzDaily with linearUpwind on BOTH scalars,
+            // omega reached 1e42 with k pinned at its 1e-15 floor, U stayed bounded (nut collapses, so the
+            // flow just goes near-laminar), every residual stayed finite, and the run marched to endTime and
+            // WROTE the fields reporting success. That is worse than a crash -- the output looks plausible.
+            //
+            // Trip on growth relative to the first iteration rather than an absolute value, so the bar is
+            // independent of mesh size and of the case's units. 1e12 is a tripwire, not a convergence
+            // criterion: a healthy cold start grows sum|turb| by ~1e2, so this cannot fire on a real solve.
+            if (!std::getenv("BRAE_ALLOW_NONFINITE") && ctl.turbulent)
+            {
+                const scalar tm = solver.turbSumMag();
+                if (iter == 1) turbMag0 = tm;
+                if (!std::isfinite(tm) || (turbMag0 > 0 && tm > 1e12 * turbMag0))
+                    throw std::runtime_error(
+                        "solution diverged: turbulence blow-up at iteration " + std::to_string(iter)
+                        + " (sum|k|+sum|eps/omega| grew from " + std::to_string((double)turbMag0) + " to "
+                        + std::to_string((double)tm) + "). The momentum residuals can stay finite while this"
+                        + " happens, so the run would otherwise write a plausible-looking but wrong field."
+                        + " No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+            }
             // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
             // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon
             // still far from tol -- the substantive bug this fixes. Unlisted fields have target -1 -> ok() ignores
             // them (OF). U stays gated on Ux alone: brae tracks no valid/solved directions, so the out-of-plane
             // component of a 2D/empty or wedge case has a DEGENERATE residual (stuck ~0.1, never reaching tol) that
             // would wrongly block convergence on every 2D case -- gating all U components needs that infra first.
+            rcChecked = 0;
             converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU);
             if (converged)
                 for (const auto& e : turbulenceReport())
                     if (!ok(e.perf.initialResidual, resCtl->scalarOr(e.field, -1))) { converged = false; break; }
+            // OF's `checked` safety: `residualControl { }`, or a dict naming only fields brae does not
+            // check, must NOT report convergence. Without this brae stopped after ONE iteration and wrote
+            // a plausible-looking field set (simpleControl.C:51-57).
+            converged = converged && rcChecked > 0;
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
-            if (!converged && iter != endTime && isWriteTime(iter, tval)) writeTimeDir(timeName(tval));  // intermediate writes
+            if (!converged && iter != nSteps && isWriteTime(iter, tval)) writeTimeDir(timeName(tval));  // intermediate writes
         }
-        const int nIter = converged ? iter - 1 : endTime;
+        const int nIter = converged ? iter - 1 : static_cast<int>(nSteps);
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
 
+        // BRAE_DUMP_PHI: write the conservative face flux, the one quantity that carries between SIMPLE
+        // iterations and is not in any written cell field. Diagnostic only.
+        if (std::getenv("BRAE_DUMP_PHI"))
+        {
+            const std::vector<scalar> phiI = solver.phiInternal();
+            FILE* fp = std::fopen(std::getenv("BRAE_DUMP_PHI"), "w");
+            if (fp)
+            {
+                for (std::size_t i = 0; i < phiI.size(); ++i) std::fprintf(fp, "%.17g\n", phiI[i]);
+                std::fclose(fp);
+            }
+        }
         // BRAE_DUMP_CONTINUITY: localise the per-cell continuity imbalance R[c]=sum_f phi_f and bucket sum|R| by
         // region (wall-adjacent / farfield-adjacent / interior) to find WHERE continuity fails to close.
         if (std::getenv("BRAE_DUMP_CONTINUITY"))

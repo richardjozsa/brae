@@ -9,12 +9,15 @@
 // (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. BOTH the momentum ddt AND the
 // turbulence transport ddt (fvm::ddt(k/eps/omega/nuTilda)) are fully implicit + OF-exact -- the turbulence is transient
 // URANS/DES, not quasi-steady (see device_simple_foam.cu:294). fvSchemes div/laplacian schemes are parsed; phi output +
-// restart, CrankNicolson ddt0 restart and coded (fixedValue/mixed) BCs are wired. NOT yet: MRF, fvOptions,
-// adjustTimeStep + maxCo (adaptive dt), runtime functionObjects (probes/forces/fieldAverage), distributed
+// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs and forceCoeffs (Cd/Cl/Cm, sampled on the write
+// cadence to postProcessing/forceCoeffs/) are wired. NOT yet: MRF, fvOptions,
+// adjustTimeStep + maxCo (adaptive dt), a general functionObject framework (forceCoeffs above is hard-wired, NOT
+// a framework -- probes/fieldAverage/sampling/surfaces are still absent and are silently ignored), distributed
 // (multi-GPU) transient. The first three are REFUSED at start-up rather than silently skipped (see main).
 // Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae; `brae` hands
 // over to it whenever a case's controlDict says `application pimpleFoam` (solvers/common/solver_dispatch.cuh).
 #include "primitive_mesh.cuh"
+#include "../common/read_surface_field.cuh"   // readSurfaceField / readPhiIfPresent (OF READ_IF_PRESENT)
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -22,10 +25,12 @@
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
 #include "mrf_read.cuh"             // readMRFProperties: only to REFUSE an MRF case (not applied transient yet)
+#include "linear_solver_setup.cuh"   // readLinearSolverControls: shared with gpuSimpleFoam/gpuRhoSimpleFoam
 #include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
 #include "fvc.cuh"
+#include "forces.cuh"               // wallForces + forceCoeffs (shared with gpuSimpleFoam)
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"       // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuSimpleFoam)
 #include <cctype>
@@ -87,43 +92,7 @@ DdtScheme parseDdtScheme(const std::string& fvSchemesPath, scalar& ocCoeff)
     throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|CrankNicolson|steadyState).");
 }
 
-// Read a surfaceScalarField (phi) written by writeSurfaceField (or by OpenFOAM) back into a SurfaceScalarField shaped
-// exactly like fvc::flux: internal = the nInternalFaces flux list; boundary indexed [patch] with boundary[pi] sized
-// patches[pi].size. readField<scalar> parses the file transparently (it does not check the FoamFile class nor the list
-// length against nCells -- that check lives only in buildField, which we bypass). Values come from `calculated` patches;
-// zeros stand in for empty/cyclic/cyclicAMI/no-value patches (the ctor recomputes cyclic/AMI flux from U + skips them,
-// and an empty face flux is 0). Used only for a seamless restart (resume the exact written flux state).
-SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
-{
-    const FieldData<scalar> fd = readField<scalar>(path);
-    SurfaceScalarField ssf;
-    if (fd.internalUniform)
-        ssf.internal.assign(static_cast<std::size_t>(nInternalFaces), fd.internalUniformValue);
-    else if (static_cast<label>(fd.internalField.size()) != nInternalFaces)
-        throw std::runtime_error("readSurfaceField: " + path + " internalField has "
-            + std::to_string(fd.internalField.size()) + " faces, but the mesh has " + std::to_string(nInternalFaces)
-            + " internal faces (wrong mesh / decomposed phi).");
-    else
-        ssf.internal = fd.internalField;
 
-    ssf.boundary.resize(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-    {
-        std::vector<scalar> vals(static_cast<std::size_t>(patches[pi].size), scalar(0));
-        for (const auto& b : fd.boundary)   // pass-1 exact-name match (written phi lists exact mesh-patch names)
-        {
-            if (b.name != patches[pi].name) continue;
-            if (b.hasValue && patches[pi].type != "cyclic" && patches[pi].type != "cyclicAMI")
-            {
-                if (b.valueUniform) std::fill(vals.begin(), vals.end(), b.uniformValue);
-                else if (b.values.size() == vals.size()) vals = b.values;   // else keep zeros (defensive)
-            }
-            break;
-        }
-        ssf.boundary[pi] = std::move(vals);
-    }
-    return ssf;
-}
 
 // CodedBCSpec + parseCodedBCs + setupCodedBCs now live in coded_bc_setup.cuh (shared with gpuSimpleFoam).
 
@@ -198,22 +167,17 @@ try
     const int nOuter   = pimple ? std::max(1, pimple->intOr("nOuterCorrectors", 1)) : 1;
     const int nCorr    = pimple ? std::max(1, pimple->intOr("nCorrectors", 1)) : 1;
     const int nNonOrth = pimple ? pimple->intOr("nNonOrthogonalCorrectors", 0) : 0;
-    const FoamDict* rf   = fvSolution.subDict("relaxationFactors");
-    const FoamDict* rfEq = rf ? rf->subDict("equations") : nullptr;
-    const FoamDict* rfFl = rf ? rf->subDict("fields") : nullptr;
-    const scalar relaxU  = rfEq ? rfEq->scalarOr("U", 1.0) : 1.0;   // transient default: no relaxation
-    const scalar relaxP  = rfFl ? rfFl->scalarOr("p", 1.0) : 1.0;
-    const scalar relaxK  = rfEq ? rfEq->scalarOr("k", 1.0) : 1.0;
-    const FoamDict* solvers = fvSolution.subDict("solvers");
-    auto solveTol = [&](const char* f, scalar dflt) {
-        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-        return s ? s->scalarOr("tolerance", dflt) : dflt;
-    };
     const scalar nu = transport.scalarOr("nu", 1e-5);
 
     DeviceSimpleControls ctl;
-    ctl.nu = nu; ctl.relaxU = relaxU; ctl.relaxP = relaxP; ctl.relaxK = relaxK; ctl.relaxEps = relaxK;
-    ctl.tolU = solveTol("U", 1e-7); ctl.tolP = solveTol("p", 1e-7); ctl.tolKE = solveTol("k", 1e-8);
+    ctl.nu = nu;
+    // relaxationFactors come from readRelaxationFactors BELOW (with the turbulence model known). Read here
+    // it took epsilon/omega's factor from "k" -- `omega 0.4` was ignored -- skipped the legacy flat form,
+    // and had no alpha<=0 guard, where OF's fvMatrix::relax skips relaxation for alpha <= 0.
+    // tolerances / relTol / smoothSolver selection come from readLinearSolverControls BELOW, once the
+    // turbulence model is known (it picks k+omega vs k+epsilon vs nuTilda). Reading them here read only
+    // "k" -- a case with a tighter omega tolerance got the loose one -- and never read relTol or
+    // smoothSolver at all, so every transient solve was absolute-tolerance BiCGStab whatever fvSolution said.
     ctl.nNonOrth = nNonOrth;
     ctl.caseDir = caseDir;                                          // AMG-hierarchy cache lives in <caseDir>/constant/polyMesh
     ctl.writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;     // BRAE_MESH_CACHE=1 -> build the AMG hierarchy ONCE, cache it, reload next run
@@ -235,6 +199,13 @@ try
         readTurbulenceModel(turbProps, ctl);
         secondName = ctl.sst ? "omega" : "epsilon";
     }
+
+    // fvSolution -> ctl, through the SHARED reader. Must come AFTER the turbulence model is read: it
+    // branches on ctl.turbulent/sa/sst to pick which scalar solver dicts to look at. "PIMPLE" is the
+    // algorithm dict -- OF's solutionControl reads consistent/nNonOrthogonalCorrectors from the dict
+    // named by algorithmName_, "PIMPLE" here (pimpleControl.H:135), not "SIMPLE".
+    readLinearSolverControls(fvSolution, secondName, ctl, "PIMPLE");
+    readRelaxationFactors(fvSolution, ctl);
 
     // ---- mesh + start fields ----
     PrimitiveMesh m; m.read(caseDir + "/constant/polyMesh");
@@ -281,6 +252,10 @@ try
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+    // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face masks so it
+    // refreshes them each iteration instead of freezing the set-up value.
+    solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
+                              tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
     solver.setDdtScheme(ddtScheme, ddtOcCoeff);
     // CrankNicolson RESTART: if the previous run wrote the ddt0 fields (present in the restart time dir), reload them and
     // prime the time state so the FIRST resumed step is full CN using the exact stored old ddt -> seamless (like OF's
@@ -332,21 +307,21 @@ try
         if (std::filesystem::exists(fieldDir + "/include"))
             std::filesystem::copy(fieldDir + "/include", outDir + "/include",
                 std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec);
-        writeVolField(fieldDir + "/U", outDir + "/U", solver.U(), fvp, precision);
-        writeVolField(fieldDir + "/p", outDir + "/p", solver.p(), fvp, precision);
+        writeVolField(fieldDir + "/U", outDir + "/U", solver.U(), fvp, precision, solver.UBoundary());
+        writeVolField(fieldDir + "/p", outDir + "/p", solver.p(), fvp, precision, solver.pBoundary());
         // phi is the restart-critical conservative flux -> write it LOSSLESS (>=17 = double max_digits10) so its
         // write->read round-trip is bit-identical (16 sig figs loses the last bit) and a restart resumes the EXACT flux
         // with no continuity transient. The viz fields (U/p/turbulence) keep the user's writePrecision.
         writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp, std::max(precision, 17));
         if (ctl.les) {   // pure LES Smagorinsky: only the algebraic sub-grid nut (no k/epsilon/omega/nuTilda field)
-            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
+            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision, solver.nutBoundary());
         } else if (ctl.sa) {
-            writeVolField(fieldDir + "/nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision);
-            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision);
+            writeVolField(fieldDir + "/nuTilda", outDir + "/nuTilda", solver.k(),   fvp, precision, solver.nuTildaBoundary());
+            writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision, solver.nutBoundary());
         } else if (ctl.turbulent) {
-            writeVolField(fieldDir + "/k",          outDir + "/k",          solver.k(),   fvp, precision);
-            writeVolField(fieldDir + "/" + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision);
-            writeVolField(fieldDir + "/nut",        outDir + "/nut",        solver.nut(), fvp, precision);
+            writeVolField(fieldDir + "/k",          outDir + "/k",          solver.k(),   fvp, precision, solver.kBoundary());
+            writeVolField(fieldDir + "/" + secondName, outDir + "/" + secondName, solver.eps(), fvp, precision, solver.epsBoundary());
+            writeVolField(fieldDir + "/nut",        outDir + "/nut",        solver.nut(), fvp, precision, solver.nutBoundary());
             if (ctl.lm) {
                 writeVolField(fieldDir + "/ReThetat", outDir + "/ReThetat", solver.ReThetat(), fvp, precision);
                 writeVolField(fieldDir + "/gammaInt", outDir + "/gammaInt", solver.gammaInt(), fvp, precision);
@@ -379,6 +354,77 @@ try
         }
     };
 
+    // ---- forceCoeffs (Cd/Cl/Cm) sampling -------------------------------------------------------------------
+    // The steady solver evaluates forces ONCE at convergence (gpuSimpleFoam.cu). A DES has no converged state:
+    // the wake sheds, so Cd(t) oscillates and only its TIME AVERAGE is meaningful. So sample it through the run
+    // and stream to postProcessing/forceCoeffs/<startTime>/coefficient.dat, matching OF's layout closely enough
+    // that the same plotting scripts work.
+    //
+    // COST: wallForces runs fvc::gaussGrad over the whole mesh ON THE HOST and calls nearWallDist internally,
+    // both mesh-wide and single-threaded. On 6M cells that is seconds per call, so sampling EVERY timestep would
+    // dwarf the solve (16 000 calls). It is therefore sampled on the WRITE cadence by default -- 160 samples over
+    // this run, ~7 per shedding cycle, enough for a stable mean if not a spectrum. BRAE_FORCE_INTERVAL overrides
+    // it (in timesteps) when a finer Cd(t) trace is worth the cost.
+    std::vector<std::string> forceWalls;
+    for (const auto& q : fvp)
+        if (q.type == "wall") forceWalls.push_back(q.name);
+    const FoamDict* fcFuncs = controlDict.subDict("functions");
+    const FoamDict* fcDict = nullptr;
+    if (fcFuncs)
+        for (const auto& s : fcFuncs->subs)
+            if (s.second.wordOr("type", "") == "forceCoeffs") { fcDict = &s.second; break; }
+    const long forceInterval = std::getenv("BRAE_FORCE_INTERVAL")
+                             ? std::atol(std::getenv("BRAE_FORCE_INTERVAL")) : 0;   // 0 -> follow the write cadence
+    std::ofstream fcOut;
+    if (fcDict && ctl.turbulent && !forceWalls.empty()) {
+        const std::string fdir = caseDir + "/postProcessing/forceCoeffs/" + timeName(startTime);
+        std::error_code fec; std::filesystem::create_directories(fdir, fec);
+        fcOut.open(fdir + "/coefficient.dat");
+        fcOut << "# Time\tCd\tCl\tCm\tFx\tFy\tFz\n";
+        fcOut.setf(std::ios::scientific); fcOut.precision(8);
+        std::printf("  forceCoeffs: sampling Cd/Cl/Cm -> postProcessing/forceCoeffs/%s/coefficient.dat%s\n",
+                    timeName(startTime).c_str(),
+                    forceInterval > 0 ? (" every " + std::to_string(forceInterval) + " steps").c_str() : " on the write cadence");
+    } else if (fcDict) {
+        // Do not let a forceCoeffs block look like it is running when it is not.
+        std::printf("  forceCoeffs: present in controlDict but NOT sampled (%s)\n",
+                    !ctl.turbulent ? "laminar case" : "no wall patches");
+    }
+
+    // Evaluate forces from the CURRENT device state and append one row. Mirrors the steady solver's block
+    // (gpuSimpleFoam.cu): pull U/p back, re-evaluate wall BCs, then wallForces on the requested patches.
+    auto sampleForces = [&](scalar tval) {
+        if (!fcOut.is_open()) return;
+        const std::vector<vector> Ug = solver.U();
+        const std::vector<scalar> pg = solver.p();
+        for (label c = 0; c < nC; ++c) U.internal[c] = Ug[c];
+        p.internal = pg;
+        U.evaluateBoundary();
+        p.evaluateBoundary();
+        const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
+        const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
+        const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
+        const bool velNutWall = ctl.sa || ctl.nutWall != NutWall::Nutk;
+        const std::vector<scalar> saNutWall = velNutWall ? solver.nutWall() : std::vector<scalar>();
+        const std::vector<scalar>* nwb = velNutWall ? &saNutWall : nullptr;
+        auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
+        const std::vector<std::string> fcP = fcDict->wordListOr("patches", forceWalls);
+        const scalar rhoInf  = fcDict->scalarOr("rhoInf", 1.0), magUInf = fcDict->scalarOr("magUInf", 1.0);
+        const scalar Aref    = fcDict->scalarOr("Aref", 1.0),   lRef    = fcDict->scalarOr("lRef", 1.0);
+        const vector liftDir = toV(fcDict->scalarListOr("liftDir", {}), vector{0,1,0});
+        const vector dragDir = toV(fcDict->scalarListOr("dragDir", {}), vector{1,0,0});
+        const vector pitchAx = toV(fcDict->scalarListOr("pitchAxis", {}), vector{0,0,1});
+        const vector CofR    = toV(fcDict->scalarListOr("CofR", {}), vector{0,0,0});
+        const ForceResult F  = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, fcP, rhoInf, 0.0, CofR,
+                                          wCmu, wKappa, wE, nwb);
+        const ForceCoeffs cc = forceCoeffs(F, dragDir, liftDir, pitchAx, rhoInf, magUInf, Aref, lRef);
+        const vector T = F.total();
+        fcOut << tval << '\t' << cc.Cd << '\t' << cc.Cl << '\t' << cc.Cm << '\t'
+              << T.x << '\t' << T.y << '\t' << T.z << '\n';
+        fcOut.flush();                       // a long DES should not lose its Cd trace if the run is killed
+        std::printf("  forceCoeffs: Cd=%.6e  Cl=%.6e  Cm=%.6e\n", cc.Cd, cc.Cl, cc.Cm);
+    };
+
     // ---- transient time loop ----
     const scalar tEnd = endTime + 0.5 * deltaT;
     long timeIndex = 0;
@@ -393,11 +439,14 @@ try
         if (!std::getenv("BRAE_ALLOW_NONFINITE")
             && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
-        if (isWriteTime(timeIndex, t)) { writeTimeDir(tn); lastWritten = tn; }
+        const bool isWrite = isWriteTime(timeIndex, t);
+        if (isWrite) { writeTimeDir(tn); lastWritten = tn; }
+        // Sample Cd on the write cadence, or on BRAE_FORCE_INTERVAL when set (see the cost note above).
+        if (forceInterval > 0 ? (timeIndex % forceInterval == 0) : isWrite) sampleForces(t);
     }
     {
         const std::string tn = timeName(startTime + deltaT * (scalar)timeIndex);
-        if (tn != lastWritten) writeTimeDir(tn);
+        if (tn != lastWritten) { writeTimeDir(tn); sampleForces(startTime + deltaT * (scalar)timeIndex); }
     }
     return 0;
 }

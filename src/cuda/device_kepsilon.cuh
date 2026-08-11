@@ -121,15 +121,18 @@ inline DeviceWallData buildDeviceWallData(
 void deviceWallEpsG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& Ux,
                      const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                      DeviceBuffer<scalar>& eps0, DeviceBuffer<scalar>& G0, const KEpsilonCoeffs& co = {}, int nutWall = 0,
-                     scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
+                     scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
+                     const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
 
 // add the eps / k reaction (Sp/Su) + SuSp(divU) terms to a matrix's diag/source (in place).
 void deviceEpsReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,
                        const DeviceBuffer<scalar>& gByNu, const DeviceBuffer<scalar>& divU,
-                       DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source, const KEpsilonCoeffs& co = {});
+                       DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source, const KEpsilonCoeffs& co = {},
+                       const DeviceBuffer<scalar>* rho = nullptr);   // compressible: alpha*rho on every RHS term
 void deviceKReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps,
                      const DeviceBuffer<scalar>& G, const DeviceBuffer<scalar>& divU,
-                     DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
+                     DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source,
+                     const DeviceBuffer<scalar>* rho = nullptr);   // compressible: alpha*rho on every RHS term
 // realizableKE (OF RAS/realizableKE): variable Cmu (rCmu) + strain magnitude magS from the gradU tensor; nut =
 // rCmu*k^2/eps; eps reaction = strain production C1*magS*eps - destruction C2*eps^2/(k+sqrt(nu*eps)). Cell-local
 // (no halo), so the distributed kEps correct reuses them on its already-halo-consistent gradU tensor.
@@ -168,7 +171,12 @@ void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, c
 // true wall eddy viscosity for the momentum boundary nuEff (vs the cell-value approximation).
 void deviceBoundaryNut(const DeviceBoundary& db, const DeviceBuffer<label>& isWall, const DeviceBuffer<scalar>& y,
                        const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& nut, scalar nu, DeviceBuffer<scalar>& nutBnd,
-                       const KEpsilonCoeffs& co = {}, scalar atmZ0 = 0.0, bool atmBoundNut = true);   // z0>0 -> atmNutkWallFunction
+                       const KEpsilonCoeffs& co = {}, scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction
+                       const DeviceBuffer<scalar>* nuFace = nullptr,   // compressible: per-face nu = mu_b/rho_b
+                       // kEpsilon: on a 'calculated' nut patch OF carries Cmu*k_b^2/eps_b, not the cell value.
+                       const DeviceBuffer<label>*  calcMask = nullptr,
+                       const DeviceBuffer<scalar>* kBnd = nullptr,
+                       const DeviceBuffer<scalar>* epsBnd = nullptr);
 
 // The full device kEpsilon::correct(): production -> wall functions/override -> eps eqn (with the wall
 // setValues constraint) -> k eqn -> correctNut. Updates k/eps/nut in place. Mirrors the CPU correct().
@@ -180,13 +188,29 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                            DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut,
                            const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
                            scalar nu, scalar relaxEps, scalar relaxK, scalar tol, bool bounded = false,
+                           bool boundedEps = false,   // div(phi,epsilon) `bounded` (bounded = div(phi,k)'s)
                            bool limitedK = false, bool limitedEps = false, scalar twoBykK = 2.0, scalar twoBykEps = 2.0,
                            const KEpsilonCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
                            bool linearUpwindK = false, bool linearUpwindEps = false, bool nonOrth = false,
                            bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                            int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
                            scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough wall)
-                           const ScalarDdt& kDdt = {}, const ScalarDdt& eDdt = {});   // transient fvm::ddt(k)/ddt(eps)
+                           const ScalarDdt& kDdt = {}, const ScalarDdt& eDdt = {},
+                            const DeviceBuffer<scalar>* rho = nullptr,          // compressible: alpha*rho weighting
+                            const DeviceBuffer<scalar>* muLam = nullptr,        // compressible: laminar dynamic mu
+                            const DeviceBuffer<scalar>* rhoBnd = nullptr,       // compressible: rho at boundary faces
+                            const DeviceBuffer<scalar>* nuWallFace = nullptr,  // compressible: nu = mu_b/rho_b per wall face
+                            const DeviceBuffer<scalar>* nutBnd = nullptr,      // nut at boundary faces -> patch diffusivity
+                            const DeviceBuffer<scalar>* muBnd = nullptr,       // compressible: mu at boundary faces
+                            // OF `grad(k)`/`grad(epsilon)` cellLimited coefficient (0 = unlimited); see the
+                            // kOmegaSST declaration below for why this is distinct from gradULimitK.
+                            scalar gradScalarLimitK = 0.0,
+                            // fvOptions scalarFixedValueConstraint on k / epsilon (OF eqn.setValues).
+                            // Applied BEFORE the eps wall function, per kEpsilon.C:266-267.
+                            const DeviceBuffer<label>*  fvoKMask = nullptr,
+                            const DeviceBuffer<scalar>* fvoKVal  = nullptr,
+                            const DeviceBuffer<label>*  fvoEMask = nullptr,
+                            const DeviceBuffer<scalar>* fvoEVal  = nullptr);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -198,6 +222,7 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& omega, DeviceBuffer<scalar>& nut,
                             const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
                             scalar nu, scalar relaxOmega, scalar relaxK, scalar tol, bool bounded = false,
+                            bool boundedEps = false,   // div(phi,omega) `bounded` (bounded = div(phi,k)'s)
                             bool limitedK = false, bool limitedOmega = false, scalar twoBykK = 2.0, scalar twoBykOmega = 2.0,
                             const KOmegaSSTCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
                             bool linearUpwindK = false, bool linearUpwindOmega = false, bool nonOrth = false, scalar gradULimitK = 0.0,
@@ -208,8 +233,30 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const ScalarDdt& kDdt = {}, const ScalarDdt& sDdt = {},   // transient fvm::ddt(k)/ddt(omega)
                             bool des = false,   // kOmegaSSTDDES: DES limiter on the k destruction
                             bool iddes = false,   // kOmegaSSTIDDES: the improved (WMLES) length scale (needs hmax+hwn)
-                            const DeviceBuffer<scalar>* hmax = nullptr,   // per-cell maxDeltaxyz (IDDES delta); null -> DDES cubeRootVol
-                            const DeviceBuffer<scalar>* hwn = nullptr);   // per-cell wall-normal spacing (IDDES delta 3rd term)
+                            const DeviceBuffer<scalar>* hmax = nullptr,   // per-cell maxDeltaxyz (IDDES delta,
+                                                                          // null -> DDES cubeRootVol
+                            const DeviceBuffer<scalar>* hwn = nullptr,   // per-cell wall-normal spacing (IDDES delta 3rd term)
+                            const DeviceBuffer<scalar>* rho = nullptr,   // compressible: rho-weight reactions + diffusivity
+                            const DeviceBuffer<scalar>* muLam = nullptr,   // compressible: laminar DYNAMIC viscosity mu [Pa s]
+                            const DeviceBuffer<scalar>* nuWallFace = nullptr,   // compressible: nu = mu_b/rho_b per WALL face
+                            const DeviceBuffer<scalar>* rhoBnd = nullptr,   // compressible: rho at boundary faces (volumetric flux for divU)
+                            const DeviceBuffer<scalar>* nutBnd = nullptr,   // nut at boundary faces -> patch diffusivity
+                            const DeviceBuffer<scalar>* muBnd = nullptr,   // compressible: mu at boundary faces
+                            // OF `grad(k)`/`grad(omega)` cellLimited coefficient (0 = unlimited). Distinct from
+                            // gradULimitK above, which limits grad(U) for the production term; this one limits the
+                            // TRANSPORTED scalar's own gradient, which feeds its limitedLinear weight, its
+                            // linearUpwind correction and the non-orth laplacian correction.
+                            scalar gradScalarLimitK = 0.0,
+                            // fvOptions scalarFixedValueConstraint on k / epsilon (OF eqn.setValues).
+                            // Applied BEFORE the eps wall function, per kEpsilon.C:266-267.
+                            const DeviceBuffer<label>*  fvoKMask = nullptr,
+                            const DeviceBuffer<scalar>* fvoKVal  = nullptr,
+                            const DeviceBuffer<label>*  fvoEMask = nullptr,
+                            const DeviceBuffer<scalar>* fvoEVal  = nullptr);
+
+// nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
+void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
+                        DeviceBuffer<scalar>& nuWall);
 
 // kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition) extra step: after the SST k/omega solve, transport ReThetat
 // and gammaInt and update gammaIntEff (fed back into the SST k equation next iteration). See PORTING_KOMEGASSTLM.md.
@@ -267,17 +314,27 @@ void deviceSAReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda,
 // nutUSpaldingWallFunction boundary nut: wall faces -> Newton uTau from Spalding; other faces -> adjacent cell nut.
 // y / isWall are per boundary face (nearWallDist y, wall mask); nutBnd is in/out (warm-started seed). nu+nutBnd at
 // walls gives the SA wall shear (deep wall-function meshes, y+ >> 1).
+// nutUWallFunction (STEPWISE blender, OF's default): nut from the log-law yPlus fixed-point iteration.
+void deviceBoundaryNutU(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
+                        const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
+                        const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                        const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
+                        DeviceBuffer<scalar>& nutBnd,
+                        const DeviceBuffer<scalar>* nuFace = nullptr);
+
 void deviceBoundaryNutSpalding(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
                                const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
                                const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                const DeviceBuffer<scalar>& nutCell, scalar nu, const SpalartAllmarasCoeffs& co,
-                               DeviceBuffer<scalar>& nutBnd);
+                               DeviceBuffer<scalar>& nutBnd,
+                               const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 // nutUBlendedWallFunction wall nut (velocity-based binomial n=4 blend); kappa/E explicit (any RAS model).
 void deviceBoundaryNutBlended(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
                               const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
                               const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                               const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
-                              DeviceBuffer<scalar>& nutBnd);
+                              DeviceBuffer<scalar>& nutBnd,
+                              const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 } // namespace brae

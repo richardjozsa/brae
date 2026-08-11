@@ -139,7 +139,8 @@ void relaxKernel(
     scalar* __restrict__ relaxedDiag,
     scalar* __restrict__ delta,
     const scalar* __restrict__ cycSumOff,
-    const scalar* __restrict__ iCmaxMag)
+    const scalar* __restrict__ iCmaxMag,
+    const scalar* __restrict__ iCmin)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -154,7 +155,7 @@ void relaxKernel(
     {
         const int p = bndPerm[k];
         magSum += iCmaxMag ? iCmaxMag[p] : fabs(iCbnd[p]);   // OF relax: cmptMax(cmptMag(iC)) over comps (= |iC0| when equal)
-        minSum += iCbnd[p];
+        minSum += iCmin ? iCmin[p] : iCbnd[p];               // OF relax REMOVES cmptMin(iC) -- signed, across comps
     }
     const scalar d0 = rawDiag[c];
     const scalar dr = fmax(fabs(d0 + magSum), sumOff) / alpha - minSum;
@@ -327,13 +328,14 @@ void deviceRelaxDiag(
     DeviceBuffer<scalar>& relaxedDiag,
     DeviceBuffer<scalar>& delta,
     const scalar* cycSumOff,
-    const scalar* iCmaxMag)
+    const scalar* iCmaxMag,
+    const scalar* iCmin)
 {
     relaxedDiag.resize(A.nCells);
     delta.resize(A.nCells);
     relaxKernel<<<nBlocks(A.nCells), TPB>>>(A.nCells, A.ownerStart, A.losort, A.losortStart, A.upper, A.lower,
                                             dm.bndCellStart.data(), dm.bndPerm.data(), iCbnd.data(), A.diag, alpha,
-                                            relaxedDiag.data(), delta.data(), cycSumOff, iCmaxMag);
+                                            relaxedDiag.data(), delta.data(), cycSumOff, iCmaxMag, iCmin);
     cudaCheck(cudaGetLastError(), "relaxDiag");
 }
 namespace {
@@ -359,6 +361,32 @@ void deviceCmptMaxMag3(
     out.resize(n);
     cmptMaxMag3Kernel<<<nBlocks(n), TPB>>>(n, a.data(), b.data(), c.data(), out.data());
     cudaCheck(cudaGetLastError(), "cmptMaxMag3");
+}
+
+
+__global__
+void cmptMin3Kernel(
+    int n,
+    const scalar* __restrict__ a,
+    const scalar* __restrict__ b,
+    const scalar* __restrict__ c,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = fmin(a[i], fmin(b[i], c[i]));
+}
+
+
+void deviceCmptMin3(
+    const DeviceBuffer<scalar>& a,
+    const DeviceBuffer<scalar>& b,
+    const DeviceBuffer<scalar>& c,
+    DeviceBuffer<scalar>& out)
+{
+    const int n = static_cast<int>(a.size());
+    out.resize(n);
+    cmptMin3Kernel<<<nBlocks(n), TPB>>>(n, a.data(), b.data(), c.data(), out.data());
+    cudaCheck(cudaGetLastError(), "cmptMin3");
 }
 
 } // namespace brae

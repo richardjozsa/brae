@@ -84,7 +84,6 @@ add_library(brae_core STATIC
     src/cuda/reductions.cu
     src/cuda/device_spmv.cu
     src/cuda/device_pcg.cu
-    src/cuda/device_pcg_distributed.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
     src/cuda/device_simple.cu
@@ -97,7 +96,10 @@ add_library(brae_core STATIC
     src/cuda/device_spalart.cu
     src/cuda/device_komega_sst.cu
     src/cuda/device_smagorinsky.cu
+    src/cuda/device_generalized_newtonian.cu
     src/cuda/device_coded_bc.cu
+    src/cuda/device_energy.cu
+    src/thermophysicalModels/device_thermo.cu
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
@@ -191,321 +193,11 @@ foreach(_np 1 2 4 8)
 endforeach()
 
 # Multi-GPU Phase 1a: NVSHMEM bootstrap + symmetric heap (host-side) smoke test
-if(BRAE_WITH_NVSHMEM)
-    add_executable(test_nvshmem_smoke tests/test_nvshmem_smoke.cu)
-    target_include_directories(test_nvshmem_smoke PRIVATE ${BRAE_HEADER_DIRS})
-    target_link_libraries(test_nvshmem_smoke PRIVATE brae_core)
-    foreach(_np 1 2 4)
-        add_test(NAME nvshmem_smoke_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_nvshmem_smoke>)
-    endforeach()
-
-    # Phase 1b: device halo exchange (DeviceHalo/NVSHMEM) vs the host interface oracle
-    add_executable(test_gpu_interface_exchange tests/test_gpu_interface_exchange.cu)
-    target_include_directories(test_gpu_interface_exchange PRIVATE ${BRAE_HEADER_DIRS})
-    target_link_libraries(test_gpu_interface_exchange PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_interface_exchange_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_interface_exchange>)
-    endforeach()
-    # NOTE: full CUDA-graph capture of the exchange is deferred to Phase 5. NVSHMEM's on-stream barrier is not
-    # graph-capturable (fatal "operation not permitted when stream is capturing"); an in-graph exchange needs
-    # the device-initiated put+signal path (-rdc). See docs/multi-gpu.md Phase 1b/5.
-
-    # Phase 2: device distributed SpMV (deviceParallelAmul) vs the serial oracle
-    add_executable(test_gpu_parallel_spmv tests/test_gpu_parallel_spmv.cu)
-    target_include_directories(test_gpu_parallel_spmv PRIVATE ${BRAE_HEADER_DIRS})
-    target_link_libraries(test_gpu_parallel_spmv PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_spmv_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_spmv>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 3: device distributed Jacobi-PCG (deviceParallelJacobiPCG) vs the single-GPU device PCG
-    add_executable(test_gpu_parallel_pcg tests/test_gpu_parallel_pcg.cu)
-    target_include_directories(test_gpu_parallel_pcg PRIVATE ${BRAE_HEADER_DIRS})
-    target_link_libraries(test_gpu_parallel_pcg PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_pcg_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_pcg>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 4a foundation: device processor-coupled fvc::gaussGrad on a decomposed mesh vs the serial gradient
-    add_executable(test_gpu_parallel_grad tests/test_gpu_parallel_grad.cu)
-    target_include_directories(test_gpu_parallel_grad PRIVATE ${BRAE_HEADER_DIRS})
-    target_link_libraries(test_gpu_parallel_grad PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_grad_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_grad>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 4a L2: device distributed Jacobi-BiCGStab (non-symmetric) vs the single-GPU device BiCGStab
-    add_executable(test_gpu_parallel_bicgstab tests/test_gpu_parallel_bicgstab.cu)
-    target_include_directories(test_gpu_parallel_bicgstab PRIVATE ${BRAE_HEADER_DIRS})
-    target_link_libraries(test_gpu_parallel_bicgstab PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_bicgstab_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_bicgstab>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Distributed AMI mapDistribute foundation: gather reproduces the global stencil values across ranks
-    add_executable(test_distributed_ami_gather tests/test_distributed_ami_gather.cu)
-    target_include_directories(test_distributed_ami_gather PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_distributed_ami_gather PRIVATE brae_core)
-    foreach(_np 1 2)
-        add_test(NAME distributed_ami_gather_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_distributed_ami_gather>
-                         # committed cyclicAMI fixture (tc_wedge_ami is gitignored -> absent on a fresh CI checkout)
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelAMI)
-    endforeach()
-
-    # Phase 4a L8: device distributed momentum PREDICTOR vs the host predictor
-    add_executable(test_gpu_parallel_predictor tests/test_gpu_parallel_predictor.cu)
-    target_include_directories(test_gpu_parallel_predictor PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_predictor PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_predictor_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_predictor>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 4a L8 driver: the device distributed SIMPLE LOOP (ParallelDeviceSimple, N iterations with a
-    # maintained phi) vs the host distributed loop, + reconstructField back to the global mesh
-    add_executable(test_gpu_parallel_loop tests/test_gpu_parallel_loop.cu)
-    target_include_directories(test_gpu_parallel_loop PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_loop PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_loop_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_loop>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 4b: the distributed kOmegaSST::correct() (2nd RAS model) reproduces np=1
-    add_executable(test_gpu_parallel_komegasst tests/test_gpu_parallel_komegasst.cu)
-    target_include_directories(test_gpu_parallel_komegasst PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_komegasst PRIVATE brae_core)
-    add_test(NAME gpu_parallel_komegasst_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_komegasst>
-                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/sst_ref.txt)
-    set_tests_properties(gpu_parallel_komegasst_ref PROPERTIES FIXTURES_SETUP SSTREF)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_komegasst_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_komegasst>
-                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/sst_ref.txt)
-        set_tests_properties(gpu_parallel_komegasst_np${_np} PROPERTIES FIXTURES_REQUIRED SSTREF)
-    endforeach()
-
-    # Phase 4b: the CLOSED distributed turbulent SIMPLE loop (momentum+pressure with nuEff=nu+nut, then
-    # kEpsilon correct(), maintained across iterations) reproduces np=1.
-    add_executable(test_gpu_parallel_turbloop tests/test_gpu_parallel_turbloop.cu)
-    target_include_directories(test_gpu_parallel_turbloop PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_turbloop PRIVATE brae_core)
-    add_test(NAME gpu_parallel_turbloop_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_turbloop>
-                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_ref.txt)
-    set_tests_properties(gpu_parallel_turbloop_ref PROPERTIES FIXTURES_SETUP TURBLOOP)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_turbloop_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_turbloop>
-                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_ref.txt)
-        set_tests_properties(gpu_parallel_turbloop_np${_np} PROPERTIES FIXTURES_REQUIRED TURBLOOP)
-    endforeach()
-
-    # SST in the closed loop (second field = omega): same gate, sst mode
-    add_test(NAME gpu_parallel_turbloop_sst_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_turbloop>
-                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_sst_ref.txt "" sst)
-    set_tests_properties(gpu_parallel_turbloop_sst_ref PROPERTIES FIXTURES_SETUP TURBLOOPSST)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_turbloop_sst_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_turbloop>
-                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/turbloop_sst_ref.txt "" sst)
-        set_tests_properties(gpu_parallel_turbloop_sst_np${_np} PROPERTIES FIXTURES_REQUIRED TURBLOOPSST)
-    endforeach()
-
-    # Phase 4b: the full distributed kEpsilon::correct() (production + wall functions + eps/k transport + nut)
-    # reproduces np=1. Duct walls are y/z, cut is x -> near-wall cells sit adjacent to the cut.
-    add_executable(test_gpu_parallel_kepsilon tests/test_gpu_parallel_kepsilon.cu)
-    target_include_directories(test_gpu_parallel_kepsilon PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_kepsilon PRIVATE brae_core)
-    add_test(NAME gpu_parallel_kepsilon_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_kepsilon>
-                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/keps_ref.txt)
-    set_tests_properties(gpu_parallel_kepsilon_ref PROPERTIES FIXTURES_SETUP KEPSREF)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_kepsilon_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_kepsilon>
-                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/keps_ref.txt)
-        set_tests_properties(gpu_parallel_kepsilon_np${_np} PROPERTIES FIXTURES_REQUIRED KEPSREF)
-    endforeach()
-
-    # Phase 4b foundation: the distributed scalar transport solve (deviceParallelScalarTransport) -- the
-    # reusable core of the turbulence step (k/eps/omega/nuTilda) -- reproduces np=1 on a flux-carrying cut.
-    add_executable(test_gpu_parallel_scalar tests/test_gpu_parallel_scalar.cu)
-    target_include_directories(test_gpu_parallel_scalar PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_scalar PRIVATE brae_core)
-    add_test(NAME gpu_parallel_scalar_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_scalar>
-                     32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/scalar_ref.txt)
-    set_tests_properties(gpu_parallel_scalar_ref PROPERTIES FIXTURES_SETUP SCALARREF)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_scalar_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_scalar>
-                         32 16 16 ${CMAKE_CURRENT_BINARY_DIR}/scalar_ref.txt)
-        set_tests_properties(gpu_parallel_scalar_np${_np} PROPERTIES FIXTURES_REQUIRED SCALARREF)
-    endforeach()
-
-    # Phase 4a: the linearUpwind/LUST interface correction on a cut that CARRIES FLUX (the cavity's cut is a
-    # symmetry plane -> phi~0 -> those terms are multiplied by zero and any bug in them is invisible).
-    add_executable(test_gpu_parallel_duct tests/test_gpu_parallel_duct.cu)
-    target_include_directories(test_gpu_parallel_duct PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_duct PRIVATE brae_core)
-    # np=1 writes the reference (no cuts), then np=2/4 must reproduce it. Sequential: np>1 needs the file.
-    add_test(NAME gpu_parallel_duct_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
-                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_ref.txt)
-    set_tests_properties(gpu_parallel_duct_ref PROPERTIES FIXTURES_SETUP DUCTREF)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_duct_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
-                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_ref.txt)
-        set_tests_properties(gpu_parallel_duct_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTREF)
-    endforeach()
-
-    # SHEARED duct: the same flux-carrying cut, but on a NON-ORTHOGONAL mesh (shear 0.5 -> 26.57 deg, =
-    # atan(0.5)). Every other brae test mesh is orthogonal, where the cut-face geometry conventions
-    # (dNei = Cf - C_remote) coincide with their normal-projected variants and cannot be told apart. This is
-    # the only gate that exercises the interface terms on a non-orthogonal cut.
-    add_test(NAME gpu_parallel_duct_skew_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
-                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_skew_ref.txt nolust "" 1 0.5)
-    set_tests_properties(gpu_parallel_duct_skew_ref PROPERTIES FIXTURES_SETUP DUCTSKEW)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_duct_skew_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
-                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_skew_ref.txt nolust "" 1 0.5)
-        set_tests_properties(gpu_parallel_duct_skew_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTSKEW)
-    endforeach()
-
-    # NON-ORTHOGONAL correction on the sheared cut: nonOrthDeltaCoeffs implicit + the explicit corrVec.grad
-    # correction (momentum) + the pEqn source AND face-flux correction. Invisible on an orthogonal mesh
-    # (corrVec == 0), so this gate is the only thing standing between it and silent wrongness on real meshes.
-    add_test(NAME gpu_parallel_duct_nonorth_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
-                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_nonorth_ref.txt nolust "" 1 0.5 nonorth)
-    set_tests_properties(gpu_parallel_duct_nonorth_ref PROPERTIES FIXTURES_SETUP DUCTNO)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_duct_nonorth_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
-                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_nonorth_ref.txt nolust "" 1 0.5 nonorth)
-        set_tests_properties(gpu_parallel_duct_nonorth_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTNO)
-    endforeach()
-
-    # LUST (0.75 linear + 0.25 linearUpwind) over the same flux-carrying cut: it exercises BOTH interface
-    # deferred corrections (linearUpwind's gradient term AND the linear term), so it is the stronger gate.
-    add_test(NAME gpu_parallel_duct_lust_ref
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 1 $<TARGET_FILE:test_gpu_parallel_duct>
-                     32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_lust_ref.txt lust)
-    set_tests_properties(gpu_parallel_duct_lust_ref PROPERTIES FIXTURES_SETUP DUCTLUST)
-    foreach(_np 2 4)
-        add_test(NAME gpu_parallel_duct_lust_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_gpu_parallel_duct>
-                         32 16 16 20 ${CMAKE_CURRENT_BINARY_DIR}/duct_lust_ref.txt lust)
-        set_tests_properties(gpu_parallel_duct_lust_np${_np} PROPERTIES FIXTURES_REQUIRED DUCTLUST)
-    endforeach()
-
-    # Phase 4a EXIT GATE: the OOM proof -- a mesh too big for one GPU runs split across two. No ctest entry:
-    # the mesh size is hardware-specific (it must exceed ONE GPU's VRAM), so it is driven by hand.
-    add_executable(test_gpu_parallel_oom tests/test_gpu_parallel_oom.cu)
-    target_include_directories(test_gpu_parallel_oom PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/tests
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_oom PRIVATE brae_core)
-
-    # Phase 4a L8 blocker: a processor face contributes ZERO matrix coeffs on device (bcType 8 = coupled)
-    add_executable(test_gpu_parallel_bc tests/test_gpu_parallel_bc.cu)
-    target_include_directories(test_gpu_parallel_bc PRIVATE ${BRAE_HEADER_DIRS})
-    target_link_libraries(test_gpu_parallel_bc PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_bc_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_bc>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 4a L7: device processor-face pressure flux (pEqn.flux) vs host parallelMatrixFlux + conservation
-    add_executable(test_gpu_parallel_pflux tests/test_gpu_parallel_pflux.cu)
-    target_include_directories(test_gpu_parallel_pflux PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_pflux PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_pflux_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_pflux>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 4a L5: device processor-face flux is conservative + matches host fvc::flux
-    add_executable(test_gpu_parallel_flux tests/test_gpu_parallel_flux.cu)
-    target_include_directories(test_gpu_parallel_flux PRIVATE ${BRAE_HEADER_DIRS})
-    target_link_libraries(test_gpu_parallel_flux PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_flux_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_flux>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 4a L4: device distributed H() vs host parallelMatrixH
-    add_executable(test_gpu_parallel_h tests/test_gpu_parallel_h.cu)
-    target_include_directories(test_gpu_parallel_h PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_h PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_h_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_h>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-
-    # Phase 4a L1: device momentum-matrix assembly (interface coeffs) vs host momentumDistributed
-    add_executable(test_gpu_parallel_momentum tests/test_gpu_parallel_momentum.cu)
-    target_include_directories(test_gpu_parallel_momentum PRIVATE ${BRAE_HEADER_DIRS}
-                               ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/simpleFoam)
-    target_link_libraries(test_gpu_parallel_momentum PRIVATE brae_core)
-    foreach(_np 1 2 4 8)
-        add_test(NAME gpu_parallel_momentum_np${_np}
-                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                         $<TARGET_FILE:test_gpu_parallel_momentum>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
-    endforeach()
-endif()
+# ---------------------------------------------------------------------------------------------------
+# The multi-GPU (distributed) test suite lived here, guarded by if(BRAE_WITH_NVSHMEM). It moved to
+# legacy/tests/ along with the distributed solvers -- multi-GPU is OUT OF SCOPE. See legacy/README.md.
+# Nothing in legacy/ is built or registered; do not re-add it without an explicit decision to resume.
+# ---------------------------------------------------------------------------------------------------
 
 add_executable(test_mesh_topology tests/test_mesh_topology.cu)
 target_include_directories(test_mesh_topology PRIVATE ${BRAE_HEADER_DIRS})
@@ -604,34 +296,13 @@ foreach(_np 1 2 4 8)
                      ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily/constant/polyMesh)
 endforeach()
 
-add_executable(test_parallel_spmv tests/test_parallel_spmv.cu)
-target_include_directories(test_parallel_spmv PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_spmv PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_spmv_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_spmv>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_pcg tests/test_parallel_pcg.cu)
-target_include_directories(test_parallel_pcg PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_pcg PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_pcg_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_pcg>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_pbicgstab tests/test_parallel_pbicgstab.cu)
-target_include_directories(test_parallel_pbicgstab PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_pbicgstab PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_pbicgstab_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_pbicgstab>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
 add_executable(test_local_mesh tests/test_local_mesh.cu)
@@ -674,14 +345,7 @@ foreach(_np 1 2 4 8)
                      ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_poisson tests/test_parallel_poisson.cu)
-target_include_directories(test_parallel_poisson PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_poisson PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_poisson_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_poisson>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
 add_executable(test_fields_bc tests/test_fields_bc.cu)
@@ -833,115 +497,39 @@ foreach(_np 1 2 4 8)
                      ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_grad tests/test_parallel_grad.cu)
-target_include_directories(test_parallel_grad PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_grad PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_grad_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_grad>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_transport tests/test_parallel_transport.cu)
-target_include_directories(test_parallel_transport PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_transport PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_transport_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_transport>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_matrixH tests/test_parallel_matrixH.cu)
-target_include_directories(test_parallel_matrixH PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_matrixH PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_matrixH_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_matrixH>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_momentum tests/test_parallel_momentum.cu)
-target_include_directories(test_parallel_momentum PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_momentum PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_momentum_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_momentum>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_predictor tests/test_parallel_predictor.cu)
-target_include_directories(test_parallel_predictor PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_predictor PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_predictor_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_predictor>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_simplestep tests/test_parallel_simplestep.cu)
-target_include_directories(test_parallel_simplestep PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_simplestep PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_simplestep_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_simplestep>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_loop tests/test_parallel_loop.cu)
-target_include_directories(test_parallel_loop PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_loop PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_loop_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_loop>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_kepsilon tests/test_parallel_kepsilon.cu)
-target_include_directories(test_parallel_kepsilon PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_kepsilon PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_kepsilon_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_kepsilon>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_turbloop tests/test_parallel_turbloop.cu)
-target_include_directories(test_parallel_turbloop PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_turbloop PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_turbloop_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_turbloop>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
-add_executable(test_parallel_divdevreff tests/test_parallel_divdevreff.cu)
-target_include_directories(test_parallel_divdevreff PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_divdevreff PRIVATE brae_core)
 foreach(_np 1 2 4 8)
-    add_test(NAME parallel_divdevreff_np${_np}
-             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
-                     $<TARGET_FILE:test_parallel_divdevreff>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 endforeach()
 
 # Converged-run driver (not a ctest gate): mpirun -np N test_parallel_converged <case> <ofTime> <iters>
-add_executable(test_parallel_converged tests/test_parallel_converged.cu)
-target_include_directories(test_parallel_converged PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(test_parallel_converged PRIVATE brae_core)
 
-# The production solver app: mpirun -np N brae_simpleFoam -case <caseDir>
-add_executable(brae_simpleFoam src/applications/solvers/simpleFoam/simpleFoam.cu)
-target_include_directories(brae_simpleFoam PRIVATE ${BRAE_HEADER_DIRS})
-target_link_libraries(brae_simpleFoam PRIVATE brae_core)
+# brae_simpleFoam (the MPI-parallel HOST solver) moved to legacy/ -- multi-GPU is out of scope.
 
 # The single-GPU device-resident solver app: brae -case <caseDir>
 add_executable(brae src/applications/solvers/simpleFoam/gpuSimpleFoam.cu)
@@ -961,7 +549,7 @@ add_dependencies(brae brae_pimpleFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
-# slow-labelled (~2 min); regenerate the oracle with validation/komegasstlm_wall_vs_openfoam.sh.
+# slow-labelled (~2 min); regenerate the oracle with validation/legacy_cf/komegasstlm_wall_vs_openfoam.sh -- QUARANTINED (D5): it's still on retired cf paths and cannot run as-is.
 add_test(NAME komegasstlm_flatplate
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/validation/lm_ctest.sh
                  $<TARGET_FILE:brae> ${CMAKE_CURRENT_SOURCE_DIR}/validation/lmFlatPlate)
@@ -979,14 +567,6 @@ foreach(_np 1 2)
     else()
         set(_amitol 1e-3)
     endif()
-    add_test(NAME ami_oracle_np${_np}
-             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_oracle.sh
-                     $<TARGET_FILE:brae>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/validation/tc_wedge_ami
-                     ${CMAKE_CURRENT_BINARY_DIR}/ami_oracle_work_np${_np}
-                     ${_np} ${_amitol} ${_amitol}
-                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/compare_ami_fields.py)
-    set_tests_properties(ami_oracle_np${_np} PROPERTIES LABELS slow TIMEOUT 400 SKIP_RETURN_CODE 125)
 endforeach()
 
 # Single-GPU hardening regression lock: assert each fail-loud guard still fires on a mutated case
@@ -1015,6 +595,476 @@ add_executable(test_cyclic_fvc tests/test_cyclic_fvc.cu)
 target_include_directories(test_cyclic_fvc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_fvc PRIVATE brae_core)
 add_test(NAME cyclic_fvc COMMAND test_cyclic_fvc ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+
+# brae_rhoSimpleFoam: steady compressible solver (subsonic, laminar)
+add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu)
+target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
+
+# rhoSimpleFoam phase 4.3: alphat wall conditions load, Jayatilleke refused by name
+add_executable(test_alphat_bc tests/test_alphat_bc.cu)
+target_include_directories(test_alphat_bc PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_alphat_bc PRIVATE brae_core)
+add_test(NAME alphat_bc COMMAND test_alphat_bc ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox)
+
+# rhoSimpleFoam phase 3 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam on a heated duct.
+# Needs an OF install; skipped (77) if absent.
+add_test(NAME rho_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/rho_vs_openfoam.sh)
+set_tests_properties(rho_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam solver-control gate: SIMPLEC + nNonOrthogonalCorrectors + loose relTol, none of which
+# any other compressible case sets. The compressible driver silently dropped 15 fvSolution controls until
+# readLinearSolverControls; this is what makes that visible. Tolerance 2e-4 is brae's SIMPLEC floor
+# (bisected: nNonOrth alone is exact at 2.6e-6), an open item recorded in the script.
+add_test(NAME ctl_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ctl_vs_openfoam.sh)
+set_tests_properties(ctl_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# rhoSimpleFoam kEpsilon gate. Same duct as the kOmegaSST gate, RASModel kEpsilon.
+# Tolerance is 2e-2 rather than the SST's 5e-4 for a MEASURED reason: brae's kEpsilon already differs
+# from OF by k 5.09e-3 / epsilon 8.11e-3 in the INCOMPRESSIBLE solver on this same geometry
+# (brae_simpleFoam vs OF simpleFoam), so that is the floor. This gate certifies the COMPRESSIBLE
+# additions land on that floor, not brae's kEpsilon fidelity -- which is a separate open item.
+# Dropping the rho weighting gives k 5.0e-2 / eps 2.3e-2, well clear of the floor, so it still bites.
+add_test(NAME ke_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ke_vs_openfoam.sh)
+set_tests_properties(ke_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# rhoSimpleFoam BC gate: flowRateInletVelocity. OF sets U_b = avgU*n with
+#   avgU = -flowRate/gSum(rho*magSf)   (flowRateInletVelocityFvPatchVectorField::updateValues)
+# using the OUTWARD normal, so a positive rate is inflow. The gate runs the massFlowRate form, whose sum
+# is rho-weighted and therefore recomputed every outer iteration -- the volumetric form (validation/
+# rhoFRvol) is the easy half, since its sum is pure area and never changes.
+#
+# It also pins the bug that took the longest to find: buildDeviceVectorBoundary mapped bcCategory 9 to
+# device bcType 9, an UNKNOWN type, because only the scalar buildDeviceBoundary had been taught about it.
+# U is a vector field, so the inlet ran with an undefined BC and the profile bowed at the wall corners
+# (row 0 5.041 vs OF 5.163) while mid-channel looked right. Reverting that one line gives T 7.7e-4.
+add_test(NAME fr_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/fr_vs_openfoam.sh)
+set_tests_properties(fr_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam BC gate: a totalPressure inlet on a COMPRESSIBLE case. OF's totalPressure branches on
+# the dimensions of p -- kinematic gives p0 - 0.5*neg(phi)|U|^2, absolute gives p0 - 0.5*RHO*neg(phi)|U|^2.
+# brae implemented only the kinematic form, so every compressible totalPressure inlet was missing the
+# density on its dynamic head. No other gate uses totalPressure, so none of them could see it.
+add_test(NAME tp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tp_vs_openfoam.sh)
+set_tests_properties(tp_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam scheme gate: div(phi,h|e) and div(phi,K|Ekp) limitedLinear rather than upwind.
+# brae used to HARDCODE upwind for the energy equation and ignore fvSchemes entirely -- a silent
+# first-order downgrade. Every other compressible gate specifies upwind, so none of them can see it.
+# Covers BOTH halves: the implicit div(phi,he) and the explicit div(phi,K|Ekp), which are separate code
+# paths and were separately wrong.
+add_test(NAME lu_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/lu_vs_openfoam.sh)
+set_tests_properties(lu_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam transport gate: the same heated duct with transport sutherland instead of const.
+# The two models compute the laminar thermal diffusivity DIFFERENTLY (const: mu/Pr; sutherland: the
+# Eucken kappa/Cp, with no Pr in the dict at all), and sutherland makes mu vary strongly with T -- which
+# is what exposes whether the energy laplacian uses the PATCH diffusivity or the adjacent cell's. With
+# transport const those are numerically identical, so the const gates cannot see either error.
+add_test(NAME suth_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/suth_vs_openfoam.sh)
+set_tests_properties(suth_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam energy-form gate: the same heated duct with energy sensibleInternalEnergy (OF "e").
+# Every stock OF rhoSimpleFoam tutorial uses e rather than sensibleEnthalpy, and the two forms must give
+# the SAME temperature field -- OF's own h and e runs agree to 3e-11. They only do so if Cv, the gamma on
+# alphaEff and the p/rho in Ekp are all right, so this gate pins three things the h gate cannot see.
+add_test(NAME rhoE_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoE_vs_openfoam.sh)
+set_tests_properties(rhoE_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# E1 (dict_audit finding): OF controlDict write cadence on the compressible driver. Found by the audit --
+# gpuRhoSimpleFoam read NONE of writeControl/writeInterval/purgeWrite/deltaT and wrote one time directory.
+add_test(NAME wc_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/wc_vs_openfoam.sh)
+set_tests_properties(wc_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# E5b (dict_audit, found only once the audit ran on REFUSED cases): OF RAS { turbulence off; } freezes the
+# model -- k/epsilon|omega/nut keep their initial values and momentum uses that frozen nut.
+add_test(NAME turbswitch_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/turbswitch_vs_openfoam.sh)
+set_tests_properties(turbswitch_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# mixedEnergy: a  (Robin) T wall -- the third of OF's three energy BC families, and the only one
+# that exercises OF's (1-vf) weight on refGrad.
+add_test(NAME mx_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/mx_vs_openfoam.sh)
+set_tests_properties(mx_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# heRhoThermo vs hePsiThermo rho TIMING at the end of pEqn.H. Compared at iteration 1, because the effect
+# IS a one-iteration lag and a low-Mach case cannot distinguish the two.
+add_test(NAME rhotiming_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhotiming_vs_openfoam.sh)
+set_tests_properties(rhotiming_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# B5: heat-flux wall (fixedGradient T). The compressible gates above all use fixedValue T walls, which
+# exercise only the fixedEnergy half of basicThermo::heBoundaryTypes(); a fixedGradient T was read and then
+# silently discretised as zeroGradient, i.e. an adiabatic wall that converged to a plausible wrong answer.
+# Also the only gate that asserts OpenFOAM can PARSE what brae writes.
+add_test(NAME hf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/hf_vs_openfoam.sh)
+set_tests_properties(hf_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# rhoSimpleFoam phase 4 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam, kOmegaSST heated duct.
+# Compares seven fields (T p U k omega nut rho) -- the compressible turbulence coupling is the kind that
+# converges cleanly while being wrong, so residuals prove nothing here. Skipped (77) without an OF install.
+# squareBend (transonic + consistent, Mach ~0.96) to CONVERGENCE vs OF. This is the evidence that
+# lifted the `transonic yes` refusal: it is the only gate with an ASYMMETRIC pressure matrix (implicit
+# fvm::div(phid,p) -> BiCGStab) and the only one on heRhoThermo's stored-rho timing at high Mach.
+add_test(NAME transonic_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/transonic_vs_openfoam.sh)
+set_tests_properties(transonic_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     LABELS slow
+                     TIMEOUT 1800)
+
+# aerofoilNACA0012 to CONVERGENCE vs OF. Slow (~700 outer iterations on both sides) and labelled so.
+# It is the only gate that can catch a defect living in the pressure equation's net mass balance rather
+# than in a field norm: the pinned-pressure bug reached endTime with every iteration-2 stage agreeing to
+# 1e-3. See the header of the script, and cudafoam/solver-porting-dissection.md for how it was found.
+add_test(NAME naca_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/naca_vs_openfoam.sh)
+set_tests_properties(naca_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     LABELS slow
+                     TIMEOUT 3600)
+
+add_test(NAME sst_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/sst_vs_openfoam.sh)
+set_tests_properties(sst_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# linearUpwind on the turbulence scalars -- every other gate uses upwind there, so this is the only
+# one that can see which convection scheme k/omega actually run.
+add_test(NAME luturb_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/luturb_vs_openfoam.sh)
+set_tests_properties(luturb_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1200)
+
+# SpalartAllmaras had NO ctest coverage; this is the first SA gate (airFoil2D, external aero + wall function).
+add_test(NAME sa_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/sa_vs_openfoam.sh)
+set_tests_properties(sa_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1200)
+
+# inletOutlet on TEMPERATURE -- the only gate that exercises the energy boundary's inletOutlet mask.
+add_test(NAME io_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/io_vs_openfoam.sh)
+set_tests_properties(io_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# Turbulent inlet BCs on a flowRateInletVelocity inlet -- the only gate where the set-up value and the
+# converged value differ, so the per-iteration refresh is actually exercised.
+add_test(NAME ti_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ti_vs_openfoam.sh)
+set_tests_properties(ti_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# linearUpwind on the kinetic-energy term + grad(K)'s own boundary values (sensibleInternalEnergy).
+add_test(NAME ke2_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ke2_vs_openfoam.sh)
+set_tests_properties(ke2_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# Regex-keyed boundaryField entries (alphatWallFunction Prt) -- OF patch/group/regex resolution.
+add_test(NAME rx_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/rx_vs_openfoam.sh)
+set_tests_properties(rx_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# pressureControl pMaxFactor/pMinFactor reference: only patches that FIX a value (OF pressureControl.C:75).
+add_test(NAME pm_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/pm_vs_openfoam.sh)
+set_tests_properties(pm_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 600)
+
+# endTime is an ABSOLUTE time (OF Time::run), not a run length, and a restarted run must reproduce a
+# continuous one. Both steady drivers read endTime as a length, which is only correct from startTime 0 --
+# so every fresh-start gate was blind to it. Uses rhoBox: the identity needs a QUIET state, and
+# angledDuct's cold start is chaotic under the pressureControl ceiling.
+add_test(NAME roundtrip_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/roundtrip_vs_openfoam.sh)
+set_tests_properties(roundtrip_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# flowRateInletVelocity must be fed the SOLVER's rho (the relaxed one OF registers), not thermo.rho().
+# Needs a case with BOTH a relaxed rho and a flow-rate inlet; angledDuct is the only one, which is why
+# this defect survived every other gate and left the case unable to converge at all.
+add_test(NAME flowrate_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/flowrate_vs_openfoam.sh)
+set_tests_properties(flowrate_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# RESTART fidelity: OF's createFields.H reads phi and rho with IOobject::READ_IF_PRESENT, so a restart
+# resumes the STORED fields. Every other compressible gate starts from 0/, where neither file exists and
+# both codes take the fallback -- which is how brae shipped without either read. This gate restarts both
+# codes from the same OF-written time directory, and carries its own negative control (the same brae run
+# with phi/rho deleted, which must FAIL the tolerance).
+add_test(NAME restart_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/restart_vs_openfoam.sh)
+set_tests_properties(restart_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 900)
+
+# rhoSimpleFoam phase 2: mass flux reduces exactly to the volumetric flux at constant density
+add_executable(test_rho_flux tests/test_rho_flux.cu)
+target_include_directories(test_rho_flux PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_flux PRIVATE brae_core)
+add_test(NAME rho_flux COMMAND test_rho_flux)
+
+# rhoSimpleFoam phase 1 gate: sensible-enthalpy equation on a frozen velocity field
+add_executable(test_energy_frozen tests/test_energy_frozen.cu)
+target_include_directories(test_energy_frozen PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_energy_frozen PRIVATE brae_core)
+add_test(NAME energy_frozen COMMAND test_energy_frozen)
+# Gate 1 proper: same case, brae vs OpenFOAM scalarTransportFoam. Needs an OF install; skipped if absent.
+add_test(NAME energy_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/energy_vs_openfoam.sh)
+set_tests_properties(energy_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77)
+
+# INTEGRATION: the real deviceThermoCorrect() liquid path end to end -- inversion wired to property
+# evaluation. Catches the wiring errors the standalone tests structurally cannot: wrong energy
+# semantics, wrong p, properties evaluated before T is updated, solver rho written instead of rhoThermo.
+add_executable(test_liquid_correct tests/test_liquid_correct.cu)
+target_include_directories(test_liquid_correct PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_liquid_correct PRIVATE brae_core)
+add_test(NAME liquid_correct COMMAND test_liquid_correct)
+
+# e -> T inversion (sensibleInternalEnergy), the form squareBendLiq transports. Same generic Newton,
+# different F and dF/dT. 13 temperatures x 4 PRESSURES, because Es = Hs - p/rho and a single pressure
+# cannot distinguish e(T) from e(p,T). Oracle is OF's thermophysicalPropertiesSelector<liquidProperties>.
+add_executable(test_etot tests/test_etot.cu)
+target_include_directories(test_etot PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_etot PRIVATE brae_core)
+add_test(NAME etot COMMAND test_etot)
+
+# Standalone h -> T Newton inversion for the liquid path. Targets are OF-generated enthalpies and the
+# initial guesses are REVERSED (280 K target started from 400 K), so the test exercises inversion rather
+# than a good guess. Accepts on the ENTHALPY residual, not |dT| -- a wrong derivative changes the path,
+# not the fixed point, so |dT| alone would pass it.
+add_executable(test_hetot tests/test_hetot.cu)
+target_include_directories(test_hetot PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_hetot PRIVATE brae_core)
+add_test(NAME hetot COMMAND test_hetot)
+
+# Liquid thermo FIELD POPULATION: given a NONUNIFORM T field (280-400 K, one temperature per cell),
+# does brae fill Cp/mu/kappa/rhoThermo per cell and per boundary face with OF's values? A uniform field
+# cannot tell "evaluated per cell" from "broadcast", which is why the test refuses to use one.
+add_executable(test_liquid_fields tests/test_liquid_fields.cu)
+target_include_directories(test_liquid_fields PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_liquid_fields PRIVATE brae_core)
+add_test(NAME liquid_fields COMMAND test_liquid_fields)
+
+add_executable(test_liquid_fixed_bc tests/test_liquid_fixed_bc.cu)
+target_include_directories(test_liquid_fixed_bc PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_liquid_fixed_bc PRIVATE brae_core)
+add_test(NAME liquid_fixed_bc COMMAND test_liquid_fixed_bc)
+
+add_executable(test_generalized_newtonian tests/test_generalized_newtonian.cu)
+target_include_directories(test_generalized_newtonian PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_generalized_newtonian PRIVATE brae_core)
+add_test(NAME generalized_newtonian COMMAND test_generalized_newtonian)
+
+# NSRDS correlation forms + H2O coefficients (squareBendLiq's `properties liquid` path) against a table
+# generated by OpenFOAM ITSELF (dissect/liqref), so the test covers form and coefficients together.
+# Also asserts dh/dT == Cp(T) -- the consistency a Newton he->T inversion cannot check for itself.
+add_executable(test_nsrds tests/test_nsrds.cu)
+target_include_directories(test_nsrds PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_nsrds PRIVATE brae_core)
+add_test(NAME nsrds COMMAND test_nsrds)
+
+# rhoSimpleFoam phase 0 gate: thermophysical subsystem (perfectGas + hConst + Sutherland/const)
+add_executable(test_thermo_perfect_gas tests/test_thermo_perfect_gas.cu)
+target_include_directories(test_thermo_perfect_gas PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_thermo_perfect_gas PRIVATE brae_core)
+add_test(NAME thermo_perfect_gas COMMAND test_thermo_perfect_gas)
+
+# heRhoThermo/perfectGas must parse identically to hePsiThermo, and heRhoThermo with any OTHER
+# equationOfState must be refused. Asserted at the PARSE level because brae is not run-to-run
+# bit-reproducible (~3e-9 on T after one iteration), so a solver-level equivalence check would need a
+# statistical argument; the claim itself is deterministic.
+add_executable(test_thermo_type_equiv tests/test_thermo_type_equiv.cu)
+target_include_directories(test_thermo_type_equiv PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_thermo_type_equiv PRIVATE brae_core)
+add_test(NAME thermo_type_equiv COMMAND test_thermo_type_equiv)
+
+add_executable(test_linear_solver_setup tests/test_linear_solver_setup.cu)
+target_include_directories(test_linear_solver_setup PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_linear_solver_setup PRIVATE brae_core)
+add_test(NAME linear_solver_setup COMMAND test_linear_solver_setup)
+
+# D2: boundary coefficients (internalCoeffs/boundaryCoeffs) vs OF across four REAL BC types at once.
+add_test(NAME bc_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/bc_vs_openfoam.sh)
+set_tests_properties(bc_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS bcoeff_compare
+                     TIMEOUT 600)
+
+# D5: every validation/*_vs_openfoam.sh must be registered, runnable and asserting. 27 were none of those.
+add_executable(test_gate_registration tests/test_gate_registration.cu)
+target_include_directories(test_gate_registration PRIVATE ${BRAE_HEADER_DIRS})
+add_test(NAME gate_registration COMMAND test_gate_registration ${CMAKE_CURRENT_SOURCE_DIR})
+
+# E6: the universal gas constant must be RESOLVED like OF (DimensionedConstants NA*k), not compiled in.
+add_executable(test_sensible_energy tests/test_sensible_energy.cu)
+target_include_directories(test_sensible_energy PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_sensible_energy PRIVATE brae_core)
+add_test(NAME sensible_energy COMMAND test_sensible_energy)
+
+add_executable(test_foam_constants tests/test_foam_constants.cu)
+target_include_directories(test_foam_constants PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_foam_constants PRIVATE brae_core)
+add_test(NAME foam_constants COMMAND test_foam_constants)
+
+# E2/E3 (dict_audit): brae must SAY when it substitutes its own linear solver / preconditioner.
+add_executable(test_solver_notices tests/test_solver_notices.cu)
+target_include_directories(test_solver_notices PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_solver_notices PRIVATE brae_core)
+add_test(NAME solver_notices COMMAND test_solver_notices)
+
+# Group C: fvSchemes entries must resolve within their own sub-dictionary (C1-C4).
+add_executable(test_scheme_blocks tests/test_scheme_blocks.cu)
+target_include_directories(test_scheme_blocks PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_scheme_blocks PRIVATE brae_core)
+add_test(NAME scheme_blocks COMMAND test_scheme_blocks)
+
+add_executable(test_residual_control tests/test_residual_control.cu)
+target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_residual_control PRIVATE brae_core)
+add_test(NAME residual_control COMMAND test_residual_control)
+
+add_executable(test_overset_refused tests/test_overset_refused.cu)
+target_include_directories(test_overset_refused PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_overset_refused PRIVATE brae_core)
+add_executable(test_uniform_function1 tests/test_uniform_function1.cu)
+target_include_directories(test_uniform_function1 PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_uniform_function1 PRIVATE brae_core)
+add_test(NAME uniform_function1 COMMAND test_uniform_function1)
+
+add_test(NAME overset_refused
+         COMMAND test_overset_refused ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+
+# diag_compare: DIAGNOSTIC, not a test. Assembles the same scalar equation as the OpenFOAM utility
+# in tools/dumpScalarMatrix and compares the matrix cell by cell. Needs OF's Ddiag/Dsource in the case,
+# so it is built but never registered with ctest.
+# D2: boundary coefficients (internalCoeffs/boundaryCoeffs) vs OF for REAL BC types. D1 compared only the
+# diagonal and source, and only with fixedValue/zeroGradient.
+# Phase 0 stage harness: compare one SIMPLE stage brae-vs-OF in dependency order.
+add_executable(stage_compare tests/stage_compare.cu)
+target_include_directories(stage_compare PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(stage_compare PRIVATE brae_core)
+
+add_executable(bcoeff_compare tests/bcoeff_compare.cu)
+target_include_directories(bcoeff_compare PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(bcoeff_compare PRIVATE brae_core)
+
+add_executable(diag_compare tests/diag_compare.cu)
+target_include_directories(diag_compare PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(diag_compare PRIVATE brae_core)
+
+add_executable(test_linear_upwind_const tests/test_linear_upwind_const.cu)
+target_include_directories(test_linear_upwind_const PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_linear_upwind_const PRIVATE brae_core)
+add_test(NAME linear_upwind_const
+         COMMAND test_linear_upwind_const ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
 # Cyclic increment C3b: cyclic coupling inside an iterative solver (periodic Poisson)
 add_executable(test_cyclic_poisson tests/test_cyclic_poisson.cu)
@@ -1454,7 +1504,7 @@ endif()
 # with INSTALL_RPATH, which is empty by default -- so the first `cmake --install` produced binaries that could
 # not find libnvshmem_host.so.3 and failed for every user, not only under sudo. USE_LINK_PATH carries the
 # directories of the libraries actually linked (NVSHMEM, OpenMPI) into the installed binary.
-foreach(exe IN ITEMS brae brae-agent brae_simpleFoam brae_pimpleFoam)
+foreach(exe IN ITEMS brae brae-agent brae_pimpleFoam)
     if(TARGET ${exe})
         set_target_properties(${exe} PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
         install(TARGETS ${exe} RUNTIME DESTINATION bin)

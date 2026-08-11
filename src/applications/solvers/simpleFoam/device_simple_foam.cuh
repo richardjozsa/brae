@@ -20,14 +20,20 @@
 #include "device_mesh.cuh"
 #include "device_ldu.cuh"
 #include "device_blas.cuh"
+#include "thermo_model.cuh"   // hConstHeToT: boundary he -> boundary T for the written field
 #include "device_pcg.cuh"
 #include "device_simple.cuh"
 #include "device_boundary.cuh"
+#include "thermo_types.cuh"
+#include "device_thermo.cuh"
+#include "device_energy.cuh"
+#include "rho_simple_controls.cuh"
 #include "device_cyclic.cuh"
 #include "device_ami.cuh"
 #include "device_interface.cuh"   // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_kepsilon.cuh"
 #include "device_komega_sst.cuh"   // deviceS2/deviceF2/deviceNutSST for the startup validate() correctNut
+#include "device_generalized_newtonian.cuh"   // laminar generalizedNewtonian/powerLaw viscosity
 #include "device_smagorinsky.cuh"  // deviceSmagorinskyNut for the pure-LES (algebraic sub-grid nut) path
 #include "device_coded_bc.cuh"     // NVRTC device-resident coded (runtime-compiled) boundary conditions
 #include "cell_wall_dist.cuh"
@@ -72,6 +78,23 @@ public:
     // motorBike AND pitzDaily, i.e. fully laminar; harmless on attached flows but the seed of divergence on high-Re
     // skewed meshes. kMin_/epsilonMin_/omegaMin_ default to SMALL (= 1e-15), matching the floors used in correct().
     void validateTurbulence();
+    // E7: re-run OF's validate() ONCE the thermo exists, which is where OF does it.
+    //
+    // OF constructs the thermo, THEN the turbulence model, THEN calls validate() -> correctNut(). brae
+    // constructs the solver (validate included) before the compressible driver has seeded the thermo, so
+    // its startup correctNut saw a boundary velocity built from a PLACEHOLDER density: a
+    // flowRateInletVelocity patch falls back to `rhoInlet` until a real rho exists, and on rhoTI that is
+    // 1.0 against a true 1.161, giving an inlet U of 58.85 m/s instead of 50.69 against a uniform internal
+    // 50. The resulting du/dx = 354 makes sqrt(S2) = 500.6 and trips the SST Bradshaw limiter, so
+    // nut/(k/omega) came out 0.2477 where OF has 1 -- predicted to six decimals by that arithmetic before
+    // any code changed. Invisible with `turbulence on` (the next iteration overwrites the seed), and the
+    // answer with `turbulence off`.
+    //
+    // rhoBndSeed, when given, is the BOUNDARY half of a `rho` field read off disk. OF's createFields.H
+    // builds rho with IOobject::READ_IF_PRESENT, so a restart resumes the STORED density rather than
+    // recomputing thermo.rho(); the stored one carries rho.relax()'s history and is NOT reproducible
+    // from p and T. Pass nullptr (or a wrong-sized vector) for OF's fresh-start fallback, thermo.rho().
+    void revalidateAfterThermo(const std::vector<scalar>* rhoBndSeed = nullptr);
     // PIMPLE-foundation composable phase: turbulence transport (k/eps/omega/nuTilda -> nut). Uses only members,
     // so SIMPLE's step() and a future PIMPLE outer loop both call it (once per outer corrector) unchanged.
     void correctTurbulence();
@@ -112,6 +135,34 @@ public:
     // pressure-velocity correction; turbulence }, then continuity errors. Returns the outer-loop residual signal.
     DeviceSimpleResidual pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors);
 
+    // Steady COMPRESSIBLE step (rhoSimpleFoam). Composes the same three phases as simpleStep/pimpleStep
+    // with the energy equation and the thermo update inserted, in OF's rhoSimpleFoam.C order:
+    //
+    //     UEqn -> EEqn -> pEqn -> thermo.correct() -> rho.relax() -> turbulence
+    //
+    // EEqn sits between momentum and pressure because the pressure equation needs the density the NEW
+    // temperature implies, not the previous one. Requires setCompressible() first.
+    DeviceSimpleResidual rhoSimpleStep();
+
+    // The compressible state, so the driver can seed T/he before the loop and read T back after it.
+    // The solver owns the buffers (they are sized against its mesh); the driver owns what goes in them.
+    DeviceThermo& thermo() { return th_; }
+    const DeviceThermo& thermo() const { return th_; }
+
+    // Switch the solver into compressible mode. dbHe is the enthalpy boundary (built from the case's 0/T
+    // via deviceEnergyBoundaryFromT); th is allocated and seeded by the caller so the driver owns field
+    // construction, exactly as it already owns U/p.
+    // Per-boundary-face Prt from 0/alphat: alphatWallFunction patches carry their own (OF default 0.85),
+    // every other face uses the turbulence model's (OF default 1.0). Optional -- absent, the model's is used.
+    void setAlphatPrt(const std::vector<scalar>& prtFace);
+    // Energy linear solver from fvSolution solvers.(h|e). Was hardcoded tol=1e-10, relTol=0, BiCGStab.
+    void setEnergySolver(scalar tol, scalar relTol, bool useGS)
+    { eTol_ = tol; eRelTol_ = relTol; eUseGS_ = useGS; }
+    void setCompressible(
+        const ThermoCoeffs& tc,
+        const RhoSimpleControls& rc,
+        DeviceBoundary dbHe);
+
     // Enable an MRF rotating zone: builds the device frame data + makes the resident flux RELATIVE (so the
     // momentum/pressure are solved in the rotating frame). Call once after construction, before stepping.
     void setMRF(
@@ -147,6 +198,29 @@ public:
         return u;
     }
     std::vector<scalar> p()   const { return dp_.host(); }
+    // Device-side p, for the compressible thermo update (which must not round-trip through the host).
+    const DeviceBuffer<scalar>& pDevice() const { return dp_; }
+    // Turbulence magnitude for the divergence tripwire: sum|k| + sum|second scalar|, as a DEVICE reduction
+    // (no D2H of the fields). Used only to detect blow-up, never as a convergence measure.
+    scalar turbSumMag() const
+    {
+        scalar s = 0;
+        if (dk_.size()) s += deviceSumMag(dk_);
+        if (de_.size()) s += deviceSumMag(de_);
+        return s;
+    }
+    // Per-face turbulent-inlet data, so the boundary values can be refreshed per iteration (OF parity).
+    void setTurbulentInlets(const std::vector<label>& tiMask, const std::vector<scalar>& tiIntensity,
+                            const std::vector<label>& mlMask, const std::vector<scalar>& mlLength)
+    {
+        bool any = false;
+        for (label m : tiMask) if (m) { any = true; break; }
+        if (!any) for (label m : mlMask) if (m) { any = true; break; }
+        if (!any) return;
+        tiMask_.copyFrom(tiMask); tiIntensity_.copyFrom(tiIntensity);
+        mlMask_.copyFrom(mlMask); mlLength_.copyFrom(mlLength);
+        hasTurbInlet_ = true;
+    }
     std::vector<scalar> k()   const { return dk_.host(); }
     std::vector<scalar> eps() const { return de_.host(); }
     std::vector<scalar> ReThetat() const { return ReThetat_.host(); }   // kOmegaSSTLM
@@ -157,7 +231,112 @@ public:
     std::vector<scalar> cellY() const { return y_.size() ? y_.host() : std::vector<scalar>(); }   // cell wall distance (SST/SA)
     // diagnostics: the conservative face flux (internal then boundary) for continuity-error localisation.
     std::vector<scalar> phiInternal() const { return phiInt_.host(); }
+    // The SOLVED boundary values, so the written boundaryField reports what the solve used rather than
+    // echoing the input file. nut is the one that matters most: on a wall its value comes from the wall
+    // function, and post-processing (yPlus, wall shear, force split) reads it straight back.
+    std::vector<scalar> nutBoundary() const
+    {
+        return nutBndAll_.size() ? nutBndAll_.host() : std::vector<scalar>();
+    }
+    // Generic: evaluate any cell field on its own boundary descriptor.
+    std::vector<scalar> boundaryOf(const DeviceBoundary& db, const DeviceBuffer<scalar>& f) const
+    {
+        if (!db.n || !f.size()) return {};
+        DeviceBuffer<scalar> b;
+        deviceBCValue(db, f, b);
+        return b.host();
+    }
+    // T on the boundary. he is the solved variable, so the boundary T is T(he_b) -- evaluating he's own
+    // BC (which now resolves inletOutlet per iteration) and converting, rather than echoing 0/T.
+    // T at boundary faces, for the field WRITER and the initialisation dumps.
+    //
+    // This inverts he_b for the same reason the solver's own boundary path does, and it must use the same
+    // thermodynamics -- it did not. On the liquid path it ran the perfect-gas closed form over a liquid
+    // he_b of ~-1.56e7 J/kg and wrote nonsense into every `T` boundaryField brae produced, including the
+    // init_Tb dump that step 6's "boundary matches OF" check was read from. The solve was unaffected
+    // (nothing reads this back), which is precisely why it survived: a wrong number on an output path
+    // that no assertion covered.
+    // grad(U) on the CURRENT U, for comparing brae's gradient operator against OF's `postProcess -func
+    // grad(U)` on byte-identical input. Called at set-up (before any equation is solved) so both sides
+    // see the same field -- a diff taken inside turbulence.correct() compares a post-momentum-predictor
+    // U against OF's untouched initial one and measures the solve, not the operator.
+    std::vector<scalar> gradUField()
+    {
+        DeviceBuffer<scalar> g;
+        deviceGradU(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], g,
+                    hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+        return g.host();
+    }
+    std::vector<scalar> TBoundary() const
+    {
+        if (!compressible_ || !dbHe_.n || !th_.he.size()) return {};
+        // Prefer the boundary temperature the thermo already established this correct(). Re-deriving it
+        // here would be a SECOND inversion with its own answer: on a fixedValue patch the solver holds
+        // the prescribed value exactly, while an independent Newton lands a residual away from it, so
+        // brae would write 349.999999999999 for a wall OF writes as 350. Two code paths for one quantity
+        // is the same defect as the four boundary property kernels, just smaller.
+        if (TBnd_.size() == static_cast<std::size_t>(dbHe_.n)) return TBnd_.host();
+        DeviceBuffer<scalar> heB;
+        deviceBCValue(dbHe_, th_.he, heB);
+        const std::vector<scalar> h = heB.host();
+        std::vector<scalar> t(h.size());
+        if (tc_.model == ThermoModel::liquidH2O)
+        {
+            // e = h(T) - p/rho(T) needs p at the same faces; Hs does not, and passes 0.
+            std::vector<scalar> pb;
+            if (tc_.internalEnergy && dbP_.n == dbHe_.n)
+            {
+                DeviceBuffer<scalar> pB;
+                deviceBCValue(dbP_, dp_, pB);
+                pb = pB.host();
+            }
+            const EnergyForm form = tc_.internalEnergy ? EnergyForm::sensibleInternalEnergy
+                                                       : EnergyForm::sensibleEnthalpy;
+            for (std::size_t i = 0; i < h.size(); ++i)
+                t[i] = h2oEnergyToT(form, h[i], i < pb.size() ? pb[i] : scalar(0), 300.0).T;
+        }
+        else
+        {
+            for (std::size_t i = 0; i < h.size(); ++i) t[i] = hConstHeToT(h[i], tc_);
+        }
+        // fixesValue LAST, and on BOTH paths. A prescribed temperature is an input, so it is copied
+        // rather than recovered -- an inversion would land a Newton residual away from it and write
+        // 349.999999999999 for a wall OF writes as 350. Applied here and not only in the branch above
+        // because this fallback runs before the first correct() has filled TBnd_, which is exactly when
+        // the initialisation dump is taken.
+        if (TFixMask_.size() == h.size() && TFixBnd_.size() == h.size())
+        {
+            const std::vector<label>  msk = TFixMask_.host();
+            const std::vector<scalar> fix = TFixBnd_.host();
+            for (std::size_t i = 0; i < h.size(); ++i) if (msk[i]) t[i] = fix[i];
+        }
+        return t;
+    }
+    // U on the boundary: each component evaluated against its own descriptor, then recombined. Needed
+    // because a vector BC can be per-component (slip/symmetry set vf = |n_k| per component), so there is
+    // no single scalar evaluation that covers it.
+    std::vector<vector> UBoundary() const
+    {
+        if (!dbU_.comp[0].n) return {};
+        DeviceBuffer<scalar> b0, b1, b2;
+        deviceBCValue(dbU_.comp[0], Uk_[0], b0);
+        deviceBCValue(dbU_.comp[1], Uk_[1], b1);
+        deviceBCValue(dbU_.comp[2], Uk_[2], b2);
+        const std::vector<scalar> h0 = b0.host(), h1 = b1.host(), h2 = b2.host();
+        std::vector<vector> v(h0.size());
+        for (std::size_t i = 0; i < h0.size(); ++i) v[i] = vector{h0[i], h1[i], h2[i]};
+        return v;
+    }
+    // nuTilda shares the k slot on the SA path.
+    std::vector<scalar> nuTildaBoundary() const { return boundaryOf(dbK_, dk_); }
+    std::vector<scalar> kBoundary()   const { return boundaryOf(dbK_,   dk_); }
+    std::vector<scalar> epsBoundary() const { return boundaryOf(dbEps_, de_); }
+    std::vector<scalar> pBoundary()   const { return boundaryOf(dbP_,   dp_); }
     std::vector<scalar> phiBoundary() const { return phiBnd_.host(); }
+    // rho on the boundary -- the EOS result the solve actually used, already maintained per face by the
+    // pressure equation (phiHbyA is rho-weighted with it). Not derivable from the T/p descriptors here,
+    // which is why it needs its own accessor rather than boundaryOf().
+    std::vector<scalar> rhoBoundary() const { return compressible_ ? rhoBnd_.host() : std::vector<scalar>{}; }
 
     // CrankNicolson ddt0 (stored old ddt) persistence -- get/set for seamless restart (the driver writes+reads these).
     bool isCrankNicolson() const { return ddtScheme_ == DdtScheme::CrankNicolson; }
@@ -219,6 +398,22 @@ private:
     bool   limUActive_ = false;
     scalar limUMax_ = 0;
     DeviceBuffer<label> limUCells_;   // limitVelocity clamp
+    // limitTemperature. Held as HE limits, not T limits: OF converts once with the case thermo and clamps
+    // the energy variable the equation actually solved (limitTemperature::correct(he)).
+    bool   limTActive_ = false;
+    bool   limTAllCells_ = false;     // selectionMode all -> the he BOUNDARY is clamped too
+    scalar limTMin_ = 0, limTMax_ = 0;
+    DeviceBuffer<label> limTCells_;
+    // fixedTemperatureConstraint: OF constrains the ENERGY matrix (eqn.setValues), so this is carried as a
+    // per-cell mask + per-cell he value and handed to the same setValues path the eps wall function uses.
+    bool                fixTActive_ = false;
+    DeviceWallData      fixTMask_;    // only isWallCell is used by the setValues kernels
+    DeviceBuffer<scalar> fixTHe_;
+    // scalarFixedValueConstraint on k / epsilon|omega. Per-cell mask + per-cell value, handed to the same
+    // setValues path; OF applies it before the eps wall function (kEpsilon.C:266 then :267).
+    bool                 fixScaK_ = false, fixScaE_ = false;
+    DeviceBuffer<label>  fixScaMask_;
+    DeviceBuffer<scalar> fixScaKVal_, fixScaEVal_;
     bool   vdcActive_ = false;
     scalar vdcUMax_ = 0, vdcC_ = 1;
     DeviceBuffer<label> vdcCells_;   // velocityDampingConstraint
@@ -259,9 +454,80 @@ private:
     DeviceBuffer<scalar> ReThetat_, gammaInt_, gammaIntEff_;                   // kOmegaSSTLM transition fields
     DeviceBuffer<scalar> dnutBndWall_;                                          // persistent Spalding wall-nut (SA warm seed)
     DeviceBuffer<scalar> nuConst_, zeroSrc_, zeroBndU_, ones_;
+
+    // Compressible state (rhoSimpleFoam). compressible_ stays false for every incompressible case, so
+    // none of this is reachable from the existing solvers and the steady/PIMPLE paths are untouched.
+    bool compressible_ = false;
+    ThermoCoeffs tc_{};
+    RhoSimpleControls rc_{};
+    DeviceThermo th_{};
+    DeviceBoundary dbHe_{};
     DeviceBuffer<scalar> pD_, pU_, pL_, diagCp_, bp_;            // persistent pressure matrix (graph-stable addresses)
     DeviceBuffer<label>  bndIsWall_, adjustMask_;              // wall mask (true boundary nut); adjustPhi adjustable mask
+    // kEpsilon: 1 on boundary faces whose 0/nut BC is 'calculated'. OF fills those by field assignment
+    // (Cmu*k_b^2/eps_b) rather than extrapolating the cell, and the two differ by >12x at a fixed-k inlet.
+    DeviceBuffer<label>  nutCalcMask_;
+    bool hasNutCalc_ = false;
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces
+    // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
+    // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed
+    // muEff_b = mu_b + rho_b*nut_b and the kinematic nu_b = mu_b/rho_b the wall functions ask for.
+    // SIMPLEC: (rAtU - rAU) for the HbyA correction, rho*(rAtU - rAU) for the FLUX correction on the
+    // compressible path (OF pcEqn.H). Identical buffers when incompressible.
+    DeviceBuffer<scalar> drAtUFlux_;
+    scalar eTol_ = 1e-10, eRelTol_ = 0.0;
+    bool   eUseGS_ = false;
+    DeviceBuffer<scalar> rhoBnd_, muBnd_, nuWallBnd_;
+    // T at boundary faces, refreshed from he_b immediately before the boundary properties that consume
+    // it -- OF heRhoThermo::calculate establishes T_b once per patch and then evaluates rho/mu/alphah
+    // from it, rather than re-inverting he_b inside each one.
+    DeviceBuffer<scalar> TBnd_;
+    // OF's fvPatchField::fixesValue(), captured from the T boundary at set-up: 1 where T is PRESCRIBED,
+    // with the prescribed value alongside. Those faces keep T_b exact and have he_b re-derived from the
+    // live p_b every correct(), instead of inverting an he_b frozen at the initial pressure.
+    DeviceBuffer<label>  TFixMask_;
+    DeviceBuffer<scalar> TFixBnd_;
+public:
+    // Both vectors are in DeviceBoundary face order and must be dbHe_.n long, or they are ignored.
+    void setFixedBoundaryT(const std::vector<label>& mask, const std::vector<scalar>& value)
+    {
+        if (mask.size() != value.size()) return;
+        TFixMask_.copyFrom(mask);
+        TFixBnd_.copyFrom(value);
+    }
+private:
+    // The BOUNDARY half of the solver's own `rho` field -- the one OF relaxes. rhoBnd_ above is
+    // thermo.rho() at the boundary, recomputed fresh from p_b and T_b every time it is asked for, which
+    // is right for everything that reads thermo.rho() (nu(patchi), alphaEff(patchi), the turbulence
+    // model). It is WRONG for `phiHbyA = fvc::interpolate(rho)*fvc::flux(HbyA)`, which reads the solver's
+    // rho field, and that field is assigned once per outer iteration and then relaxed.
+    DeviceBuffer<scalar> rhoBndP_, rhoBndPPrev_;
+    // BRAE_PTRACE: which SIMPLE iteration the pressure stage trace is on. Advanced once per call to
+    // correctPressureVelocity, read by the pre-limit dump, so P0..P6 of one iteration share an index.
+    int pTraceIt_ = 0;
+    // pEqn.relax() source (D - D0)*p. Absolute, so it is added to bp_ AFTER deviceFoldPressure (which
+    // multiplies divPhi by the cell volume); a member so the fold site can see it.
+    DeviceBuffer<scalar> pRelaxSrc_;
+    // flowRateInletVelocity, massFlowRate form: OF recomputes avgU = -mdot/gSum(rho*magSf) every call, so
+    // it moves with the solution. frMagSf_ is magSf masked to the flowRate patches (0 elsewhere), making
+    // the patch sum a single dot product against the live boundary rho; frN_ holds the outward normals.
+    struct FlowRatePatch { scalar mdot; };
+    std::vector<FlowRatePatch> frPatches_;
+    std::vector<DeviceBuffer<scalar>> frMagSf_;
+    DeviceBuffer<scalar> frNx_, frNy_, frNz_;
+    // turbulentIntensityKineticEnergyInlet / turbulentMixingLength*Inlet: per-face masks + coefficients so
+    // the inlet k and epsilon|omega can be REBUILT each outer iteration, as OF's updateCoeffs does. Frozen
+    // set-up values are exact only when the inlet U never moves; flowRateInletVelocity moves it.
+    DeviceBuffer<label>  tiMask_;      // 1 where k has a turbulentIntensityKineticEnergyInlet face
+    DeviceBuffer<scalar> tiIntensity_;
+    DeviceBuffer<label>  mlMask_;      // 1 = epsilon, 2 = omega
+    DeviceBuffer<scalar> mlLength_;
+    bool hasTurbInlet_ = false;
+    bool hasFlowRate_ = false;
+    DeviceBuffer<label>  wfBndIdx_;   // wall-face -> boundary-face index (built once)
+    DeviceBuffer<scalar> wfNu_;       // nu = mu_b/rho_b gathered onto wall faces, for omegaWallFunction/G0
+    DeviceBuffer<scalar> nutBndAll_;  // nut at boundary faces (wall-function value on walls), for alphat_b
+    DeviceBuffer<scalar> prtBnd_;     // per-face Prt: the alphatWallFunction's on its patches, the model's elsewhere
     bool   hasMixed_ = false;                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)

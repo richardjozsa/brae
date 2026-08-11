@@ -10,6 +10,7 @@
 #include "fv_patch_field.cuh"
 #include "foam_field_reader.cuh"
 #include "fv_patch.cuh"
+#include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include <cmath>
 #include <memory>
 #include <vector>
@@ -25,13 +26,7 @@ inline void applyTurbulentInletK(
 {
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        const PatchFieldData<scalar>* b = nullptr;
-        for (const auto& bd : kFD.boundary)
-            if (bd.name == fvp[pi].name)
-            {
-                b = &bd;
-                break;
-            }
+        const PatchFieldData<scalar>* b = findPatchEntry(kFD.boundary, fvp[pi]);
         if (!b || b->type != "turbulentIntensityKineticEnergyInlet") continue;
         const std::vector<vector>& Uin = U.boundary[pi]->value();
         std::vector<scalar> kin(fvp[pi].size);
@@ -53,13 +48,7 @@ inline void applyTurbulentInletSecond(
     const scalar Cmu75 = std::pow(Cmu, 0.75), Cmu25 = std::pow(Cmu, 0.25);
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        const PatchFieldData<scalar>* b = nullptr;
-        for (const auto& bd : sFD.boundary)
-            if (bd.name == fvp[pi].name)
-            {
-                b = &bd;
-                break;
-            }
+        const PatchFieldData<scalar>* b = findPatchEntry(sFD.boundary, fvp[pi]);
         if (!b) continue;
         const bool eps = (b->type == "turbulentMixingLengthDissipationRateInlet");
         const bool om  = (b->type == "turbulentMixingLengthFrequencyInlet");
@@ -72,6 +61,51 @@ inline void applyTurbulentInletSecond(
         second.boundary[pi] = std::make_unique<InletOutletPatchField<scalar>>(fvp[pi], false, scalar{0}, sin);
     }
     second.evaluateBoundary();
+}
+
+
+// Per-face masks + coefficients for the PER-ITERATION refresh (device side). The applyTurbulentInlet*
+// functions above compute the set-up value; these describe WHICH faces must be recomputed every outer
+// iteration and with what coefficient, because OF re-evaluates them in updateCoeffs. Flattened in the
+// same patch order as DeviceBoundary (cyclic/cyclicAMI excluded), so the indices line up with refValue.
+struct TurbulentInletMasks
+{
+    std::vector<label>  tiMask;        // 1 = turbulentIntensityKineticEnergyInlet (on k)
+    std::vector<scalar> tiIntensity;
+    std::vector<label>  mlMask;        // 1 = mixingLength epsilon, 2 = mixingLength omega
+    std::vector<scalar> mlLength;
+    bool any() const
+    {
+        for (label m : tiMask) if (m) return true;
+        for (label m : mlMask) if (m) return true;
+        return false;
+    }
+};
+
+inline TurbulentInletMasks buildTurbulentInletMasks(
+    const FieldData<scalar>& kFD,
+    const FieldData<scalar>& sFD,
+    const std::vector<FvPatch>& fvp)
+{
+    TurbulentInletMasks m;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;   // DeviceBoundary skips these
+        const PatchFieldData<scalar>* kb = findPatchEntry(kFD.boundary, fvp[pi]);
+        const PatchFieldData<scalar>* sb = findPatchEntry(sFD.boundary, fvp[pi]);
+        const bool ti = kb && kb->type == "turbulentIntensityKineticEnergyInlet";
+        const int  ml = (sb && sb->type == "turbulentMixingLengthDissipationRateInlet") ? 1
+                      : (sb && sb->type == "turbulentMixingLengthFrequencyInlet")       ? 2 : 0;
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
+            m.tiMask.push_back(ti ? 1 : 0);
+            m.tiIntensity.push_back(ti ? kb->intensity : scalar(0));
+            m.mlMask.push_back(ml);
+            // mixingLength must be > 0: OF requires it (scalarMinMax::ge(SMALL)) and 1/L would be inf.
+            m.mlLength.push_back(ml ? sb->mixingLength : scalar(1));
+        }
+    }
+    return m;
 }
 
 } // namespace brae

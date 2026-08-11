@@ -9,6 +9,7 @@
 #include <fstream>
 #include <map>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -38,7 +39,10 @@ inline bool isConstraintPatchType(const std::string& t)
 {
     return t == "empty" || t == "symmetryPlane" || t == "symmetry" || t == "wedge" || t == "cyclic"
         || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicSlip" || t == "processor"
-        || t == "processorCyclic" || t == "nonuniformTransformCyclic" || t == "overset";
+        || t == "processorCyclic" || t == "nonuniformTransformCyclic";
+    // NOTE: "overset" is deliberately NOT here. It is a coupled patch whose fvPatchField cannot be
+    // synthesised from the mesh type -- treating it as a constraint made an unsupported overset case run
+    // silently. buildPatches refuses it outright (fv_patch.cu).
 }
 
 struct FoamDict
@@ -46,17 +50,25 @@ struct FoamDict
     std::vector<std::pair<std::string, std::vector<std::string>>> leaves;   // key -> value tokens
     std::vector<std::pair<std::string, FoamDict>>                 subs;     // key -> subdict
 
+    // Every key this dict was ever ASKED for. The point is the complement: a key that is in the file but
+    // never in here is an input brae read off disk and then ignored -- the single failure mode that has
+    // produced almost every defect in this project (present, parsed, never applied). Recorded on the
+    // lookup path itself so it cannot drift from what the code actually consumes; `mutable` because
+    // asking a question about a dict is logically const.
+    mutable std::set<std::string> queried;
+
     const FoamDict* subDict(const std::string& key) const
     {
+        queried.insert(key);
         for (const auto& s : subs)
-            if (s.first == key) return &s.second;          // literal wins
+            if (s.first == key) return &s.second;          // literal wins (duplicates were merged at parse)
         const FoamDict* hit = nullptr;
         for (const auto& s : subs)                                              // else last regex match
         {
             if (s.first == key) continue;
             try
             {
-                if (std::regex_match(key, compileFoamRegex(s.first))) hit = &s.second;
+                if (std::regex_match(key, compileFoamRegex(s.first))) { hit = &s.second; queried.insert(s.first); }
             }
             catch (...) {}
         }
@@ -65,15 +77,20 @@ struct FoamDict
     // Regex-aware leaf lookup: literal first, else last matching wildcard key (OF semantics).
     const std::vector<std::string>* find(const std::string& name) const
     {
+        queried.insert(name);
+        const std::vector<std::string>* lit = nullptr;      // LAST literal match wins, as in OpenFOAM
         for (const auto& l : leaves)
-            if (l.first == name) return &l.second;          // literal wins
+            if (l.first == name) lit = &l.second;
+        if (lit) return lit;
         const std::vector<std::string>* hit = nullptr;
         for (const auto& l : leaves)                                                // else last regex match
         {
             if (l.first == name) continue;
             try
             {
-                if (std::regex_match(name, compileFoamRegex(l.first))) hit = &l.second;
+                // A regex key that MATCHED counts as consumed -- `"(k|omega|e)" 1e-4` is one entry
+                // answering three questions, and reporting it unread would be noise, not a gap.
+                if (std::regex_match(name, compileFoamRegex(l.first))) { hit = &l.second; queried.insert(l.first); }
             }
             catch (...) {}
         }
@@ -141,7 +158,39 @@ inline FoamDict parseDictBody(TokenStream& ts, bool top)
         if (ts.peek() == "{")
         {
             ts.next();
-            d.subs.emplace_back(key, parseDictBody(ts, false));
+            {
+                // A REPEATED sub-dictionary MERGES into the existing one, later keys winning -- OpenFOAM's
+                // documented behaviour and not the same rule as for leaf entries (those simply override).
+                // gasMixing's thermophysicalProperties relies on it: a full `thermoType { type hePsiThermo;
+                // ... equationOfState perfectGas; ... }` followed by `thermoType { type heRhoThermo; }`,
+                // which foamDictionary resolves to heRhoThermo + perfectGas. Replacing wholesale would have
+                // left a thermoType with nothing but `type`, and brae would refuse a case OpenFOAM runs.
+                FoamDict body = parseDictBody(ts, false);
+                FoamDict* existing = nullptr;
+                for (auto& sd : d.subs)
+                    if (sd.first == key) existing = &sd.second;
+                if (!existing)
+                {
+                    d.subs.emplace_back(key, std::move(body));
+                }
+                else
+                {
+                    for (auto& l : body.leaves)
+                    {
+                        bool replaced = false;
+                        for (auto& e : existing->leaves)
+                            if (e.first == l.first) { e.second = l.second; replaced = true; break; }
+                        if (!replaced) existing->leaves.push_back(l);
+                    }
+                    for (auto& sb : body.subs)
+                    {
+                        bool replaced = false;
+                        for (auto& e : existing->subs)
+                            if (e.first == sb.first) { e.second = sb.second; replaced = true; break; }
+                        if (!replaced) existing->subs.push_back(sb);
+                    }
+                }
+            }
         }
         else
         {
@@ -206,8 +255,15 @@ inline std::string expandDictVariables(const std::string& rawIn)
     // 3. build the variable map: a "name value... ;" entry whose key is a plain identifier and value isn't a subdict
     auto isIdent = [](const std::string& s)
     {
+        // Same character set the $name scanner below accepts, and for the same reason: OF's word::valid
+        // (wordI.H:59) permits '-' and '.', and cases use them as dictionary keys --
+        // `relaxationFactors-SIMPLE`, `sampled.plane-0.25`. Rejecting them here meant such a block was
+        // never registered as a variable, so `$relaxationFactors-SIMPLE` had nothing to expand to and
+        // resolved to nothing at all. The two rules MUST agree: a name accepted at the use site but
+        // refused at the definition site is silently unresolvable.
         if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
-        for (char c : s) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+        for (char c : s)
+            if (!(std::isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.')) return false;
         return true;
     };
     std::map<std::string, std::string> vars;
@@ -270,7 +326,24 @@ inline std::string expandDictVariables(const std::string& rawIn)
                 bool brace = false;
                 if (j < text.size() && text[j] == '{') { brace = true; ++j; }
                 const std::size_t s = j;
-                while (j < text.size() && (std::isalnum((unsigned char)text[j]) || text[j] == '_')) ++j;
+                // WHICH CHARACTERS BELONG TO THE NAME. OF's word::valid (wordI.H:59) rejects only
+                // whitespace and " ' / ; { }, so a macro name may contain '-' and '.' -- and real cases
+                // use both: gasMixing/injectorPipe selects its relaxation with
+                //     relaxationFactors-SIMPLE { fields { p 0.3; rho 0.05; } equations { U 0.7; ... } }
+                //     relaxationFactors { $relaxationFactors-SIMPLE }
+                // Stopping the name at '-' read that as $relaxationFactors (the dictionary being defined)
+                // followed by the literal text "-SIMPLE", so the expansion silently produced nothing and
+                // every factor fell back to 1.0 -- an UNRELAXED SIMPLE against OF's p 0.3 / rho 0.05 /
+                // U 0.7 / e 0.5. The banner printed the fallbacks, so the case looked configured.
+                //
+                // DELIBERATELY NARROWER THAN word::valid. OF reads a token with a real lexer, where '('
+                // and ')' terminate a word before word::valid is ever consulted; this is a text
+                // substitution with no such lexer, so accepting every word::valid character would let a
+                // name swallow trailing punctuation. alnum/_/-/. covers the names OF cases actually use
+                // and cannot run past a delimiter.
+                while (j < text.size()
+                       && (std::isalnum((unsigned char)text[j]) || text[j] == '_'
+                           || text[j] == '-' || text[j] == '.')) ++j;
                 const std::string name = text.substr(s, j - s);
                 if (brace && j < text.size() && text[j] == '}') ++j;
                 const auto it = vars.find(name);

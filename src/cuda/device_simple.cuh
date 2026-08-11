@@ -17,7 +17,11 @@ void deviceMatrixH(const DeviceLduView& A, const DeviceMesh& dm, const DeviceBuf
 
 // rAU = V/diagC  (A = diagC/V, rAU = 1/A). diagC already folded (= diag + internalCoeffs cmptAv).
 void deviceReciprocalV(const DeviceMesh& dm, const DeviceBuffer<scalar>& diagC, DeviceBuffer<scalar>& rAU);
-// SIMPLEC consistent rAtU = V/max(rowSum, 0.1*diagA); rowSum = A*ones (= 1/rAU - H1).
+// SIMPLEC consistent rAtU = V/rowSum, rowSum = A*ones. This is OF's 1/(1/rAU - UEqn.H1()) exactly:
+// H1 = (-sum(offdiag) + sum(coupled boundaryCoeffs))/V and A = D/V, so V*(A - H1) = D + sum(offdiag)
+// - sum(coupled bCoeffs) = rowSum on a mesh with no coupled patches. diagA is unused (kept for ABI).
+// NOTE: there is NO max(rowSum, 0.1*diagA) clamp -- an earlier version of this comment claimed one and
+// OF has none; the code never had it either (diagA is (void)-cast).
 void deviceSimplecRAtU(const DeviceMesh& dm, const DeviceBuffer<scalar>& rowSum, const DeviceBuffer<scalar>& diagA,
                        DeviceBuffer<scalar>& rAtU);
 // linearUpwind deferred correction for div(phi,U_i): corrSource[c] = Sum(+/-) phi_f*(grad(U_i)_upwind . (Cf-C_up)).
@@ -65,12 +69,19 @@ void deviceSetReference(DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& b, lab
 // iCmaxMag (optional): per-boundary-face cmptMax(cmptMag(iC0,iC1,iC2)), the max-over-components boundary diagonal
 // magnitude (OF fvMatrix::relax adds this to the diagonal). When given it replaces |iCbnd| in the dominance/relax
 // (and hence rAU) sum; needed where the boundary diagonal differs per component (slip/symmetry). nullptr -> |iCbnd|.
+// iCmin: OF's relax REMOVES cmptMin(iC) after the relax, which is NOT the same quantity it added -- the add uses
+// cmptMax(cmptMag(iC)), the remove uses the signed cmptMin across components. They agree only when the three
+// components are equal, so this matters exactly where iC is per-component (slip/symmetry). nullptr -> iCbnd.
 void deviceRelaxDiag(const DeviceLduView& A, const DeviceMesh& dm, const DeviceBuffer<scalar>& iCbnd, scalar alpha,
                      DeviceBuffer<scalar>& relaxedDiag, DeviceBuffer<scalar>& delta, const scalar* cycSumOff = nullptr,
-                     const scalar* iCmaxMag = nullptr);
+                     const scalar* iCmaxMag = nullptr, const scalar* iCmin = nullptr);
 
 // per-element out[i] = max(|a[i]|, |b[i]|, |c[i]|) (cmptMax(cmptMag) across the 3 momentum components' boundary iC).
 void deviceCmptMaxMag3(const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b, const DeviceBuffer<scalar>& c,
                        DeviceBuffer<scalar>& out);
+
+// per-element out[i] = min(a[i], b[i], c[i]) -- SIGNED, matching OF cmptMin (not cmptMin of magnitudes).
+void deviceCmptMin3(const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b, const DeviceBuffer<scalar>& c,
+                    DeviceBuffer<scalar>& out);
 
 } // namespace brae

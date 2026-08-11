@@ -39,6 +39,13 @@ struct FvOptionsData
     bool                porActive = false;
     std::vector<label>  porCells;
     vector              porD{0,0,0}, porF{0,0,0};   // adjusted Darcy d [1/m^2] + Forchheimer f [1/m]
+    // porosityModels::fixedCoeff -- a SECOND model, not a variant. alpha [1/s], beta [1/m], both passed
+    // through adjustNegativeResistance, then diag(alpha)/diag(beta) rotated into the coordinateSystem's
+    // frame (fixedCoeff.C calcTransformModelData). Row-major 3x3.
+    bool                porFixed = false;
+    scalar              porAlphaT[9] = {0,0,0,0,0,0,0,0,0};
+    scalar              porBetaT[9]  = {0,0,0,0,0,0,0,0,0};
+    scalar              porRhoRef = 1.0;
     // meanVelocityForce: a uniform body force adjusted each iter to drive the mean velocity to Ubar (channel flow).
     bool                mvfActive = false;
     vector              mvfUbar{0,0,0};
@@ -48,6 +55,30 @@ struct FvOptionsData
     bool                limUActive = false;
     scalar              limUMax = 0;
     std::vector<label>  limUCells;                  // empty => all cells
+    // fixedTemperatureConstraint (fvConstraint, mode uniform): pin T on a cell selection by CONSTRAINING the
+    // energy matrix -- OF does `eqn.setValues(cells_, thermo.he(thermo.p(), Tuni, cells_))`, i.e. the same
+    // matrix manipulation the epsilon wall function uses (zero the row's off-diagonals, force the value).
+    // Clamping he after the solve instead would be a different operator: the neighbours' rows would still
+    // carry the unconstrained coupling.
+    // scalarFixedValueConstraint: OF FixedValueConstraint reads a `fieldValues` sub-dict, one entry per
+    // field name (FixedValueConstraint.C read()), and constrains each with eqn.setValues.
+    std::map<std::string, scalar> fixScaVals;   // field name -> fixed value
+    std::vector<label>            fixScaCells;
+
+    bool                fixTActive = false;
+    scalar              fixTTemp = 0;               // `temperature` [K]; converted to he by the solver's thermo
+    std::vector<label>  fixTCells;
+
+    // limitTemperature (fvConstraint): clamp T into [Tmin, Tmax] on a selection, applied through the ENERGY
+    // variable. OF's limitTemperature::correct(he) converts the two temperature limits to he limits with the
+    // case's own thermo (heMin = thermo.he(p, Tmin, cells)) and clamps he, NOT T -- he is what the equation
+    // solved, so clamping T and converting back would leave he and T inconsistent for the rest of the
+    // iteration. It then clamps the he BOUNDARY too on every patch that does not fix a value, but only when
+    // the selection is the whole mesh (limitTemperature.C: `if (!cellSetOption::useSubMesh())`).
+    bool                limTActive = false;
+    scalar              limTMin = 0, limTMax = 0;
+    std::vector<label>  limTCells;                  // empty => all cells
+    bool                limTAllCells = false;       // selectionMode all -> also clamp the he boundary
     // velocityDampingConstraint (fvConstraint): implicit diagonal sink diag += C*V^(2/3)*(|U|-UMax) where |U|>UMax.
     bool                vdcActive = false;
     scalar              vdcUMax = 0, vdcC = 1;
@@ -130,9 +161,12 @@ inline FvOptionsData readFvOptions(
         const bool isAd  = (type == "actuationDiskSource");
         const bool isRot = (type == "rotorDisk" || type == "rotorDiskSource");
         const bool isVdc = (type == "velocityDampingConstraint");
+        const bool isLimT = (type == "limitTemperature");
+        const bool isFixT = (type == "fixedTemperatureConstraint");
+        const bool isFixS = (type == "scalarFixedValueConstraint");
         const std::string act = opt.wordOr("active", "yes");
         if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;   // inactive -> skip (OF)
-        if (!isVec && !isSca && !isPor && !isMvf && !isLim && !isAd && !isRot && !isVdc)
+        if (!isVec && !isSca && !isPor && !isMvf && !isLim && !isAd && !isRot && !isVdc && !isLimT && !isFixT && !isFixS)
         {
             fo.unsupported.push_back("source '" + s.first + "' has unsupported type '" + type + "'");
             continue;
@@ -173,6 +207,109 @@ inline FvOptionsData readFvOptions(
             ++fo.count;
             continue;
         }
+        if (isFixS)   // scalarFixedValueConstraint
+        {
+            const std::string selMode = co.wordOr("selectionMode", opt.wordOr("selectionMode", "all"));
+            if (selMode == "cellZone")
+            {
+                const auto it = zones.find(co.wordOr("cellZone", opt.wordOr("cellZone", "")));
+                if (it != zones.end()) fo.fixScaCells = it->second;
+            }
+            else if (selMode == "all")
+            {
+                fo.fixScaCells.resize(nCells);
+                for (label c = 0; c < nCells; ++c) fo.fixScaCells[c] = c;
+            }
+            else
+            {
+                fo.unsupported.push_back("scalarFixedValueConstraint '" + s.first + "': selectionMode '"
+                                         + selMode + "' -- brae supports all|cellZone");
+                continue;
+            }
+            const FoamDict* fvd = co.subDict("fieldValues");
+            if (!fvd || fo.fixScaCells.empty())
+            {
+                fo.unsupported.push_back("scalarFixedValueConstraint '" + s.first + "': needs a fieldValues sub-dict");
+                continue;
+            }
+            for (const auto& lv : fvd->leaves)   // OF iterates the fieldValues sub-dict entry by entry
+            {
+                const std::string& fn = lv.first;
+                if (fn == "k" || fn == "epsilon" || fn == "omega") fo.fixScaVals[fn] = fvd->scalarOr(fn, 0.0);
+                else fo.unsupported.push_back("scalarFixedValueConstraint '" + s.first + "': field '" + fn
+                                              + "' -- brae constrains k|epsilon|omega here");
+            }
+            if (fo.fixScaVals.empty()) continue;
+            ++fo.count;
+            continue;
+        }
+
+        if (isFixT)   // fixedTemperatureConstraint (mode uniform)
+        {
+            const std::string mode = co.wordOr("mode", opt.wordOr("mode", "uniform"));
+            if (mode != "uniform")
+            {
+                fo.unsupported.push_back("fixedTemperatureConstraint '" + s.first + "': mode '" + mode
+                                         + "' -- brae supports `uniform` (lookup reads another T field)");
+                continue;
+            }
+            fo.fixTTemp = co.scalarOr("temperature", opt.scalarOr("temperature", 0.0));
+            if (!(fo.fixTTemp > 0))
+            {
+                fo.unsupported.push_back("fixedTemperatureConstraint '" + s.first + "': needs a positive `temperature`");
+                continue;
+            }
+            const std::string selMode = co.wordOr("selectionMode", opt.wordOr("selectionMode", "all"));
+            if (selMode == "cellZone")
+            {
+                const auto it = zones.find(co.wordOr("cellZone", opt.wordOr("cellZone", "")));
+                if (it != zones.end()) fo.fixTCells = it->second;
+            }
+            else if (selMode == "all")
+            {
+                fo.fixTCells.resize(nCells);
+                for (label c = 0; c < nCells; ++c) fo.fixTCells[c] = c;
+            }
+            else
+            {
+                fo.unsupported.push_back("fixedTemperatureConstraint '" + s.first + "': selectionMode '"
+                                         + selMode + "' -- brae supports all|cellZone");
+                continue;
+            }
+            if (fo.fixTCells.empty()) continue;
+            fo.fixTActive = true;
+            ++fo.count;
+            continue;
+        }
+
+        if (isLimT)   // limitTemperature (clamp T into [min, max] via the energy variable)
+        {
+            // OF reads them as plain `min`/`max` on the option dict (limitTemperature.C read()).
+            fo.limTMin = co.scalarOr("min", opt.scalarOr("min", 0.0));
+            fo.limTMax = co.scalarOr("max", opt.scalarOr("max", 0.0));
+            if (!(fo.limTMax > fo.limTMin))
+            {
+                fo.unsupported.push_back("limitTemperature '" + s.first + "': needs max > min");
+                continue;
+            }
+            const std::string selMode = co.wordOr("selectionMode", opt.wordOr("selectionMode", "all"));
+            if (selMode == "cellZone")
+            {
+                const auto it = zones.find(co.wordOr("cellZone", opt.wordOr("cellZone", "")));
+                if (it != zones.end()) fo.limTCells = it->second;
+            }
+            else if (selMode != "all")
+            {
+                fo.unsupported.push_back("limitTemperature '" + s.first + "': selectionMode '" + selMode
+                                         + "' -- brae supports all|cellZone");
+                continue;
+            }
+            fo.limTAllCells = (selMode == "all");
+            fo.limTActive = true;
+            ++fo.count;
+            continue;
+        }
+
         if (isLim)   // limitVelocity (clamp |U| <= max)
         {
             fo.limUMax = co.scalarOr("max", opt.scalarOr("max", 0.0));
@@ -327,10 +464,64 @@ inline FvOptionsData readFvOptions(
         if (isPor)   // explicitPorositySource (DarcyForchheimer)
         {
             const std::string pm = co.wordOr("type", "");
-            if (pm != "DarcyForchheimer")   // powerLaw / fixedCoeff not implemented -> would silently apply ZERO resistance
+            if (pm != "DarcyForchheimer" && pm != "fixedCoeff")   // powerLaw would silently apply ZERO resistance
             {
                 fo.unsupported.push_back("porosity source '" + s.first + "' uses model '" + pm
-                                         + "' -- only DarcyForchheimer is supported (others would apply no resistance)");
+                                         + "' -- brae supports DarcyForchheimer and fixedCoeff");
+                continue;
+            }
+            if (pm == "fixedCoeff")
+            {
+                const std::string zn2 = co.wordOr("cellZone", "");
+                const auto it2 = zones.find(zn2);
+                if (it2 == zones.end() || it2->second.empty()) continue;
+                const FoamDict* fcp = co.subDict("fixedCoeffCoeffs");
+                const FoamDict& fc = fcp ? *fcp : co;
+                auto last3 = [](const std::vector<scalar>& a) -> vector
+                { return a.size() >= 3 ? vector{a[a.size()-3], a[a.size()-2], a[a.size()-1]} : vector{0,0,0}; };
+                const vector al = adjustNeg(last3(fc.scalarListOr("alpha", {})));
+                const vector be = adjustNeg(last3(fc.scalarListOr("beta",  {})));
+                fo.porRhoRef = fc.scalarOr("rhoRef", 1.0);
+
+                // coordinateSystem -> rotation. OF axesRotation (axesRotation.C): the LOCAL AXES ARE THE
+                // COLUMNS of R, for axisOrder E1_E2: col0 = e1, col1 = e2 with the e1-collinear part
+                // removed, col2 = col0 ^ col1. Then csys().transform(T) = R & T & R.T (transform.H:214).
+                scalar R[9] = {1,0,0, 0,1,0, 0,0,1};
+                const FoamDict* cs = fc.subDict("coordinateSystem");
+                if (cs)
+                {
+                    const std::vector<scalar> e1v = cs->scalarListOr("e1", {1,0,0});
+                    const std::vector<scalar> e2v = cs->scalarListOr("e2", {0,1,0});
+                    scalar a1[3] = {e1v.size()>2?e1v[e1v.size()-3]:1, e1v.size()>1?e1v[e1v.size()-2]:0, e1v.size()>0?e1v[e1v.size()-1]:0};
+                    scalar a2[3] = {e2v.size()>2?e2v[e2v.size()-3]:0, e2v.size()>1?e2v[e2v.size()-2]:1, e2v.size()>0?e2v[e2v.size()-1]:0};
+                    scalar m1 = std::sqrt(a1[0]*a1[0]+a1[1]*a1[1]+a1[2]*a1[2]);
+                    if (m1 > 0) { a1[0]/=m1; a1[1]/=m1; a1[2]/=m1; }
+                    const scalar dot = a2[0]*a1[0]+a2[1]*a1[1]+a2[2]*a1[2];   // removeCollinear(ax1)
+                    for (int k = 0; k < 3; ++k) a2[k] -= dot*a1[k];
+                    scalar m2 = std::sqrt(a2[0]*a2[0]+a2[1]*a2[1]+a2[2]*a2[2]);
+                    if (m2 > 0) { a2[0]/=m2; a2[1]/=m2; a2[2]/=m2; }
+                    const scalar a3[3] = { a1[1]*a2[2]-a1[2]*a2[1], a1[2]*a2[0]-a1[0]*a2[2], a1[0]*a2[1]-a1[1]*a2[0] };
+                    for (int r = 0; r < 3; ++r) { R[3*r+0]=a1[r]; R[3*r+1]=a2[r]; R[3*r+2]=a3[r]; }   // axes are COLUMNS
+                }
+                // T' = R & diag(v) & R.T
+                auto rot = [&](const vector& v, scalar* out)
+                {
+                    const scalar d[3] = {v.x, v.y, v.z};
+                    for (int i2 = 0; i2 < 3; ++i2)
+                        for (int j2 = 0; j2 < 3; ++j2)
+                        {
+                            scalar acc = 0;
+                            for (int k = 0; k < 3; ++k) acc += R[3*i2+k]*d[k]*R[3*j2+k];
+                            out[3*i2+j2] = acc;
+                        }
+                };
+                rot(al, fo.porAlphaT);
+                rot(be, fo.porBetaT);
+                fo.porCells = it2->second;
+                if (fo.porActive) fo.unsupported.push_back("source '" + s.first + "': a 2nd explicitPorositySource -- brae keeps only one");
+                fo.porActive = true;
+                fo.porFixed  = true;
+                ++fo.count;
                 continue;
             }
             const std::string zn = co.wordOr("cellZone", "");

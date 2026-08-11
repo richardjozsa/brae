@@ -26,6 +26,43 @@ validation/*
 !validation/pitzDaily282/
 !validation/pitzDailyTurb/
 !validation/pitzDailyTurbBig/
+!validation/rhoBox/
+!validation/rhoBoxE/
+!validation/rhoSuth/
+!validation/rhoLU/
+!validation/rhoTP/
+!validation/rhoFR/
+!validation/rhoFRvol/
+!validation/rhoSST/
+!validation/rhoKE/
+!validation/rhoCtl/
+!validation/rhoLUturb/
+!validation/rhoIO/
+!validation/rhoTI/
+!validation/rhoKE2/
+!validation/rhoRX/
+!validation/rhoPM/
+!validation/energyBox/
+!validation/rho_vs_openfoam.sh
+!validation/rhoE_vs_openfoam.sh
+!validation/suth_vs_openfoam.sh
+!validation/lu_vs_openfoam.sh
+!validation/tp_vs_openfoam.sh
+!validation/fr_vs_openfoam.sh
+!validation/sst_vs_openfoam.sh
+!validation/ke_vs_openfoam.sh
+!validation/luturb_vs_openfoam.sh
+!validation/sa_vs_openfoam.sh
+!validation/io_vs_openfoam.sh
+!validation/ti_vs_openfoam.sh
+!validation/ke2_vs_openfoam.sh
+!validation/rx_vs_openfoam.sh
+!validation/pm_vs_openfoam.sh
+!validation/ctl_vs_openfoam.sh
+!validation/energy_vs_openfoam.sh
+!validation/restart_vs_openfoam.sh
+!validation/flowrate_vs_openfoam.sh
+!validation/roundtrip_vs_openfoam.sh
 
 # CTest-generated output (regenerated on every ctest run)
 Testing/
@@ -39,3 +76,12 @@ __pycache__/
 demo/amgpcg/case1024/
 demo/amgpcg/case1M/
 demo/amgpcg/out/
+
+# delta: dictionaries + README only. The mesh, the time directories and the STL (licence unknown, see
+# the case README) are all regenerated or user-supplied, so none of them are tracked.
+demo/delta/[0-9]*/
+!demo/delta/0.orig/
+demo/delta/constant/polyMesh/
+demo/delta/constant/extendedFeatureEdgeMesh/
+demo/delta/constant/triSurface/*
+!demo/delta/constant/triSurface/README

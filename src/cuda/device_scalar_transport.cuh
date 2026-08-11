@@ -13,9 +13,14 @@
 #include "device_cyclic.cuh"
 #include "device_interface.cuh"   // interfaceAssembleMomentum/OffDiagSum/ZeroWallIfCoeff
 #include "device_amg.cuh"         // deviceSymGaussSeidel
+#include "stage_dump.cuh"      // Phase 0 stage harness
 #include "device_ddt.cuh"         // ScalarDdt + deviceFvmDdtDiag/Source (transient turbulence)
 #include <cuda_runtime.h>
 #include <vector>
+#include <fstream>
+#include <filesystem>
+#include <cstdlib>
+#include <cstdio>
 
 namespace brae {
 
@@ -125,19 +130,55 @@ void deviceSolveScalarTransport(
     const DeviceBuffer<scalar>* eps0 = nullptr,
     DeviceAMI* ami = nullptr,
     DeviceCyclic* cyc = nullptr,
-    const ScalarDdt& ddt = ScalarDdt{})   // transient fvm::ddt(f); default (steady) -> no-op
+    const ScalarDdt& ddt = ScalarDdt{},   // transient fvm::ddt(f); default (steady) -> no-op
+    const DeviceBuffer<scalar>* DBnd = nullptr,   // per-FACE boundary diffusivity; null -> adjacent-cell value
+    // OF `grad(<field>) cellLimited Gauss linear <k>`. 0 = unlimited. The gradient feeds the limitedLinear
+    // weight, the linearUpwind deferred correction and the non-orthogonal laplacian correction, so an
+    // unlimited gradient on a field the case asked to limit is a different discretisation, not a detail.
+    // Only grad(U) was ever honoured; grad(k)/grad(omega)/grad(e) lines were parsed by nothing.
+    scalar gradLimitK = 0.0,
+    // OF's bound(f, fMin) exists for POSITIVE-DEFINITE quantities: k, epsilon, omega, nuTilda. Every
+    // turbulence caller here is one of those, so the default is true. The ENERGY is not: EEqn.H never
+    // bounds he, and OF's sensible energy is legitimately NEGATIVE below the reference temperature
+    // (air at 298 K has he = -8.59e4 J/kg). Bounding it there replaces the whole field with ~0 and
+    // pins T at Cp*Tref/Cv = 417.7 K, which is exactly what NACA0012 did once he was given OF's
+    // reference point. Harmless while brae used he = Cv*T > 0 -- which is why it survived this long.
+    bool boundPositive = true,
+    // fvOptions scalarFixedValueConstraint: OF FixedValueConstraint::constrain -> eqn.setValues(cells, value).
+    // Applied BEFORE the wall block, because kEpsilon.C runs fvOptions.constrain(epsEqn) at line 266 and
+    // boundaryManipulate (the epsilon wall function's own setValues) at 267 -- so on a cell claimed by both,
+    // the WALL FUNCTION wins. Same three kernels; only the mask and the values differ.
+    const DeviceBuffer<label>* fvoSetMask = nullptr,
+    const DeviceBuffer<scalar>* fvoSetVal = nullptr)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
     deviceInterpolate(dm, D, Df);
     DeviceBuffer<scalar> aD, aU, aL, lD, lU, lL, luCorr, lapCorr;   // luCorr/lapCorr = linearUpwind / non-orth deferred sources (empty otherwise)
-    DeviceBuffer<scalar> gx, gy, gz;                               // grad(field): shared by limitedLinear / linearUpwind / non-orth
-    if (limited || linearUpwind || nonOrth) { DeviceBuffer<scalar> bv; deviceBCValue(db, field, bv); deviceGaussGrad(dm, field, bv, gx, gy, gz); }
+    DeviceBuffer<scalar> gx, gy, gz;         // gradSchemes `default`: limitedLinear's limiter + non-orth
+    DeviceBuffer<scalar> lgx, lgy, lgz;      // the gradient linearUpwind NAMES (limited when that name is cellLimited)
+    // ONE GRADIENT CANNOT SERVE ALL THREE. Only linearUpwind takes a named gradient
+    // (linearUpwind.C: mesh.gradScheme(gradSchemeName_)); limitedLinear's limiter and the non-orthogonal
+    // laplacian correction both resolve gradSchemes `default`, which is plain Gauss linear here. Limiting
+    // the shared buffer in place therefore over-limited the other two -- measured on squareBendLiq as a
+    // transient nut excursion to 1.5e+01 against OF's 1.4e-03.
+    const bool limitLU = (gradLimitK > 0.0) && linearUpwind;
+    if (limited || linearUpwind || nonOrth)
+    {
+        DeviceBuffer<scalar> bv;
+        deviceBCValue(db, field, bv);
+        deviceGaussGrad(dm, field, bv, gx, gy, gz);
+        if (limitLU)
+        {
+            deviceCopy(lgx, gx); deviceCopy(lgy, gy); deviceCopy(lgz, gz);
+            deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK);
+        }
+    }
     if (limited) deviceDivLimitedCoeffs(dm, phiInt, field, gx, gy, gz, twoByk, aD, aU, aL);   // Gauss limitedLinear: implicit limited weight
     else
     {
         deviceDivUpwindCoeffs(dm, phiInt, aD, aU, aL);
-        if (linearUpwind) deviceLinearUpwindCorr(dm, phiInt, gx, gy, gz, luCorr);             // Gauss linearUpwind: upwind matrix + deferred corr
+        if (linearUpwind) deviceLinearUpwindCorr(dm, phiInt, limitLU ? lgx : gx, limitLU ? lgy : gy, limitLU ? lgz : gz, luCorr);             // Gauss linearUpwind: upwind matrix + deferred corr
     }
     // laplacian "corrected": nonOrthDeltaCoeffs implicit (in deviceLaplacianCoeffs) + corrVec.grad(field) explicit (deviceLaplacianCorr).
     deviceLaplacianCoeffs(dm, Df, lD, lU, lL, nonOrth);
@@ -146,10 +187,41 @@ void deviceSolveScalarTransport(
     if (bounded) { DeviceBuffer<scalar> bt; deviceHadamard(bt, divU, dm.V); deviceAxpy(-1.0, bt, aD); }   // -Sp(div(phi),f)
     DeviceBuffer<scalar> src(static_cast<std::size_t>(nC));
     cudaCheck(cudaMemsetAsync(src.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "src zero");
+    // BRAE_DUMP_TERMS=<dir>: every contribution to this field's equation, separately, per cell, per call.
+    // A global norm cannot say WHICH term drives a localised excursion -- the deferred linearUpwind source
+    // and the reaction production are added to the same RHS and are indistinguishable afterwards. Captured
+    // here, before they are folded together.
+    DeviceBuffer<scalar> dgConv, dgReact, srcReact;
+    const char* termDir = std::getenv("BRAE_DUMP_TERMS");
+    if (termDir) { deviceCopy(dgConv, aD); }
     reaction(aD, src);                                            // model reaction: adds to diag + source
+    if (termDir)
+    {
+        deviceCopy(dgReact, aD); deviceCopy(srcReact, src);
+        static int callNo = 0;
+        const int myCall = callNo++;
+        std::error_code tec;
+        std::filesystem::create_directories(termDir, tec);
+        char fn[512];
+        std::snprintf(fn, sizeof fn, "%s/%s_%04d", termDir, fieldName, myCall);
+        std::ofstream o(fn);
+        o.precision(10);
+        const std::vector<scalar> hF = field.host(), hDc = dgConv.host(), hDr = dgReact.host(), hSr = srcReact.host();
+        const std::vector<scalar> hLU = luCorr.size()  ? luCorr.host()  : std::vector<scalar>(nC, 0.0);
+        const std::vector<scalar> hLC = lapCorr.size() ? lapCorr.host() : std::vector<scalar>(nC, 0.0);
+        o << "# cell field diagConvLap diagAfterReact srcReact luCorr lapCorr\n";
+        for (int c = 0; c < nC; ++c)
+            o << c << ' ' << hF[c] << ' ' << hDc[c] << ' ' << hDr[c] << ' '
+              << hSr[c] << ' ' << hLU[c] << ' ' << hLC[c] << '\n';
+    }
     if (luCorr.size())  deviceAxpy(-1.0, luCorr, src);           // linearUpwind deferred correction (explicit RHS)
     if (lapCorr.size()) deviceAxpy(-1.0, lapCorr, src);          // non-orth laplacian correction (explicit RHS, mirrors momentum)
-    DeviceBuffer<scalar> aIC, aBC, lIC, lBC; deviceBCDivCoeffs(db, phiBnd, aIC, aBC); deviceBCLaplacianCoeffs(db, D, lIC, lBC);
+    DeviceBuffer<scalar> aIC, aBC, lIC, lBC; deviceBCDivCoeffs(db, phiBnd, aIC, aBC);
+    // OF evaluates the laplacian coefficient with the PATCH diffusivity (gamma.boundaryField()), not the
+    // adjacent cell's. They coincide for a zeroGradient wall (no flux anyway) but not at a fixedValue one,
+    // which is where a wall function puts its whole effect -- so the energy equation supplies DBnd.
+    if (DBnd && DBnd->size()) deviceBCLaplacianCoeffsFace(db, *DBnd, lIC, lBC);
+    else                      deviceBCLaplacianCoeffs(db, D, lIC, lBC);
     deviceAxpy(-1.0, lIC, aIC); deviceAxpy(-1.0, lBC, aBC);
     // interface (cyclic/cyclicAMI) coupling: fold div(phi,f) - laplacian(D,f) at the interface into the diagonal and
     // set the off-diagonal ifCoeff. A scalar is invariant under the cyclic transform (no rotation of the value), so the
@@ -167,7 +239,14 @@ void deviceSolveScalarTransport(
     DeviceBuffer<scalar> aRD, aDelta; deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
                                                       ifSumOff.size() ? ifSumOff.data() : nullptr);
     { DeviceBuffer<scalar> t; deviceHadamard(t, aDelta, field); deviceAxpy(1.0, t, src); }
-    if (wall && eps0)   // eps near-wall setValues constraint (k has none)
+    if (fvoSetMask && fvoSetVal)   // fvOptions scalarFixedValueConstraint (OF: before boundaryManipulate)
+    {
+        svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), fvoSetMask->data(), fvoSetVal->data(), aU.data(), aL.data(), src.data());
+        svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), fvoSetMask->data(), aIC.data(), aBC.data());
+        svCellKernel<<<nBlocks(nC), TPB>>>(nC, fvoSetMask->data(), aRD.data(), fvoSetVal->data(), src.data());
+        cudaCheck(cudaGetLastError(), "fvOptionsSetValues");
+    }
+        if (wall && eps0)   // eps near-wall setValues constraint (k has none)
     {
         svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), wall->isWallCell.data(), eps0->data(), aU.data(), aL.data(), src.data());
         svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), wall->isWallCell.data(), aIC.data(), aBC.data());
@@ -177,6 +256,14 @@ void deviceSolveScalarTransport(
         cudaCheck(cudaGetLastError(), "setValues");
     }
     DeviceBuffer<scalar> diagC, B; deviceFold(dm, aRD, src, aIC, aBC, diagC, B);
+    // Stage harness: the assembled system for this transported scalar, at its first assembly only.
+    if (stageDumpActive() && stageDumpFirstOnly((std::string("xport-") + fieldName).c_str()))
+    {
+        stageDump(std::string("stage_") + fieldName + "D",   diagC);
+        stageDump(std::string("stage_") + fieldName + "Src", B);
+        stageDump(std::string("stage_") + fieldName + "Diff", D);
+        stageDump(std::string("stage_") + fieldName + "Psi",  field);
+    }
     const DeviceLduView sv = (ami && ami->n)
         ? deviceLduViewAmi(dm, diagC, aU, aL, ami->n, ami->ownCell.data(), ami->off.data(), ami->nbrCell.data(), ami->weight.data(), ami->ifCoeff.data())
         : (cyc && cyc->n)
@@ -189,11 +276,43 @@ void deviceSolveScalarTransport(
     bool wantGS = useGS;
     if (const char* e = std::getenv("BRAE_SCALAR_GS")) wantGS = (std::atoi(e) != 0);
     const bool gs = wantGS && !(ami && ami->n) && !(cyc && cyc->n);
+    // OF lduMatrix::solver::normFactor, NOT sum|b|.
+    //
+    //     sumA   = row sums of A            (matrix_.sumA(...))
+    //     xRef   = average(psi)             (gAverage(psi))
+    //     normF  = sum(|A.psi - sumA*xRef| + |b - sumA*xRef|) + small
+    //
+    // This scales EVERY residual the solver reports and tests, so getting it wrong changes what the
+    // absolute `tolerance` means (relTol is a ratio and cancels it, but `tol` does not) and makes brae's
+    // "Solving for epsilon" lines incomparable with OF's. brae already had the correct formula in
+    // pcg.cu, gamg.cu and parallel_pbicgstab.cuh -- this path alone used sum|b|, which for the epsilon
+    // equation is dominated by the production source and the near-wall setValues rows and so runs far
+    // larger than OF's, making the normalised residual look converged sooner than it is.
+    //
+    // sumA comes from A applied to a field of ones, which is the row sum by definition, so the interface
+    // off-diagonals are included exactly as deviceAmul accounts for them -- no second traversal to keep
+    // in step with the LDU layout.
+    const scalar normF = [&]{
+        const int n = static_cast<int>(field.size());
+        if (n == 0) return scalar(1);
+        DeviceBuffer<scalar> ones, sumA, Apsi, t, w;
+        ones.copyFrom(std::vector<scalar>(static_cast<std::size_t>(n), scalar(1)));
+        deviceAmul(sv, ones, sumA);                     // sumA = A * 1 = row sums
+        deviceAmul(sv, field, Apsi);                    // A.psi
+        const scalar xRef = deviceDot(field, ones) / static_cast<scalar>(n);
+        deviceCopy(t, sumA);
+        deviceScale(t, xRef);                           // t = sumA*xRef
+        deviceCopy(w, Apsi); deviceAxpy(-1.0, t, w);    // w = A.psi - t
+        scalar nf = deviceSumMag(w);
+        deviceCopy(w, B);    deviceAxpy(-1.0, t, w);    // w = b - t
+        nf += deviceSumMag(w);                          // sum|..| + sum|..| == sum(|..|+|..|)
+        return nf + scalar(1e-20);                      // solverPerformance::small_
+    }();
     DeviceSolverPerf perf;                                        // OF-style report: init/final/nIter for this scalar
-    if (gs) deviceSymGaussSeidel(sv, B, field, deviceSumMag(B) + 1e-20, tol, relTolKE, 3000, &perf);
-    else    perf = deviceJacobiBiCGStab(sv, B, field, deviceSumMag(B) + 1e-20, tol, relTolKE, 3000, keCheckEvery);  // loose (relTol); interface in the Amul
+    if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf);
+    else    perf = deviceJacobiBiCGStab(sv, B, field, normF, tol, relTolKE, 3000, keCheckEvery);  // loose (relTol); interface in the Amul
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
-    deviceBoundField(dm, field, 1e-15);                           // OF bound(field): neg -> local avg, not floor
+    if (boundPositive) deviceBoundField(dm, field, 1e-15);        // OF bound(field): neg -> local avg, not floor
 }
 
 } // namespace brae

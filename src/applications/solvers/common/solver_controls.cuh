@@ -15,7 +15,7 @@ namespace brae {
 // NOT from the turbulence model. nutk = k-based stepwise log law (nutkWallFunction); Spalding =
 // velocity-based Spalding blend (nutUSpaldingWallFunction); Blended = velocity-based binomial n=4
 // blend (nutUBlendedWallFunction). All three are honoured on any RAS model, exactly as OF does.
-enum class NutWall { Nutk, Spalding, Blended };
+enum class NutWall { Nutk, Spalding, Blended, NutU };   // NutU = nutUWallFunction (STEPWISE blender)
 
 struct DeviceSimpleControls
 {
@@ -40,6 +40,73 @@ struct DeviceSimpleControls
     bool   gsK = false, gsEps = false;             // scalar linear solver = smoothSolver+symGaussSeidel (read from fvSolution solvers.{k|nuTilda} / {epsilon|omega}).
     bool   gsU = false;                            // momentum linear solver = smoothSolver+(sym)GaussSeidel (read from fvSolution solvers.U).
     scalar twoBykK = 2.0, twoBykEps = 2.0;         // 2/max(k_,SMALL) from the limitedLinear coefficient (k_=1 -> 2).
+    // div(phi,h|e) and div(phi,K|Ekp) -- the ENERGY equation's convection scheme (rhoSimpleFoam). Read from
+    // fvSchemes like every other div scheme; brae used to hardcode upwind here and silently ignore what the
+    // case asked for, which is a first-order downgrade that still converges. The K/Ekp term takes the same
+    // scheme because OF's tutorials point div(phi,K) at the same entry ($energy) as div(phi,e).
+    // div(phi,h|e) "bounded": OF's boundedConvectionScheme subtracts fvm::Sp(fvc::surfaceIntegrate(phi), he).
+    // It vanishes at converged continuity, so every steady duct gate passes without it -- but it is a real
+    // STABILISER while div(phi) != 0, and the NACA0012 case at Mach 0.72 diverges in one iteration without it.
+    bool   boundedHe = false;
+    // Same story for the turbulence scalars. OF's `bounded` is a per-SCHEME wrapper
+    // (boundedConvectionScheme wraps one div), so div(phi,k) can be bounded while div(phi,U) is not.
+    // brae read `bounded` only off the div(phi,U) line and reused that one flag for every scalar, so
+    // demo/delta and demo/f16 (`div(phi,U) Gauss LUST` + `div(phi,nuTilda) bounded ...`) ran nuTilda
+    // UNBOUNDED. The term is -Sp(div(phi),f): on an upwind row it takes diag from sum|outflow phi| to
+    // sum|inflow phi| = sum|offdiag|, i.e. it guarantees marginal diagonal dominance. Without it any
+    // cell with net inflow (everywhere, before continuity converges) is not diagonally dominant.
+    bool   boundedK   = false;   // div(phi,k) / div(phi,nuTilda)
+    bool   boundedEps = false;   // div(phi,epsilon) / div(phi,omega)
+    bool   limitedHe = false;                      // div(phi,h|e) "limitedLinear"
+    bool   luHe = false;                           // div(phi,h|e) "linearUpwind"
+    scalar twoBykHe = 2.0;
+    // div(phi,K|Ekp), the KINETIC term -- a separate fvSchemes entry from div(phi,h|e) and a separate
+    // discretisation in OF. All four keys used to OR into the He slots, so a case asking for
+    // `div(phi,e) linearUpwind` + `div(phi,K) upwind` ran the kinetic term second-order anyway (and the
+    // reverse ran the energy equation first-order). They agree in every stock tutorial, where both are
+    // `$energy` -- which is exactly why the merge went unnoticed.
+    bool   boundedKin = false;
+    bool   limitedKin = false;
+    bool   luKin = false;
+    scalar twoBykKin = 2.0;
+    bool   foundKinScheme = false;                 // false -> mirror the He slots (the old behaviour)
+    // OF's RAS/LES `turbulence` switch (RASModel.C:70, getOrDefault<Switch>("turbulence", true)). `off`
+    // makes correct() return immediately: k, epsilon/omega and nut stay FROZEN at their initial values
+    // while the momentum equation keeps using that frozen nut. It is NOT the same as `simulationType
+    // laminar`, where nut is zero and never read. brae never read the switch, so a case asking to freeze
+    // the turbulence ran a fully live model. Found by dict_audit (E5) once the audit was made to run on
+    // REFUSED cases -- aerofoilNACA0012 sets it, and aerofoilNACA0012 refuses on fvOptions.
+    bool   turbulenceOn = true;
+    // B1: SIMPLE/transonic. OF's rhoSimpleFoam pEqn.H takes a different branch entirely -- the pressure
+    // equation gains an IMPLICIT convection term fvm::div(phid, p) with phid = (psi_f/rho_f)*phiHbyA, the
+    // part of phiHbyA now carried implicitly is subtracted off, and the matrix is relaxed (the subsonic
+    // branch relaxes only the FIELD, never the equation). Running a transonic case down the subsonic
+    // branch converges to a wrong answer in silence, which is why this was a refusal until now.
+    bool   transonic = false;
+    // OF fvMatrix::relax() applies relaxationFactors/equations/<field> and does NOTHING when the entry is
+    // absent (fvMatrix.C:1250-1263 -- it only relaxes if relaxEquation() finds one). Both facts matter:
+    // the factor AND whether it was given.
+    bool   hasRelaxPEqn = false;
+    scalar relaxPEqn = 1.0;
+    // grad(<turbulence scalar>) / grad(energy) cellLimited coefficients. Separate from gradULimitK: OF takes
+    // one gradScheme entry per field, and aerofoilNACA0012 limits grad(U), grad(k) and grad(omega) alike.
+    // The cellLimited coeff of the gradient the linearUpwind DIV STATEMENT names -- distinct from
+    // gradULimitK/gradKLimitK, which come from an explicit gradSchemes `grad(U)`/`grad(k)` entry.
+    // OF keeps these apart: linearUpwind.C takes mesh.gradScheme(gradSchemeName_), while kEpsilon.C's
+    // production uses plain fvc::grad(U) -> gradSchemes `default`. Conflating them limits the production
+    // gradient on a case that never asked for it, which collapses GbyNu and with it epsilon.
+    // OF laminarModels::generalizedNewtonian + powerLaw viscosity (simulationType laminar, laminar{}).
+    // Replaces the molecular viscosity with a strain-rate-dependent one; see device_generalized_newtonian.
+    bool   gnPowerLaw = false;
+    scalar gnNuMin = 0.0, gnNuMax = 0.0, gnN = 1.0;
+    scalar gradULULimitK = 0.0;                    // linearUpwind's own grad(U)
+    scalar gradKLULimitK = 0.0;                    // linearUpwind's own grad(k)/grad(epsilon)
+    scalar gradKLimitK = 0.0;                      // grad(k) / grad(omega) / grad(epsilon) / grad(nuTilda)
+    scalar gradHeLimitK = 0.0;                     // grad(h) / grad(e)
+    // The cellLimited coefficient of the gradient the KINETIC term's linearUpwind uses. Separate from
+    // gradHeLimitK because fvSchemes gives div(phi,K|Ekp) its own entry, which may name a different
+    // gradient from div(phi,h|e); it falls back to the energy's when the case omits it.
+    scalar gradKinLimitK = 0.0;                    // grad(K) / grad(Ekp)
     KEpsilonCoeffs keCoeffs;                       // k-eps model coeffs (default = OF); read from turbulenceProperties RAS.kEpsilonCoeffs.
     bool   sst = false;                            // RASModel kOmegaSST (the "second turbulence scalar" eps slot holds omega).
     bool   lm = false;                             // RASModel kOmegaSSTLM (sst + Langtry-Menter gamma-ReThetat transition).
@@ -73,6 +140,10 @@ struct DeviceSimpleResidual
     scalar UxFinal = 0, UyFinal = 0, UzFinal = 0;
     int UxIters = 0, UyIters = 0, UzIters = 0;     // U per-component final + nIter
     int pIters = 0;
+    // energy. Captured here rather than left in the turbulence report because correctTurbulence() clears
+    // that store before the turbulence solves, which would wipe the EEqn entry the energy already pushed.
+    scalar he = 0, heFinal = 0;
+    int    heIters = 0;
     scalar contLocal = 0, contGlobal = 0;          // time step continuity errors, raw (driver applies deltaT + cumulative)
 };
 

@@ -42,9 +42,16 @@ void mixedUpdateKernel(
     const label* __restrict__ fc,
     const scalar* __restrict__ phiB,
     const scalar* __restrict__ magSf,
+    const scalar* __restrict__ rhoBnd,   // compressible: phiB is a MASS flux, so U.n = phiB/(rho_b*|Sf|)
     const scalar* __restrict__ Ux,
     const scalar* __restrict__ Uy,
     const scalar* __restrict__ Uz,
+    const scalar* __restrict__ Ub0,     // EVALUATED patch velocity (OF's `Up`), not the cell value
+    const scalar* __restrict__ Ub1,
+    const scalar* __restrict__ Ub2,
+    const scalar* __restrict__ nx,      // unit face normal
+    const scalar* __restrict__ ny,
+    const scalar* __restrict__ nz,
     scalar* __restrict__ vfU0,
     scalar* __restrict__ vfU1,
     scalar* __restrict__ vfU2,
@@ -55,10 +62,20 @@ void mixedUpdateKernel(
 
     const bool mu = maskU[i], mp = maskP[i];
     if (!mu && !mp) return;
-    const int c = fc[i];
-    const scalar mU = sqrt(Ux[c] * Ux[c] + Uy[c] * Uy[c] + Uz[c] * Uz[c]);   // local |U| (adjacent cell)
-    scalar ct = (phiB[i] / magSf[i]) / fmax(mU, 1e-30);                      // (U.n)/|U|
-    ct = fmin(fmax(ct, -1.0), 1.0);
+    // OF, exactly:
+    //   freestreamVelocity  valueFraction = 0.5 - 0.5*(Up & nf)/mag(Up)   (…VelocityFvPatchVectorField.C:106)
+    //   freestreamPressure  valueFraction = 0.5 + 0.5*(Up & nf)/mag(Up)   (…PressureFvPatchScalarField.C:119)
+    // where Up is the PATCH velocity -- the same vector in both the dot product and the magnitude, so the
+    // ratio is a genuine direction cosine in [-1,1].
+    //
+    // brae previously formed it from mixed quantities: the normal component came from the face FLUX and
+    // the magnitude from the ADJACENT CELL speed. Those disagree wherever the patch and cell velocities
+    // differ, so the ratio was not a cosine, needed clamping to stay in range, and drifted from OF's
+    // continuous Robin blend at exactly the angles the blend exists to handle.
+    const scalar ubx = Ub0[i], uby = Ub1[i], ubz = Ub2[i];
+    const scalar mUb = sqrt(ubx*ubx + uby*uby + ubz*ubz);
+    scalar ct = (ubx*nx[i] + uby*ny[i] + ubz*nz[i]) / fmax(mUb, 1e-30);
+    ct = fmin(fmax(ct, -1.0), 1.0);   // |cos| <= 1 analytically; the clamp is only against roundoff now
     if (mu)   // velocity sign
     {
         const scalar vfu = 0.5 - 0.5 * ct;
@@ -193,7 +210,15 @@ void selectMixedKernel(
 }
 
 
-// totalPressure: refValue = p0 - 0.5*neg(phi_b)*magSqr(U_b)  (OF totalPressureFvPatchScalarField, incompressible).
+// totalPressure (OF totalPressureFvPatchScalarField::updateCoeffs). OF branches on the DIMENSIONS of p:
+//
+//   kinematic p (incompressible):  p = p0 - 0.5*neg(phi)*magSqr(U)
+//   absolute p, psi "none":        p = p0 - 0.5*RHO*neg(phi)*magSqr(U)      <- rhoBnd supplies the rho
+//
+// The rho factor is not optional on a compressible case: it is the difference between a dynamic head in
+// m2/s2 and one in Pa. Passing rhoBnd = null gives the incompressible form, bit-identical to before.
+// (OF's third branch, the high-speed isentropic form with a named psi and gamma, is NOT implemented --
+// readThermoCoeffs-style refusal happens at load rather than silently running the low-speed form.)
 __global__
 void tpUpdateKernel(
     int n,
@@ -203,16 +228,60 @@ void tpUpdateKernel(
     const scalar* __restrict__ Uxb,
     const scalar* __restrict__ Uyb,
     const scalar* __restrict__ Uzb,
+    const scalar* __restrict__ rhoBnd,   // compressible: rho at the face; null -> kinematic (incompressible)
     scalar* __restrict__ refValue)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n || !tpMask[i]) return;
 
     const scalar u2 = Uxb[i]*Uxb[i] + Uyb[i]*Uyb[i] + Uzb[i]*Uzb[i];
-    refValue[i] = p0[i] - 0.5 * (phiB[i] < 0.0 ? 1.0 : 0.0) * u2;       // neg(phi)=inflow -> static = total - dynamic head
+    const scalar rw = rhoBnd ? rhoBnd[i] : scalar(1);
+    refValue[i] = p0[i] - 0.5 * rw * (phiB[i] < 0.0 ? 1.0 : 0.0) * u2;   // neg(phi)=inflow -> static = total - dynamic head
 }
 } // namespace
 
+
+// flowRateInletVelocity, massFlowRate form (OF flowRateInletVelocityFvPatchVectorField::updateValues,
+// extrapolateProfile false):  avgU = -flowRate/gSum(rho*magSf);  U_b = avgU*n.
+//
+// avgU is a single patch-wide scalar, computed by the caller as -mdot/dot(rhoBnd, maskedMagSf) -- the
+// mask makes that dot product exactly OF's gSum over this patch. Faces outside the patch have mask 0
+// and are left untouched.
+__global__
+void frUpdateKernel(
+    int n,
+    const scalar* __restrict__ mask,
+    scalar avgU,
+    const scalar* __restrict__ nx,
+    const scalar* __restrict__ ny,
+    const scalar* __restrict__ nz,
+    scalar* __restrict__ refX,
+    scalar* __restrict__ refY,
+    scalar* __restrict__ refZ)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || mask[i] <= scalar(0)) return;
+    refX[i] = avgU * nx[i];
+    refY[i] = avgU * ny[i];
+    refZ[i] = avgU * nz[i];
+}
+
+void deviceUpdateFlowRateInlet(
+    DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& maskMagSf,
+    scalar avgU,
+    const DeviceBuffer<scalar>& nx,
+    const DeviceBuffer<scalar>& ny,
+    const DeviceBuffer<scalar>& nz)
+{
+    const int n = dbU.comp[0].n;
+    if (n == 0) return;
+    frUpdateKernel<<<nBlocks(n), TPB>>>(n, maskMagSf.data(), avgU, nx.data(), ny.data(), nz.data(),
+                                        dbU.comp[0].refValue.data(),
+                                        dbU.comp[1].refValue.data(),
+                                        dbU.comp[2].refValue.data());
+    cudaCheck(cudaGetLastError(), "frUpdate");
+}
 
 void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phiBnd)
 {
@@ -228,12 +297,23 @@ void deviceUpdateMixedFreestream(
     const DeviceBuffer<scalar>& phiBnd,
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
-    const DeviceBuffer<scalar>& Uz)
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>* rhoBnd)
 {
     const int n = dbP.n;
     if (n == 0) return;
+    // OF's `Up` is the patch field's CURRENT value, i.e. the previous evaluate -- so evaluating here with
+    // the existing valueFraction before overwriting it is the same lag OF has.
+    DeviceBuffer<scalar> ub0, ub1, ub2;
+    deviceBCValue(dbU.comp[0], Ux, ub0);
+    deviceBCValue(dbU.comp[1], Uy, ub1);
+    deviceBCValue(dbU.comp[2], Uz, ub2);
     mixedUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].mixedMask.data(), dbP.mixedMask.data(), dbP.faceCell.data(),
-                                           phiBnd.data(), dbP.magSf.data(), Ux.data(), Uy.data(), Uz.data(),
+                                           phiBnd.data(), dbP.magSf.data(),
+                                           (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr,
+                                           Ux.data(), Uy.data(), Uz.data(),
+                                           ub0.data(), ub1.data(), ub2.data(),
+                                           dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
                                            dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
                                            dbU.comp[2].valueFraction.data(), dbP.valueFraction.data());
     cudaCheck(cudaGetLastError(), "mixedUpdate");
@@ -317,12 +397,92 @@ void deviceUpdateTotalPressure(
     const DeviceBuffer<scalar>& phiB,
     const DeviceBuffer<scalar>& Uxb,
     const DeviceBuffer<scalar>& Uyb,
-    const DeviceBuffer<scalar>& Uzb)
+    const DeviceBuffer<scalar>& Uzb,
+    const DeviceBuffer<scalar>* rhoBnd)
 {
     if (db.n == 0) return;
     tpUpdateKernel<<<nBlocks(db.n), TPB>>>(db.n, db.tpMask.data(), db.p0.data(), phiB.data(), Uxb.data(),
-                                           Uyb.data(), Uzb.data(), db.refValue.data());
+                                           Uyb.data(), Uzb.data(),
+                                           (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(db.n)) ? rhoBnd->data() : nullptr,
+                                           db.refValue.data());
     cudaCheck(cudaGetLastError(), "tpUpdate");
 }
 
 } // namespace brae
+
+namespace brae {
+namespace {
+
+// turbulentIntensityKineticEnergyInlet: refValue = 1.5*I^2*|Up|^2, from the CURRENT boundary U.
+__global__
+void tkeInletKernel(
+    int n,
+    const label* __restrict__ mask,
+    const scalar* __restrict__ intensity,
+    const scalar* __restrict__ ux,
+    const scalar* __restrict__ uy,
+    const scalar* __restrict__ uz,
+    scalar* __restrict__ kRef)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !mask[i]) return;
+    const scalar u2 = ux[i]*ux[i] + uy[i]*uy[i] + uz[i]*uz[i];
+    kRef[i] = scalar(1.5) * intensity[i] * intensity[i] * u2;
+}
+
+// turbulentMixingLength{DissipationRate,Frequency}Inlet, from the CURRENT boundary k.
+//   epsilon: (Cmu^0.75/L)*k^1.5      omega: sqrt(k)/(Cmu^0.25*L)
+__global__
+void mixingLengthInletKernel(
+    int n,
+    const label* __restrict__ mask,      // 1 = epsilon, 2 = omega
+    const scalar* __restrict__ len,
+    const scalar* __restrict__ kRef,
+    scalar Cmu75,
+    scalar Cmu25,
+    scalar* __restrict__ sRef)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !mask[i]) return;
+    const scalar kb = fmax(kRef[i], scalar(0));
+    sRef[i] = (mask[i] == 1) ? Cmu75 * pow(kb, scalar(1.5)) / len[i]
+                             : sqrt(kb) / (Cmu25 * len[i]);
+}
+
+}   // namespace
+
+// OF re-evaluates both of these in updateCoeffs EVERY outer iteration, so they track the solution. brae
+// evaluated them once on the host at set-up. That is exact for a fixedValue U inlet (Up never moves) and
+// wrong for flowRateInletVelocity, where Up is rebuilt each iteration from the live boundary density: the
+// set-up value uses the SEED density (rhoInlet, or 1.0 when absent), so on angledDuct the frozen inlet |U|
+// is ~1.19x too large and k_inlet lands ~41% high, epsilon ~67% high.
+void deviceUpdateTurbulentInletK(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<label>& mask,
+    const DeviceBuffer<scalar>& intensity,
+    DeviceBoundary& dbK)
+{
+    const int n = dbK.n;
+    if (!n || !mask.size()) return;
+    tkeInletKernel<<<nBlocks(n), TPB>>>(n, mask.data(), intensity.data(),
+                                        dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(),
+                                        dbU.comp[2].refValue.data(), dbK.refValue.data());
+    cudaCheck(cudaGetLastError(), "tkeInlet");
+}
+
+void deviceUpdateTurbulentInletSecond(
+    const DeviceBoundary& dbK,
+    const DeviceBuffer<label>& mask,
+    const DeviceBuffer<scalar>& len,
+    scalar Cmu,
+    DeviceBoundary& dbSecond)
+{
+    const int n = dbSecond.n;
+    if (!n || !mask.size()) return;
+    mixingLengthInletKernel<<<nBlocks(n), TPB>>>(n, mask.data(), len.data(), dbK.refValue.data(),
+                                                 pow(Cmu, scalar(0.75)), pow(Cmu, scalar(0.25)),
+                                                 dbSecond.refValue.data());
+    cudaCheck(cudaGetLastError(), "mixingLengthInlet");
+}
+
+}   // namespace brae

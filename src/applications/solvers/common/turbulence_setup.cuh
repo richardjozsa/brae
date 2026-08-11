@@ -6,6 +6,7 @@
 // gpuSimpleFoam so both drivers stay identical. Call readTurbulenceModel BEFORE readTurbulenceFields (needs ctl.sst).
 #include "solver_controls.cuh"
 #include "foam_dict.cuh"
+#include "brae_notice.cuh"
 #include "foam_field_reader.cuh"
 #include "geometric_field.cuh"
 #include "fv_patch.cuh"
@@ -23,6 +24,52 @@ namespace brae {
 // constant/turbulenceProperties RASModel -> ctl turbulence flags + coeffs (ctl.turbulent must already be set).
 inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls& ctl)
 {
+        // `simulationType laminar` DOES NOT MEAN "no model". OF selects a laminarModel, and the default
+        // (Stokes) is the only one that leaves the molecular viscosity alone. A
+        //     laminar { model generalizedNewtonian; viscosityModel powerLaw; ... }
+        // replaces nu with a strain-rate-dependent field, which is a different momentum equation.
+        //
+        // REFUSED RATHER THAN IGNORED. Measured on squareBendLiqNoNewtonian: OF's powerLaw is
+        //     nu = max(nuMin, min(nuMax, nu0*pow(max(strainRate, SMALL), n-1)))
+        // and with that case's nu0 = mu/rho ~ 8.9e-7, n = 0.4 and nuMin = 1e-3, nu sits AT nuMin over
+        // essentially the whole field -- about 1120x the Newtonian value. brae previously read
+        // `simulationType laminar`, never looked inside the sub-dictionary, ran with the molecular nu and
+        // produced a confident non-converged answer (Ux 1.9e-2, p 3.4e-1 still oscillating at iteration
+        // 500). The dict audit did flag `laminar/` as unread, which is what a notice is for; a viscosity
+        // model is not a notice-level omission.
+        if (!ctl.turbulent)
+        {
+            if (const FoamDict* lam = turbProps.subDict("laminar"))
+            {
+                const std::string lmodel = lam->wordOr("model", "Stokes");
+                if (lmodel == "generalizedNewtonian")
+                {
+                    // OF reads the coefficients from powerLawCoeffs{} if present, else from the enclosing
+                    // dictionary (dictionary::optionalSubDict), which is how this tutorial writes them.
+                    const std::string vm = lam->wordOr("viscosityModel", "");
+                    if (vm != "powerLaw")
+                        throw std::runtime_error(
+                            "brae: unsupported generalizedNewtonian viscosityModel '" + vm +
+                            "' (only 'powerLaw' is implemented).");
+                    const FoamDict* co = lam->subDict("powerLawCoeffs");
+                    const FoamDict& src = co ? *co : *lam;
+                    ctl.gnPowerLaw = true;
+                    ctl.gnN     = src.scalarOr("n", 1.0);
+                    ctl.gnNuMin = src.scalarOr("nuMin", 0.0);
+                    ctl.gnNuMax = src.scalarOr("nuMax", 0.0);
+                    if (ctl.gnNuMax <= 0.0)
+                        throw std::runtime_error("brae: generalizedNewtonian powerLaw needs nuMin and nuMax.");
+                    std::printf("  laminar generalizedNewtonian/powerLaw: n=%.4g nuMin=%.4g nuMax=%.4g"
+                                "  (nu = clamp(nu0*strainRate^(n-1)))\n", ctl.gnN, ctl.gnNuMin, ctl.gnNuMax);
+                }
+                else if (lmodel != "Stokes")
+                    throw std::runtime_error(
+                        "brae: unsupported laminar model '" + lmodel + "' in constant/turbulenceProperties. "
+                        "Only 'Stokes' (the OF default, molecular viscosity unchanged) is implemented. A "
+                        "generalizedNewtonian model replaces nu with a strain-rate-dependent field, so "
+                        "running without it is a different momentum equation, not an approximation.");
+            }
+        }
         if (ctl.turbulent)
         {
             // simulationType LES: DES/LES models live under an LES{} sub-dict (OF convention). SA-DDES reuses the SA
@@ -95,6 +142,17 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 return;
             }
             const FoamDict* ras = turbProps.subDict("RAS");
+            // OF Switch: yes/no/on/off/true/false/1/0. Default true when absent (RASModel.C:70).
+            if (ras)
+            {
+                const std::string sw = ras->wordOr("turbulence", "true");
+                ctl.turbulenceOn = !(sw == "off" || sw == "no" || sw == "false" || sw == "0");
+                if (!ctl.turbulenceOn)
+                    noticeApplied("turbulenceProperties RAS/turbulence",
+                                  "'" + sw + "' -- the model is FROZEN: k/epsilon|omega/nut keep their initial "
+                                  "values and momentum uses that frozen nut (OF RASModel::correct() returns "
+                                  "immediately). This is not the same as simulationType laminar.");
+            }
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
             ctl.lm  = (model == "kOmegaSSTLM");                 // Langtry-Menter transition = kOmegaSST + gamma-ReThetat
             ctl.sst = (model == "kOmegaSST") || ctl.lm;
@@ -162,12 +220,14 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
 }
 
 // The turbulence start fields, read from fieldDir with the nut wall function + turbulent-inlet BCs applied.
-struct TurbulenceFields { GeometricField<scalar> k, eps, nut, ReThetat, gammaInt; };
+struct TurbulenceFields { GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;     TurbulentInletMasks turbInletMasks;
+};
 
 inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const std::vector<FvPatch>& fvp, label nC,
                                              DeviceSimpleControls& ctl, const std::string& secondName,
                                              const GeometricField<vector>& U)
 {
+    TurbulentInletMasks masks;
         // Wall-function fidelity guard -- fail loud on a nut/epsilon/omega wall-function BC placed on a patch NOT typed
         // 'wall': brae gates the near-wall model on the geometric patch type, so the wall function would be SILENTLY
         // inert. Conservative on the patch match -- only errors when the BC patch resolves to a concrete non-'wall'
@@ -204,6 +264,10 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                 if (!gt.empty() && gt != "wall") continue;                 // only wall patches drive the choice
                 if (pb.type == "nutUSpaldingWallFunction") { ctl.nutWall = NutWall::Spalding; }
                 else if (pb.type == "nutUBlendedWallFunction") { ctl.nutWall = NutWall::Blended; }
+                // nutUWallFunction: OF's default blender is STEPWISE (nutUWallFunctionFvPatchScalarField.C:259,
+                // wallFunctionBlenders(dict, blenderType::STEPWISE, 4)). Any other blender is a different
+                // formula, so it is refused rather than approximated by the stepwise one.
+                else if (pb.type == "nutUWallFunction") { ctl.nutWall = NutWall::NutU; }
                 else if (pb.type == "atmNutkWallFunction")   // atmospheric rough-wall nut (k-based path + roughness z0)
                 {
                     ctl.atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
@@ -217,7 +281,8 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             }
             if (!ctl.sa && ctl.nutWall != NutWall::Nutk)
                 printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
-                       ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction" : "nutUBlendedWallFunction",
+                       ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
+                       : ctl.nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
                        ctl.sst ? "kOmegaSST" : "kEpsilon");
         };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
@@ -260,12 +325,25 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                 gammaInt.evaluateBoundary();
                 std::printf("  kOmegaSSTLM (Langtry-Menter transition): + ReThetat + gammaInt transport\n");
             }
-            // turbulent-inlet BCs: inflow value computed from U (k) then from k (epsilon/omega).
-            const scalar wCmu = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
-            applyTurbulentInletK(k, kFD, U, fvp);
-            applyTurbulentInletSecond(eps, sFD, k, wCmu, fvp);
+            // turbulent-inlet BCs are NOT evaluated here. OF's rule is that a boundary condition updates
+            // when ITS OWN equation is assembled: turbulentIntensityKineticEnergyInlet and
+            // turbulentMixingLengthDissipationRateInlet are k/epsilon BCs, so their updateCoeffs() first
+            // fires inside kEqn/epsEqn (kEpsilon.C:252,273) -- called from turbulence->correct(), the LAST
+            // phase of the outer iteration. Until then the patch simply holds the `value` entry read from
+            // the file, exactly like any other fixedValue-derived BC at construction.
+            //
+            // Evaluating them here instead made the FIRST momentum solve see an inlet k recomputed from
+            // the set-up velocity. On squareBend that is k = 1.5*(0.05*523.087)^2 = 1026 against the
+            // file's `uniform 1`, so the inlet `calculated` nut (Cmu*k_b^2/eps_b) came out 0.0877 instead
+            // of 0.09*1/200 = 4.5e-04 -- and the inlet boundary diffusivity 157x OF's, which propagated
+            // through Upred, HbyA, phiHbyA, phid and p.
+            //
+            // A3 fixed these inlets being FROZEN at set-up and never refreshed. The refresh is right; doing
+            // it a phase early is not. Only the per-face MASKS are built here -- they say WHICH faces
+            // correctTurbulence() must recompute, which is set-up information, not a value.
+            masks = buildTurbulentInletMasks(kFD, sFD, fvp);
         }
-    return { std::move(k), std::move(eps), std::move(nut), std::move(ReThetat), std::move(gammaInt) };
+    return { std::move(k), std::move(eps), std::move(nut), std::move(ReThetat), std::move(gammaInt), std::move(masks) };
 }
 
 }  // namespace brae

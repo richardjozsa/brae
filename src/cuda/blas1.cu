@@ -197,6 +197,27 @@ void deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const 
 }
 
 
+// out = a ./ b. A zero denominator yields zero rather than a NaN: the only caller is the transonic
+// pressure equation, where a face with rho_f = 0 has no flux to carry anyway, and a NaN there would
+// propagate silently into the whole matrix.
+__global__
+void divideKernel(const scalar* __restrict__ a, const scalar* __restrict__ b, scalar* __restrict__ out, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = (b[i] != scalar(0)) ? a[i] / b[i] : scalar(0);
+}
+
+
+void deviceDivide(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b)
+{
+    const int n = static_cast<int>(a.size());
+    out.resize(n);
+    divideKernel<<<nBlocks(n), TPB>>>(a.data(), b.data(), out.data(), n);
+    cudaCheck(cudaGetLastError(), "divide");
+}
+
+
 void deviceHadamard(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b)
 {
     const int n = static_cast<int>(a.size());
