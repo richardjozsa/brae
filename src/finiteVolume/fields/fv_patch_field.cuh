@@ -698,6 +698,20 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "which brae does not apply -- it would silently run with zero tangential velocity. Remove the "
             "entry (if the tangential component really is zero) or use a BC that fixes the full vector.");
     }
+    // `table` is implemented (Function1::table + the solver's per-step p0 refresh), so it is not in
+    // unsupportedFunction1 at all. Anything still recorded there -- polynomial, csvFile, expression --
+    // is genuinely unevaluated and must stay named rather than silently frozen at its t=0 value.
+    if ((d.type == "uniformTotalPressure" || d.type == "totalPressure") && !d.unsupportedFunction1.empty())
+    {
+        // Same rule as uniformFixedValue below: a time-varying p0 that brae cannot evaluate must be
+        // named, not silently replaced by whatever `value` happens to hold -- that would run a
+        // constant-pressure outlet where the case asked for a ramp.
+        throw std::runtime_error(
+            "brae: patch " + p.name + " is " + d.type + " with a non-constant p0 ('"
+            + d.unsupportedFunction1 + "'). brae evaluates only `constant`/`uniform` Function1 entries, "
+            "so the prescribed time variation would be lost. Replace p0 with a constant, or drive the "
+            "case at fixed total pressure.");
+    }
     if (d.type == "uniformFixedValue" && !d.unsupportedFunction1.empty())
     {
         // A non-constant uniformValue. Refusing rather than falling back to whatever `value` happens to
@@ -722,7 +736,11 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // That is its only standard usage (no-flux walls), so we map it to zeroGradient (exact there). See
     // PORTING_PRESSURE_REFERENCE.md; a fixedFluxPressure on a non-fixed-velocity patch would need the gradient path.
     if (d.type == "fixedFluxPressure") return std::make_unique<ZeroGradientPatchField<T>>(p);
-    if (d.type == "totalPressure")   // p0 read into the inletValue slot (foam_field_reader); fall back to value
+    // uniformTotalPressure is totalPressure with a TIME-VARYING p0 -- OF's own class differs only in
+    // that p0 comes from a Function1 (uniformTotalPressureFvPatchScalarField.C:149 samples it every
+    // updateCoeffs). The face treatment is identical: p_b = p0 - 0.5*neg(phi)*magSqr(U). So it builds
+    // the same patch field, and the solver refreshes p0 per step from the table.
+    if (d.type == "totalPressure" || d.type == "uniformTotalPressure")   // p0 read into the inletValue slot
     {
         // OF has three branches. brae implements the two that share one expression (kinematic, and the
         // compressible low-speed form with rho). The isentropic branch a named psi selects is different

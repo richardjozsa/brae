@@ -564,6 +564,22 @@ namespace brae {
         // reflects the just-updated U BCs above, e.g. pressureInletOutletVelocity) + the boundary flux.
         if (hasTotalP_)
         {
+            // p0(t) BEFORE the total-pressure update, matching OF's updateCoeffs order: p0 is sampled
+            // at the current time, then p_b = p0 - 0.5*neg(phi)*magSqr(U) is formed from it.
+            if (!tvP0_.empty())
+            {
+                std::vector<scalar> p0h = dbP_.p0.host();
+                for (const auto& e : tvP0_)
+                {
+                    const scalar v = e.f.value(time_);
+                    for (label i = 0; i < e.count; ++i)
+                    {
+                        const label f = e.start + i;
+                        if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
+                    }
+                }
+                dbP_.p0.copyFrom(p0h);
+            }
             DeviceBuffer<scalar> ubx, uby, ubz;
             deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
             deviceBCValue(dbU_.comp[1], Uk_[1], uby);

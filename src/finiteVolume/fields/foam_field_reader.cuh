@@ -3,8 +3,10 @@
 // boundaryField { patch { type; value; ... } }. Templated on the value type (scalar/vector).
 // ASCII for now; binary field values land with the binary field reader (later increment).
 #include "cf_types.cuh"
+#include "function1.cuh"   // OF Function1: constant / table
 #include "foam_token_reader.cuh"
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <filesystem>
 
@@ -45,6 +47,8 @@ struct PatchFieldData
     // stale `value` from an overridden fixedValue entry, so the field silently takes that constant
     // instead. Recorded here and refused at construction rather than guessed at.
     std::string    unsupportedFunction1;
+    Function1      p0Function1;              // uniformTotalPressure p0(t); empty unless hasP0Function1
+    bool           hasP0Function1 = false;
     // pressureInletOutletVelocity's optional `tangentialVelocity`. OF sets
     // refValue = tv - n*(n & tv) (pressureInletOutletVelocityFvPatchVectorField.C:135); brae leaves the
     // tangential refValue at zero, so honouring the key would need per-face storage it does not have.
@@ -392,8 +396,73 @@ inline FieldData<T> readField(const std::string& path)
                     }
                     else if (key == "p0")   // totalPressure reference p0 (reuse the inletValue slot)
                     {
-                        readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
-                        p.hasInletValue = true;
+                        // p0 is a Function1 on uniformTotalPressure: it may be `table (...)`,
+                        // `polynomial`, `csvFile`, an expression -- not just a field value.
+                        // readValueOrInternal only knows uniform/nonuniform, so a table made the
+                        // TOKENISER fail mid-parse ("expected '(' got '0'", pimpleFoam/RAS/TJunction).
+                        // That is a raw parser error where this codebase's rule is that unsupported
+                        // input is NAMED. Record it and let the dispatch refuse by name instead.
+                        const std::string m = ts.peek();
+                        if (m == "uniform" || m == "nonuniform")
+                        {
+                            readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
+                            p.hasInletValue = true;
+                        }
+                        else if (m == "constant")
+                        {
+                            ts.next();
+                            p.inletUniformValue = readFoamValue<T>(ts);
+                            p.inletUniform = true;
+                            p.hasInletValue = true;
+                        }
+                        else if (isFoamNumber(m))
+                        {
+                            p.inletUniformValue = readBareFoamValue<T>(ts, ts.next());
+                            p.inletUniform = true;
+                            p.hasInletValue = true;
+                        }
+                        else if (m == "table")
+                        {
+                            // OF Function1 `table ((t v) (t v) ...)`: linear between entries, CLAMPed
+                            // outside (TableBase.C:76). pimpleFoam/RAS/TJunction ramps p0 this way.
+                            ts.next();                       // "table"
+                            ts.expect("(");
+                            std::vector<std::pair<scalar, scalar>> pts;
+                            while (!ts.eof() && ts.peek() != ")")
+                            {
+                                ts.expect("(");
+                                const scalar tt = ts.nextScalar();
+                                const scalar vv = ts.nextScalar();
+                                ts.expect(")");
+                                pts.emplace_back(tt, vv);
+                            }
+                            ts.expect(")");
+                            p.p0Function1 = Function1::table(std::move(pts));
+                            p.hasP0Function1 = true;
+                            // NOT YET WIRED: DeviceSimpleSolver::setTimeVaryingP0 exists and the
+                            // per-step device refresh is in place, but no driver hands the tables over,
+                            // so p0 would stay frozen at its t=0 value while the case believes it is
+                            // ramping. Measured on pimpleFoam/RAS/TJunction: inlet p fell 9.32 -> 8.62
+                            // where the table asks for p0 13.09 -> 15.11. A plausible wrong answer is
+                            // worse than a refusal, so keep naming it until the driver wiring lands.
+                            p.unsupportedFunction1 = "table (parsed, but p0(t) is not yet applied)";
+                            // Seed the constant slot with t = 0 so a solver that never advances time
+                            // still has a defined p0 rather than zero.
+                            // p0 is a PRESSURE: scalar only. The reader is templated on T, so guard
+                            // rather than cast -- a vector field has no p0 and must not silently get one.
+                            if constexpr (std::is_same_v<T, scalar>)
+                            {
+                                p.inletUniformValue = p.p0Function1.value(0);
+                                p.inletUniform = true;
+                                p.hasInletValue = true;
+                            }
+                        }
+                        else
+                        {
+                            p.unsupportedFunction1 = m;
+                            ts.next();
+                            skipToSemicolon(ts, 0);
+                        }
                         ts.expect(";");
                     }
                     else if (key == "uniformValue")   // uniformFixedValue: steady PatchFunction1 "constant <v>"

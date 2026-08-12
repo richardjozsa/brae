@@ -11,6 +11,7 @@
 // nuEff at boundary faces = the adjacent-cell value (this path's convention, consistent with its laplacian
 // boundary). The fully-faithful boundary-nut (nutkWallFunction) treatment lives in the host simple_foam.cuh.
 #include "cf_types.cuh"
+#include "function1.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -390,6 +391,13 @@ public:
     // target: 0=U (vector), 1=p, 2=k/nuTilda, 3=second (omega/epsilon). mixed=true -> codedMixed (also writes valueFraction).
     void addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target = 0, bool mixed = false);
     void setTime(scalar t) { time_ = t; }
+
+    // uniformTotalPressure: p0 is a Function1 of time, so the device p0 must be refreshed each step
+    // before deviceUpdateTotalPressure recomputes p_b. OF does the same -- updateCoeffs() calls
+    // p0_->value(time) every step (uniformTotalPressureFvPatchScalarField.C:149). One entry per patch
+    // that declared a non-constant p0; a constant p0 needs none and keeps the value set at read time.
+    struct TimeVaryingP0 { label start = 0, count = 0; Function1 f; };
+    void setTimeVaryingP0(std::vector<TimeVaryingP0> v) { tvP0_ = std::move(v); }
     std::vector<vector> Uddt0() const
     {
         const auto x = Uddt0_[0].host(), y = Uddt0_[1].host(), z = Uddt0_[2].host();
@@ -476,6 +484,7 @@ private:
     // Transient (PIMPLE) state: ddt scheme + time steps + old-time velocity levels (U.oldTime()[.oldTime()]), rotated by
     // advanceTime(). steadyState + empty old-time buffers in the default steady SIMPLE path, where ddt is a no-op.
     DdtScheme ddtScheme_ = DdtScheme::steadyState;
+    std::vector<TimeVaryingP0> tvP0_;   // uniformTotalPressure p0(t), empty for constant p0
     scalar    deltaT_ = 0, deltaT0_ = 0;
     scalar    ocCoeff_ = 1;         // CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>"); 0=Euler-like, 1=pure CN
     bool      cnWarm_  = false;     // CrankNicolson: the ddt0 recurrence has done its first (Euler-startup) update
