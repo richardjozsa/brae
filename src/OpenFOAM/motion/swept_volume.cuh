@@ -28,6 +28,7 @@
 
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -122,6 +123,29 @@ inline std::vector<scalar> meshPhi(
     if (deltaT <= 0) return mp;
     for (label f = 0; f < nF; ++f) mp[f] = faceSweptVol(m, f, oldP, newP)/deltaT;
     return mp;
+}
+
+// fvc::makeRelative / makeAbsolute -- OF fvcMeshPhi.C:76 and :121.
+//
+//     makeRelative(phi, U):  if (mesh.moving()) phi -= fvc::meshPhi(U);
+//     makeAbsolute(phi, U):  if (mesh.moving()) phi += fvc::meshPhi(U);
+//
+// Both are NO-OPS on a static mesh, which is why every existing brae case is unaffected.
+//
+// WHY IT MATTERS. On a moving mesh the convective term must see the flux RELATIVE to the mesh: a fluid
+// travelling with the mesh convects nothing. Skip this and a translating mesh convects its own motion
+// into the solution -- a wrong answer that still converges. The runnable check for it is exactly that
+// statement: move the mesh and the fluid together and the relative flux must vanish.
+inline void makeRelative(std::vector<scalar>& phi, const std::vector<scalar>& meshPhiF)
+{
+    const std::size_t n = std::min(phi.size(), meshPhiF.size());
+    for (std::size_t f = 0; f < n; ++f) phi[f] -= meshPhiF[f];
+}
+
+inline void makeAbsolute(std::vector<scalar>& phi, const std::vector<scalar>& meshPhiF)
+{
+    const std::size_t n = std::min(phi.size(), meshPhiF.size());
+    for (std::size_t f = 0; f < n; ++f) phi[f] += meshPhiF[f];
 }
 
 }   // namespace brae
