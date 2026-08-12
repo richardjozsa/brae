@@ -65,13 +65,90 @@ CodedBcKernel compileSource(const std::string& src, const std::string& fn, const
 
 const char* VEC3_PREAMBLE =
     "struct vec3 { double x, y, z; };\n"
-    "__device__ inline vec3 make3(double a, double b, double c){ vec3 v; v.x=a; v.y=b; v.z=c; return v; }\n";
+    "__device__ inline vec3 make3(double a, double b, double c){ vec3 v; v.x=a; v.y=b; v.z=c; return v; }\n"
+    // ------------------------------------------------------------------------------------------
+    // OpenFOAM Field-API compatibility, IN ADDITION to the per-face model above (which several
+    // cases already use and which is unchanged).
+    //
+    // OF snippets are written against whole-field types:
+    //     const vector axis(1, 0, 0);
+    //     vectorField v(2.0*this->patch().Cf() ^ axis);
+    //     v.replace(vector::X, 1.0);
+    //     operator==(v);
+    // (simpleFoam/pipeCyclic). That is a different programming model from `out.x = ...`, not a
+    // missing symbol -- which is why the snippet failed to compile at all.
+    //
+    // WHY A PER-FACE PROXY IS EXACT HERE, not an approximation: every operator in that expression is
+    // ELEMENT-WISE (scale, cross product, component replace, assign). A field expression built only
+    // from element-wise operators evaluated face-by-face is identical to evaluating it on the whole
+    // field. So `vectorField` is a typedef of the per-face vector.
+    //
+    // THE LIMIT, and it is a real one: anything with a REDUCTION (gSum, average, max over the patch)
+    // is NOT element-wise and would silently give the per-face value instead of the field value.
+    // Those are refused by name at parse time rather than compiled -- see rejectFieldReductions().
+    "struct ofVec {\n"
+    "  double x, y, z;\n"
+    "  __device__ ofVec() : x(0), y(0), z(0) {}\n"
+    "  __device__ ofVec(double a, double b, double c) : x(a), y(b), z(c) {}\n"
+    "  __device__ void replace(int c, double v) { if (c==0) x=v; else if (c==1) y=v; else z=v; }\n"
+    "  __device__ double component(int c) const { return c==0?x:(c==1?y:z); }\n"
+    "  static const int X = 0, Y = 1, Z = 2;\n"
+    "};\n"
+    "typedef ofVec vector;\n"
+    "typedef ofVec vectorField;\n"      // per-face proxy: exact for element-wise expressions
+    "typedef double scalar;\n"
+    "typedef double scalarField;\n"
+    "__device__ inline ofVec operator^(const ofVec& a, const ofVec& b){\n"
+    "  return ofVec(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x); }\n"
+    "__device__ inline ofVec operator*(double s, const ofVec& a){ return ofVec(s*a.x, s*a.y, s*a.z); }\n"
+    "__device__ inline ofVec operator*(const ofVec& a, double s){ return ofVec(s*a.x, s*a.y, s*a.z); }\n"
+    "__device__ inline ofVec operator+(const ofVec& a, const ofVec& b){ return ofVec(a.x+b.x, a.y+b.y, a.z+b.z); }\n"
+    "__device__ inline ofVec operator-(const ofVec& a, const ofVec& b){ return ofVec(a.x-b.x, a.y-b.y, a.z-b.z); }\n"
+    "__device__ inline double operator&(const ofVec& a, const ofVec& b){ return a.x*b.x + a.y*b.y + a.z*b.z; }\n"
+    "__device__ inline double mag(const ofVec& a){ return sqrt(a.x*a.x + a.y*a.y + a.z*a.z); }\n"
+    "struct ofPatch {\n"
+    "  double cfx, cfy, cfz;\n"
+    "  __device__ ofVec Cf() const { return ofVec(cfx, cfy, cfz); }\n"
+    "};\n";
 } // namespace
+
+// A per-face proxy is exact for ELEMENT-WISE field expressions and wrong for REDUCTIONS: gSum over a
+// patch is one number for the whole patch, and evaluating it face-by-face silently yields the local
+// value instead. That is precisely the "plausible wrong answer" this project keeps refusing, so these
+// are rejected by name rather than compiled into something that looks like it worked.
+static void rejectFieldReductions(const std::string& name, const std::string& body)
+{
+    static const char* kReductions[] = {
+        "gSum", "gMax", "gMin", "gAverage", "sum(", "average(", "max(", "min(", "returnReduce"
+    };
+    for (const char* r : kReductions)
+        if (body.find(r) != std::string::npos)
+            throw std::runtime_error(
+                std::string("brae coded BC '") + name + "': '" + r + "' is a field REDUCTION. brae "
+                "evaluates coded snippets per face, which is exact for element-wise expressions but "
+                "would give the local value instead of the patch value here. Refused rather than run.");
+}
 
 CodedBcKernel compileCodedVectorBc(const std::string& name, const std::string& body)
 {
+    rejectFieldReductions(name, body);
     const std::string fn = "bc_" + name;
+    // The body becomes a MEMBER FUNCTION, not an inline block. OF snippets say `this->patch().Cf()`
+    // and `operator==(v)`, both of which need a `this` to resolve against; a free block cannot provide
+    // one. The per-face variables stay as members, so snippets written against the older model
+    // ("out.x = fx*2") resolve exactly as before -- both models compile from the same preamble.
     const std::string src = std::string(VEC3_PREAMBLE) +
+        "struct Ctx {\n"
+        "  double fx, fy, fz, cx, cy, cz, t;\n"
+        "  ofPatch p_;\n"
+        "  vec3* outp;\n"
+        "  __device__ const ofPatch& patch() const { return p_; }\n"
+        "  __device__ void operator==(const ofVec& v) { outp->x=v.x; outp->y=v.y; outp->z=v.z; }\n"
+        "  __device__ void run(vec3& out);\n"
+        "};\n"
+        "__device__ void Ctx::run(vec3& out) {\n"
+        "  (void)fx;(void)fy;(void)fz;(void)cx;(void)cy;(void)cz;(void)t;(void)out;\n"
+        + body + "\n}\n"
         "extern \"C\" __global__ void " + fn + "(\n"
         "    int n, int offset,\n"
         "    const double* CfX, const double* CfY, const double* CfZ, double t,\n"
@@ -84,9 +161,10 @@ CodedBcKernel compileCodedVectorBc(const std::string& name, const std::string& b
         "    const double fx = CfX[g], fy = CfY[g], fz = CfZ[g];\n"
         "    const int ic = faceCell[g];\n"
         "    const double cx = Ux[ic], cy = Uy[ic], cz = Uz[ic];\n"
-        "    (void)fx;(void)fy;(void)fz;(void)cx;(void)cy;(void)cz;(void)t;\n"
         "    vec3 out; out.x = 0; out.y = 0; out.z = 0;\n"
-        "    {\n" + body + "\n    }\n"
+        "    Ctx ctx; ctx.fx=fx; ctx.fy=fy; ctx.fz=fz; ctx.cx=cx; ctx.cy=cy; ctx.cz=cz; ctx.t=t;\n"
+        "    ctx.p_.cfx=fx; ctx.p_.cfy=fy; ctx.p_.cfz=fz; ctx.outp=&out;\n"
+        "    ctx.run(out);\n"
         "    refX[g] = out.x; refY[g] = out.y; refZ[g] = out.z;\n"
         "}\n";
     return compileSource(src, fn, name);

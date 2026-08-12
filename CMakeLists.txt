@@ -638,6 +638,18 @@ target_link_libraries(test_boundary_mu_eff PRIVATE brae_core)
 # functionObject ran before the solver knew deltaT. All three were green on the full suite throughout.
 # Carries its own negative control (scheme removed under `default none` must be REFUSED), so the gate
 # is proven able to fail rather than merely passing.
+# Restart fidelity. A restart must reproduce a continuous run: OF pairs createPhi.H:45 READ_IF_PRESENT
+# with AUTO_WRITE so phi RESUMES rather than being rebuilt from fvc::flux(U). Before the fix this case
+# measured U 7.85e-06 / p 2.08e-05 against a 9.5e-12 reproducibility floor -- six orders above noise,
+# shipping, and covered by nothing. Mutation-checked: reverting the phi read makes this test fail with
+# exactly those numbers.
+add_test(NAME restart_continuity
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/validation/restart_continuity.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/channel
+                 ${CMAKE_CURRENT_BINARY_DIR}/restart_continuity_work)
+set_tests_properties(restart_continuity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
 add_test(NAME tracer_transport
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/validation/tracer_transport.sh
                  $<TARGET_FILE:brae_rhoSimpleFoam>

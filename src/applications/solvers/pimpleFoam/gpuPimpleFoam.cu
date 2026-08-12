@@ -17,6 +17,7 @@
 // Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae; `brae` hands
 // over to it whenever a case's controlDict says `application pimpleFoam` (solvers/common/solver_dispatch.cuh).
 #include "primitive_mesh.cuh"
+#include "../common/start_time.cuh"   // OF Time::setControls() startFrom, shared
 #include "../common/read_surface_field.cuh"   // readSurfaceField / readPhiIfPresent (OF READ_IF_PRESENT)
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -132,6 +133,15 @@ try
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
+
+    // As in the other drivers. turbulenceProperties is deliberately NOT registered: this driver reads it
+    // inside an `if (exists(...))` block further down, so it would be destroyed before this scope and the
+    // audit would report on a dangling dict.
+    DictAuditScope audit;
+    audit.add(controlDict, "system/controlDict");
+    audit.add(fvSolution,  "system/fvSolution");
+    audit.add(transport,   "constant/transportProperties");
+    audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
     scalar ddtOcCoeff = 1.0;
     const DdtScheme ddtScheme  = parseDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
 
@@ -215,24 +225,16 @@ try
     FvGeometry g; g.build(m);
     const std::vector<FvPatch> fvp = buildPatches(m, g);
     const label nC = m.nCells();
-    // startFrom latestTime -> RESTART: resume from the newest numeric time dir that holds a U field (else startTime).
-    std::string startStr = timeName(startTime);
-    if (controlDict.wordOr("startFrom", "startTime") == "latestTime")
-    {
-        namespace fs = std::filesystem;
-        std::error_code ec; scalar best = 0; std::string bestName; bool found = false;
-        for (const auto& e : fs::directory_iterator(caseDir, ec))
-        {
-            if (!e.is_directory()) continue;
-            const std::string nm = e.path().filename().string();
-            char* end = nullptr; const scalar t = std::strtod(nm.c_str(), &end);
-            if (end == nm.c_str() || *end != '\0') continue;             // not a pure number -> not a time dir
-            if (!fs::exists(e.path() / "U")) continue;
-            if (!found || t > best) { best = t; bestName = nm; found = true; }
-        }
-        if (found) { startTime = best; startStr = bestName;
-            std::printf("gpuPimpleFoam: startFrom latestTime -> resuming from time '%s'\n", bestName.c_str()); }
-    }
+    // startFrom, via the shared resolver -- the same one the other drivers use, and the behaviour OF
+    // puts in Time::setControls() (Time.C:149-188).
+    //
+    // THIS DRIVER'S OWN COPY WAS WRONG. It tested only `latestTime`, so `startFrom firstTime` fell
+    // through to startTime and was silently ignored -- OF resolves both. Found by consolidating three
+    // hand-written copies of one behaviour, which is the second such defect in this sweep after phi.
+    std::string startStr = resolveStartTime(caseDir,
+                                            controlDict.wordOr("startFrom", "startTime"),
+                                            timeName(startTime));
+    startTime = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
     const std::string fieldDir = caseDir + "/" + startStr;
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
     GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC); p.evaluateBoundary();
@@ -291,18 +293,11 @@ try
                 nC);
 
     // ---- write cadence (Foam::Time: writeControl timeStep|runTime + writeInterval + purgeWrite FIFO) ----
-    long writeTimeIndex = 0;
-    std::deque<std::string> writtenTimes;
-    auto isWriteTime = [&](long it, scalar tval) -> bool {
-        if (writeControl == "timeStep")
-            return writeInterval >= 1 && (it % (long)writeInterval) == 0;
-        if (writeControl == "runTime" || writeControl == "adjustable" || writeControl == "adjustableRunTime") {
-            const long wi = (long)(((tval - startTime) + 0.5 * deltaT) / writeInterval);
-            if (wi > writeTimeIndex) { writeTimeIndex = wi; return true; }
-            return false;
-        }
-        return false;
-    };
+
+    // Write cadence from Time's WriteControl, as OF does (TimeIO.C:277). This driver's own
+    // isWriteTime lambda was measured identical to the shared one over 8 controlDict cases x 40
+    // steps -- including runTime float accumulation and a non-zero-startTime restart -- before
+    // being removed. Unlike its startFrom copy, which had silently lost `firstTime`.
     // Everything a functionObject can need already exists at this point in this driver, so the registry
     // is populated immediately. The lookups still happen on first execute() -- that indirection is what
     // lets the steady drivers build Time at start-up, and costs nothing here.
@@ -399,14 +394,9 @@ try
             }
         }
         std::printf("written %s\n", outDir.c_str());
-        if (purgeWrite > 0) {
-            if (writtenTimes.empty() || writtenTimes.back() != tname) writtenTimes.push_back(tname);
-            while ((int)writtenTimes.size() > purgeWrite) {
-                std::error_code pec;
-                std::filesystem::remove_all(caseDir + "/" + writtenTimes.front(), pec);
-                writtenTimes.pop_front();
-            }
-        }
+        // purgeWrite, from Time's WriteControl -- measured identical to this driver's copy and
+        // purging at the same point (immediately after the write).
+        time.writeControl().recordWritten(caseDir, tname);
     };
 
     // ---- forceCoeffs (Cd/Cl/Cm) sampling -------------------------------------------------------------------
@@ -506,7 +496,7 @@ try
         if (!std::getenv("BRAE_ALLOW_NONFINITE")
             && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
-        const bool isWrite = isWriteTime(timeIndex, t);
+        const bool isWrite = time.writeControl().isWriteTime(timeIndex, t);
         if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
         // Sample Cd on the write cadence, or on BRAE_FORCE_INTERVAL when set (see the cost note above).
         if (forceInterval > 0 ? (timeIndex % forceInterval == 0) : isWrite) sampleForces(t);

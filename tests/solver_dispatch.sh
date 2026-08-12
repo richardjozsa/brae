@@ -34,10 +34,18 @@ mkcase "$WORK/unsupported" "application     interFoam;" "Euler"
 check unsupported_application "$WORK/unsupported" "'interFoam' is not a solver brae implements yet"
 grep -qF "pimpleFoam" "$WORK/unsupported_application.log" || { echo "FAIL: error does not list brae's solvers"; fail=1; }
 
-# 2. controlDict and fvSchemes disagree (steady solver, transient ddt): a case error, so stop rather than
-#    guess which of the two the user meant.
+# 2. STEADY solver + transient ddtSchemes: NOT an error. OpenFOAM's steady solvers construct no ddt term
+#    at all (simpleFoam's UEqn is div(phi,U) + MRF.DDt(U) + divDevSigma(U) == fvOptions(U)), so the entry
+#    is inert there. OF's OWN squareBend tutorial ships `application simpleFoam` with
+#    `ddtSchemes { default Euler; }` and runs; brae used to REFUSE it, which was a false positive against
+#    a shipped case. It must now report the entry as ignored and run steady.
 mkcase "$WORK/mismatch" "application     simpleFoam;" "Euler"
-check application_ddt_mismatch "$WORK/mismatch" "ddtSchemes.default is 'Euler'"
+check application_ddt_ignored "$WORK/mismatch" "'Euler' on the steady solver"
+
+# 2b. The REVERSE is still an error: a transient solver with steadyState would drop the time derivative
+#     entirely -- a different equation, not an unused entry.
+mkcase "$WORK/mismatch2" "application     pimpleFoam;" "steadyState"
+check transient_with_steadyState "$WORK/mismatch2" "would drop the time derivative"
 
 # 3. Hand-written case with no `application`: fall back to the ddt scheme. Euler -> the transient solver, which
 #    is reached (the notice) and then fails on the absent mesh -- selection is what matters here.

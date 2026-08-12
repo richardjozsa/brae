@@ -36,7 +36,8 @@
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"   // noticeIgnored: the established "never drop an input silently" channel
 #include "object_registry.cuh"   // OF: class Time : public objectRegistry (Time.H:74-80)
-#include "write_control.cuh"   // OF writeControl/writeInterval cadence, which Time owns   // noticeIgnored: the established "never drop an input silently" channel
+#include "write_control.cuh"
+#include "start_time.cuh"   // OF Time::setControls() startFrom (Time.C:149)   // OF writeControl/writeInterval cadence, which Time owns   // noticeIgnored: the established "never drop an input silently" channel
 #include <functional>
 #include <map>
 #include <memory>
@@ -214,11 +215,53 @@ public:
     // solver's write cadence. A solver without WriteControl drives the write side itself by calling
     // write() at its own write point; the LIFECYCLE (start/execute/end) is Time's either way, which is
     // the part that must not be per-solver.
+    // OWNING constructor: Time builds its own WriteControl and resolves startFrom, exactly as OF's
+    // Time::setControls() does (Time.C:149-188 for startFrom, TimeIO.C:277 for writeControl). Neither is
+    // a solver's business -- OF's simpleFoam.C/pimpleFoam.C/rhoSimpleFoam.C mention neither.
+    //
+    // Before this, all three brae drivers carried their own copies: two inline `startFrom` blocks and
+    // three separate `isWriteTime` lambdas. Measured identical before consolidating (startFrom on an
+    // adversarial directory; writeControl over 8 cases x 40 steps including runTime float accumulation
+    // and a non-zero-startTime restart), so this is pure de-duplication -- but read_surface_field was
+    // the same shape and HAD silently diverged, at 10^6x the reproducibility floor.
+    Time(const std::string& caseDir, const FoamDict& controlDict,
+         const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
+         const std::vector<std::string>& approximatedOutside = {},
+         const std::vector<std::string>& appliedOutside = {})
+      : owned_(controlDict), wc_(&owned_), nSteps_(0)
+    {
+        startName_ = resolveStartTime(caseDir,
+                                      controlDict.wordOr("startFrom", "startTime"),
+                                      controlDict.wordOr("startTime", "0"));
+        owned_.setStartTime(static_cast<scalar>(std::strtod(startName_.c_str(), nullptr)));
+        for (const auto& t : types) functionObjects_.registerType(t.first, t.second);
+        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside);
+    }
+
+    // Register and read functionObjects AFTER construction. Needed because startFrom must resolve
+    // before a functionObject that reads a field from the start directory can even be described --
+    // Time knows the start time, and the factory needs it. OF has no such ordering problem: its
+    // functionObjects find their fields lazily through the objectRegistry, so they can be built before
+    // anything they touch exists. brae's do too, EXCEPT for the field PATH, which is still passed in.
+    void readFunctionObjects(
+        const FoamDict& controlDict,
+        const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
+        const std::vector<std::string>& approximatedOutside = {},
+        const std::vector<std::string>& appliedOutside = {})
+    {
+        for (const auto& t : types) functionObjects_.registerType(t.first, t.second);
+        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside);
+    }
+
+    // The resolved start directory name -- OF's Time::timeName() at construction.
+    const std::string& startName() const { return startName_; }
+    WriteControl&      writeControl()    { return owned_; }
+
     Time(const FoamDict& controlDict, WriteControl* wc, int nSteps,
          const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
          const std::vector<std::string>& approximatedOutside = {},
          const std::vector<std::string>& appliedOutside = {})
-      : wc_(wc), nSteps_(nSteps)
+      : owned_(controlDict), wc_(wc ? wc : &owned_), nSteps_(nSteps)
     {
         for (const auto& t : types) functionObjects_.registerType(t.first, t.second);
         functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside);
@@ -283,7 +326,9 @@ public:
     const FunctionObjectList& functionObjects() const { return functionObjects_; }
 
 private:
+    WriteControl       owned_;      // used when Time constructs its own; wc_ points here or at the caller's
     WriteControl*      wc_;
+    std::string        startName_ = "0";
     ObjectRegistry     registry_;
     FunctionObjectList functionObjects_;
     int                nSteps_;
