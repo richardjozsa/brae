@@ -148,4 +148,52 @@ inline void makeAbsolute(std::vector<scalar>& phi, const std::vector<scalar>& me
     for (std::size_t f = 0; f < n; ++f) phi[f] += meshPhiF[f];
 }
 
+// movingWallVelocity -- OF movingWallVelocityFvPatchVectorField::Uwall().
+//
+//     oldFc  = face centre at the OLD points
+//     Up     = (faceCentres_new - oldFc)/deltaT       the wall's own velocity from the mesh motion
+//     phip   = meshPhi on the patch
+//     Un     = phip/(magSf + VSMALL)
+//     Uwall  = Up + n*(Un - (n & Up))
+//
+// The last line is the whole point and is easy to mis-read as "Up plus a normal correction". It
+// REPLACES the normal component: the tangential part comes from the face-centre displacement, the
+// normal part from the swept volume. Those two disagree slightly on a deforming face, and OF trusts
+// the swept volume for the normal direction because that is what the SCL is written against -- using
+// n&Up there instead would violate the SCL the flux was just made consistent with.
+//
+// Un uses meshPhi, so this is only correct once meshPhi is (verified above against the SCL). Every
+// input is already in place; nothing here re-derives geometry.
+inline std::vector<vector> movingWallVelocity(
+    const PrimitiveMesh& m,
+    label patchStart, label patchSize,
+    const std::vector<vector>& oldP,
+    const std::vector<vector>& newP,
+    const std::vector<scalar>& meshPhiF,   // per face, sweptVol/deltaT
+    const std::vector<vector>& Sf,         // CURRENT (moved) face areas
+    const std::vector<scalar>& magSf,
+    scalar deltaT)
+{
+    std::vector<vector> Uw(static_cast<std::size_t>(patchSize), vector{0,0,0});
+    if (deltaT <= 0) return Uw;
+    const scalar kVSmall = 1e-300;
+    for (label i = 0; i < patchSize; ++i)
+    {
+        const label f = patchStart + i;
+        const vector oldFc = detail::faceCentreOf(m, f, oldP);
+        const vector newFc = detail::faceCentreOf(m, f, newP);
+        const vector Up{(newFc.x - oldFc.x)/deltaT,
+                        (newFc.y - oldFc.y)/deltaT,
+                        (newFc.z - oldFc.z)/deltaT};
+        const scalar a = magSf[f];
+        const vector n = (a > kVSmall) ? vector{Sf[f].x/a, Sf[f].y/a, Sf[f].z/a} : vector{0,0,0};
+        const scalar Un   = meshPhiF[f]/(a + kVSmall);
+        const scalar nDUp = n.x*Up.x + n.y*Up.y + n.z*Up.z;
+        Uw[static_cast<std::size_t>(i)] = vector{Up.x + n.x*(Un - nDUp),
+                                                 Up.y + n.y*(Un - nDUp),
+                                                 Up.z + n.z*(Un - nDUp)};
+    }
+    return Uw;
+}
+
 }   // namespace brae
