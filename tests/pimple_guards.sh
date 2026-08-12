@@ -20,6 +20,25 @@ mkcase()   # mkcase <dir> [extra controlDict lines]
     printf 'FoamFile { version 2.0; format ascii; class dictionary; object transportProperties; }\ntransportModel Newtonian;\nnu 1e-05;\n' > "$1/constant/transportProperties"
     printf 'FoamFile { version 2.0; format ascii; class dictionary; object turbulenceProperties; }\nsimulationType laminar;\n' > "$1/constant/turbulenceProperties"
 }
+# The mirror of `refuses`: the entry must no longer STOP the run at dictionary-read time.
+#
+# These fixtures carry no mesh -- they exist to check what the dictionary stage accepts or rejects, and
+# they always die later on the absent polyMesh. So the assertion is "got PAST the dict stage", evidenced
+# by reaching the mesh error, not "produced a Courant number" (which needs a mesh and a flux). Asserting
+# the latter here would be asserting something the fixture cannot show.
+accepts_past_dict() {
+    local name=$1 dir=$2
+    "$BIN" -case "$dir" > "$WORK/$name.log" 2>&1
+    if grep -qF "not supported yet" "$WORK/$name.log"; then
+        echo "FAIL: $name -- still refused at the dictionary stage, but the feature is implemented"; fail=1; return
+    fi
+    if ! grep -qF "constant/polyMesh/points" "$WORK/$name.log"; then
+        echo "FAIL: $name -- did not reach the mesh stage; it stopped on something else"
+        tail -2 "$WORK/$name.log"; fail=1; return
+    fi
+    echo "ok:   $name"
+}
+
 refuses()  # refuses <name> <case dir> <expected text>
 {
     local log="$WORK/$1.log"
@@ -37,11 +56,13 @@ refuses()  # refuses <name> <case dir> <expected text>
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-# 1. adjustTimeStep: running at the fixed deltaT instead is a DIFFERENT simulation, not an approximation of the
-#    requested one, so it cannot be quietly ignored.
+# 1. adjustTimeStep is now IMPLEMENTED (OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT, via the
+#    shared cfdTools module). It used to be refused, because running at the fixed deltaT instead is a
+#    DIFFERENT simulation rather than an approximation. It must now RUN and report the Courant number --
+#    a case that silently stopped reporting Co would mean the control loop is not executing.
 mkcase "$WORK/adjustdt" "adjustTimeStep yes;
 maxCo 0.9;"
-refuses adjust_time_step "$WORK/adjustdt" "adjustTimeStep yes is not supported yet"
+accepts_past_dict adjust_time_step "$WORK/adjustdt"
 
 # 2. An active MRF zone: dropping the rotation leaves a converged-looking field of the wrong flow.
 mkcase "$WORK/mrf"

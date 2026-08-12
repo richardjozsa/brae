@@ -35,6 +35,7 @@
 #include "forces.cuh"               // wallForces + forceCoeffs (shared with gpuSimpleFoam)
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"       // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuSimpleFoam)
+#include "time_controls.cuh"   // OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT
 #include "brae_time.cuh"
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include <cctype>
@@ -146,7 +147,7 @@ try
     const DdtScheme ddtScheme  = parseDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
 
     scalar       startTime     = controlDict.scalarOr("startTime", 0.0);   // resolved below for startFrom latestTime (restart)
-    const scalar deltaT        = controlDict.scalarOr("deltaT", 1e-3);
+    scalar deltaT              = controlDict.scalarOr("deltaT", 1e-3);   // varies when adjustTimeStep
     const scalar endTime       = controlDict.scalarOr("endTime", 1.0);
     const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
     const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);
@@ -168,12 +169,10 @@ try
                 fvo + " is present, and brae's transient solver does not apply fvOptions yet (the steady solver "
                 "does). Marching this case would silently drop those sources.");
 
-    // adjustTimeStep needs the Courant-limited dt that brae does not compute yet; running the case at the fixed
-    // deltaT instead is a different simulation, so say so rather than quietly ignore the switch.
-    if (controlDict.wordOr("adjustTimeStep", "no") == "yes")
-        throw std::runtime_error(
-            "controlDict adjustTimeStep yes is not supported yet (no Courant-based dt). Set adjustTimeStep no and "
-            "a fixed deltaT; keep it under your target maxCo.");
+    // adjustTimeStep: Courant-limited dt, via the SHARED cfdTools module (OF readTimeControls /
+    // CourantNo / setInitialDeltaT / setDeltaT). Previously refused outright, which cost 11 of the 35
+    // OpenFOAM pimpleFoam tutorials -- it is the default for transient cases.
+    const TimeControls timeControls = TimeControls::read(controlDict);
 
     // ---- PIMPLE + solver controls (fvSolution) ----
     const FoamDict* pimple  = fvSolution.subDict("PIMPLE");
@@ -485,11 +484,37 @@ try
     // Time drives the functionObject lifecycle; the transient loop keeps its own time-valued
     // advancement, which is a genuinely different shape from the steady solvers' iteration index and is
     // not worth restructuring for this. loop() fires start()/execute() at OF's points.
-    time.setSteps(static_cast<int>(std::lround((tEnd - (startTime + deltaT)) / deltaT)) + 1);
+    // A Courant-adapted run has no fixed step count, so cap the loop generously and let `t <= tEnd`
+    // end it; with a fixed dt this is the exact count as before.
+    {
+        const long nSteps = std::lround((tEnd - (startTime + deltaT)) / deltaT) + 1;
+        time.setSteps(static_cast<int>(timeControls.adjustTimeStep ? std::max(nSteps, 1L)*1000 : nSteps));
+    }
+    // OF setInitialDeltaT: start AT the requested Courant number rather than ramping to it.
+    auto courant = [&]() {
+        return courantNo(surfaceSumMagPhi(m.owner(), m.neighbour(), solver.phiInternal(),
+                                          solver.phiBoundary(), nC, m.nInternalFaces()),
+                         g.V(), deltaT);
+    };
+    if (timeControls.adjustTimeStep)
+    {
+        const CourantNumbers c0 = courant();
+        deltaT = setInitialDeltaT(deltaT, c0.CoNum, timeControls);
+        std::printf("Courant Number mean: %g max: %g\ndeltaT = %g\n", c0.meanCoNum, c0.CoNum, deltaT);
+    }
     for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
         const DeviceSimpleResidual r = solver.pimpleStep(deltaT, nOuter, nCorr);
+        // OF order: the Courant number is evaluated on the flux the step just produced, and deltaT for
+        // the NEXT step follows from it (CourantNo.H then setDeltaT.H, both at the top of the loop).
+        if (timeControls.adjustTimeStep)
+        {
+            const CourantNumbers c = courant();
+            const scalar next = setDeltaT(deltaT, c.CoNum, timeControls);
+            std::printf("Courant Number mean: %g max: %g\n", c.meanCoNum, c.CoNum);
+            deltaT = next;
+        }
         const std::string tn = timeName(t);
         std::printf("Time = %s\n  Ux %.3e  Uy %.3e  Uz %.3e  p %.3e  contLocal %.3e  contGlobal %.3e\n",
                     tn.c_str(), r.Ux, r.Uy, r.Uz, r.p, r.contLocal, r.contGlobal);
