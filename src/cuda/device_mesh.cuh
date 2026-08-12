@@ -35,6 +35,29 @@ struct DeviceMesh
 // cyclicFvPatchField::updateInterfaceMatrix, it is NOT merged into this owner-sorted internal-face LDU (doing
 // so breaks the amulKernel's owner-contiguous scatter, which assumes faces sorted by owner). The `cyclics`
 // argument is kept for API symmetry but the LDU itself carries only the mesh internal faces.
+// Refresh ONLY the geometric buffers after a mesh move -- OF fvMesh::movePoints.
+//
+// OF invalidates exactly two groups and nothing else:
+//   primitiveMesh::clearGeom        cellCentres, cellVolumes, faceCentres, faceAreas
+//   surfaceInterpolation::clearOut  weights, deltaCoeffs, nonOrthDeltaCoeffs, nonOrthCorrectionVectors
+//
+// TOPOLOGY SURVIVES. owner/neighbour and the derived addressing (ownerStart, losort, losortStart, the
+// boundary gather) are functions of the FACES, not the points, and polyMesh::movePoints keeps the
+// topology fixed. Rebuilding them would be wasted work; worse, the LDU addressing is what every
+// assembled matrix and the AMG hierarchy are indexed by, so silently reordering it mid-run would
+// invalidate them. This function therefore moves only the geometry across and leaves addressing alone.
+//
+// Implemented by rebuilding through buildDeviceMesh and adopting the geometric buffers, rather than
+// duplicating the upload logic: a second copy of it would drift from the builder, and the two would
+// disagree on some later change to how a quantity is computed. The cost is that the addressing is
+// rebuilt and discarded -- correct first; if it shows up in a profile, split the builder in two.
+inline void refreshDeviceMeshGeometry(
+    DeviceMesh& dm,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    const std::vector<CyclicInterface>& cyclics = {});
+
 inline DeviceMesh buildDeviceMesh(
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -173,6 +196,40 @@ inline DeviceMesh buildDeviceMesh(
     return dm;
 }
 
+inline void refreshDeviceMeshGeometry(
+    DeviceMesh& dm,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    const std::vector<CyclicInterface>& cyclics)
+{
+    DeviceMesh fresh = buildDeviceMesh(m, g, fvp, cyclics);
+    if (fresh.nCells != dm.nCells || fresh.nInternalFaces != dm.nInternalFaces
+     || fresh.nBndFaces != dm.nBndFaces)
+        throw std::runtime_error("brae: refreshDeviceMeshGeometry saw a different mesh size -- a move "
+                                 "must not change topology (OF polyMesh::movePoints keeps it fixed).");
+
+    // primitiveMesh::clearGeom equivalents
+    dm.V     = std::move(fresh.V);
+    dm.Sfx   = std::move(fresh.Sfx);
+    dm.Sfy   = std::move(fresh.Sfy);
+    dm.Sfz   = std::move(fresh.Sfz);
+    dm.magSf = std::move(fresh.magSf);
+    // surfaceInterpolation::clearOut equivalents
+    dm.w         = std::move(fresh.w);
+    dm.dc        = std::move(fresh.dc);
+    dm.nonOrthDc = std::move(fresh.nonOrthDc);
+    dm.corrVecX  = std::move(fresh.corrVecX);
+    dm.corrVecY  = std::move(fresh.corrVecY);
+    dm.corrVecZ  = std::move(fresh.corrVecZ);
+    // face-to-cell offsets: functions of faceCentres and cellCentres, both cleared by clearGeom
+    dm.dOwnX = std::move(fresh.dOwnX); dm.dOwnY = std::move(fresh.dOwnY); dm.dOwnZ = std::move(fresh.dOwnZ);
+    dm.dNeiX = std::move(fresh.dNeiX); dm.dNeiY = std::move(fresh.dNeiY); dm.dNeiZ = std::move(fresh.dNeiZ);
+    dm.dBndX = std::move(fresh.dBndX); dm.dBndY = std::move(fresh.dBndY); dm.dBndZ = std::move(fresh.dBndZ);
+    // owner/nei, ownerStart/losort/losortStart, bnd* deliberately NOT touched: topology, unchanged.
+}
+
+
 // Flatten a boundary field (per patch -> per face) into one device array in patch order (matches bndCell order).
 inline std::vector<scalar> flattenBoundary(const std::vector<std::vector<scalar>>& bnd)
 {
@@ -220,6 +277,8 @@ void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phi
 // limitedLinear convection (OF "Gauss limitedLinear k_"): implicit limited face weight W_f = limiter*CDweight +
 // (1-limiter)*pos0(phi), limiter = clamp(twoByk*r, 0, 1), r = NVDTVD ratio from grad(field). twoByk = 2/max(k_,SMALL)
 // (k_=1 -> twoByk=2). gx/gy/gz = cell grad(field) (Gauss). Reduces to deviceDivUpwindCoeffs at limiter=0.
+void deviceDivCentralCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
+                            DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
 void deviceDivLimitedCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& field,
                             const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
                             scalar twoByk, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);

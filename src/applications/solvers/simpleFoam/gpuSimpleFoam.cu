@@ -380,7 +380,8 @@ int main(int argc, char** argv)
 
         GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC);
         U.evaluateBoundary();
-        GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC);
+        const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
+        GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC);
         p.evaluateBoundary();
         // pressure needs a reference iff NO p patch fixes the value (singular all-Neumann system, e.g. closed
         // lid-driven cavity / fixedFluxPressure-walled domains). Then adjustPhi + pEqn.setReference (OF needReference).
@@ -459,6 +460,14 @@ int main(int argc, char** argv)
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                                   ctl.turbulent ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa) ? &tf.eps : nullptr, ctl.turbulent ? &tf.nut : nullptr,
                                   ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+        // uniformTotalPressure p0(t). OF samples p0_->value(t) at construction with the CURRENT
+        // time and again in every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:73,149),
+        // so the tables are handed over before the first step and re-evaluated per step inside the
+        // solver. Without this the parsed table sat unused and p0 stayed frozen at its seed --
+        // measured on pimpleFoam/RAS/TJunction as inlet p FALLING 9.32 -> 8.62 where the table asks
+        // for 13.09 -> 15.11, i.e. a case that runs and silently ignores the prescribed ramp.
+        solver.setTimeVaryingP0(DeviceSimpleSolver::collectTimeVaryingP0(pFd, fvp));
+        solver.setTime(static_cast<scalar>(std::strtod(startStr.c_str(), nullptr)));   // seed p0 at the START time, as OF's constructor does
         timeRegistry.store("solver", &solver);   // from here the functionObjects can resolve
         _tsLap("solver ctor (incl AMG)");
         if (partition)   // caches written by the mesh read + the AMG build above; done, like decomposePar finishing.

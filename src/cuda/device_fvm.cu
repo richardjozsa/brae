@@ -32,6 +32,27 @@ void lapFaceKernel(
 }
 
 
+// Gauss LINEAR (central differencing) -- OF's `linear` surfaceInterpolationScheme returns the plain
+// geometric weights, mesh().surfaceInterpolation::weights() (linear.H:106). gaussConvectionScheme::fvmDiv
+// then builds the SAME coefficients as upwind, only with those weights instead of pos0(phi):
+//     lower = -w*phi ;  upper = lower + phi
+// So this differs from divFaceKernel by one line -- the weight -- and nothing else. It is UNBOUNDED by
+// construction (that is what central differencing is), which is why OF pairs it with `bounded` on
+// convection-dominated cases and why LES uses it deliberately.
+__global__
+void divFaceLinearKernel(int nIf, const scalar* __restrict__ phi, const scalar* __restrict__ w,
+                         scalar* __restrict__ upper, scalar* __restrict__ lower)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f < nIf)
+    {
+        const scalar p = phi[f];
+        const scalar lo = -w[f] * p;
+        lower[f] = lo;
+        upper[f] = lo + p;
+    }
+}
+
 __global__
 void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__ upper, scalar* __restrict__ lower)
 {
@@ -392,6 +413,24 @@ void deviceLaplacianCorr(
     deviceFaceDivSource(dm, ffc, lapCorrSource);
 }
 
+
+// The central-difference counterpart of deviceDivUpwindCoeffs, sharing its diagonal gather.
+void deviceDivCentralCoeffs(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& phiInt,
+    DeviceBuffer<scalar>& diag,
+    DeviceBuffer<scalar>& upper,
+    DeviceBuffer<scalar>& lower)
+{
+    const int nIf = dm.nInternalFaces, nC = dm.nCells;
+    upper.resize(nIf);
+    lower.resize(nIf);
+    diag.resize(nC);
+    divFaceLinearKernel<<<nBlocks(nIf), TPB>>>(nIf, phiInt.data(), dm.w.data(), upper.data(), lower.data());
+    cudaCheck(cudaGetLastError(), "divFaceLinear");
+    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    cudaCheck(cudaGetLastError(), "diagGather");
+}
 
 void deviceDivUpwindCoeffs(
     const DeviceMesh& dm,

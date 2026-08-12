@@ -1,4 +1,5 @@
 #include "foam_token_reader.cuh"
+#include "eval_expression.cuh"   // OF #eval scalar expressions
 #include "foam_dict.cuh"   // expandDictVariables ($macro expansion) for the expandVars path
 
 #include <fstream>
@@ -175,9 +176,15 @@ std::string expandIncludes(const std::string& text, const std::string& baseDir, 
             const std::string dir = text.substr(i + 1, j - i - 1);
             // brae does not evaluate #calc/#eval/#codeStream: the raw expression string flows into stod/stoi and is
             // silently mis-parsed (e.g. endTime #calc "1000*2" -> 1000). Fail loud rather than run a wrong control value.
-            if (dir == "calc" || dir == "eval" || dir == "codeStream")
-                throw std::runtime_error("brae does not evaluate #" + dir + " directives -- the expression would be"
-                    " silently mis-parsed into a wrong value. Replace it with a literal value.");
+            // #eval / #calc are handled in a LATER pass (expandEvalDirectives), after $macro
+            // expansion -- their bodies routinely reference macros (`#eval{ $lRef*0.004 }`, NACA4412),
+            // and evaluating here would see a literal '$'. Left untouched by this pass.
+            if (dir == "eval") { out += text[i]; ++i; continue; }
+            if (dir == "calc" || dir == "codeStream")
+                throw std::runtime_error("brae does not evaluate #" + dir + " directives -- OpenFOAM"
+                    " COMPILES these (calcEntry.C -> codeStream/dynamicCode), so they may contain"
+                    " arbitrary C++, not just arithmetic. #eval IS evaluated; replace #" + dir +
+                    " with #eval{...} if the body is a scalar expression, else with a literal value.");
             if (dir == "includeFunc")
             {
                 // #includeFunc <name>[(args)] (unquoted; OF function-template include). brae only RUNS force/forceCoeffs
@@ -345,6 +352,73 @@ std::vector<std::string> tokenize(const std::string& s)
 
 } // namespace
 
+// #eval{...} / #calc "..." -- OF src/OpenFOAM/expressions. Run AFTER $macro expansion, because the
+// bodies reference macros. An expression that cannot be evaluated exactly THROWS from evalExpression;
+// it is never defaulted, since an #eval that quietly became 0 is a silently wrong control value.
+std::string expandEvalDirectives(const std::string& text)
+{
+    if (text.find('#') == std::string::npos) return text;
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); )
+    {
+        if (text[i] == '#')
+        {
+            std::size_t j = i + 1;
+            while (j < text.size() && std::isalpha(static_cast<unsigned char>(text[j]))) ++j;
+            const std::string dir = text.substr(i + 1, j - i - 1);
+            // #eval ONLY. OF's #calc is a DIFFERENT mechanism: calcEntry.C includes codeStream.H and
+            // dynamicCode.H -- it COMPILES C++ and can contain arbitrary code, not just arithmetic.
+            // Evaluating it as an expression would work for `#calc "2*3"` and silently diverge on
+            // anything else, so it stays refused with #codeStream.
+            if (dir == "eval")
+            {
+                std::size_t k = j;
+                while (k < text.size() && (text[k] == ' ' || text[k] == '\t')) ++k;
+                // Three delimiter forms, all of which OF accepts:
+                //   #eval{ expr }      #eval "expr"      #eval #{ expr #}
+                // The last is OF's verbatim-block form and is used by LES/planeChannel.
+                std::size_t bodyStart = 0, bodyEnd = 0, next = 0;
+                if (k + 1 < text.size() && text[k] == '#' && text[k + 1] == '{')
+                {
+                    const std::size_t e = text.find("#}", k + 2);
+                    if (e == std::string::npos)
+                        throw std::runtime_error("brae: unterminated #" + dir + " #{ ... #} expression");
+                    bodyStart = k + 2; bodyEnd = e; next = e + 2;
+                }
+                else
+                {
+                    const char open = (k < text.size() ? text[k] : '\0');
+                    const char close = (open == '{') ? '}' : (open == '"' ? '"' : '\0');
+                    if (close == '\0')
+                        throw std::runtime_error("brae: #" + dir + " must be followed by {expression}, "
+                            "\"expression\" or #{ expression #}; brae evaluates scalar expressions only.");
+                    std::size_t e = k + 1;
+                    int depth = 1;
+                    while (e < text.size())
+                    {
+                        if (open == '{' && text[e] == '{') ++depth;
+                        else if (text[e] == close && (open != '{' || --depth == 0)) break;
+                        ++e;
+                    }
+                    if (e >= text.size())
+                        throw std::runtime_error("brae: unterminated #" + dir + " expression");
+                    bodyStart = k + 1; bodyEnd = e; next = e + 1;
+                }
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%.17g",
+                              static_cast<double>(evalExpression(text.substr(bodyStart, bodyEnd - bodyStart))));
+                out += buf;
+                i = next;
+                continue;
+            }
+        }
+        out += text[i];
+        ++i;
+    }
+    return out;
+}
+
 TokenStream::TokenStream(const std::string& path, bool expandVars)
 {
     // Expand #include directives at the text level (no-op unless a '#' is present, polyMesh stays untouched/fast).
@@ -353,6 +427,7 @@ TokenStream::TokenStream(const std::string& path, bool expandVars)
     // fragment is visible. expandDictVariables strips comments + substitutes $name/${name}; stripComments below is then
     // a no-op. polyMesh/non-field reads skip this entirely (expandVars=false).
     if (expandVars) txt = expandDictVariables(txt);
+    txt = expandEvalDirectives(txt);   // after $macros: #eval bodies reference them
     std::vector<std::string> all = tokenize(stripComments(txt));
 
     // Skip the leading "FoamFile { ... }" header dict, if present.

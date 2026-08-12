@@ -29,6 +29,10 @@ struct DeviceSimpleControls
     bool   bounded   = false;    // "bounded Gauss upwind": add -Sp(div(phi),U). Set from fvSchemes; default off.
     bool   consistent = false;   // SIMPLEC (rAtU consistency correction, p=1). Set from fvSolution SIMPLE.consistent.
     bool   linearUpwind = false; // div(phi,U) "linearUpwind": add the deferred gradient correction. Set from fvSchemes.
+    // div(phi,U) bare "linear" = central differencing (OF linear.H:106 -> the geometric weights).
+    // Standard for LES, where upwind dissipation would damp the resolved turbulence the model exists to
+    // capture. Unbounded by construction, which is why cases pair it with `bounded`.
+    bool   divULinear = false;
     bool   linearUpwindV = false;// div(phi,U) "linearUpwindV": linearUpwind + OF's vector direction limiter (also sets linearUpwind).
     bool   lust = false;         // div(phi,U) "LUST": deferred correction = 0.75*linear + 0.25*linearUpwind (OF LUST.H).
     bool   nonOrth = false;      // laplacian "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction. Set from fvSchemes.

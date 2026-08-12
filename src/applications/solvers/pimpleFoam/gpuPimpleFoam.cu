@@ -236,7 +236,8 @@ try
     startTime = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
     const std::string fieldDir = caseDir + "/" + startStr;
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
-    GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC); p.evaluateBoundary();
+    const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
+    GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC); p.evaluateBoundary();
     // phi: on restart READ the previously-written conservative face flux (surfaceScalarField) so the resumed run
     // continues the EXACT flux state (the >=17-digit write makes the phi write->read round-trip bit-identical) -- no
     // first-step continuity transient. The overall restart is seamless to ~1e-10 (nut re-validated at startup, like OF),
@@ -256,6 +257,14 @@ try
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+    // uniformTotalPressure p0(t). OF samples p0_->value(t) at construction with the CURRENT
+    // time and again in every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:73,149),
+    // so the tables are handed over before the first step and re-evaluated per step inside the
+    // solver. Without this the parsed table sat unused and p0 stayed frozen at its seed --
+    // measured on pimpleFoam/RAS/TJunction as inlet p FALLING 9.32 -> 8.62 where the table asks
+    // for 13.09 -> 15.11, i.e. a case that runs and silently ignores the prescribed ramp.
+    solver.setTimeVaryingP0(DeviceSimpleSolver::collectTimeVaryingP0(pFd, fvp));
+    solver.setTime(startTime);   // seed p0 at the START time, as OF's constructor does
     // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face masks so it
     // refreshes them each iteration instead of freezing the set-up value.
     solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,

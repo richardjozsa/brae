@@ -6,6 +6,7 @@
 #include "cf_types.cuh"
 #include "foam_token_reader.cuh"
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace brae {
@@ -55,6 +56,23 @@ public:
     label nCells()         const { return nCells_; }
 
     const std::vector<vector>&    points()      const { return points_; }
+
+    // OF polyMesh::movePoints(newPoints) -- replace the point positions, keeping the topology
+    // (faces, owner, neighbour, patches) untouched. The CALLER must then rebuild FvGeometry, exactly
+    // as OF's fvMesh::movePoints follows polyMesh::movePoints with updateGeomNotOldVol() and
+    // surfaceInterpolation::clearOut(): every derived quantity -- Sf, magSf, V, C, Cf, weights,
+    // deltaCoeffs -- is a function of the points and is stale the moment they move.
+    //
+    // `points0` (the ORIGINAL positions) must be kept by the caller: OF's solidBodyMotionSolver
+    // transforms points0 by an absolute function of t (points0MotionSolver), never the current points.
+    // Transforming the current points each step would compound round-off and drift.
+    void movePoints(std::vector<vector> newPoints)
+    {
+        if (newPoints.size() != points_.size())
+            throw std::runtime_error("brae: movePoints with a different point count -- topology change "
+                                     "is not supported (OF polyMesh::movePoints keeps topology fixed).");
+        points_ = std::move(newPoints);
+    }
     const std::vector<label>&     faceVerts()   const { return faceVerts_; }
     const std::vector<label>&     faceOffsets() const { return faceOffsets_; }
     const std::vector<label>&     owner()       const { return owner_; }

@@ -12,6 +12,7 @@
 // boundary). The fully-faithful boundary-nut (nutkWallFunction) treatment lives in the host simple_foam.cuh.
 #include "cf_types.cuh"
 #include "function1.cuh"
+#include "foam_field_reader.cuh"   // FieldData/PatchFieldData: the parsed p0 Function1
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -398,6 +399,36 @@ public:
     // that declared a non-constant p0; a constant p0 needs none and keeps the value set at read time.
     struct TimeVaryingP0 { label start = 0, count = 0; Function1 f; };
     void setTimeVaryingP0(std::vector<TimeVaryingP0> v) { tvP0_ = std::move(v); }
+
+    // Build the list from a pressure field's parsed boundary entries. Shared so all three drivers wire
+    // it identically -- three hand-rolled loops over patch offsets is how the copies in this codebase
+    // have historically drifted.
+    //
+    // The offsets must be the DeviceBoundary face order, which buildDeviceBoundary produces by walking
+    // `patches` in order and emitting patch.size faces each. Getting that wrong would ramp the wrong
+    // patch's p0, so it is derived from the same traversal rather than assumed.
+    static std::vector<TimeVaryingP0> collectTimeVaryingP0(
+        const FieldData<scalar>& pFd,
+        const std::vector<FvPatch>& patches)
+    {
+        std::vector<TimeVaryingP0> out;
+        label start = 0;
+        for (const FvPatch& fp : patches)
+        {
+            for (const auto& b : pFd.boundary)
+            {
+                if (b.name != fp.name || !b.hasP0Function1) continue;
+                TimeVaryingP0 e;
+                e.start = start;
+                e.count = fp.size;
+                e.f     = b.p0Function1;
+                out.push_back(std::move(e));
+                break;
+            }
+            start += fp.size;
+        }
+        return out;
+    }
     std::vector<vector> Uddt0() const
     {
         const auto x = Uddt0_[0].host(), y = Uddt0_[1].host(), z = Uddt0_[2].host();

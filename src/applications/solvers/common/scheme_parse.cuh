@@ -356,8 +356,14 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 if (inDiv && ln.find("div(phi,U)") != std::string::npos)
                 {
                     foundDivU = true;
-                    checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST"}, {"limitedLinear", "limitedLinearV"});
+                    checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST", "linear"}, {"limitedLinear", "limitedLinearV"});
                     if (ln.find("bounded") != std::string::npos)      ctl.bounded = true;
+                    // Gauss LINEAR = central differencing: OF's `linear` scheme returns the plain
+                    // geometric weights (linear.H:106), so fvmDiv builds lower=-w*phi, upper=lower+phi
+                    // with w from the mesh instead of pos0(phi). divSchemeWord() returns the token right
+                    // after "Gauss", so this is only true for a BARE `linear` -- "linearUpwind" and
+                    // "limitedLinear" are different words and are matched by their own branches above.
+                    if (divSchemeWord(ln) == "linear")               ctl.divULinear = true;
                     if (ln.find("linearUpwind") != std::string::npos) ctl.linearUpwind = true;   // linearUpwindV contains this -> upwind matrix + gradients
                     if (ln.find("linearUpwindV") != std::string::npos) ctl.linearUpwindV = true; // + OF vector direction limiter
                     if (ln.find("LUST") != std::string::npos)         ctl.lust = true;   // 0.75 linear + 0.25 linearUpwind

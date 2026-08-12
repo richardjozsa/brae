@@ -748,7 +748,12 @@ namespace brae {
         if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);   // cyclic-face contribution to grad(p) in the momentum source
         if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);       // AMI-face contribution to grad(p)
         DeviceBuffer<scalar> mDiag, lD, lU, lL;   // mUp/mLo are now members (shared with the pressure phase)
-        deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
+        // div(phi,U): central differencing when the case asks for a bare `Gauss linear`, otherwise the
+        // upwind matrix (with linearUpwind's deferred correction added separately below). Same
+        // coefficients either way -- only the interpolation weight differs, exactly as OF's
+        // gaussConvectionScheme::fvmDiv takes weights from whichever scheme was named.
+        if (ctl_.divULinear) deviceDivCentralCoeffs(dm, phiInt_, mDiag, mUp, mLo);
+        else                 deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
         deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
         deviceAxpy(-1.0,lD,mDiag);
         deviceAxpy(-1.0,lU,mUp);

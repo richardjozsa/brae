@@ -439,13 +439,7 @@ inline FieldData<T> readField(const std::string& path)
                             ts.expect(")");
                             p.p0Function1 = Function1::table(std::move(pts));
                             p.hasP0Function1 = true;
-                            // NOT YET WIRED: DeviceSimpleSolver::setTimeVaryingP0 exists and the
-                            // per-step device refresh is in place, but no driver hands the tables over,
-                            // so p0 would stay frozen at its t=0 value while the case believes it is
-                            // ramping. Measured on pimpleFoam/RAS/TJunction: inlet p fell 9.32 -> 8.62
-                            // where the table asks for p0 13.09 -> 15.11. A plausible wrong answer is
-                            // worse than a refusal, so keep naming it until the driver wiring lands.
-                            p.unsupportedFunction1 = "table (parsed, but p0(t) is not yet applied)";
+
                             // Seed the constant slot with t = 0 so a solver that never advances time
                             // still has a defined p0 rather than zero.
                             // p0 is a PRESSURE: scalar only. The reader is templated on T, so guard

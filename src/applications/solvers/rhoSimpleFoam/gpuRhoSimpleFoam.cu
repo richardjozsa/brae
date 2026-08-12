@@ -131,7 +131,8 @@ int main(int argc, char** argv)
         // value() < endTime - 0.5*deltaT), so the run length is endTime - startTime -- see the loop.
         const scalar tStart = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
         GeometricField<vector> U = buildField<vector>(readField<vector>(t0 + "/U"), fvp, nC);
-        GeometricField<scalar> p = buildField<scalar>(readField<scalar>(t0 + "/p"), fvp, nC);
+        const FieldData<scalar> pFd = readField<scalar>(t0 + "/p");
+        GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC);
         GeometricField<scalar> T = buildField<scalar>(readField<scalar>(t0 + "/T"), fvp, nC);
         U.evaluateBoundary();
         p.evaluateBoundary();
@@ -438,6 +439,14 @@ int main(int argc, char** argv)
                                   ctl.turbulent ? &tf.k : nullptr,
                                   ctl.turbulent ? &tf.eps : nullptr,
                                   ctl.turbulent ? &tf.nut : nullptr);
+        // uniformTotalPressure p0(t). OF samples p0_->value(t) at construction with the CURRENT
+        // time and again in every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:73,149),
+        // so the tables are handed over before the first step and re-evaluated per step inside the
+        // solver. Without this the parsed table sat unused and p0 stayed frozen at its seed --
+        // measured on pimpleFoam/RAS/TJunction as inlet p FALLING 9.32 -> 8.62 where the table asks
+        // for 13.09 -> 15.11, i.e. a case that runs and silently ignores the prescribed ramp.
+        solver.setTimeVaryingP0(DeviceSimpleSolver::collectTimeVaryingP0(pFd, fvp));
+        solver.setTime(tStart);   // seed p0 at the START time, as OF's constructor does
         timeRegistry.store("solver", &solver);   // from here the functionObjects can resolve
 
         // he boundary: built from the case's 0/T, then converted. brae never reads a 0/he, exactly as OF
