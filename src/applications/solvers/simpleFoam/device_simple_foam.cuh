@@ -456,10 +456,17 @@ private:
     scalar vdcUMax_ = 0, vdcC_ = 1;
     DeviceBuffer<label> vdcCells_;   // velocityDampingConstraint
     // actuationDiskSource (Froude): thrust over a disk cellZone, computed each iter from the monitored upstream U.
-    bool   adActive_ = false;
-    vector adDiskDir_{1,0,0};
-    scalar adArea_ = 0, adA_ = 0, adVtot_ = 0, adNmon_ = 0;
-    DeviceBuffer<scalar> adMaskVDisk_, adMonMask01_;   // V in disk cells / 1 in monitor cells
+    // One entry per actuationDiskSource. Each turbine carries its OWN masks: sharing them across disks
+    // would apply every turbine's thrust to the union of their cells, which converges to a plausible
+    // but wrong wind field rather than failing.
+    struct ActuationDiskDev
+    {
+        vector diskDir{1,0,0};
+        scalar area = 0, a = 0, vtot = 0, nmon = 0;
+        DeviceBuffer<scalar> maskVDisk, monMask01;   // V in disk cells / 1 in monitor cells
+    };
+    bool adActive_ = false;
+    std::vector<ActuationDiskDev> adDisks_;
     DeviceRotorDisk rotor_;                            // rotorDiskSource (BEM); per-cell force recomputed each iter
     DeviceBuffer<scalar> rotorFx_, rotorFy_, rotorFz_;
     AMGData amg_;

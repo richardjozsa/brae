@@ -159,6 +159,33 @@ inline bool isFoamNumber(const std::string& t)
     const char c = t[0];
     return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
 }
+// OF Function1 accepts a BARE value as shorthand for `constant <v>`: `uniformValue (0 0 0);` and
+// `uniformValue 5;` are constants, not tables. brae required the keyword, so a bare vector was
+// classified as an unsupported Function1 and the case refused -- simpleFoam/turbineSiting's terrain
+// patch is exactly `uniformFixedValue` with `uniformValue (0 0 0)`.
+template <typename T>
+inline T readBareFoamValue(TokenStream& ts, const std::string& first);
+
+template <>
+inline scalar readBareFoamValue<scalar>(TokenStream& ts, const std::string& first)
+{
+    (void)ts;
+    return static_cast<scalar>(std::strtod(first.c_str(), nullptr));
+}
+
+template <>
+inline vector readBareFoamValue<vector>(TokenStream& ts, const std::string& first)
+{
+    // `first` is already the '('; the three components and the ')' remain.
+    (void)first;
+    vector v{};
+    v.x = ts.nextScalar();
+    v.y = ts.nextScalar();
+    v.z = ts.nextScalar();
+    ts.expect(")");
+    return v;
+}
+
 
 template <typename T>
 inline void readValueOrInternal(
@@ -371,10 +398,17 @@ inline FieldData<T> readField(const std::string& path)
                     }
                     else if (key == "uniformValue")   // uniformFixedValue: steady PatchFunction1 "constant <v>"
                     {
-                        const std::string m = ts.next();     // "constant" | "uniform" (steady forms; tables unsupported)
+                        const std::string m = ts.next();     // "constant" | "uniform" | a BARE value
                         if (m == "constant" || m == "uniform")
                         {
                             p.uniformValue = readFoamValue<T>(ts);
+                            p.valueUniform = true;
+                            p.hasValue = true;
+                        }
+                        else if (m == "(" || isFoamNumber(m))
+                        {
+                            // Bare constant (see readBareFoamValue): OF's Function1 shorthand.
+                            p.uniformValue = readBareFoamValue<T>(ts, m);
                             p.valueUniform = true;
                             p.hasValue = true;
                         }

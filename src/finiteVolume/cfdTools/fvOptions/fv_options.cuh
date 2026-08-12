@@ -15,6 +15,7 @@
 // adds them with deviceAxpy; no new device kernel is needed.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
+#include "cell_selection.cuh"   // OF cellSetOption: all|cellZone|cellSet resolved in ONE place
 #include "rotor_disk.cuh"
 #include <algorithm>
 #include <cstdlib>
@@ -85,10 +86,22 @@ struct FvOptionsData
     std::vector<label>  vdcCells;                   // empty => all cells
     // actuationDiskSource (Froude): wind-turbine/propeller momentum source over a disk cellZone, the thrust computed
     // each iter from the upstream-monitored velocity. T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), a = 1 - Cp/Ct.
-    bool                adActive = false;
-    vector              adDiskDir{1,0,0};
-    scalar              adArea = 0, adA = 0;        // diskArea, induction a = 1 - Cp/Ct
-    std::vector<label>  adDiskCells, adMonitorCells;
+    // actuationDiskSource: a LIST. A wind farm is several turbines (simpleFoam/turbineSiting ships two),
+    // and each is fully independent -- its own monitor cells, its own Uref, its own thrust, its own disk
+    // cells. Their momentum sinks simply superpose. brae kept only the first and refused the rest, so a
+    // two-turbine case could not run at all.
+    //
+    // The masks MUST be per disk. Sharing one mask would apply every turbine's thrust to the union of
+    // their cells -- a plausible-looking wrong wind field, which is the failure mode this codebase
+    // refuses on principle.
+    struct ActuationDisk
+    {
+        vector             diskDir{1,0,0};
+        scalar             area = 0, a = 0;       // diskArea, induction a = 1 - Cp/Ct
+        std::vector<label> diskCells, monitorCells;
+    };
+    bool                       adActive = false;
+    std::vector<ActuationDisk> adDisks;
     RotorDiskParams     rotor;                      // rotorDiskSource (BEM); geometry built later from the mesh
     int  count = 0;                      // number of options read (0 => no file / empty => all hooks no-op)
     // Sources whose NAME brae recognizes but that it CANNOT apply here (unsupported selectionMode cellSet, a
@@ -120,12 +133,16 @@ inline const FoamDict& coeffsOf(const FoamDict& opt, const std::string& type)
 // Read fvOptions for a case. `zones` = cellZone name -> cells (readCellZones). `V` = cell volumes. Absent file -> empty.
 inline FvOptionsData readFvOptions(
     const std::string& caseDir,
-    const std::map<std::string, std::vector<label>>& zones,
+    const std::map<std::string, std::vector<label>>& zonesIn,
     const std::vector<scalar>& V,
     label nCells,
     const std::vector<vector>& cellCentres = {})
 {
     FvOptionsData fo;
+    // Local copy: a cellSet resolved below is adopted into this map under its own name, so every
+    // source branch can look it up exactly as it looks up a cellZone -- one lookup path, both modes.
+    std::map<std::string, std::vector<label>> zones = zonesIn;
+    const std::string polyMeshDir = caseDir + "/constant/polyMesh";
     std::string path = caseDir + "/system/fvOptions";
     {
         std::ifstream f(path);
@@ -180,15 +197,24 @@ inline FvOptionsData readFvOptions(
             if (sm == "cellSet")  return c.wordOr("cellSet",  o.wordOr("cellSet",  ""));   // mapped to the same-named cellZone
             return "";
         };
+        // selectionMode cellSet: resolved through the SHARED resolver, as OF does in cellSetOption
+        // (cellSetOption.H:175) rather than per source. Previously this required a same-named cellZone
+        // to exist, so simpleFoam/turbineSiting -- whose actuationDiskSource[Froude] brae already
+        // implements -- was refused outright for want of a file reader. Reading the set makes it work
+        // for EVERY source type at once, which is why it belongs here and not in the disk branch.
         if (co.wordOr("selectionMode", opt.wordOr("selectionMode", "all")) == "cellSet")
         {
             const std::string cs = co.wordOr("cellSet", opt.wordOr("cellSet", ""));
-            if (zones.find(cs) == zones.end())   // brae reads cellZones; no same-named cellZone -> can't locate the cells
+            if (zones.find(cs) == zones.end())
             {
-                fo.unsupported.push_back("source '" + s.first + "' uses selectionMode cellSet '" + cs + "' with no matching"
-                    " cellZone -- brae selects cells by cellZone; convert the set (topoSet: cellZoneSet), or use selectionMode cellZone");
-                continue;
-            }   // else: the same-named cellZone exists -> the sources below resolve it via selZoneName
+                const CellSelection sel = resolveCellSelection(polyMeshDir, "cellSet", cs, zones);
+                if (!sel.ok)
+                {
+                    fo.unsupported.push_back("source '" + s.first + "' " + sel.reason);
+                    continue;
+                }
+                zones[cs] = sel.cells;   // adopt it under its own name; every branch below reads `zones`
+            }
         }
 
         if (isMvf)   // meanVelocityForce (channel-flow driver)
@@ -342,23 +368,23 @@ inline FvOptionsData readFvOptions(
         if (type == "actuationDiskSource")   // Froude actuator disk (turbine/propeller)
         {
             if (co.wordOr("variant", "Froude") != "Froude") continue;    // (variableScaling: future)
+            FvOptionsData::ActuationDisk disk;
             const std::vector<scalar> dd = co.scalarListOr("diskDir", {});
             if (dd.size() >= 3)
             {
                 vector d{dd[dd.size()-3], dd[dd.size()-2], dd[dd.size()-1]};
                 const scalar m = std::sqrt(d.x*d.x+d.y*d.y+d.z*d.z);
-                if (m > 0) fo.adDiskDir = vector{d.x/m, d.y/m, d.z/m};
+                if (m > 0) disk.diskDir = vector{d.x/m, d.y/m, d.z/m};
             }
-            fo.adArea = co.scalarOr("diskArea", 0.0);
+            disk.area = co.scalarOr("diskArea", 0.0);
             const scalar Cp = co.scalarOr("Cp", 0.0), Ct = co.scalarOr("Ct", 0.0);
-            if (fo.adArea <= 0 || Ct <= 0 || Cp <= 0) continue;
-            fo.adA = 1.0 - Cp/Ct;                                        // induction (sink cancels)
-            // disk cells: the selection cellZone (cellZone, or a cellSet mapped to the same-named cellZone).
+            if (disk.area <= 0 || Ct <= 0 || Cp <= 0) continue;
+            disk.a = 1.0 - Cp/Ct;                                        // induction (sink cancels)
             {
                 const auto it = zones.find(selZoneName(co, opt));
-                if (it != zones.end()) fo.adDiskCells = it->second;
+                if (it != zones.end()) disk.diskCells = it->second;
             }
-            if (fo.adDiskCells.empty()) continue;
+            if (disk.diskCells.empty()) continue;
             // monitor cells: POINTS -> findCell(upstreamPoint) (closest cell centre); cellSet/cellZone -> named zone.
             const std::string mm = co.wordOr("monitorMethod", "points");
             if (mm == "points")
@@ -380,16 +406,16 @@ inline FvOptionsData readFvOptions(
                         const scalar d2 = r.x*r.x+r.y*r.y+r.z*r.z;
                         if (d2 < bd) { bd = d2; best = c; }
                     }
-                    fo.adMonitorCells = { best };
+                    disk.monitorCells = { best };
                 }
             }
             else   // cellSet/cellZone monitor
             {
                 const auto it = zones.find(co.wordOr("cellSet", co.wordOr("cellZone", "")));
-                if (it != zones.end()) fo.adMonitorCells = it->second;
+                if (it != zones.end()) disk.monitorCells = it->second;
             }
-            if (fo.adMonitorCells.empty()) continue;
-            if (fo.adActive) fo.unsupported.push_back("source '" + s.first + "': a 2nd actuationDiskSource -- brae keeps only one");
+            if (disk.monitorCells.empty()) continue;
+            fo.adDisks.push_back(std::move(disk));   // every turbine, not just the first
             fo.adActive = true;
             ++fo.count;
             continue;

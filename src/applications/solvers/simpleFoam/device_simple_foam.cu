@@ -877,12 +877,13 @@ namespace brae {
             }
         // actuationDiskSource (Froude): T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), Uref = mean U over the monitor cells
         // (lagged). Computed once per iter; distributed over the disk cells (V[c]/Vtot) into relaxSrc below.
-        scalar adT = 0;
-        if (adActive_)
+        std::vector<scalar> adT(adDisks_.size(), 0.0);
+        for (std::size_t di = 0; di < adDisks_.size(); ++di)
         {
-            const scalar ud = (deviceDot(Uk_[0], adMonMask01_)*adDiskDir_.x + deviceDot(Uk_[1], adMonMask01_)*adDiskDir_.y
-                             + deviceDot(Uk_[2], adMonMask01_)*adDiskDir_.z) / adNmon_;   // Uref . diskDir
-            adT = 2.0 * adArea_ * ud*ud * adA_ * (1.0 - adA_);
+            const auto& d = adDisks_[di];
+            const scalar ud = (deviceDot(Uk_[0], d.monMask01)*d.diskDir.x + deviceDot(Uk_[1], d.monMask01)*d.diskDir.y
+                             + deviceDot(Uk_[2], d.monMask01)*d.diskDir.z) / d.nmon;   // this disk's Uref . diskDir
+            adT[di] = 2.0 * d.area * ud*ud * d.a * (1.0 - d.a);
         }
         // rotorDiskSource (BEM): per-cell body force from the current U (lagged), recomputed each iter.
         if (rotor_.active) deviceRotorForce(rotor_, nC_, Uk_[0], Uk_[1], Uk_[2], rotorFx_, rotorFy_, rotorFz_);
@@ -957,7 +958,11 @@ namespace brae {
             if (mvfActive_) deviceAxpy((kk==0?mvfFlowDir_.x:kk==1?mvfFlowDir_.y:mvfFlowDir_.z)*mvfGradP_, mvfMaskV_, relaxSrc[kk]);  // meanVelocityForce body force (flowDir*gradP*V)
             // actuationDisk: OF adds T*diskDir DIRECTLY to eqn.source() (= eqn -= ., opposite cf's relaxSrc convention,
             // which mirrors meanVelocityForce's eqn += Su) -> relaxSrc -= (V/Vtot)*T*diskDir (a momentum sink/turbine).
-            if (adActive_) deviceAxpy(-adT*(kk==0?adDiskDir_.x:kk==1?adDiskDir_.y:adDiskDir_.z)/adVtot_, adMaskVDisk_, relaxSrc[kk]);
+            for (std::size_t di = 0; di < adDisks_.size(); ++di)   // turbines superpose into relaxSrc
+            {
+                const auto& d = adDisks_[di];
+                deviceAxpy(-adT[di]*(kk==0?d.diskDir.x:kk==1?d.diskDir.y:d.diskDir.z)/d.vtot, d.maskVDisk, relaxSrc[kk]);
+            }
             if (rotor_.active) deviceAxpy(-1.0, *rotorF[kk], relaxSrc[kk]);   // rotorDiskSource: relaxSrc -= force (OF eqn -= force)
             if (stageDumpActive() && stageDumpFirstOnly(kk==0?"msrc0":(kk==1?"msrc1":"msrc2")))
                 stageDump(std::string("stage_mSrc") + char('0'+kk), relaxSrc[kk]);   // OF UEqn.source() minus -V*grad(p)
@@ -2147,21 +2152,28 @@ namespace brae {
         if (fo.adActive)
         {
             adActive_ = true;
-            adDiskDir_ = fo.adDiskDir;
-            adArea_ = fo.adArea;
-            adA_ = fo.adA;
-            std::vector<scalar> dm01(nC_, 0.0);
-            for (label c : fo.adDiskCells)
-                if (c>=0 && c<nC_) dm01[c] = 1.0;
-            DeviceBuffer<scalar> dmask;
-            dmask.copyFrom(dm01);
-            deviceHadamard(adMaskVDisk_, dm_.V, dmask);
-            adVtot_ = deviceSumMag(adMaskVDisk_);   // V in disk / total disk volume
-            std::vector<scalar> mon(nC_, 0.0);
-            for (label c : fo.adMonitorCells)
-                if (c>=0 && c<nC_) mon[c] = 1.0;
-            adMonMask01_.copyFrom(mon);
-            adNmon_ = (scalar)fo.adMonitorCells.size();
+            adDisks_.clear();
+            adDisks_.resize(fo.adDisks.size());
+            for (std::size_t di = 0; di < fo.adDisks.size(); ++di)
+            {
+                const auto& src = fo.adDisks[di];
+                auto& d = adDisks_[di];
+                d.diskDir = src.diskDir;
+                d.area    = src.area;
+                d.a       = src.a;
+                std::vector<scalar> dm01(nC_, 0.0);
+                for (label c : src.diskCells)
+                    if (c>=0 && c<nC_) dm01[c] = 1.0;
+                DeviceBuffer<scalar> dmask;
+                dmask.copyFrom(dm01);
+                deviceHadamard(d.maskVDisk, dm_.V, dmask);
+                d.vtot = deviceSumMag(d.maskVDisk);   // V in THIS disk / its own total volume
+                std::vector<scalar> mon(nC_, 0.0);
+                for (label c : src.monitorCells)
+                    if (c>=0 && c<nC_) mon[c] = 1.0;
+                d.monMask01.copyFrom(mon);
+                d.nmon = (scalar)src.monitorCells.size();
+            }
         }
         fvoCount_ = fo.count;
     }

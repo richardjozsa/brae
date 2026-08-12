@@ -588,6 +588,24 @@ std::vector<std::pair<std::string, std::vector<label>>> readBinaryCellZones(cons
                 skipSpaceAndComments(b, i);
                 if (i < b.size() && !(b[i] >= '0' && b[i] <= '9'))
                     readWordBytes(b, i);
+                // An EMPTY list is written as `cellLabels List<label> 0;` -- a count with NO
+                // parenthesised body at all, which is what OF emits for a zone that matched no cells
+                // (simpleFoam/turbineSiting after a serial topoSet). Demanding '(' unconditionally
+                // threw "expected '(' after count" and took the whole case down on a legal file.
+                {
+                    std::size_t probe = i;
+                    skipSpaceAndComments(b, probe);
+                    std::size_t cnt = 0; bool any = false;
+                    while (probe < b.size() && b[probe] >= '0' && b[probe] <= '9')
+                    { cnt = cnt*10 + (b[probe]-'0'); ++probe; any = true; }
+                    skipSpaceAndComments(b, probe);
+                    if (any && cnt == 0 && probe < b.size() && b[probe] == ';')
+                    {
+                        i = probe;                 // empty zone: nothing to read
+                        skipPastByte(b, i, ';');
+                        continue;
+                    }
+                }
                 const std::size_t n = readAsciiCount(b, i);   // count, cursor just past '('
                 cells.resize(n);
                 readRaw(b, i, cells.data(), n);               // n raw int32 labels
