@@ -64,7 +64,10 @@ struct FastScan
     }
 };
 
-constexpr unsigned BRAE_MESH_CACHE_MAGIC = 0x43464D32;   // "CFM2"
+constexpr unsigned BRAE_MESH_CACHE_MAGIC = 0x43464D33;   // "CFM3"
+// Bumped CFM2 -> CFM3 when PatchInfo gained nonOverlapPatch: the record layout changed, so a cache
+// written by the previous build must be REJECTED rather than read as garbage (loadBinary returns
+// false on a magic mismatch and the caller re-reads the polyMesh).
 template<class T>
 void wvec(std::FILE* f, const std::vector<T>& v)
 {
@@ -116,6 +119,7 @@ void PrimitiveMesh::writeBinary(const std::string& path) const
         std::fwrite(&p.start, sizeof(p.start), 1, f);
         std::fwrite(&p.size, sizeof(p.size), 1, f);
         wstr(f, p.neighbourPatch);
+        wstr(f, p.nonOverlapPatch);
         std::size_t ng = p.inGroups.size();
         std::fwrite(&ng, sizeof(ng), 1, f);
         for (const auto& g : p.inGroups) wstr(f, g);
@@ -143,7 +147,7 @@ bool PrimitiveMesh::loadBinary(const std::string& path)
         {
             ok = ok && rstr(f, p.name) && rstr(f, p.type)
                  && std::fread(&p.start, sizeof(p.start), 1, f) == 1 && std::fread(&p.size, sizeof(p.size), 1, f) == 1
-                 && rstr(f, p.neighbourPatch);
+                 && rstr(f, p.neighbourPatch) && rstr(f, p.nonOverlapPatch);
             std::size_t ng = 0;
             ok = ok && std::fread(&ng, sizeof(ng), 1, f) == 1;
             if (ok)
@@ -239,6 +243,7 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
             else if (key == "nFaces")         { pi.size  = ts.nextLabel(); ts.expect(";"); }
             else if (key == "startFace")      { pi.start = ts.nextLabel(); ts.expect(";"); }
             else if (key == "neighbourPatch") { pi.neighbourPatch = ts.next(); ts.expect(";"); }
+            else if (key == "nonOverlapPatch") { pi.nonOverlapPatch = ts.next(); ts.expect(";"); }
             else if (key == "transform")      { pi.transform = ts.next();      ts.expect(";"); }
             else if (key == "rotationAxis")   { ts.expect("("); pi.rotationAxis   = {ts.nextScalar(), ts.nextScalar(), ts.nextScalar()}; ts.expect(")"); ts.expect(";"); }
             else if (key == "rotationCentre") { ts.expect("("); pi.rotationCentre = {ts.nextScalar(), ts.nextScalar(), ts.nextScalar()}; ts.expect(")"); ts.expect(";"); }

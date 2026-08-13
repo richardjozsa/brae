@@ -3,6 +3,7 @@
 // the class declaration (members + method signatures) stays in the header. Prerequisite for the PIMPLE solver,
 // which reuses solveMomentumPredictor / correctPressureVelocity / correctTurbulence under a transient loop.
 #include "device_simple_foam.cuh"
+#include "swept_volume.cuh"   // meshPhi + makeRelative (OF fvcMeshPhi)
 #include "device_scalar_transport.cuh"   // deviceSolveScalarTransport: shared with k/epsilon/omega/energy
 #include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
 
@@ -52,6 +53,16 @@ namespace brae {
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
         dbP_  = buildDeviceBoundary(p, fvp, g);
         wall_ = buildDeviceWallData(m, g, fvp, U);
+        {   // DeviceBoundary face offset of each patch, for setPatchVelocity
+            label st = 0;
+            patchStart_.assign(fvp.size(), 0);
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                patchStart_[pi] = st;
+                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                st += fvp[pi].size;
+            }
+        }
         if (nut)
         {
             std::vector<label> cm;
@@ -940,7 +951,9 @@ namespace brae {
             deviceAxpy(1.0, *ddr[kk], relaxSrc[kk]);                                  // += explicit divDevReff stress
             // + fvm::ddt(U) SOURCE for this component: rDeltaT*V*(coefft0*Uold - coefft00*Uold2). Into relaxSrc so it
             // feeds BOTH the predictor solve AND H()/HbyA (OF's UEqn.H() includes the ddt source). No-op for SIMPLE.
-            deviceFvmDdtSource(dm.V, ddtc, 1.0, Uold_[kk], Uold2_[kk], relaxSrc[kk], ddtc.cn ? &Uddt0_[kk] : nullptr);   // CrankNicolson: + ocCoeff*ddt0
+            // V^{n-1} on the SOURCE, V^n on the diagonal (OF EulerDdtScheme.C:383-388). That pairing
+            // is the discrete SCL; one volume for both leaks continuity every step on a moving mesh.
+            deviceFvmDdtSource(Vold_.size() ? Vold_ : dm.V, ddtc, 1.0, Uold_[kk], Uold2_[kk], relaxSrc[kk], ddtc.cn ? &Uddt0_[kk] : nullptr);   // CrankNicolson: + ocCoeff*ddt0
             if (mrf_.active) deviceMrfCoriolis(mrf_, dm.V, Uk_[0], Uk_[1], Uk_[2], kk, relaxSrc[kk]);   // MRF Coriolis: -V*(Omega x U)_kk on zone cells
             // Explicit momentum corrections (linearUpwind deferred + non-orth laplacian) go into relaxSrc so they
             // feed BOTH the predictor solve AND H()/HbyA, OF's UEqn.H() includes them. Adding them only to the
@@ -1628,6 +1641,78 @@ namespace brae {
     // (deltaT0 <- deltaT). Call ONCE at the top of each time step, before the outer-corrector loop -- OF does this at
     // runTime++ (the registry ages every field's oldTime). First call: Uold2_ stays empty + deltaT0_=0, so ddtCoeffs()
     // bootstraps to Euler exactly like pimpleFoam's first step (only one old level exists yet).
+    std::vector<scalar> DeviceSimpleSolver::moveMesh(
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<FvPatch>& fvp,
+        const std::vector<vector>& oldPoints,
+        const std::vector<vector>& newPoints,
+        scalar deltaT)
+    {
+        // 0. storeOldVol(V()) -- OF fvMesh::movePoints:944, BEFORE the geometry is recomputed. The ddt
+        //    source needs the volume the old-time field belongs to.
+        Vold_.copyFrom(dm_.V.host());   // DeviceBuffer is non-copyable; this is storeOldVol
+
+        // 1. geometry: only the geometric buffers, addressing untouched (OF clearGeom + clearOut).
+        refreshDeviceMeshGeometry(dm_, m, g, fvp);
+
+        // 1b. AMI weights. A sliding interface maps source faces to target faces by OVERLAP, so its
+        //     weights are a function of the current geometry -- once the rotor turns they address the
+        //     wrong faces. OF rebuilds them on a move (cyclicAMIPolyPatch::movePoints ->
+        //     AMIInterpolation::update); brae built them once at construction and never again, which
+        //     is why pimpleFoam/RAS/rotatingFanInRoom diverged with a growing continuity error while
+        //     its Courant number sat at 0.46 -- flux crossing the interface was being gathered from
+        //     faces that had rotated away.
+        //
+        //     Both halves must re-run: buildAMIInterfaces recomputes the overlap from the MOVED
+        //     geometry, buildDeviceAMI re-uploads it. Doing only the upload would re-send stale weights.
+        if (hasAMI_)
+        {
+            const std::vector<AMIInterface> amis = buildAMIInterfaces(m, g, fvp);
+            ami_ = buildDeviceAMI(amis);
+        }
+
+        // 2. meshPhi = sweptVol/deltaT, per face (OF fvMesh::movePoints stores this as mesh.phi()).
+        const std::vector<scalar> mp = meshPhi(m, oldPoints, newPoints, deltaT);
+
+        // 3. fvc::makeRelative(phi, U): phi -= meshPhi. Split the same way the flux is stored --
+        //    internal faces first, then boundary faces in mesh order.
+        const label nIf = m.nInternalFaces();
+        {
+            std::vector<scalar> pi = phiInt_.host();
+            for (std::size_t f = 0; f < pi.size() && f < mp.size(); ++f) pi[f] -= mp[f];
+            phiInt_.copyFrom(pi);
+        }
+        {
+            std::vector<scalar> pb = phiBnd_.host();
+            for (std::size_t b = 0; b < pb.size(); ++b)
+            {
+                const std::size_t f = static_cast<std::size_t>(nIf) + b;
+                if (f < mp.size()) pb[b] -= mp[f];
+            }
+            phiBnd_.copyFrom(pb);
+        }
+        return mp;
+    }
+
+    void DeviceSimpleSolver::setPatchVelocity(label patchi, const std::vector<vector>& Uw)
+    {
+        // dbU_ holds the three components' boundary descriptors in DeviceBoundary face order; a patch
+        // occupies a contiguous run starting at its own offset.
+        if (patchi < 0 || patchi >= (label)patchStart_.size()) return;
+        const label start = patchStart_[patchi];
+        for (int k = 0; k < 3; ++k)
+        {
+            std::vector<scalar> rv = dbU_.comp[k].refValue.host();
+            for (std::size_t i = 0; i < Uw.size(); ++i)
+            {
+                const std::size_t f = static_cast<std::size_t>(start) + i;
+                if (f < rv.size()) rv[f] = (k == 0 ? Uw[i].x : k == 1 ? Uw[i].y : Uw[i].z);
+            }
+            dbU_.comp[k].refValue.copyFrom(rv);
+        }
+    }
+
     void DeviceSimpleSolver::advanceTime(scalar deltaT)
     {
         const bool cn  = (ddtScheme_ == DdtScheme::CrankNicolson);

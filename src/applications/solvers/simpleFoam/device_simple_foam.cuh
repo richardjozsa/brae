@@ -132,6 +132,30 @@ public:
         }
     }
     // Advance one time level: store U.oldTime()[.oldTime()] + roll deltaT -> deltaT0 (OF runTime++ / GeometricField::oldTime).
+    // Move the mesh for one time step -- OF pimpleFoam.C:139-160, in OF's order:
+    //     mesh.controlledUpdate();          move points, recompute geometry
+    //     if (mesh.changing()) { ... fvc::makeRelative(phi, U); }
+    // The mesh moves BEFORE the equations, and phi is made relative immediately after, so the
+    // convective term never sees an absolute flux on a moving mesh.
+    //
+    // Every input is already verified independently: the transform (rigid invariants), the geometry
+    // refresh (bit-identical to a rebuild, addressing preserved), meshPhi (SCL to 1e-20) and
+    // makeRelative (relative flux vanishes, mutation-proven). This only composes them.
+    //
+    // Returns the per-face meshPhi so the caller can build movingWallVelocity from it.
+    std::vector<scalar> moveMesh(
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<FvPatch>& fvp,
+        const std::vector<vector>& oldPoints,
+        const std::vector<vector>& newPoints,
+        scalar deltaT);
+
+    // Overwrite one U patch's refValue -- the device half of movingWallVelocity's updateCoeffs.
+    // OF does `vectorField::operator=(Uwall())` on the patch field; this is the same assignment, on the
+    // buffers the momentum assembly reads.
+    void setPatchVelocity(label patchi, const std::vector<vector>& Uw);
+
     void advanceTime(scalar deltaT);
     // One PIMPLE time step: advanceTime, then nOuterCorrectors x { momentum predictor (ddt folded in); nCorrectors x
     // pressure-velocity correction; turbulence }, then continuity errors. Returns the outer-loop residual signal.
@@ -552,6 +576,10 @@ private:
     // kEpsilon: 1 on boundary faces whose 0/nut BC is 'calculated'. OF fills those by field assignment
     // (Cmu*k_b^2/eps_b) rather than extrapolating the cell, and the two differ by >12x at a fixed-k inlet.
     DeviceBuffer<label>  nutCalcMask_;
+    // OF fvMesh::movePoints does storeOldVol(V()) BEFORE moving: the ddt source needs V^{n-1} while the
+    // diagonal uses V^n. Empty on a fixed mesh, where both are the same buffer and nothing changes.
+    DeviceBuffer<scalar> Vold_;
+    std::vector<label> patchStart_;   // DeviceBoundary face offset per patch
     DeviceBuffer<scalar> nutBndFile_;   // nut's own boundaryField (OF reads nut_b from here, not cells)
     bool hasNutCalc_ = false;
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces

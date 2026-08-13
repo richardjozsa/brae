@@ -161,4 +161,67 @@ inline MeshMotion readMeshMotion(const std::string& caseDir)
     return mm;
 }
 
+// Which POINTS move -- OF zoneMotion.C.
+//
+//     movePts = bitSet(nPoints)
+//     for celli in cellZone:  for facei in cells[celli]:  movePts.set(faces[facei])
+//     pointIDs_ = movePts.sortedToc()
+//     moveAllCells_ = pointIDs_.empty()        <-- an EMPTY selection means move EVERYTHING
+//
+// Every vertex of every face of every zone cell, so the zone's outer shell of points moves with it and
+// the cells just outside DEFORM rather than tear. Selecting only "points of zone cells" would give the
+// same set here, but this is what OF walks and the face route is what handles a zone whose boundary
+// cuts through a cell.
+//
+// Returns an empty list to mean "move all points", matching moveAllCells_.
+inline std::vector<label> movingPointIDs(const PrimitiveMesh& m, const std::vector<label>& zoneCells)
+{
+    if (zoneCells.empty()) return {};                  // OF: empty -> move the entire mesh
+
+    // cell -> faces, the inverse of owner/neighbour, which is all brae stores.
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    std::vector<std::vector<label>> cellFaces(static_cast<std::size_t>(m.nCells()));
+    for (label f = 0; f < m.nFaces(); ++f)
+    {
+        if (own[f] >= 0 && own[f] < m.nCells()) cellFaces[own[f]].push_back(f);
+        if (f < (label)nei.size() && nei[f] >= 0 && nei[f] < m.nCells()) cellFaces[nei[f]].push_back(f);
+    }
+
+    std::vector<char> movePts(static_cast<std::size_t>(m.nPoints()), 0);
+    for (const label c : zoneCells)
+    {
+        if (c < 0 || c >= m.nCells()) continue;
+        for (const label f : cellFaces[c])
+            for (label k = 0; k < m.faceSize(f); ++k)
+                movePts[static_cast<std::size_t>(m.faceVert(f, k))] = 1;
+    }
+    std::vector<label> ids;
+    for (label pI = 0; pI < m.nPoints(); ++pI) if (movePts[pI]) ids.push_back(pI);
+    return ids;
+}
+
+// OF solidBodyMotionSolver::curPoints(): moving points come from points0 transformed ABSOLUTELY;
+// every other point keeps its CURRENT position. Starting the non-moving ones from points0 instead
+// would silently un-do any earlier motion of theirs.
+inline std::vector<vector> curPoints(
+    const std::vector<vector>& points0,
+    const std::vector<vector>& currentPoints,
+    const std::vector<label>& pointIDs,
+    const SolidBodyMotion& motion,
+    scalar t)
+{
+    if (pointIDs.empty())                              // moveAllCells
+    {
+        std::vector<vector> out(points0.size());
+        for (std::size_t i = 0; i < points0.size(); ++i) out[i] = motion.transform(points0[i], t);
+        return out;
+    }
+    std::vector<vector> out = currentPoints;
+    for (const label pI : pointIDs)
+        if (pI >= 0 && pI < (label)out.size())
+            out[static_cast<std::size_t>(pI)] = motion.transform(points0[static_cast<std::size_t>(pI)], t);
+    return out;
+}
+
 }   // namespace brae

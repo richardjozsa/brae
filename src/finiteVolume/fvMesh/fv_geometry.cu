@@ -1,4 +1,5 @@
 #include "fv_geometry.cuh"
+#include <stdexcept>
 #include <cmath>
 
 namespace brae {
@@ -152,11 +153,39 @@ void FvGeometry::makeInterpolation(const PrimitiveMesh& m)
     }
 }
 
-void FvGeometry::build(const PrimitiveMesh& m)
+void FvGeometry::buildFaceGeometry(const PrimitiveMesh& m)
 {
     makeFaceCentresAndAreas(m);
+    areaScaled_ = false;          // areas are raw again: a fresh scale is now legal
+    rawArea_.clear();
+}
+
+void FvGeometry::buildCellGeometry(const PrimitiveMesh& m)
+{
     makeCellCentresAndVols(m);
     makeInterpolation(m);
+}
+
+void FvGeometry::applyAreaScaling(const std::vector<std::pair<label, scalar>>& faceScale)
+{
+    if (areaScaled_)
+        throw std::runtime_error(
+            "brae: FvGeometry::applyAreaScaling called twice without an intervening buildFaceGeometry. "
+            "cyclicACMI area scaling is defined against the RAW face areas; applying it to already-scaled "
+            "areas would compound the mask every step and shrink the interface away.");
+    for (const auto& fs : faceScale)
+    {
+        rawArea_.emplace(fs.first, magSf_[fs.first]);   // remember the raw area before touching it
+        Sf_[fs.first]    = Sf_[fs.first]*fs.second;
+        magSf_[fs.first] = magSf_[fs.first]*fs.second;
+    }
+    areaScaled_ = true;
+}
+
+void FvGeometry::build(const PrimitiveMesh& m)
+{
+    buildFaceGeometry(m);
+    buildCellGeometry(m);
 }
 
 } // namespace brae

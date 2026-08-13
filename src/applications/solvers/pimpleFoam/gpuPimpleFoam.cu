@@ -35,6 +35,9 @@
 #include "forces.cuh"               // wallForces + forceCoeffs (shared with gpuSimpleFoam)
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"       // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuSimpleFoam)
+#include "acmi_area_scaling.cuh"
+#include "solid_body_motion.cuh"   // OF dynamicMeshDict + solidBody transform
+#include "swept_volume.cuh"        // OF meshPhi / makeRelative / movingWallVelocity
 #include "time_controls.cuh"   // OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT
 #include "brae_time.cuh"
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
@@ -173,6 +176,8 @@ try
     // CourantNo / setInitialDeltaT / setDeltaT). Previously refused outright, which cost 11 of the 35
     // OpenFOAM pimpleFoam tutorials -- it is the default for transient cases.
     const TimeControls timeControls = TimeControls::read(controlDict);
+    // constant/dynamicMeshDict. Absent -> inactive, so every existing case takes the identical path.
+    const MeshMotion meshMotion = readMeshMotion(caseDir);
 
     // ---- PIMPLE + solver controls (fvSolution) ----
     const FoamDict* pimple  = fvSolution.subDict("PIMPLE");
@@ -221,8 +226,13 @@ try
 
     // ---- mesh + start fields ----
     PrimitiveMesh m; m.read(caseDir + "/constant/polyMesh");
-    FvGeometry g; g.build(m);
-    const std::vector<FvPatch> fvp = buildPatches(m, g);
+    // cyclicACMI needs the face areas split by the overlap mask BEFORE cell volumes are computed --
+    // the interface's faces are in the mesh twice. buildGeometryPatchesAndAMI is exactly g.build +
+    // buildPatches on a mesh without one.
+    FvGeometry g;
+    std::vector<FvPatch> fvpBuilt;
+    { std::vector<AMIInterface> amisInit; buildGeometryPatchesAndAMI(m, g, fvpBuilt, amisInit); }
+    const std::vector<FvPatch> fvp = std::move(fvpBuilt);
     const label nC = m.nCells();
     // startFrom, via the shared resolver -- the same one the other drivers use, and the behaviour OF
     // puts in Time::setControls() (Time.C:149-188).
@@ -314,6 +324,30 @@ try
     timeRegistry.store("geometry", &g);
     timeRegistry.store("patches", &fvp);
     timeRegistry.store("solver", &solver);
+
+    const std::vector<vector> points0 = m.points();   // OF points0: transformed absolutely each step
+    std::vector<label> movingPts;                     // empty => whole mesh (OF moveAllCells_)
+    if (meshMotion.active)
+    {
+        const auto zones = readCellZones(caseDir + "/constant/polyMesh");
+        const auto it = zones.find(meshMotion.cellZone);
+        if (it == zones.end())
+            throw std::runtime_error("brae: dynamicMeshDict cellZone '" + meshMotion.cellZone +
+                "' is not in constant/polyMesh/cellZones; brae will not guess which cells move.");
+        movingPts = movingPointIDs(m, it->second);
+        std::printf("  mesh motion: %zu of %d points move (cellZone '%s', %zu cells)\n",
+                    movingPts.size(), (int)m.nPoints(), meshMotion.cellZone.c_str(), it->second.size());
+    }
+    std::vector<char> mwvPatch(fvp.size(), 0);
+    if (meshMotion.active)
+    {
+        const FieldData<vector> uFdM = readField<vector>(fieldDir + "/U");
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (const auto& b : uFdM.boundary)
+                if (b.name == fvp[pi].name && b.type == "movingWallVelocity") { mwvPatch[pi] = 1; break; }
+        std::printf("  mesh motion: solidBody on cellZone '%s'\n", meshMotion.cellZone.c_str());
+    }
+
     std::vector<ScalarTransportFO*> scalarTransports;
     std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
     foTypes.emplace_back(
@@ -514,6 +548,32 @@ try
     for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
+        // OF pimpleFoam.C:139-160 -- the mesh moves at the START of the step, before the equations,
+        // and phi is made relative immediately after. points0 (the ORIGINAL positions) are transformed
+        // by an absolute function of t, never the current points: OF's points0MotionSolver does the
+        // same, and transforming incrementally would compound round-off over a run.
+        if (meshMotion.active)
+        {
+            const std::vector<vector> oldPoints = m.points();
+            // Only the zone's points move (OF zoneMotion + solidBodyMotionSolver::curPoints). Moving
+            // the whole mesh instead would rotate the stationary half of the domain with the rotor.
+            const std::vector<vector> newPoints =
+                curPoints(points0, oldPoints, movingPts, meshMotion.motion, t);
+            m.movePoints(newPoints);
+            rebuildGeometryWithACMI(m, g, fvp);           // host geometry (+ACMI split), then device
+            const std::vector<scalar> mp =
+                solver.moveMesh(m, g, fvp, oldPoints, newPoints, deltaT);
+
+            // movingWallVelocity: Uwall from the motion, written into the patch refValue. OF assigns it
+            // in updateCoeffs() at the same point -- after the move, before assembly.
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (!mwvPatch[pi]) continue;
+                const std::vector<vector> Uw = movingWallVelocity(
+                    m, fvp[pi].start, fvp[pi].size, oldPoints, newPoints, mp, g.Sf(), g.magSf(), deltaT);
+                solver.setPatchVelocity(static_cast<label>(pi), Uw);
+            }
+        }
         const DeviceSimpleResidual r = solver.pimpleStep(deltaT, nOuter, nCorr);
         // OF order: the Courant number is evaluated on the flux the step just produced, and deltaT for
         // the NEXT step follows from it (CourantNo.H then setDeltaT.H, both at the top of the loop).

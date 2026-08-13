@@ -18,6 +18,11 @@ struct PatchInfo
     label       start = 0;  // first face index (startFace)
     label       size  = 0;  // number of faces (nFaces)
     std::string neighbourPatch;  // cyclic: paired patch name
+    // cyclicACMI: the patch (a wall) that takes the UNCOVERED area fraction. The two are
+    // geometrically COINCIDENT -- OF's blockMeshDict gives them the same faces -- and the AMI
+    // overlap fraction splits the area between them (cyclicACMIPolyPatch.C:226,252). Empty for
+    // every other patch type.
+    std::string nonOverlapPatch;
     std::vector<std::string> inGroups;  // polyBoundaryMesh groups this patch belongs to (boundaryField group match)
     std::string transform;       // cyclic: "translational" / "rotational" / "unknown"
     vector      rotationAxis{0, 0, 1};    // cyclic rotational: axis direction

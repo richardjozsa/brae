@@ -17,6 +17,7 @@
 // dimensions line is checked.
 
 #include "primitive_mesh.cuh"
+#include "acmi_area_scaling.cuh"
 #include "../common/read_surface_field.cuh"   // OF READ_IF_PRESENT for phi on restart
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -110,9 +111,12 @@ int main(int argc, char** argv)
         m.read(caseDir + "/constant/polyMesh");
         mark__("mesh read");
         FvGeometry g;
-        g.build(m);
+        // cyclicACMI splits the coincident interface faces' areas before cell volumes are computed;
+        // on a mesh without one this is exactly g.build + buildPatches.
+        std::vector<FvPatch> fvpBuilt;
+        { std::vector<AMIInterface> amisInit; buildGeometryPatchesAndAMI(m, g, fvpBuilt, amisInit); }
         mark__("geometry built");
-        const std::vector<FvPatch> fvp = buildPatches(m, g);
+        const std::vector<FvPatch> fvp = std::move(fvpBuilt);
         const label nC = m.nCells();
         timeRegistry.store("mesh", &m);
         timeRegistry.store("geometry", &g);

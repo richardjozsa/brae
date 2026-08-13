@@ -948,6 +948,19 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "effectively constant for your case, compute g = q/kappa yourself and use "
             "`type fixedGradient; gradient uniform <g>;` -- brae discretises that exactly (see B5).");
     }
+    // movingWallVelocity -- OF movingWallVelocityFvPatchVectorField. It IS a fixedValue: updateCoeffs()
+    // does `vectorField::operator=(Uwall())` and then defers to fixedValueFvPatchVectorField, and on a
+    // STATIC mesh (`if (mesh.moving())` is false) it never assigns at all and is exactly the `value`
+    // entry. So the patch field is a plain fixedValue here; the solver overwrites its refValue each
+    // step from movingWallVelocity() when the mesh moves, which is the same split OF uses.
+    //
+    // A case that declares it WITHOUT a moving mesh therefore behaves correctly by construction: no
+    // move, no overwrite, the value entry stands -- which is what OF does.
+    if (d.type == "movingWallVelocity")
+    {
+        const auto v = inletOrValue(d);
+        return std::make_unique<FixedValuePatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+    }
     throw std::runtime_error("brae: unsupported BC type '" + d.type + "' on patch " + p.name);
 }
 

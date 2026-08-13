@@ -76,8 +76,22 @@ inline DdtCoeffs ddtCoeffs(DdtScheme scheme, scalar deltaT, scalar deltaT0, scal
 // Add the implicit ddt of ONE scalar component (a velocity component, or a transported scalar) to (diag, source).
 // diag/source are the assembled fvMatrix arrays (size == nCells); this ACCUMULATES, matching ddt being one UEqn term.
 // psiOld2 may be empty (Euler / bootstrap). rho is the constant density (1 for incompressible pimpleFoam). No-op when
-// c.active is false. V is the cell-volume field (mesh V; brae is always a fixed mesh so Vsc == V). Use this when diag +
-// source belong to the SAME matrix (a scalar transport, e.g. k/epsilon in PIMPLE).
+// c.active is false. V is the cell-volume field.
+//
+// MOVING MESH. OF's EulerDdtScheme::fvmDdt (EulerDdtScheme.C:383-388) is
+//     fvm.diag()   = rDeltaT*mesh().Vsc();                          // CURRENT volume
+//     fvm.source() = rDeltaT*vf.oldTime()*(moving ? Vsc0() : Vsc()); // OLD volume when moving
+// so the discrete term is (V^n*psi^n - V^{n-1}*psi^{n-1})/dt, NOT V*(psi^n - psi^{n-1})/dt. That
+// difference IS the discrete space conservation law: with phi made relative, the two together keep
+// continuity exact on a moving mesh. Using one volume for both leaves a continuity error that grows
+// every step -- measured on pimpleFoam/RAS/rotatingFanInRoom as contLocal 8.1e-03 -> 8.0e-02 while the
+// Courant number sat at 0.46, i.e. a divergence that is not a CFL problem.
+//
+// The split needs no new kernel: deviceFvmDdtDiag and deviceFvmDdtSource already take V separately, so
+// a moving-mesh caller passes the CURRENT volume to Diag and the OLD volume to Source. On a fixed mesh
+// the two buffers are the same and every existing call is unchanged.
+//
+// Use deviceFvmDdt when diag + source belong to the SAME matrix (a scalar transport, e.g. k/epsilon).
 void deviceFvmDdt(
     const DeviceBuffer<scalar>& V,
     const DdtCoeffs&            c,

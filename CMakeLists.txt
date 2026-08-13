@@ -1149,6 +1149,26 @@ target_include_directories(test_cyclic_device_rot PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_device_rot PRIVATE brae_core)
 add_test(NAME cyclic_device_rot COMMAND test_cyclic_device_rot ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicWedge)
 
+add_executable(test_acmi_area_scaling tests/test_acmi_area_scaling.cu)
+target_include_directories(test_acmi_area_scaling PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_acmi_area_scaling PRIVATE brae_core)
+add_test(NAME acmi_area_scaling COMMAND test_acmi_area_scaling)
+
+add_executable(test_acmi_mask tests/test_acmi_mask.cu)
+target_include_directories(test_acmi_mask PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_acmi_mask PRIVATE brae_core)
+add_test(NAME acmi_mask COMMAND test_acmi_mask)
+
+add_executable(test_acmi_patch_read tests/test_acmi_patch_read.cu)
+target_include_directories(test_acmi_patch_read PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_acmi_patch_read PRIVATE brae_core)
+add_test(NAME acmi_patch_read COMMAND test_acmi_patch_read)
+
+add_executable(test_ami_curved tests/test_ami_curved.cu)
+target_include_directories(test_ami_curved PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ami_curved PRIVATE brae_core)
+add_test(NAME ami_curved COMMAND test_ami_curved)
+
 add_executable(test_ami_weights tests/test_ami_weights.cu)
 target_include_directories(test_ami_weights PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_ami_weights PRIVATE brae_core)

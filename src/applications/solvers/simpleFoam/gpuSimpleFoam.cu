@@ -7,6 +7,7 @@
 //
 //   brae -case <caseDir>
 #include "primitive_mesh.cuh"
+#include "acmi_area_scaling.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -370,9 +371,12 @@ int main(int argc, char** argv)
         m.read(caseDir + "/constant/polyMesh");
         _tsLap("mesh read");
         FvGeometry g;
-        g.build(m);
+        // cyclicACMI splits the coincident interface faces' areas before cell volumes are computed;
+        // on a mesh without one this is exactly g.build + buildPatches.
+        std::vector<FvPatch> fvpBuilt;
+        { std::vector<AMIInterface> amisInit; buildGeometryPatchesAndAMI(m, g, fvpBuilt, amisInit); }
         _tsLap("geometry build");
-        const std::vector<FvPatch> fvp = buildPatches(m, g);
+        const std::vector<FvPatch> fvp = std::move(fvpBuilt);
         timeRegistry.store("mesh", &m);
         timeRegistry.store("geometry", &g);
         timeRegistry.store("patches", &fvp);
