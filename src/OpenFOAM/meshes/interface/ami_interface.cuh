@@ -118,14 +118,20 @@ inline scalar overlapArea(const std::vector<vec2>& a, const std::vector<vec2>& b
 // The flux areas stored on the interface (ai.Sf / ai.magSf) deliberately keep using g, i.e. the SCALED
 // values -- those are the areas the interface actually transports through.
 //
-// NOTE ON NORMALISATION, verified against OF's own log. OF normalises AMI weights two ways
+// NOTE ON NORMALISATION -- TWO STEPS, and cyclicACMI needs BOTH. OF normalises AMI weights two ways
 // (AMIInterpolation.C:159-208), chosen by `conformal` = requireMatch:
 //     requireMatch 1 (cyclicAMI) : denom = sum(overlap)  -> weights sum to exactly 1
 //     requireMatch 0 (cyclicACMI): denom = face area     -> weights sum to the COVERAGE
-// and the ACMI polyMesh boundary carries `requireMatch 0`. brae divides by the face area and never
-// renormalises, so it is on OF's ACMI branch already -- confirmed by OF's printed weight sums on
-// oscillatingInletACMI2D at t = 0.292: average 0.7578655102 over 40 faces with 30 covered / 1 blended /
-// 9 uncovered, i.e. (30 + 0.3146)/40. Conformal weights would have given 31/40 = 0.775.
+// and the ACMI polyMesh boundary carries `requireMatch 0`, so the loop above divides by the face area
+// exactly like OF. That is where the resemblance used to stop, and it was one call short: for ACMI, and
+// only for ACMI, OF then RE-NORMALISES those weights back to 1 at the end of
+// cyclicACMIPolyPatch::scalePatchFaceAreas, because by then the coupled Sf carries the coverage instead.
+// See the block at the re-normalisation below for what keeping both costs.
+//
+// OF's printed weight sums are NOT evidence either way. They come from inside normaliseWeights, before
+// the ACMI override: on oscillatingInletACMI2D at t = 0.292 the log says average 0.7578655102 over 40
+// faces (30 covered / 1 blended / 9 uncovered = (30 + 0.3146)/40) while the weights the run then solves
+// with are 1 on all 31 non-empty faces.
 inline std::vector<AMIInterface> buildAMIInterfaces(
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -300,6 +306,56 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
             ai.weightsSum.push_back(s);
             ai.srcOffset[i+1] = ai.srcOffset[i] + (label)stencil[i].size();
         }
+        // THE ACMI MASK -- OF cyclicACMIPolyPatch.C:348, srcMask_ = clamp(AMI.srcWeightsSum(), 0, 1).
+        // The coverage fraction IS the mask: it decides how each face's area splits between the coupled
+        // patch and its coincident nonOverlapPatch wall. Computed for every interface (it is just the
+        // clamped coverage) but only meaningful, and only used, for ACMI. Taken from the coverage BEFORE
+        // the ACMI re-normalisation below, which is the whole point of the mask.
+        ai.mask.reserve(ai.weightsSum.size());
+        for (const scalar w : ai.weightsSum)
+            ai.mask.push_back(w < scalar(0) ? scalar(0) : (w > scalar(1) ? scalar(1) : w));
+
+        // ACMI ONLY -- RE-NORMALISE THE WEIGHTS, in OF's own words (cyclicACMIPolyPatch.C:264):
+        //
+        //     "Re-normalise the weights since the effect of overlap is already accounted for in the area"
+        //         for (scalar& w : wghts) { w /= sum; }
+        //         sum = 1.0;
+        //
+        // and that is the LAST step of cyclicACMIPolyPatch::scalePatchFaceAreas, i.e. it happens only
+        // once the coupled Sf has been multiplied by the mask. The two carry the SAME coverage, so a
+        // partially covered face that keeps both applies it TWICE and transmits mask^2 of its flux.
+        //
+        // The note on this function ("brae divides by the face area and never renormalises, so it is on
+        // OF's ACMI branch already") is right about AMIInterpolation::normaliseWeights and stops one
+        // call too early: cyclicACMI overrides that branch immediately afterwards. So does the log
+        // evidence -- OF prints sum(weights) from inside normaliseWeights, BEFORE the override, which is
+        // why the printed average is the coverage on a run whose solved weights are 1.
+        //
+        // Only BLENDED faces move (0 < mask < 1). A fully covered face already sums to 1, and an
+        // uncovered one has an empty stencil, which OF skips (`if (wghts.size())`) and so does this --
+        // leaving its weightsSum at 0 rather than inventing a 1 for a face with nothing to read.
+        //
+        // BEFORE the geometry loop, not after it. The loop below AMI-interpolates the neighbour delta
+        // with these same weights (OF cyclicAMIFvPatch::makeDeltaCoeffs, which runs on the already
+        // re-normalised weights), so normalising afterwards would leave a blended face with a delta
+        // short by its coverage -- deltaCoeffs 72.7 instead of 53.3 on the fixture below, and a face
+        // interpolation weight of 0.09 instead of 0.33.
+        //
+        // Measured on pimpleFoam/RAS/oscillatingInletACMI2D (static mesh, 2 blended target faces of
+        // 136): those two faces carried 0.118 of a full face's flux against OpenFOAM's 0.201, and the
+        // resulting 3.7e-04 shortfall -- 0.9% of the 0.04 through the interface -- set up a linear
+        // pressure ramp of 7 across the downstream duct and ~10% velocity error at the interface.
+        if (ai.acmi)
+        {
+            for (label i = 0; i < S.size; ++i)
+            {
+                const scalar s = ai.weightsSum[i];
+                if (stencil[i].empty() || !(s > scalar(0))) continue;
+                for (auto& e : stencil[i]) e.second /= s;
+                ai.weightsSum[i] = scalar(1);
+            }
+        }
+
         // per-source-face geometry: the neighbour delta is AMI-interpolated (OF cyclicAMIFvPatch::makeDeltaCoeffs).
         // transform of a nbr DELTA to the src side: identity (translational) or forwardT (rotational).
         auto rotDelta = [&](const vector& d) -> vector
@@ -339,14 +395,6 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
                 ai.dNbr.push_back(g.Cf()[T.start+j] - g.C()[T.faceCells[j]]);   // nbr-side delta (Cf_tgt - C_nbr), un-rotated
             }
         }
-        // THE ACMI MASK -- OF cyclicACMIPolyPatch.C:348, srcMask_ = clamp(AMI.srcWeightsSum(), 0, 1).
-        // The coverage fraction IS the mask: it decides how each face's area splits between the coupled
-        // patch and its coincident nonOverlapPatch wall. Computed for every interface (it is just the
-        // clamped coverage) but only meaningful, and only used, for ACMI.
-        ai.mask.reserve(ai.weightsSum.size());
-        for (const scalar w : ai.weightsSum)
-            ai.mask.push_back(w < scalar(0) ? scalar(0) : (w > scalar(1) ? scalar(1) : w));
-
         // COVERAGE CHECK -- for cyclicAMI ONLY.
         //
         // A cyclicAMI source face must be FULLY covered by target faces (weightsSum ~ 1) or it loses

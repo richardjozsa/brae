@@ -1126,6 +1126,13 @@ target_link_libraries(test_cyclic_poisson PRIVATE brae_core)
 add_test(NAME cyclic_poisson COMMAND test_cyclic_poisson ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
 
 # Cyclic increment C3c: cyclic in the full SIMPLE loop (periodic channel)
+# phi's coupled-patch flux must survive write -> read, or an AMI/cyclic restart silently rebuilds the
+# interface flux from U and lands the difference on the momentum diagonal (see the test's header).
+add_executable(test_coupled_phi_roundtrip tests/test_coupled_phi_roundtrip.cu)
+target_include_directories(test_coupled_phi_roundtrip PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_coupled_phi_roundtrip PRIVATE brae_core)
+add_test(NAME coupled_phi_roundtrip COMMAND test_coupled_phi_roundtrip ${CMAKE_CURRENT_BINARY_DIR}/coupled_phi_roundtrip_work)
+
 add_executable(test_cyclic_channel tests/test_cyclic_channel.cu)
 target_include_directories(test_cyclic_channel PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_channel PRIVATE brae_core)
@@ -1153,11 +1160,13 @@ add_executable(test_acmi_area_scaling tests/test_acmi_area_scaling.cu)
 target_include_directories(test_acmi_area_scaling PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_acmi_area_scaling PRIVATE brae_core)
 add_test(NAME acmi_area_scaling COMMAND test_acmi_area_scaling)
+set_tests_properties(acmi_area_scaling PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
 
 add_executable(test_acmi_mask tests/test_acmi_mask.cu)
 target_include_directories(test_acmi_mask PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_acmi_mask PRIVATE brae_core)
 add_test(NAME acmi_mask COMMAND test_acmi_mask)
+set_tests_properties(acmi_mask PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
 
 add_executable(test_acmi_patch_read tests/test_acmi_patch_read.cu)
 target_include_directories(test_acmi_patch_read PRIVATE ${BRAE_HEADER_DIRS})

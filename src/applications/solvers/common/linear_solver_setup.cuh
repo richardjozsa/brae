@@ -112,6 +112,13 @@ inline void readLinearSolverControls(
     ctl.tolU = solverTol("U", 1e-8);
     ctl.relTolP = solverRelTol("p");
     ctl.relTolU = solverRelTol("U");
+    // The `Final` variants, defaulting to the base entry when the case does not define one (see the
+    // note in DeviceSimpleControls). Read unconditionally: a steady case simply never sets finalIter,
+    // and reading them here is what stops the dict audit calling pFinal an unimplemented input.
+    ctl.tolPFinal = solverTol("pFinal", ctl.tolP);
+    ctl.tolUFinal = solverTol("UFinal", ctl.tolU);
+    ctl.relTolPFinal = solvers && solvers->subDict("pFinal") ? solverRelTol("pFinal") : ctl.relTolP;
+    ctl.relTolUFinal = solvers && solvers->subDict("UFinal") ? solverRelTol("UFinal") : ctl.relTolU;
     ctl.gsU = useSymGS("U");
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;
@@ -122,10 +129,15 @@ inline void readLinearSolverControls(
 
     if (ctl.turbulent)
     {
+        // brae solves the turbulence pair to ONE tolerance (the tighter of the two), so the Final pair
+        // collapses the same way. Falling back to the base value per field keeps a case that defines
+        // only one of them (kFinal but no epsilonFinal) from tightening the pair on the strength of it.
         if (ctl.sa)
         {
             ctl.tolKE = solverTol("nuTilda", 1e-8);
             ctl.relTolKE = solverRelTol("nuTilda");
+            ctl.tolKEFinal = solverTol("nuTildaFinal", ctl.tolKE);
+            ctl.relTolKEFinal = solvers && solvers->subDict("nuTildaFinal") ? solverRelTol("nuTildaFinal") : ctl.relTolKE;
             ctl.gsK = useSymGS("nuTilda");
             ctl.gsEps = false;
             noticeSolverChoice("nuTilda", "Jacobi-BiCGStab", ctl.gsK);
@@ -134,6 +146,11 @@ inline void readLinearSolverControls(
         {
             ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol(secondName, 1e-8));
             ctl.relTolKE = std::fmin(solverRelTol("k"), solverRelTol(secondName));
+            ctl.tolKEFinal = std::fmin(solverTol("kFinal", solverTol("k", 1e-8)),
+                                       solverTol(secondName + "Final", solverTol(secondName, 1e-8)));
+            ctl.relTolKEFinal = std::fmin(
+                solvers && solvers->subDict("kFinal") ? solverRelTol("kFinal") : solverRelTol("k"),
+                solvers && solvers->subDict(secondName + "Final") ? solverRelTol(secondName + "Final") : solverRelTol(secondName));
             ctl.gsK = useSymGS("k");
             ctl.gsEps = useSymGS(secondName);
             noticeSolverChoice("k", "Jacobi-BiCGStab", ctl.gsK);
@@ -147,6 +164,12 @@ inline void readLinearSolverControls(
         ctl.consistent = (cons == "yes" || cons == "true" || cons == "on" || cons == "1");   // SIMPLEC
     }
     ctl.nNonOrth = algo ? algo->intOr("nNonOrthogonalCorrectors", 0) : 0;
+    {
+        // pimpleControl.C:53. When set, pFinal is reserved for the last pressure corrector of the LAST
+        // outer iteration; by default every outer iteration's last corrector gets it.
+        const std::string fl = algo ? algo->wordOr("finalOnLastPimpleIterOnly", "no") : "no";
+        ctl.finalOnLastPimpleIterOnly = (fl == "yes" || fl == "true" || fl == "on" || fl == "1");
+    }
     {
         const std::vector<scalar> bf = algo ? algo->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
         if (bf.size() >= 3) ctl.bodyForce = vector{bf[0], bf[1], bf[2]};   // constant momentum source

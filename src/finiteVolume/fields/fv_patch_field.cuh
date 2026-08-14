@@ -7,6 +7,7 @@
 #include "fv_patch.cuh"
 #include "foam_field_reader.cuh"
 #include "cf_pstream.cuh"
+#include "foam_dict.cuh"   // isCoupledInterfaceType
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -871,7 +872,7 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // cyclic: the device-resident solver couples it via appended internal faces (DeviceMesh), so the host patch
     // field is a no-op placeholder here (its value is unused; the FvPatch type "cyclic" drives the device skip).
-    if (d.type == "cyclic" || d.type == "cyclicAMI")          return std::make_unique<ZeroGradientPatchField<T>>(p);
+    if (isCoupledInterfaceType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")
         return std::make_unique<SymmetryPlanePatchField<T>>(p);  // slip = OF basicSymmetry

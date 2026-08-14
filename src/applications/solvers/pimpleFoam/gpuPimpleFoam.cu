@@ -264,9 +264,20 @@ try
 
     TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
 
+    // Whether the coupled-patch flux above survives into the solver: the ctor rebuilds cyc_/ami_ phi from
+    // U (right for a fresh start), so a restart has to put the stored values back over the top of it.
+    const bool phiHadCoupledValues = std::filesystem::exists(phiPath);
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+    if (phiHadCoupledValues)
+    {
+        std::vector<std::pair<label, std::vector<scalar>>> ifPhi;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            if (isCoupledInterfaceType(fvp[pi].type) && !phi.boundary[pi].empty())
+                ifPhi.push_back({(label)pi, phi.boundary[pi]});
+        solver.setInterfacePatchFlux(ifPhi);
+    }
     // uniformTotalPressure p0(t). OF samples p0_->value(t) at construction with the CURRENT
     // time and again in every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:73,149),
     // so the tables are handed over before the first step and re-evaluated per step inside the
@@ -404,7 +415,15 @@ try
         // phi is the restart-critical conservative flux -> write it LOSSLESS (>=17 = double max_digits10) so its
         // write->read round-trip is bit-identical (16 sig figs loses the last bit) and a restart resumes the EXACT flux
         // with no continuity transient. The viz fields (U/p/turbulence) keep the user's writePrecision.
-        writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp, std::max(precision, 17));
+        {
+            // ...and that includes the COUPLED patches: a cyclic/AMI face's flux is on the interface, not
+            // in phiBoundary, so leaving it out made the restart rebuild it from U instead of resuming it.
+            std::map<std::string, std::vector<scalar>> ifPhi;
+            for (auto& b : solver.interfacePatchFlux())
+                if (b.first >= 0 && b.first < (label)fvp.size()) ifPhi[fvp[b.first].name] = std::move(b.second);
+            writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp,
+                              std::max(precision, 17), "[0 3 -1 0 0 0 0]", ifPhi);
+        }
         if (ctl.les) {   // pure LES Smagorinsky: only the algebraic sub-grid nut (no k/epsilon/omega/nuTilda field)
             writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision, solver.nutBoundary());
         } else if (ctl.sa) {

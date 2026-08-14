@@ -44,7 +44,7 @@ inline DeviceBoundary buildDeviceBoundary(
     std::vector<scalar> ref, dc, ms, vf, p0, rg;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;                     // cyclic = internal-like (handled by appended faces)
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
         // A processor patch is COUPLED: it stays in the boundary gather (the explicit operators need its bval
         // slot, filled with the halo-interpolated face value by DeviceHalo::scatterBoundaryValues), but must
         // contribute NO matrix coefficients -- its coupling is the interface off-diagonal. bcCategory() is NOT
@@ -193,7 +193,7 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
     std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3];   // rg = fixedGradient, per component
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;                     // cyclic = internal-like (handled by appended faces)
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
         // A processor patch is COUPLED: it stays in the boundary gather (the explicit operators need its bval
         // slot, filled with the halo-interpolated face value by DeviceHalo::scatterBoundaryValues), but must
         // contribute NO matrix coefficients -- its coupling is the interface off-diagonal. bcCategory() is NOT

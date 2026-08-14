@@ -50,6 +50,8 @@ namespace brae {
         ctorMark("deviceMesh built");
         cyc_  = buildDeviceCyclic(cyclics, g, fvp);
         ami_  = buildDeviceAMI(amis);
+        for (const auto& c : cyclics) cycRuns_.push_back({c.patch, (label)c.faceCells.size()});
+        for (const auto& a : amis)    amiRuns_.push_back({a.patch, (label)a.ownCell.size()});
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
         dbP_  = buildDeviceBoundary(p, fvp, g);
         wall_ = buildDeviceWallData(m, g, fvp, U);
@@ -59,7 +61,7 @@ namespace brae {
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
                 patchStart_[pi] = st;
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 st += fvp[pi].size;
             }
         }
@@ -72,7 +74,7 @@ namespace brae {
             std::vector<scalar> nb;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 const bool calc = (fvp[pi].type != "wall") && (nut->boundary[pi]->bcCategory() == 2);
                 if (calc) hasNutCalc_ = true;
                 const std::vector<scalar>& pv = nut->boundary[pi]->value();
@@ -93,7 +95,7 @@ namespace brae {
             label bi = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i, ++bi)
                     if (fvp[pi].type == "wall") wfb.push_back(bi);
             }
@@ -105,7 +107,7 @@ namespace brae {
             std::vector<scalar> ref, dc, ms;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     ty.push_back(0);
@@ -151,7 +153,7 @@ namespace brae {
             std::vector<scalar> nx, ny, nz;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     nx.push_back(fvp[pi].nf[i].x);
@@ -167,7 +169,7 @@ namespace brae {
                 label bi = 0;
                 for (std::size_t pj = 0; pj < fvp.size(); ++pj)
                 {
-                    if (fvp[pj].type == "cyclic" || fvp[pj].type == "cyclicAMI") continue;
+                    if (isCoupledInterfaceType(fvp[pj].type)) continue;
                     for (label i = 0; i < fvp[pj].size; ++i, ++bi)
                         if (pj == pi) mask[bi] = fvp[pj].magSf[i];
                 }
@@ -193,7 +195,7 @@ namespace brae {
             std::vector<scalar> yv;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 const bool wall = (fvp[pi].type == "wall");
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -210,7 +212,7 @@ namespace brae {
             std::vector<scalar> bx, by, bz;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     const vector& cf = g.Cf()[fvp[pi].start + i];
@@ -225,7 +227,7 @@ namespace brae {
             std::vector<label> adj;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 const bool fixed = U.boundary[pi]->fixesValue();
                 for (label i = 0; i < fvp[pi].size; ++i)
                     adj.push_back(fixed ? 0 : 1);
@@ -276,11 +278,16 @@ namespace brae {
             else                 interfaceFlux(cyc_, Uk_[0], Uk_[1], Uk_[2]);
         }
         if (hasAMI_) interfaceFlux(ami_, Uk_[0], Uk_[1], Uk_[2]);   // conservative initial AMI flux from U_init
+        // Stage harness: fvc::flux(U) ON the interface, from the U just read off disk. The one interface
+        // quantity that can be compared against OpenFOAM with NO circularity -- restart both codes from
+        // the same time directory and this is the same function of the same input on both sides, before
+        // either has taken a step. Everything downstream (HbyA, p) is contaminated by the other's answer.
+        if (hasAMI_ && stageDumpActive()) stageDump("stage_ami_fluxU_init", ami_.phi);
         {
             std::vector<scalar> o;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (fvp[pi].type == "cyclic" || fvp[pi].type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 o.insert(o.end(), phi.boundary[pi].begin(), phi.boundary[pi].end());
             }
             phiBnd_.copyFrom(o);
@@ -474,15 +481,15 @@ namespace brae {
             const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr, ddtc.cn ? &gammaIntddt0_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
-                                             ctl_.nu, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
-                                             ctl_.saCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
+                                             ctl_.nu, ctl_.relaxK, ctl_.keTol(), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
+                                             ctl_.saCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.boundedEps,
-                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
+                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.keTol(), ctl_.boundedK, ctl_.boundedEps,
+                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery,
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
                                        static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
@@ -503,13 +510,13 @@ namespace brae {
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
-                                             ctl_.tolKE, ctl_.relTolKE, ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
+                                             ctl_.keTol(), ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
                                              ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, reDdt, giDdt);   // LM transition ddt
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
-                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.tolKE, ctl_.boundedK, ctl_.boundedEps,
-                                      ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.relTolKE, ctl_.bicgCheckEvery,
+                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.keTol(), ctl_.boundedK, ctl_.boundedEps,
+                                      ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery,
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
                                       ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
@@ -534,7 +541,7 @@ namespace brae {
         if (stageDumpActive() && stageDumpFirstOnly("phiIn")) stageDump("stage_phiIn", phiInt_);
         if (stageDumpActive() && stageDumpFirstOnly("phiInB")) stageDump("stage_phiInB", phiBnd_);
         const DeviceMesh& dm = dm_;
-        const scalar tol = ctl_.tolU;
+        const scalar tol = ctl_.uTol();
         // Transient fvm::ddt(U): the ONE term steady SIMPLE lacks. steadyState (SIMPLE) -> ddtc.active==false -> the two
         // deviceFvmDdt* calls below are exact no-ops (this method stays byte-for-byte SIMPLE). pimpleStep() sets the
         // scheme + rotates the old-time fields, so the transient (PIMPLE) path folds ddt into the SAME predictor.
@@ -802,6 +809,21 @@ namespace brae {
             interfaceOffDiagSum(ami_, amiSumOff);
             if (ami_.rotational) interfaceScaleImplicit(ami_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
         }
+        // KEEP THE MOMENTUM INTERFACE COEFFICIENT. cyc_/ami_.ifCoeff is ONE buffer written by two different
+        // assemblies: interfaceAssembleMomentum here, and interfaceAssembleLaplacian for the pressure in
+        // correctPressureVelocity. UEqn.H() needs the MOMENTUM one (interfaceAddH), and on the first
+        // pressure corrector it still holds it -- H is built before the pressure is assembled. On the
+        // SECOND corrector it does not: the first corrector's pressure assembly has overwritten it, so H
+        // picks up gammaFace*deltaCoeffs*magSf instead of -(nuFace*dc*magSf) + min(phi,0). On
+        // pimpleFoam/RAS/oscillatingInletACMI2D that is 4.7e-05 in place of -5.3e-08, a factor of ~900,
+        // and it lands on H at exactly the interface cells.
+        //
+        // The symptom is specific enough to name: with nCorrectors 1 brae matched OpenFOAM to 7.6e-08 in
+        // U from an identical start; with nCorrectors 2 the same step came out 2.6e-03, as a UNIFORM
+        // pressure offset on the whole upstream block (a uniform shift has no gradient, so the bulk
+        // velocity stayed exact and only the interface-adjacent columns moved).
+        if (hasCyclic_) deviceCopy(cycIfCoeffMom_, cyc_.ifCoeff);
+        if (hasAMI_)    deviceCopy(amiIfCoeffMom_, ami_.ifCoeff);
         if (fvoMomSp_.size()) deviceAxpy(-1.0, fvoMomSp_, mDiag);   // fvOptions implicit momentum Sp: diag -= Sp*V (== fvm::Sp)
         // explicitPorositySource (DarcyForchheimer): isotropic resistance into the diagonal (mDiag += V*tr(Cd)); the
         // anisotropic remainder is added to relaxSrc per component below. Uses the LAMINAR nu (OF mu/rho, not nuEff).
@@ -1028,10 +1050,10 @@ namespace brae {
             scalar ur;
             DeviceSolverPerf uperf;
             if (ctl_.gsU && !hasCyclic_ && !hasAMI_)
-                ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.relTolU, 5000, &uperf);
+                ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf);
             else
             {
-                uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.relTolU, 5000, ctl_.bicgCheckEvery);
+                uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, ctl_.bicgCheckEvery);
                 ur = uperf.initialResidual;
             }
             // keep all 3 components + their final residual / nIter (OF prints Solving for Ux/Uy/Uz each iteration)
@@ -1043,6 +1065,10 @@ namespace brae {
 
     void DeviceSimpleSolver::correctPressureVelocity(DeviceSimpleResidual& res)
     {
+        // Put the momentum interface coefficient back before H() is built: a previous corrector's pressure
+        // assembly leaves the LAPLACIAN coefficient in the same buffer (see solveMomentumPredictor).
+        if (hasCyclic_ && cycIfCoeffMom_.size() == cyc_.ifCoeff.size()) deviceCopy(cyc_.ifCoeff, cycIfCoeffMom_);
+        if (hasAMI_    && amiIfCoeffMom_.size() == ami_.ifCoeff.size()) deviceCopy(ami_.ifCoeff, amiIfCoeffMom_);
         const DeviceMesh& dm = dm_;
         // P0 of the pressure stage trace (BRAE_PTRACE): p as it ENTERS the pressure correction. The
         // counter advances once per SIMPLE iteration here and is read (not advanced) by the pre-limit
@@ -1177,6 +1203,15 @@ namespace brae {
             else interfaceFlux(cyc_, HbyA[0], HbyA[1], HbyA[2]);   // cyclic-face phiHbyA = interp(HbyA).Sf -> cyc_.phi
         }
         if (hasAMI_) interfaceFlux(ami_, HbyA[0], HbyA[1], HbyA[2]);   // AMI-face phiHbyA = (w*HbyA[own]+(1-w)*interp(HbyA[nbr])).Sf
+        // Stage harness: phiHbyA ON the interface. This is the one quantity neither code writes per face, and
+        // it is where a coupling defect shows up as a number rather than as a downstream symptom.
+        if (hasAMI_ && stageDumpActive() && stageDumpFirstOnly("amiPhiHbyA"))
+        {
+            stageDump("stage_ami_phiHbyA", ami_.phi);
+            stageDump("stage_ami_HbyAx", HbyA[0]);
+            stageDump("stage_ami_HbyAy", HbyA[1]);
+            stageDump("stage_ami_rAU", rAU);
+        }
         DeviceBuffer<scalar> hxb,hyb,hzb;
         deviceBCValue(dbU_.comp[0],HbyA[0],hxb);
         deviceBCValue(dbU_.comp[1],HbyA[1],hyb);
@@ -1368,8 +1403,14 @@ namespace brae {
         const int nPass = (ctl_.nonOrth ? ctl_.nNonOrth : 0) + 1;
         DeviceBuffer<scalar> pIC, pBC, ffcP, ffcPcyc, ffcPami;
         DeviceSolverPerf pp, pp0;
+        // The other half of OF's finalInnerIter(): `corrNonOrtho_ == nNonOrthCorr_ + 1`. The caller has
+        // already decided whether this is the final pressure corrector; only its LAST non-orth pass gets
+        // pFinal, the earlier passes being intermediate solves of the same corrector. Restored on the way
+        // out so the steady caller, which never sets it, is unaffected.
+        const bool finalInnerCorrector = ctl_.finalInner;
         for (int nonOrthPass = 0; nonOrthPass < nPass; ++nonOrthPass)
         {
+            ctl_.finalInner = finalInnerCorrector && (nonOrthPass == nPass - 1);
             if (nonOrthPass > 0)   // recompute grad(p) from the just-solved p (pass 0 uses the entry grad in gx/gy/gz)
             {
                 DeviceBuffer<scalar> pbvN;
@@ -1501,6 +1542,27 @@ namespace brae {
             // cyclic pressure Laplacian laplacian(rAtU,p): fold the interface diagonal into diagCp_ + set cyc_.ifCoeff.
             if (hasCyclic_) interfaceAssembleLaplacian(cyc_, rAtU, diagCp_, /*addToDiag*/true);
             if (hasAMI_)    interfaceAssembleLaplacian(ami_, rAtU, diagCp_, /*addToDiag*/true);   // AMI pressure laplacian
+            // Stage harness: the assembled AMI interface, per SOURCE face. The quantity to check first is the
+            // row sum: the pressure operator annihilates constants only if each row's off-diagonal sum
+            // (ifCoeff*sum_k w_k) cancels its diagonal term (-ifCoeff), i.e. only if sum_k w_k == 1. That is
+            // what the ACMI re-normalisation in ami_interface.cuh restores -- before it, blended faces summed
+            // to their coverage and this dump was how the residual showed up as a number.
+            if (hasAMI_ && stageDumpActive() && stageDumpFirstOnly("amiP"))
+            {
+                stageDump("stage_ami_magSf",   ami_.magSf);
+                stageDump("stage_ami_dc",      ami_.deltaCoeffs);
+                stageDump("stage_ami_weights", ami_.weights);
+                stageDump("stage_ami_wsum",    ami_.weightsSum);
+                stageDump("stage_ami_ifCoeff", ami_.ifCoeff);
+                stageDump("stage_ami_w",       ami_.weight);
+                const std::vector<label> oc = ami_.ownCell.host(), of = ami_.off.host(), nc = ami_.nbrCell.host();
+                stageDump("stage_ami_own", std::vector<scalar>(oc.begin(), oc.end()));
+                stageDump("stage_ami_off", std::vector<scalar>(of.begin(), of.end()));
+                stageDump("stage_ami_nbr", std::vector<scalar>(nc.begin(), nc.end()));
+                stageDump("stage_ami_rAtU", rAtU);
+                stageDump("stage_ami_Sfx", ami_.Sfx);
+                stageDump("stage_ami_Sfy", ami_.Sfy);
+            }
             // explicit non-orth correction: faceFluxCorr from grad(p) for THIS pass; add -V*div(ffc) to b, and subtract
             // ffc from the reconstructed flux below (so div(phi)=0 on non-orth faces). gx/gy/gz = grad(p) this pass.
             ffcP = DeviceBuffer<scalar>();
@@ -1534,7 +1596,7 @@ namespace brae {
                     ? deviceLduViewCyclic(dm,diagCp_,pU_,pL_, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
                     : deviceLduViewAmi(dm,diagCp_,pU_,pL_, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
                 const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
-                pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000);
+                pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), 3000);
             }
             else if (compressible_ && ctl_.transonic)
             {
@@ -1546,16 +1608,17 @@ namespace brae {
                 // solver brae already uses for every asymmetric scalar transport.
                 const DeviceLduView pv = deviceLduView(dm, diagCp_, pU_, pL_);
                 const scalar nfp = deviceNormFactor(pv, dp_, bp_, ones_);
-                pp = deviceJacobiBiCGStab(pv, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000, ctl_.pcgCheckEvery);
+                pp = deviceJacobiBiCGStab(pv, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), 3000, ctl_.pcgCheckEvery);
             }
             else
             {
                 const scalar nfp = deviceNormFactor(deviceLduView(dm,diagCp_,pU_,pL_), dp_, bp_, ones_);
                 amgGalerkin(amg_, diagCp_, pU_, pL_);                                      // re-coarsen the pressure matrix
-                pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pL_), amg_, bp_, dp_, nfp, ctl_.tolP, ctl_.relTolP, 3000, ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling);
+                pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pL_), amg_, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), 3000, ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling);
             }
             if (nonOrthPass == 0) pp0 = pp;   // SIMPLE residualControl uses the FIRST pass's initial residual (OF convention)
         }
+        ctl_.finalInner = finalInnerCorrector;   // undo the per-pass narrowing (see the loop head)
         res.p = pp0.initialResidual;
         res.pFinal = pp.finalResidual;
         res.pIters = pp.nIterations;
@@ -1579,6 +1642,7 @@ namespace brae {
         {
             stageDump("stage_pSolved", dp_);         // straight out of the linear solver
             stageDump("stage_phiSolved", phiInt_);
+            if (hasAMI_) stageDump("stage_ami_phiCorrected", ami_.phi);   // interface flux after the p correction
         }
         if (stageDumpActive() && stageDumpFirstOnly("pSolved")) stageDump("stage_pSolved", dp_);   // pre-relax, pre-limit
         // P3: straight out of the linear solve, BEFORE field relaxation -- the decisive quantity. If the
@@ -1628,6 +1692,12 @@ namespace brae {
         {
             DeviceBuffer<scalar> divPhi;
             deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            // The interface faces are NOT in the DeviceBoundary (deviceDiv cannot see them), so their flux has to
+            // be added the same way div(phiHbyA) does it for the pressure equation. Omitting it here does not
+            // report a smaller error, it reports a LARGER one: the pEqn drives div(phi) INCLUDING the interface
+            // to zero, so a residual that leaves the interface out measures the interface flux itself.
+            if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, divPhi);
+            if (hasAMI_)    interfaceAddDiv(ami_, dm.V, divPhi);
             DeviceBuffer<scalar> R;
             deviceHadamard(R, divPhi, dm.V);
             const scalar sumV = deviceDot(dm.V, ones_) + 1e-300;
@@ -1666,10 +1736,26 @@ namespace brae {
         //
         //     Both halves must re-run: buildAMIInterfaces recomputes the overlap from the MOVED
         //     geometry, buildDeviceAMI re-uploads it. Doing only the upload would re-send stale weights.
+        //
+        //     ...but the WEIGHTS are the only thing a move invalidates. OF's phi is a surfaceScalarField
+        //     and fvMesh::movePoints recomputes the AMI without touching the flux its coupled patch is
+        //     carrying. buildDeviceAMI returns a FRESH DeviceAMI whose .phi is a newly allocated buffer,
+        //     so assigning it wholesale threw that flux away at the top of every step after the first.
+        //     ami_.phi is the interface's convection coefficient (deviceAmiAssembleMomentum takes
+        //     min(phi,0)/max(phi,0) from it), so a zeroed one leaves the interface with pure diffusion
+        //     and no convective coupling at all. On pimpleFoam/RAS/oscillatingInletACMI2D that showed up
+        //     as step 1 matching OF to 6e-04 and step 2 putting the inlet channel 1140 above the duct --
+        //     and as a RESTART curing it, because the constructor rebuilds the flux from U while a
+        //     continuation has nothing left to rebuild it from.
+        //     The patch sizes are fixed (only the overlap moves), so the flux stays face-for-face valid.
         if (hasAMI_)
         {
+            DeviceBuffer<scalar> phiKeep = std::move(ami_.phi);
             const std::vector<AMIInterface> amis = buildAMIInterfaces(m, g, fvp);
             ami_ = buildDeviceAMI(amis);
+            if (phiKeep.size() == ami_.phi.size()) ami_.phi = std::move(phiKeep);
+            amiRuns_.clear();
+            for (const auto& a : amis) amiRuns_.push_back({a.patch, (label)a.ownCell.size()});
         }
 
         // 2. meshPhi = sweptVol/deltaT, per face (OF fvMesh::movePoints stores this as mesh.phi()).
@@ -1693,6 +1779,55 @@ namespace brae {
             phiBnd_.copyFrom(pb);
         }
         return mp;
+    }
+
+    // Split the flattened interface flux back out per coupled patch, and put it back. Both directions use
+    // the SAME (patch, count) runs recorded where the interface was built, so a layout change cannot make
+    // the write and the read disagree silently.
+    std::vector<std::pair<label, std::vector<scalar>>> DeviceSimpleSolver::interfacePatchFlux() const
+    {
+        std::vector<std::pair<label, std::vector<scalar>>> out;
+        auto split = [&out](const std::vector<std::pair<label, label>>& runs, const DeviceBuffer<scalar>& phi)
+        {
+            if (runs.empty() || phi.size() == 0) return;
+            const std::vector<scalar> h = phi.host();
+            std::size_t off = 0;
+            for (const auto& r : runs)
+            {
+                const std::size_t n = static_cast<std::size_t>(r.second);
+                if (off + n > h.size()) break;                      // layout mismatch: write nothing rather than garbage
+                out.push_back({r.first, std::vector<scalar>(h.begin() + off, h.begin() + off + n)});
+                off += n;
+            }
+        };
+        split(cycRuns_, cyc_.phi);
+        split(amiRuns_, ami_.phi);
+        return out;
+    }
+
+    void DeviceSimpleSolver::setInterfacePatchFlux(const std::vector<std::pair<label, std::vector<scalar>>>& byPatch)
+    {
+        auto seed = [&byPatch](const std::vector<std::pair<label, label>>& runs, DeviceBuffer<scalar>& phi)
+        {
+            if (runs.empty() || phi.size() == 0) return;
+            std::vector<scalar> h = phi.host();
+            std::size_t off = 0;
+            for (const auto& r : runs)
+            {
+                const std::size_t n = static_cast<std::size_t>(r.second);
+                if (off + n > h.size()) break;
+                for (const auto& b : byPatch)
+                    if (b.first == r.first && b.second.size() == n)
+                    {
+                        std::copy(b.second.begin(), b.second.end(), h.begin() + off);
+                        break;
+                    }
+                off += n;
+            }
+            phi.copyFrom(h);
+        };
+        seed(cycRuns_, cyc_.phi);
+        seed(amiRuns_, ami_.phi);
     }
 
     void DeviceSimpleSolver::setPatchVelocity(label patchi, const std::vector<vector>& Uw)
@@ -1833,7 +1968,7 @@ namespace brae {
         deviceSolveScalarTransport(
             dm_, db, field, fieldName, D, phiInt_, phiBnd_, divPhi,
             schemeBounded, schemeLimited, schemeLinearUpwind, schemeNonOrth, schemeTwoByk,
-            relax, tol, ctl_.relTolKE, ctl_.bicgCheckEvery, false,
+            relax, tol, ctl_.keRelTol(), ctl_.bicgCheckEvery, false,
             [](DeviceBuffer<scalar>&, DeviceBuffer<scalar>&){},   // passive: no reaction
             nullptr, nullptr,
             hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
@@ -2085,6 +2220,8 @@ namespace brae {
         {
             DeviceBuffer<scalar> divPhi;
             deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, divPhi);   // interface faces are outside the DeviceBoundary
+            if (hasAMI_)    interfaceAddDiv(ami_, dm.V, divPhi);   // (see step(): the pEqn's div includes them)
             DeviceBuffer<scalar> R;
             deviceHadamard(R, divPhi, dm.V);
             const scalar sumV = deviceDot(dm.V, ones_) + 1e-300;
@@ -2103,15 +2240,30 @@ namespace brae {
         const int nCorr  = nCorrectors      > 0 ? nCorrectors      : 1;
         for (int oc = 0; oc < nOuter; ++oc)
         {
+            // OF pimpleControl::loop -> mesh.data().setFinalIteration(true) on the LAST outer corrector.
+            // That is the flag the bare solve() in UEqn.H and the turbulence models pick up, so U and
+            // k/epsilon are on their Final entries for the whole of this iteration.
+            ctl_.finalIter = (oc == nOuter - 1);
             solveMomentumPredictor(res);                     // momentum incl. implicit ddt
             for (int pc = 0; pc < nCorr; ++pc)               // PIMPLE pressure (inner) correctors
+            {
+                // ...p is different: pEqn.H asks for p.select(pimple.finalInnerIter()), which is the LAST
+                // pressure corrector regardless of which outer iteration this is, unless the case set
+                // finalOnLastPimpleIterOnly. The non-orth half of finalInnerIter() is applied inside
+                // correctPressureVelocity, which owns that loop.
+                ctl_.finalInner = (pc == nCorr - 1) && (!ctl_.finalOnLastPimpleIterOnly || ctl_.finalIter);
                 correctPressureVelocity(res);
+            }
             correctTurbulence();
         }
+        ctl_.finalIter = false;    // the steady path and anything outside the loop read the base entries
+        ctl_.finalInner = false;
         // continuity errors on the corrected flux (identical to step()).
         {
             DeviceBuffer<scalar> divPhi;
             deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, divPhi);   // interface faces are outside the DeviceBoundary
+            if (hasAMI_)    interfaceAddDiv(ami_, dm.V, divPhi);   // (see step(): the pEqn's div includes them)
             DeviceBuffer<scalar> R;
             deviceHadamard(R, divPhi, dm.V);
             const scalar sumV = deviceDot(dm.V, ones_) + 1e-300;

@@ -184,15 +184,33 @@ int main()
     // -------------------------------------------------------------------------------------------
     // 6. THE ORDERED ENTRY POINT, and the resolution of "do the weights double-count the mask?".
     //
-    // OF normalises AMI weights two ways (AMIInterpolation.C:159-208), selected by requireMatch:
-    //     requireMatch 1 (cyclicAMI) : denom = sum(overlap) -> weights sum to exactly 1
-    //     requireMatch 0 (cyclicACMI): denom = face area    -> weights sum to the COVERAGE
-    // The ACMI polyMesh boundary carries requireMatch 0, and OF's own log on oscillatingInletACMI2D
-    // confirms the consequence: at t = 0.292, sum(weights) average = 0.7578655102 over 40 faces with
-    // 30 covered / 1 blended / 9 uncovered, i.e. (30 + 0.3146)/40. Conformal weights would have printed
-    // 31/40 = 0.775. So the mask DOES appear in both the weights and the scaled area -- in OF too. brae
-    // divides the overlap by the face area and never renormalises, so it is on that same branch, and
-    // matching OF is the requirement. This leg pins that: weights sum to the mask, not to 1.
+    // THE ANSWER IS NO, AND THIS LEG USED TO ASSERT THAT THEY DO. The reasoning it asserted was:
+    //
+    //     OF normalises AMI weights two ways (AMIInterpolation.C:159-208), selected by requireMatch:
+    //         requireMatch 1 (cyclicAMI) : denom = sum(overlap) -> weights sum to exactly 1
+    //         requireMatch 0 (cyclicACMI): denom = face area    -> weights sum to the COVERAGE
+    //     the ACMI boundary carries requireMatch 0, and OF's log on oscillatingInletACMI2D prints
+    //     sum(weights) average 0.7578655102 = (30 + 0.3146)/40, not 31/40 = 0.775
+    //
+    // Every line of that is true and the conclusion drawn from it was still wrong, which is what makes
+    // it worth keeping. It stops one call short. cyclicACMIPolyPatch::scalePatchFaceAreas scales the
+    // coupled Sf by the mask and then, as its last act (cyclicACMIPolyPatch.C:264):
+    //
+    //     "Re-normalise the weights since the effect of overlap is already accounted for in the area"
+    //         for (scalar& w : wghts) { w /= sum; }   sum = 1.0;
+    //
+    // The log line is printed from INSIDE normaliseWeights, before that override, so it reports the
+    // pre-override coverage on a run whose solved weights are 1 -- it cannot distinguish the two, and
+    // reading it as confirmation was the error.
+    //
+    // The invariant is that the coverage appears EXACTLY ONCE. This leg now pins both halves together,
+    // which is the only way to state it: the mask still reads 0, 0.5, 1, 1 (it survives, in the area)
+    // while every non-empty stencil sums to 1 (it is not there a second time). Asserting either alone
+    // passes under the double-count.
+    //
+    // The cost of the old convention, measured on pimpleFoam/RAS/oscillatingInletACMI2D: 2 blended
+    // faces of 136 carried 0.118 of a full face's flux against OF's 0.201, losing 0.9% of the interface
+    // mass flow, and that put the inlet channel ~860 above the duct in pressure.
     {
         PrimitiveMesh m6 = acmitest::twoBlockACMI(acmitest::ACMI_DY, true);
         FvGeometry g6;
@@ -221,18 +239,23 @@ int main()
                                 (int)i, A.mask[i], want[i]);
                     ++failures;
                 }
-                // weights sum to the mask (OF non-conformal), NOT to 1
+                // ...and the weights do NOT carry it a second time: OF re-normalises them to 1 once the
+                // area has the coverage. An uncovered face has no stencil and keeps a sum of 0, which
+                // is OF's `if (wghts.size())` guard, not a special case.
+                const scalar wantWs = want[i] > 0 ? scalar(1) : scalar(0);
                 scalar ws = 0;
                 for (label k = A.srcOffset[i]; k < A.srcOffset[i+1]; ++k) ws += A.weight[k];
-                if (std::fabs(ws - want[i]) > 1e-12)
+                if (std::fabs(ws - wantWs) > 1e-12)
                 {
-                    std::printf("  FAIL entry point face %d: weights sum to %.12f, expected %.12f. OF's ACMI\n"
-                                "       branch (requireMatch 0) sums to the coverage; summing to 1 would be\n"
-                                "       the cyclicAMI branch and would not match OF.\n", (int)i, ws, want[i]);
+                    std::printf("  FAIL entry point face %d: weights sum to %.12f, expected %.12f. The\n"
+                                "       coverage %.4f is already in the scaled area (asserted just above);\n"
+                                "       carrying it here too transmits mask^2 of the face's flux.\n",
+                                (int)i, ws, wantWs, want[i]);
                     ++failures;
                 }
             }
-            std::printf("  entry point: mask and weight-sums both = 0, 0.5, 1, 1 (OF non-conformal branch)\n");
+            std::printf("  entry point: mask = 0, 0.5, 1, 1 (in the area) and weight-sums = 0, 1, 1, 1\n"
+                        "               -- the coverage appears exactly once\n");
         }
 
         // THE RAW/SCALED DISTINCTION IS ENGAGED, and load-bearing. buildAMIInterfaces normalises by

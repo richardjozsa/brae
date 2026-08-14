@@ -45,6 +45,19 @@ inline bool isConstraintPatchType(const std::string& t)
     // silently. buildPatches refuses it outright (fv_patch.cu).
 }
 
+// Coupled INTERFACE patches: the pair whose face values come from the other side of the interface, not
+// from a boundary condition. brae handles these on the device (device_cyclic / device_ami), so the
+// ordinary boundary machinery -- DeviceBoundary entries, coded-BC scanning, surface-field reads, patch
+// field construction -- must skip them.
+//
+// cyclicACMI belongs here for the same reason it belongs on the device AMI path: it IS a cyclicAMI, plus
+// an area split with its coincident nonOverlapPatch wall. The wall half is an ordinary patch and is NOT
+// skipped -- it carries the uncovered fraction and needs its real boundary condition.
+inline bool isCoupledInterfaceType(const std::string& t)
+{
+    return t == "cyclic" || t == "cyclicAMI" || t == "cyclicACMI";
+}
+
 struct FoamDict
 {
     std::vector<std::pair<std::string, std::vector<std::string>>> leaves;   // key -> value tokens
@@ -153,6 +166,29 @@ inline FoamDict parseDictBody(TokenStream& ts, bool top)
             if (!top) ts.next();
             break;
         }
+        // AN EMPTY ENTRY IS NOT A KEY. A stray ';' at key position must be skipped, not read as the name
+        // of the entry that follows -- otherwise that entry is consumed as this one's VALUE and disappears.
+        //
+        // It is brae's own $macro expansion that produces them. OF expands `$p;` as a dictionary MERGE:
+        // the keyword is `$p` and p's entries are added, so no punctuation is ever duplicated. brae
+        // expands it as TEXT, substituting p's captured body -- which ends in its own ';' -- for the `$p`,
+        // leaving the file's ';' behind it. So the canonical OpenFOAM override idiom
+        //
+        //     p      { solver GAMG; tolerance 1e-5;  relTol 0.01; }
+        //     pFinal { $p; tolerance 1e-10; relTol 0; }
+        //
+        // expanded to `... relTol 0.01 ; ; tolerance 1e-10 ; relTol 0 ;` and parsed the second ';' as a
+        // key holding "tolerance 1e-10". The override was not merely lost: it was swallowed, so
+        // find("tolerance") returned the 1e-5 the macro had pulled in and pFinal silently became p.
+        //
+        // Measured on pimpleFoam/RAS/oscillatingInletACMI2D, whose pFinal is exactly that idiom: the final
+        // pressure corrector stopped at 9.7e-06 instead of 1e-10 and the step's continuity error came out
+        // 2.2e-06 against OpenFOAM's 1.3e-14. Skipping the stray ';' here takes it to 2.2e-11.
+        //
+        // Fixed at the PARSER rather than in the expansion because this is the failure mode that matters:
+        // an unparseable empty entry is harmless, an empty entry that eats the next one is a silently
+        // ignored input. OF tolerates `;;` in hand-written dictionaries too.
+        if (ts.peek() == ";") { ts.next(); continue; }
         const std::string key = ts.next();
         if (ts.eof()) break;
         if (ts.peek() == "{")

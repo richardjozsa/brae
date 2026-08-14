@@ -397,6 +397,20 @@ public:
     std::vector<scalar> epsBoundary() const { return boundaryOf(dbEps_, de_); }
     std::vector<scalar> pBoundary()   const { return boundaryOf(dbP_,   dp_); }
     std::vector<scalar> phiBoundary() const { return phiBnd_.host(); }
+
+    // THE INTERFACE FLUX, per coupled patch, for the phi write. A cyclic/AMI patch's flux is NOT in
+    // phiBoundary -- it lives on the interface object (cyc_.phi / ami_.phi), because that is what the
+    // coupling reads. OpenFOAM keeps it in phi's boundaryField and WRITES it, so its restart resumes the
+    // exact flux; brae wrote the patch with a type and no value, so the flux could not survive a restart
+    // and was rebuilt from U instead. It is not the same number: on
+    // pimpleFoam/RAS/oscillatingInletACMI2D the rebuild differed from the stored flux by 1.3e-04 on the
+    // first face, and since the momentum interface coefficient is upwind (max(phi,0)) that landed
+    // directly on the diagonal -- 0.95% of rAU on every one of the 40 source-side interface cells, and
+    // nothing else in the mesh.
+    // Returns (fvPatch index, per-face flux in patch face order); empty when there is no interface.
+    std::vector<std::pair<label, std::vector<scalar>>> interfacePatchFlux() const;
+    // The inverse, for a restart: seed cyc_.phi / ami_.phi from the values just read out of phi's file.
+    void setInterfacePatchFlux(const std::vector<std::pair<label, std::vector<scalar>>>& byPatch);
     // rho on the boundary -- the EOS result the solve actually used, already maintained per face by the
     // pressure equation (phiHbyA is rho-weighted with it). Not derivable from the T/p descriptors here,
     // which is why it needs its own accessor rather than boundaryOf().
@@ -648,6 +662,13 @@ private:
     bool   hasTotalP_ = false;                                 // any totalPressure p patch present (per-step refValue)
     bool   hasCyclic_ = false;                                 // any cyclic (periodic) interface -> Jacobi-PCG pressure (no AMG)
     DeviceCyclic cyc_;                                          // periodic interface coupling (OF updateInterfaceMatrix)
+    // (fvPatch index, face count) of each side stacked into cyc_.phi / ami_.phi, in the order
+    // buildDeviceCyclic / buildDeviceAMI concatenated them -- the map interfacePatchFlux() needs.
+    // The MOMENTUM interface off-diagonal, kept aside because cyc_/ami_.ifCoeff is shared with the
+    // pressure laplacian assembly and UEqn.H() needs the momentum one on every corrector, not just the
+    // first. See solveMomentumPredictor for what reading the wrong one costs.
+    DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
+    std::vector<std::pair<label, label>> cycRuns_, amiRuns_;
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)
     DeviceAMI    ami_;                                          // cyclicAMI weighted-stencil coupling (translational path)
 };

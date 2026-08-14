@@ -420,7 +420,7 @@ int main(int argc, char** argv)
 
             for (const FvPatch& q : fvp)
             {
-                if (q.type == "cyclic" || q.type == "cyclicAMI") continue;   // DeviceBoundary skips these
+                if (isCoupledInterfaceType(q.type)) continue;   // DeviceBoundary skips these
                 scalar prt = tc.Prt;   // the MODEL's Prt away from an alphat wall function
                 // OF-style resolution (exact name, then group, then regex) -- NOT `pb.name == q.name`.
                 // squareBend* key this entry as "(?i).*walls" against a patch literally called `walls`,
@@ -564,7 +564,7 @@ int main(int argc, char** argv)
                 o << "# name nFaces type   (DeviceBoundary order; cyclic/cyclicAMI excluded)\n";
                 for (const auto& q : fvp)
                 {
-                    if (q.type == "cyclic" || q.type == "cyclicAMI") continue;
+                    if (isCoupledInterfaceType(q.type)) continue;
                     o << q.name << ' ' << q.size << ' ' << q.type << '\n';
                 }
             }

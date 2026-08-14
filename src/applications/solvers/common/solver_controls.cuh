@@ -23,6 +23,51 @@ struct DeviceSimpleControls
     vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
     scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
     scalar relTolU = 0.0, relTolP = 0.0, relTolKE = 0.0;   // solver relTol (fvSolution solvers.{U,p,k,epsilon}.relTol). 0 = abs tol.
+    // fvSolution's `Final` VARIANTS (solvers.pFinal / UFinal / kFinal ...). PIMPLE spends its early outer
+    // correctors getting close and its last one getting the answer, so OF gives the last one its own,
+    // tighter settings: pimpleControl::loop calls mesh.data().setFinalIteration(true) on the final outer
+    // corrector, and fvMatrix::solve() then resolves its dictionary through GeometricField::select(),
+    // which appends "Final" to the field name. Every solve inside that outer corrector uses them --
+    // including each inner PISO pressure corrector, since the flag is per outer iteration.
+    //
+    // brae read only the base entries, so a case's pFinal was inert: with the oscillatingInletACMI2D
+    // settings (p: 1e-5/relTol 0.01, pFinal: 1e-10/relTol 0) that left the FINAL flux converged to the
+    // loose figure and reported time-step continuity of 1.7e-04 where OF reaches 1e-14. It cost a long
+    // detour in the cyclicACMI hunt, because a continuity residual that size reads as a coupling defect.
+    // brae's dict audit had been printing `solvers/pFinal/ (whole sub-dictionary never read)` throughout.
+    //
+    // Absent entries fall back to the base ones (OF would FatalError instead; refusing a case that OF
+    // runs is worse than solving its last corrector exactly as tightly as the others).
+    scalar tolUFinal = 1e-8, tolPFinal = 1e-7, tolKEFinal = 1e-8;
+    scalar relTolUFinal = 0.0, relTolPFinal = 0.0, relTolKEFinal = 0.0;
+    // TWO flags, because OF selects the Final entry two different ways and the difference is visible in
+    // its log on any PISO-mode case (nOuterCorrectors 1, two pressure correctors):
+    //
+    //   GAMG: Solving for p, Initial residual = 0.0513, Final residual = 2.786e-04, No Iterations 4
+    //   GAMG: Solving for p, Initial residual = 0.0042, Final residual = 5.988e-11, No Iterations 16
+    //
+    // corrector 1 stopped on `p` (relTol 0.01), corrector 2 on `pFinal` (1e-10, relTol 0) -- so pFinal
+    // is NOT simply "the last outer iteration". pEqn.H asks for it explicitly:
+    //     pEqn.solve(p.select(pimple.finalInnerIter()))
+    // and finalInnerIter() = last PISO corrector AND last non-orthogonal pass (pimpleControlI.H:98),
+    // gated on the outer iteration only when `finalOnLastPimpleIterOnly` is set, which defaults false.
+    //
+    // UEqn.H and the turbulence models instead call the bare solve(), which resolves through
+    // fvMatrix::solverDict() -> psi_.select(mesh.data().isFinalIteration()) -- the flag pimpleControl
+    // sets for the whole of the final OUTER corrector. Same case, same log: Ux converges to 3.1e-07
+    // from an initial 3.3e-03, i.e. past the `U` relTol of 0.1, so it is on UFinal every step.
+    //
+    // Neither is ever set on the steady path: OF's simpleControl has no Final concept either.
+    bool   finalInner = false;   // p        -- last pressure corrector, last non-orth pass
+    bool   finalIter  = false;   // U, k/eps -- anywhere in the last outer corrector
+    scalar pTol()     const { return finalInner ? tolPFinal     : tolP; }
+    scalar pRelTol()  const { return finalInner ? relTolPFinal  : relTolP; }
+    scalar uTol()     const { return finalIter  ? tolUFinal     : tolU; }
+    scalar uRelTol()  const { return finalIter  ? relTolUFinal  : relTolU; }
+    scalar keTol()    const { return finalIter  ? tolKEFinal    : tolKE; }
+    scalar keRelTol() const { return finalIter  ? relTolKEFinal : relTolKE; }
+    // fvSolution PIMPLE/finalOnLastPimpleIterOnly (pimpleControl.C:53, default false).
+    bool   finalOnLastPimpleIterOnly = false;
     int    bicgCheckEvery = 1;      // batched convergence for ALL BiCGStab solves (momentum + k/eps); BRAE_BICG_CHECK_EVERY.
     bool   turbulent = false;
     bool   useGraph  = true;     // replay the pressure V-cycle from a cached CUDA graph (#7c-loop)

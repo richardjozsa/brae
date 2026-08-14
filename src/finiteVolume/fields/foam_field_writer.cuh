@@ -1,4 +1,5 @@
 #pragma once
+#include <map>
 // brae::writeVolField, write a converged volume field in OpenFOAM's own structure. Unlike a raw text splice, this
 // emits a fully RESOLVED field like OpenFOAM does: the internalField is the solved nonuniform list, and the
 // boundaryField is written per mesh patch with an explicit `type` (+ value) entry, patch groups expanded, #include /
@@ -237,7 +238,7 @@ inline void writeVolField(
                        : (derived ? "calculated" : "zeroGradient");
             d = &synth;
         }
-        const bool coupled = (p.type == "cyclic" || p.type == "cyclicAMI");
+        const bool coupled = (isCoupledInterfaceType(p.type));
         const bool haveComputed = !computedBoundary.empty() && !coupled && p.size > 0
                                && bndOff + static_cast<std::size_t>(p.size) <= computedBoundary.size()
                                && p.type != "empty";
@@ -266,7 +267,13 @@ inline void writeSurfaceField(
     // Defaulted to the volumetric form so the incompressible callers are unchanged. Getting this wrong
     // still loads, but every downstream tool that checks dimensions (postProcess, funkySetFields, a
     // restart into OF) then sees a field that claims to be something it is not.
-    const std::string& dimensions = "[0 3 -1 0 0 0 0]")
+    const std::string& dimensions = "[0 3 -1 0 0 0 0]",
+    // Per-COUPLED-patch flux, keyed by patch name. cyclic/cyclicAMI/cyclicACMI faces are not in
+    // phiBoundary at all (their flux lives on the interface object), so without this they were written
+    // as a bare `type <patchType>;` with no value -- and a restart had nothing to resume from. OF writes
+    // the values; see DeviceSimpleSolver::interfacePatchFlux for what the missing round-trip cost.
+    // Absent/empty keeps the old value-less form, which is still right for a solver with no interface.
+    const std::map<std::string, std::vector<scalar>>& coupledValues = {})
 {
     std::ofstream out(outPath);
     if (!out) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
@@ -282,9 +289,17 @@ inline void writeSurfaceField(
     for (const auto& p : patches)
     {
         out << "    " << p.name << "\n    {\n";
-        if (p.type == "cyclic" || p.type == "cyclicAMI")   // coupled: flux held on the interface, not in phiBoundary
+        if (isCoupledInterfaceType(p.type))   // coupled: flux held on the interface, not in phiBoundary
         {
-            out << "        type            " << p.type << ";\n    }\n";
+            out << "        type            " << p.type << ";\n";
+            const auto cv = coupledValues.find(p.name);
+            if (cv != coupledValues.end() && cv->second.size() == static_cast<std::size_t>(p.size))
+            {
+                out << "        value           nonuniform List<scalar> \n" << p.size << "\n(\n";
+                for (scalar v : cv->second) out << v << '\n';
+                out << ")\n;\n";
+            }
+            out << "    }\n";
             continue;                                       // do NOT advance off (phiBoundary skips these)
         }
         const std::size_t n = static_cast<std::size_t>(p.size);

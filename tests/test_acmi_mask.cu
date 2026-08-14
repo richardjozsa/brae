@@ -163,6 +163,71 @@ int main()
         }
     }
 
+    // -------------------------------------------------------------------------------------------
+    // 5. THE COVERAGE IS APPLIED ONCE, NOT TWICE. For cyclicACMI the overlap fraction ends up in the
+    // face AREA (leg 2's mask, consumed by test_acmi_area_scaling). OF therefore takes it back OUT of
+    // the interpolation weights, as the last act of cyclicACMIPolyPatch::scalePatchFaceAreas:
+    //
+    //     "Re-normalise the weights since the effect of overlap is already accounted for in the area"
+    //         for (scalar& w : wghts) { w /= sum; }   sum = 1.0;
+    //
+    // brae kept the weights on AMIInterpolation's non-conformal branch (summing to the coverage) AND
+    // scaled the area, so a partially covered face transmitted mask^2 of its flux. On
+    // pimpleFoam/RAS/oscillatingInletACMI2D that was 2 faces of 136, and it still cost 0.9% of the
+    // interface mass flow, a pressure ramp of 7 down the duct and ~10% velocity error at the interface.
+    //
+    // THE BLENDED FACE IS THE WHOLE TEST. A fully covered face already sums to 1 and an uncovered one
+    // has no stencil, so on a fixture without a genuine 0 < mask < 1 face BOTH conventions agree and
+    // this leg is vacuous -- which is why it asserts the blend exists before asserting anything else.
+    // The pairing with leg 2 is the point: the mask must STILL read 0.5 (the coverage survives, in the
+    // area) while the weights read 1 (it is not there a second time).
+    {
+        std::size_t blended = 0;
+        for (const AMIInterface& A : amis)
+        {
+            const std::string nm = fvp[A.patch].name;
+            for (std::size_t i = 0; i + 1 < A.srcOffset.size(); ++i)
+            {
+                const label b = A.srcOffset[i], e = A.srcOffset[i+1];
+                if (e <= b)   // uncovered: no stencil, nothing to normalise, weightsSum stays 0
+                {
+                    if (A.weightsSum[i] != scalar(0))
+                    {
+                        std::printf("  FAIL %s face %zu: empty stencil but weightsSum %.12f, expected 0 --\n"
+                                    "       an uncovered face must not be handed a 1 it has nothing to read with\n",
+                                    nm.c_str(), i, A.weightsSum[i]);
+                        ++failures;
+                    }
+                    continue;
+                }
+                if (A.mask[i] > scalar(0) && A.mask[i] < scalar(1)) ++blended;
+                scalar s = 0;
+                for (label k = b; k < e; ++k) s += A.weight[k];
+                std::printf("  %-13s face %zu: mask %.4f  sum(weights) %.12f  weightsSum %.12f\n",
+                            nm.c_str(), i, A.mask[i], s, A.weightsSum[i]);
+                if (std::fabs(s - scalar(1)) > 1e-12)
+                {
+                    std::printf("  FAIL %s face %zu: weights sum to %.12f, expected 1. The coverage %.4f is\n"
+                                "       already in the face area; keeping it here too transmits mask^2.\n",
+                                nm.c_str(), i, s, A.mask[i]);
+                    ++failures;
+                }
+                if (std::fabs(A.weightsSum[i] - scalar(1)) > 1e-12)
+                {
+                    std::printf("  FAIL %s face %zu: weightsSum %.12f, expected 1 (OF sets sum = 1.0)\n",
+                                nm.c_str(), i, A.weightsSum[i]);
+                    ++failures;
+                }
+            }
+        }
+        if (!blended)
+        {
+            std::printf("  FAIL vacuous: no face has 0 < mask < 1, so both the right and the wrong\n"
+                        "       normalisation give sum(weights) = 1 and this leg proves nothing\n");
+            ++failures;
+        }
+    }
+
     std::printf("test_acmi_mask: %d failures\n", failures);
     return failures ? 1 : 0;
 }
