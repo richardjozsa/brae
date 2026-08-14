@@ -5,6 +5,7 @@
 #include "device_simple_foam.cuh"
 #include "swept_volume.cuh"   // meshPhi + makeRelative (OF fvcMeshPhi)
 #include "device_scalar_transport.cuh"   // deviceSolveScalarTransport: shared with k/epsilon/omega/energy
+#include "brae_notice.cuh"   // never drop an input silently (the ddtCorr scheme gate)
 #include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
 
 namespace brae {
@@ -233,6 +234,22 @@ namespace brae {
                     adj.push_back(fixed ? 0 : 1);
             }
             adjustMask_.copyFrom(adj);
+        }
+        // fvc::ddtCorr's per-boundary-face coefficient mask. OF's ddtScheme::fvcDdtPhiCoeff zeroes the
+        // coupling coefficient on exactly two kinds of patch:
+        //     if (U.boundaryField()[patchi].fixesValue() || isA<cyclicAMIFvPatch>(...)) ccbf[patchi] = 0
+        // The cyclicAMI half is why the missing ddtCorr was never an INTERFACE defect -- OF puts nothing
+        // there either. Coupled patches are not in this array at all (phiBnd_ skips them), so they get
+        // no correction for free; the mask only has to carry the fixesValue half.
+        {
+            std::vector<scalar> mask;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const scalar m01 = U.boundary[pi]->fixesValue() ? scalar(0) : scalar(1);
+                for (label i = 0; i < fvp[pi].size; ++i) mask.push_back(m01);
+            }
+            ddtCorrBndMask_.copyFrom(mask);
         }
         nuBndConst_.copyFrom(std::vector<scalar>(dbExtrap_.n, ctl.nu));
         // AMG hierarchy for the pressure Laplacian (static: faceWeights = |Sf|), built from the mesh internal faces.
@@ -1225,6 +1242,87 @@ namespace brae {
         if (stageDumpActive() && stageDumpFirstOnly("HbyAb")) stageDump3("stage_HbyAb", hxb, hyb, hzb);
         DeviceBuffer<scalar> phiHb;
         deviceBoundaryFlux(dm,hxb,hyb,hzb,phiHb);
+        // ---- fvc::ddtCorr, pEqn.H line 2 ----------------------------------------------------------
+        //     if (pimple.ddtCorr()) phiHbyA += MRF.zeroFilter(fvc::interpolate(rAU)*fvc::ddtCorr(U, phi, Uf));
+        //
+        // brae had no ddtCorr at all. It is a ~1% correction on almost every internal face (measured on
+        // pimpleFoam/RAS/oscillatingInletACMI2D: 3.5% of the peak flux, 0.31% rms, on 20924 of 21464
+        // faces), and it was the entire difference between agreeing with OpenFOAM to 1.5e-03 and to
+        // 1.1e-02 on that case once the cyclicACMI defects were out of the way.
+        //
+        // IT IS NOT AN INTERFACE TERM. OF zeroes its coefficient on every cyclicAMI patch, so a coupled
+        // face gets nothing from it in either code -- which is why chasing the ACMI flux profile kept
+        // landing on the inlet instead of the interface.
+        //
+        // Uf, DELIBERATELY NOT IMPLEMENTED. pimpleFoam passes fvc::ddtCorr(U, phi, Uf) and that
+        // dispatches to the Uf form on a dynamic mesh, where phiCorr uses (Sf & Uf.oldTime()) in place of
+        // phi.oldTime() -- they differ only in that Sf is the CURRENT area against an old face velocity.
+        // Measured against OpenFOAM's own written Uf on the moving oscillatingInletACMI2D: the two forms
+        // agree to 9.0e-10 on a translating mesh, because Sf barely changes. A ROTATING AMI would not be
+        // so kind, so this is a known limit, not a proof.
+        if (ddtCorr_ && ddtScheme_ != DdtScheme::steadyState && deltaT_ > 0
+            && phiOldInt_.size() == phiHi.size())
+        {
+            if (ddtScheme_ != DdtScheme::Euler)
+            {
+                // backward/CrankNicolson each have their OWN fvcDdtPhiCorr (extra old levels and
+                // coefficients). Running the Euler form under them would be a silent approximation, so
+                // say so and leave the term out, which is what brae did for every scheme until now.
+                if (!ddtCorrNoticed_)
+                {
+                    ddtCorrNoticed_ = true;
+                    noticeIgnored("PIMPLE/ddtCorr",
+                                  "brae implements fvc::ddtCorr only for the Euler ddt scheme; this case "
+                                  "uses another, so the correction is omitted (OF would apply its "
+                                  "scheme-specific form)");
+                }
+            }
+            else
+            {
+                DeviceBuffer<scalar> fUoInt, fUoBnd, rAUfDdt, rAUbDdt;
+                deviceVectorFlux(dm, Uold_[0], Uold_[1], Uold_[2], fUoInt);   // interpolate(U_old) & Sf
+                DeviceBuffer<scalar> uob[3];
+                for (int kk = 0; kk < 3; ++kk) deviceBCValue(dbU_.comp[kk], Uold_[kk], uob[kk]);
+                deviceBoundaryFlux(dm, uob[0], uob[1], uob[2], fUoBnd);
+                deviceInterpolate(dm, rAU, rAUfDdt);        // fvc::interpolate(rAU) -- rAU, not rAtU
+                deviceBCValue(dbExtrap_, rAU, rAUbDdt);     // adjacent-cell value on the boundary
+                // Stage harness: the correction ALONE, as pre/post pairs, so it can be differenced against
+                // OpenFOAM's own fvc::interpolate(rAU)*fvc::ddtCorr without unpicking it from phiHbyA.
+                const bool dumpDdt = stageDumpActive() && stageDumpFirstOnly("ddtCorr");
+                if (dumpDdt) { stageDump("stage_ddtCorr_pre", phiHi); stageDump("stage_ddtCorr_preB", phiHb); }
+                deviceDdtCorrFlux(dm.nInternalFaces, phiOldInt_, phiOldBnd_, fUoInt, fUoBnd,
+                                  rAUfDdt, rAUbDdt, ddtCorrBndMask_, scalar(1)/deltaT_, phiHi, phiHb);
+                // ...and on the interface. See the note on amiPhiOld_ for why this is the one coupled
+                // place OF keeps the correction. deviceDdtCorrFlux's boundary sweep is elementwise, so
+                // it serves here with an all-ones mask and no internal part.
+                DeviceBuffer<scalar> noInt;
+                auto ifDdtCorr = [&](const DeviceBuffer<scalar>& phiOld, const DeviceBuffer<scalar>& fUo,
+                                     const DeviceBuffer<scalar>& rAUface, DeviceBuffer<scalar>& phi)
+                {
+                    if (phi.size() == 0 || phiOld.size() != phi.size() || fUo.size() != phi.size()) return;
+                    if (ddtCorrIfOnes_.size() != phi.size())
+                        ddtCorrIfOnes_.copyFrom(std::vector<scalar>(phi.size(), scalar(1)));
+                    deviceDdtCorrFlux(0, noInt, phiOld, noInt, fUo, noInt, rAUface,
+                                      ddtCorrIfOnes_, scalar(1)/deltaT_, noInt, phi);
+                };
+                if (hasAMI_)
+                {
+                    DeviceBuffer<scalar> rAUfAmi;
+                    deviceAmiFaceValue(ami_, rAU, rAUfAmi);       // fvc::interpolate(rAU) on the interface
+                    if (dumpDdt) stageDump("stage_ddtCorr_amiPre", ami_.phi);
+                    ifDdtCorr(amiPhiOld_, amiFluxUold_, rAUfAmi, ami_.phi);
+                    if (dumpDdt) stageDump("stage_ddtCorr_amiPost", ami_.phi);
+                }
+                if (dumpDdt)
+                {
+                    stageDump("stage_ddtCorr_post", phiHi);
+                    stageDump("stage_ddtCorr_postB", phiHb);
+                    stageDump("stage_ddtCorr_phiOld", phiOldInt_);
+                    stageDump("stage_ddtCorr_fluxUold", fUoInt);
+                    stageDump("stage_ddtCorr_rAUf", rAUfDdt);
+                }
+            }
+        }
         // OF pcEqn.H line 1: `rho = thermo.rho();` -- the SIMPLEC/transonic path REFRESHES the solver's
         // rho at the TOP, before phiHbyA is built, and again at the bottom. pEqn.H (subsonic) does NOT:
         // it only assigns rho at the end. Counted directly in the two files: pcEqn.H has the statement in
@@ -1677,6 +1775,11 @@ namespace brae {
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);
+        // ...and the last line of OF's pEqn.H: make the flux this corrector produced relative to the mesh
+        // motion. phiHbyA is an ABSOLUTE flux (fvc::flux(HbyA)), so phi = phiHbyA - pEqn.flux() is too;
+        // the next corrector rebuilds it absolute again, so this runs per corrector exactly as OF does.
+        // No-op on a static mesh.
+        makeFluxRelative(fvp_, dm_.nInternalFaces);
     }
 
     DeviceSimpleResidual DeviceSimpleSolver::step()
@@ -1759,26 +1862,107 @@ namespace brae {
         }
 
         // 2. meshPhi = sweptVol/deltaT, per face (OF fvMesh::movePoints stores this as mesh.phi()).
-        const std::vector<scalar> mp = meshPhi(m, oldPoints, newPoints, deltaT);
-
-        // 3. fvc::makeRelative(phi, U): phi -= meshPhi. Split the same way the flux is stored --
-        //    internal faces first, then boundary faces in mesh order.
-        const label nIf = m.nInternalFaces();
+        //    KEPT, not applied here. See makeFluxRelative() for where fvc::makeRelative belongs and why
+        //    doing it at the move was wrong.
+        // The PREVIOUS step's mesh flux, kept because fvc::ddtCorr needs the old flux ABSOLUTE (see
+        // advanceTime): phi.oldTime() was made relative with it at the end of that step.
+        meshPhiPrev_ = std::move(meshPhi_);
+        meshPhi_ = meshPhi(m, oldPoints, newPoints, deltaT);
+        meshPhiValid_ = true;
+        if (stageDumpActive())
         {
-            std::vector<scalar> pi = phiInt_.host();
-            for (std::size_t f = 0; f < pi.size() && f < mp.size(); ++f) pi[f] -= mp[f];
-            phiInt_.copyFrom(pi);
-        }
-        {
-            std::vector<scalar> pb = phiBnd_.host();
-            for (std::size_t b = 0; b < pb.size(); ++b)
+            stageDump("stage_meshPhi", meshPhi_);
+            // ...and the interface's share of it, which is the quantity this was all about.
+            std::vector<scalar> imp;
+            for (const auto& r : amiRuns_)
             {
-                const std::size_t f = static_cast<std::size_t>(nIf) + b;
-                if (f < mp.size()) pb[b] -= mp[f];
+                const label st = (r.first >= 0 && r.first < (label)fvp.size()) ? fvp[r.first].start : -1;
+                for (label i = 0; i < r.second; ++i)
+                    imp.push_back((st >= 0 && (std::size_t)(st + i) < meshPhi_.size()) ? meshPhi_[st + i] : 0.0);
             }
-            phiBnd_.copyFrom(pb);
+            if (!imp.empty()) stageDump("stage_ami_meshPhi", imp);
         }
-        return mp;
+        return meshPhi_;
+    }
+
+    // fvc::makeRelative(phi, U): phi -= mesh.phi(). OF calls this at the END of pEqn.H, on the flux the
+    // pressure corrector has just produced, using the meshPhi of the move at the top of that same step.
+    //
+    // WHY NOT AT THE MOVE, where brae used to do it. Two things went wrong there:
+    //   - it relativised the PREVIOUS step's flux with THIS step's meshPhi, so fvm::div(phi,U) convected
+    //     with phi_abs(n-1) - meshPhi(n) where OF uses phi_abs(n-1) - meshPhi(n-1)
+    //   - on the FIRST step it turned the initial phi (0, from U = 0) into -meshPhi, a spurious
+    //     convective flux the same order as the physical one. OF leaves phi alone at the move unless the
+    //     case asks for correctPhi -- pimpleFoam.C guards that whole block with `if (correctPhi)`, and
+    //     oscillatingInletACMI2D says no.
+    // Measured on that case: step 1 velocity was 2.2e-02 (L2) from OpenFOAM with the whole moving channel
+    // wrong by ~10%, against 4.7e-07 for the same case held static.
+    //
+    // AND IT INCLUDES THE INTERFACE. phi is one surfaceScalarField in OF, so makeRelative reaches the
+    // coupled patches too; in brae that flux lives on cyc_/ami_.phi and was never relativised. On this
+    // fixture the interface's own meshPhi is ~0 -- the channel slides IN the interface plane, so those
+    // faces sweep no volume -- but a rotor whose AMI is not a surface of revolution, or any interface
+    // with a normal component of motion, has a non-zero one.
+    // phi +/- mesh.phi(), across every place brae keeps a flux: the internal faces, the non-coupled
+    // boundary faces (phiBnd_ skips the coupled ones, like DeviceBoundary), and the interfaces.
+    // sign = -1 is fvc::makeRelative, +1 is fvc::makeAbsolute.
+    void DeviceSimpleSolver::applyMeshPhi(
+        const std::vector<FvPatch>& fvp,
+        const std::vector<scalar>& mp,
+        scalar sign,
+        DeviceBuffer<scalar>& fInt,
+        DeviceBuffer<scalar>& fBnd,
+        DeviceBuffer<scalar>& fCyc,
+        DeviceBuffer<scalar>& fAmi)
+    {
+        if (mp.empty()) return;
+        if (fInt.size())
+        {
+            std::vector<scalar> pi = fInt.host();
+            for (std::size_t f = 0; f < pi.size() && f < mp.size(); ++f) pi[f] += sign*mp[f];
+            fInt.copyFrom(pi);
+        }
+        if (fBnd.size())
+        {
+            std::vector<scalar> pb = fBnd.host();
+            std::size_t b = 0;
+            for (std::size_t pj = 0; pj < fvp.size(); ++pj)
+            {
+                if (isCoupledInterfaceType(fvp[pj].type)) continue;
+                for (label i = 0; i < fvp[pj].size; ++i, ++b)
+                {
+                    const std::size_t f = static_cast<std::size_t>(fvp[pj].start + i);
+                    if (b < pb.size() && f < mp.size()) pb[b] += sign*mp[f];
+                }
+            }
+            fBnd.copyFrom(pb);
+        }
+        auto onInterface = [&](const std::vector<std::pair<label, label>>& runs, DeviceBuffer<scalar>& phi)
+        {
+            if (runs.empty() || phi.size() == 0) return;
+            std::vector<scalar> h = phi.host();
+            std::size_t off = 0;
+            for (const auto& r : runs)
+            {
+                const label st = (r.first >= 0 && r.first < (label)fvp.size()) ? fvp[r.first].start : -1;
+                for (label i = 0; i < r.second; ++i)
+                {
+                    const std::size_t f = static_cast<std::size_t>(st + i);
+                    if (st >= 0 && off + i < h.size() && f < mp.size()) h[off + i] += sign*mp[f];
+                }
+                off += static_cast<std::size_t>(r.second);
+            }
+            phi.copyFrom(h);
+        };
+        onInterface(cycRuns_, fCyc);
+        onInterface(amiRuns_, fAmi);
+    }
+
+    void DeviceSimpleSolver::makeFluxRelative(const std::vector<FvPatch>& fvp, label nInternalFaces)
+    {
+        if (!meshPhiValid_ || meshPhi_.empty()) return;
+        applyMeshPhi(fvp, meshPhi_, scalar(-1), phiInt_, phiBnd_, cyc_.phi, ami_.phi);
+        (void)nInternalFaces;
     }
 
     // Split the flattened interface flux back out per coupled patch, and put it back. Both directions use
@@ -1890,6 +2074,65 @@ namespace brae {
             }
             if (ddtc.cn && Uold2_[0].size()) cnWarm_ = true;   // first (Euler-startup) ddt0 update done -> subsequent updates use 1+oc
         }
+        // phi.oldTime(): the flux at the PREVIOUS time level, which fvc::ddtCorr reads. OF ages it at
+        // runTime++ along with every other field, so it is fixed for the whole step -- all of the step's
+        // pressure correctors see the same one, not each other's output.
+        deviceCopy(phiOldInt_, phiInt_);
+        deviceCopy(phiOldBnd_, phiBnd_);
+        // The interface's phi.oldTime(), and flux(U.oldTime()) across it. Both are fixed for the step, so
+        // they are built once here rather than per corrector. interfaceFlux writes into cyc_/ami_.phi --
+        // that IS the flux buffer -- so it is saved and put back around the call.
+        if (hasCyclic_ && cyc_.phi.size())
+        {
+            deviceCopy(cycPhiOld_, cyc_.phi);
+            interfaceFlux(cyc_, Uold_[0], Uold_[1], Uold_[2]);
+            deviceCopy(cycFluxUold_, cyc_.phi);
+            deviceCopy(cyc_.phi, cycPhiOld_);
+        }
+        if (hasAMI_ && ami_.phi.size())
+        {
+            deviceCopy(amiPhiOld_, ami_.phi);
+            interfaceFlux(ami_, Uold_[0], Uold_[1], Uold_[2]);
+            deviceCopy(amiFluxUold_, ami_.phi);
+            deviceCopy(ami_.phi, amiPhiOld_);
+        }
+        // ...and the old flux fvc::ddtCorr wants is the ABSOLUTE one. pimpleFoam passes Uf on a moving
+        // mesh, and the Uf form's phiCorr uses (Sf & Uf.oldTime()) where this uses phi.oldTime(). Those
+        // are not the same field: fvc::correctUf builds Uf from the flux BEFORE fvc::makeRelative, so
+        //
+        //     (Sf & Uf.oldTime())  ==  phi.oldTime() + mesh.phi() of the step that stored it
+        //
+        // verified on the moving oscillatingInletACMI2D to 2.7e-10 (L2) over the internal faces. That is
+        // why brae carries no Uf: adding back the previous step's meshPhi is the same quantity, and one
+        // surfaceVectorField cheaper. It is exact only while Sf is unchanged between the two steps --
+        // true for a translating mesh, NOT for a rotating one, where Sf turns under the stored Uf.
+        // A no-op on a static mesh, where meshPhiPrev_ is empty.
+        applyMeshPhi(fvp_, meshPhiPrev_, scalar(+1), phiOldInt_, phiOldBnd_, cycPhiOld_, amiPhiOld_);
+        // ...and SAY when that identity does not hold. It is exact only while Sf is the same at both time
+        // levels; OF dots the CURRENT Sf into the stored Uf, so any face whose area changed between the
+        // steps gets a different number. A cyclicACMI changes them by construction -- the overlap mask
+        // rescales the coupled areas every step -- and a rotating mesh changes them everywhere.
+        // Measured on the moving oscillatingInletACMI2D: step 1 exact (4.0e-07), then the error grows to
+        // 5.1e-03 by step 10 and sits on the interface columns, which is this and nothing else.
+        if (!ddtCorrAreaNoticed_ && ddtCorr_ && !meshPhiPrev_.empty() && !magSfPrev_.empty())
+        {
+            const std::vector<scalar> nowSf = dm_.magSf.host();
+            scalar worst = 0;
+            for (std::size_t f = 0; f < nowSf.size() && f < magSfPrev_.size(); ++f)
+                worst = std::fmax(worst, std::fabs(nowSf[f] - magSfPrev_[f]));
+            if (worst > scalar(1e-12))
+            {
+                ddtCorrAreaNoticed_ = true;
+                char buf[420];
+                std::snprintf(buf, sizeof(buf),
+                    "brae reconstructs OpenFOAM's Uf-based fvc::ddtCorr from phi + mesh.phi(), which is "
+                    "exact only while the face areas hold still; %g of area moved between steps (a "
+                    "cyclicACMI mask, or a rotating mesh), so the correction is approximate on those "
+                    "faces. Static meshes are unaffected.", (double)worst);
+                noticeApproximated("PIMPLE/ddtCorr (moving mesh)", buf);
+            }
+        }
+        magSfPrev_ = dm_.magSf.host();
         deltaT0_ = deltaT_;
         deltaT_  = deltaT;
     }

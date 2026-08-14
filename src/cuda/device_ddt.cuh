@@ -143,4 +143,38 @@ void deviceFvmDdtUpdateDdt0(
     const DeviceBuffer<scalar>& psiOld2,
     DeviceBuffer<scalar>&       ddt0);
 
+// fvc::ddtCorr(U, phi) -- the Rhie-Chow-style ddt flux correction pimpleFoam adds to phiHbyA:
+//
+//     phiHbyA += fvc::interpolate(rAU)*fvc::ddtCorr(U, phi, Uf)          (pEqn.H)
+//
+// EulerDdtScheme::fvcDdtPhiCorr, verified term for term against OpenFOAM v2412 on
+// pimpleFoam/RAS/oscillatingInletACMI2D (21464 internal faces, agreement 1.2e-10 L2):
+//
+//     phiCorr = phi_old - (interpolate(U_old) & Sf)
+//     coeff   = 1 - min(|phiCorr| / (|phi_old| + SMALL), 1)        <- ddtScheme::fvcDdtPhiCoeff
+//     ddtCorr = coeff * (1/deltaT) * phiCorr
+//
+// The coefficient is what makes it a CORRECTION rather than a second convection term: it is 1 where the
+// stored flux already agrees with the interpolated velocity and falls to 0 where they disagree by as
+// much as the flux itself, so a face whose flux is pure Rhie-Chow contributes nothing. On that case it
+// ran between 0.875 and 1.0.
+//
+// `coeffMask` is per BOUNDARY face: OF zeroes the coefficient wherever U fixesValue() or the patch is a
+// cyclicAMI (ddtScheme.C, fvcDdtPhiCoeff), so pass 0 there and 1 elsewhere. Coupled-interface faces are
+// not in this array at all and get no correction, which is the same thing OF's cyclicAMI branch does.
+//
+// out{Int,Bnd} are ACCUMULATED into (+=), so this adds straight onto phiHbyA.
+void deviceDdtCorrFlux(
+    int                         nInternalFaces,
+    const DeviceBuffer<scalar>& phiOldInt,   // phi.oldTime(), internal faces
+    const DeviceBuffer<scalar>& phiOldBnd,   // phi.oldTime(), boundary faces (DeviceBoundary order)
+    const DeviceBuffer<scalar>& fluxUoldInt, // (interpolate(U.oldTime()) & Sf), internal
+    const DeviceBuffer<scalar>& fluxUoldBnd, // ... boundary
+    const DeviceBuffer<scalar>& rAUf,        // fvc::interpolate(rAU), internal faces
+    const DeviceBuffer<scalar>& rAUbnd,      // rAU on the boundary faces (adjacent-cell value)
+    const DeviceBuffer<scalar>& coeffMask,   // per boundary face: 0 at fixesValue/coupled, else 1
+    scalar                      rDeltaT,
+    DeviceBuffer<scalar>&       outInt,      // += the correction
+    DeviceBuffer<scalar>&       outBnd);
+
 }  // namespace brae

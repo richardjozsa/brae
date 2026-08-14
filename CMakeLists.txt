@@ -1128,6 +1128,20 @@ add_test(NAME cyclic_poisson COMMAND test_cyclic_poisson ${CMAKE_CURRENT_SOURCE_
 # Cyclic increment C3c: cyclic in the full SIMPLE loop (periodic channel)
 # phi's coupled-patch flux must survive write -> read, or an AMI/cyclic restart silently rebuilds the
 # interface flux from U and lands the difference on the momentum diagonal (see the test's header).
+# meshPhi / fvc::makeRelative: a fluid moving WITH the mesh must have zero relative flux, on the
+# cyclicACMI interface faces as much as anywhere else (see the test's header).
+# fvc::ddtCorr: the ddt flux correction pimpleFoam adds to phiHbyA (see the test's header).
+add_executable(test_ddt_corr tests/test_ddt_corr.cu)
+target_include_directories(test_ddt_corr PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ddt_corr PRIVATE brae_core)
+add_test(NAME ddt_corr COMMAND test_ddt_corr)
+
+add_executable(test_mesh_flux_relative tests/test_mesh_flux_relative.cu)
+target_include_directories(test_mesh_flux_relative PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mesh_flux_relative PRIVATE brae_core)
+add_test(NAME mesh_flux_relative COMMAND test_mesh_flux_relative)
+set_tests_properties(mesh_flux_relative PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
 add_executable(test_coupled_phi_roundtrip tests/test_coupled_phi_roundtrip.cu)
 target_include_directories(test_coupled_phi_roundtrip PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_coupled_phi_roundtrip PRIVATE brae_core)

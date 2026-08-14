@@ -85,4 +85,67 @@ void deviceFvmDdt(
     deviceFvmDdtSource(V, c, rho, psiOld, psiOld2, source, ddt0);
 }
 
+namespace {
+// One face. Written once and used for both the internal and the boundary sweep so the two cannot drift:
+// the only difference between them is where phi_old and rAU_face come from.
+__device__ __forceinline__ scalar ddtCorrFace(scalar phiOld, scalar fluxUold, scalar rAUf, scalar rDeltaT)
+{
+    const scalar phiCorr = phiOld - fluxUold;
+    // ddtScheme<Type>::fvcDdtPhiCoeff, the ddtPhiCoeff_ < 0 branch (the default -- v2412 never reads
+    // ddtPhiCoeff from fvSchemes, so that branch is the only one a case can reach):
+    //     coeff = 1 - min(mag(phiCorr)/(mag(phi) + SMALL), 1)
+    // SMALL is Foam::SMALL = 1e-15 in double precision.
+    const scalar coeff = scalar(1) - fmin(fabs(phiCorr)/(fabs(phiOld) + scalar(1e-15)), scalar(1));
+    return rAUf*coeff*rDeltaT*phiCorr;
+}
+
+__global__ void ddtCorrIntK(int nIf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUf,
+                            scalar rDeltaT, scalar* out)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    out[f] += ddtCorrFace(phiOld[f], fluxUold[f], rAUf[f], rDeltaT);
+}
+
+__global__ void ddtCorrBndK(int nBf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUb,
+                            const scalar* mask, scalar rDeltaT, scalar* out)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nBf) return;
+    if (mask[b] == scalar(0)) return;   // fixesValue / cyclicAMI: OF sets the coupling coefficient to 0
+    out[b] += ddtCorrFace(phiOld[b], fluxUold[b], rAUb[b], rDeltaT);
+}
+}   // namespace
+
+void deviceDdtCorrFlux(
+    int                         nInternalFaces,
+    const DeviceBuffer<scalar>& phiOldInt,
+    const DeviceBuffer<scalar>& phiOldBnd,
+    const DeviceBuffer<scalar>& fluxUoldInt,
+    const DeviceBuffer<scalar>& fluxUoldBnd,
+    const DeviceBuffer<scalar>& rAUf,
+    const DeviceBuffer<scalar>& rAUbnd,
+    const DeviceBuffer<scalar>& coeffMask,
+    scalar                      rDeltaT,
+    DeviceBuffer<scalar>&       outInt,
+    DeviceBuffer<scalar>&       outBnd)
+{
+    const int nIf = nInternalFaces;
+    if (nIf > 0 && (int)phiOldInt.size() >= nIf && (int)fluxUoldInt.size() >= nIf
+        && (int)rAUf.size() >= nIf && (int)outInt.size() >= nIf)
+    {
+        ddtCorrIntK<<<nBlocks(nIf), TPB>>>(nIf, phiOldInt.data(), fluxUoldInt.data(), rAUf.data(),
+                                           rDeltaT, outInt.data());
+        cudaCheck(cudaGetLastError(), "ddtCorrInt");
+    }
+    const int nBf = (int)outBnd.size();
+    if (nBf > 0 && (int)phiOldBnd.size() >= nBf && (int)fluxUoldBnd.size() >= nBf
+        && (int)rAUbnd.size() >= nBf && (int)coeffMask.size() >= nBf)
+    {
+        ddtCorrBndK<<<nBlocks(nBf), TPB>>>(nBf, phiOldBnd.data(), fluxUoldBnd.data(), rAUbnd.data(),
+                                           coeffMask.data(), rDeltaT, outBnd.data());
+        cudaCheck(cudaGetLastError(), "ddtCorrBnd");
+    }
+}
+
 }  // namespace brae

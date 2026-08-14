@@ -183,6 +183,9 @@ try
     const FoamDict* pimple  = fvSolution.subDict("PIMPLE");
     const int nOuter   = pimple ? std::max(1, pimple->intOr("nOuterCorrectors", 1)) : 1;
     const int nCorr    = pimple ? std::max(1, pimple->intOr("nCorrectors", 1)) : 1;
+    // OF pimpleControl.C:55, default true. pEqn.H guards the whole fvc::ddtCorr term with it.
+    const std::string ddtCorrW = pimple ? pimple->wordOr("ddtCorr", "yes") : "yes";
+    const bool ddtCorrOn = !(ddtCorrW == "no" || ddtCorrW == "false" || ddtCorrW == "off" || ddtCorrW == "0");
     const int nNonOrth = pimple ? pimple->intOr("nNonOrthogonalCorrectors", 0) : 0;
     const scalar nu = transport.scalarOr("nu", 1e-5);
 
@@ -270,6 +273,7 @@ try
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+    solver.setDdtCorr(ddtCorrOn);
     if (phiHadCoupledValues)
     {
         std::vector<std::pair<label, std::vector<scalar>>> ifPhi;

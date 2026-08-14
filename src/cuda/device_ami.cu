@@ -348,6 +348,32 @@ void deviceAmiZeroWallIfCoeff(DeviceAMI& ami, const DeviceBuffer<label>& isWallC
 }
 
 
+namespace {
+// face value of a CELL field on an interface face: fvc::interpolate on a coupled patch, i.e.
+//   w*patchInternalField + (1-w)*patchNeighbourField
+__global__
+void amiFaceValueKernel(int n, const label* __restrict__ own, const scalar* __restrict__ w,
+                        const scalar* __restrict__ cell, const scalar* __restrict__ nbrInterp,
+                        scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = w[i]*cell[own[i]] + (scalar(1) - w[i])*nbrInterp[i];
+}
+}   // namespace
+
+void deviceAmiFaceValue(const DeviceAMI& ami, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out)
+{
+    out.resize(ami.n);
+    if (ami.n == 0) return;
+    DeviceBuffer<scalar> nbr;
+    deviceAmiInterpolate(ami, cell, nbr);
+    amiFaceValueKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(),
+                                               cell.data(), nbr.data(), out.data());
+    cudaCheck(cudaGetLastError(), "amiFaceValue");
+}
+
+
 void deviceAmiAddGrad(
     const DeviceAMI& ami,
     const DeviceBuffer<scalar>& psi,

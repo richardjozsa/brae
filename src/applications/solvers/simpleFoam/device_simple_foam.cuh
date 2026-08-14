@@ -151,6 +151,21 @@ public:
         const std::vector<vector>& newPoints,
         scalar deltaT);
 
+    // fvc::makeRelative(phi, U) -- subtract mesh.phi() from every stored flux, INCLUDING the coupled
+    // patches (cyc_/ami_.phi), which brae never reached. Called at the end of each pressure corrector,
+    // where OF's pEqn.H calls it; a no-op until moveMesh has supplied a meshPhi. See the definition.
+    void makeFluxRelative(const std::vector<FvPatch>& fvp, label nInternalFaces);
+    // phi +/- mesh.phi() applied to one set of flux buffers (internal, boundary, cyclic, AMI).
+    // sign -1 = fvc::makeRelative, +1 = fvc::makeAbsolute.
+    void applyMeshPhi(const std::vector<FvPatch>& fvp, const std::vector<scalar>& mp, scalar sign,
+                      DeviceBuffer<scalar>& fInt, DeviceBuffer<scalar>& fBnd,
+                      DeviceBuffer<scalar>& fCyc, DeviceBuffer<scalar>& fAmi);
+
+    // fvSolution PIMPLE/ddtCorr. OF defaults it to true and pimpleFoam's pEqn.H guards the whole
+    // fvc::ddtCorr term with it, so it is the switch that makes brae's answer comparable to a run with
+    // the correction deliberately turned off.
+    void setDdtCorr(bool on) { ddtCorr_ = on; }
+
     // Overwrite one U patch's refValue -- the device half of movingWallVelocity's updateCoeffs.
     // OF does `vectorField::operator=(Uwall())` on the patch field; this is the same assignment, on the
     // buffers the momentum assembly reads.
@@ -667,6 +682,27 @@ private:
     // The MOMENTUM interface off-diagonal, kept aside because cyc_/ami_.ifCoeff is shared with the
     // pressure laplacian assembly and UEqn.H() needs the momentum one on every corrector, not just the
     // first. See solveMomentumPredictor for what reading the wrong one costs.
+    // fvc::ddtCorr state. phi.oldTime() -- the flux at the previous TIME level, snapshotted in
+    // advanceTime and held constant across the step's correctors, exactly as OF's oldTime() is. The
+    // boundary mask is 0 wherever OF zeroes the coupling coefficient (U fixesValue, or a coupled patch)
+    // and 1 elsewhere; it is built once, since neither condition changes during a run.
+    DeviceBuffer<scalar> phiOldInt_, phiOldBnd_, ddtCorrBndMask_;
+    // ...and the same two things ON the interface, where OF's ddtCorr is the ONLY place it survives.
+    // ddtScheme::fvcDdtPhiCoeff zeroes the coefficient on `isA<cyclicAMIFvPatch>`, and cyclicACMIFvPatch
+    // derives from coupledFvPatch, NOT from cyclicAMIFvPatch -- so a plain cyclicAMI gets no correction
+    // and a cyclicACMI does. Everywhere else it vanishes on its own: a boundary face's phi IS U_b & Sf,
+    // so phiCorr is identically zero there. Measured on oscillatingInletACMI2D at t=0.01, OF's term is
+    // 0 on inlet/outlet/walls/blockage and max 1.07e-04 on the two coupled patches.
+    DeviceBuffer<scalar> amiPhiOld_, cycPhiOld_, amiFluxUold_, cycFluxUold_, ddtCorrIfOnes_;
+    bool   ddtCorr_ = true;         // fvSolution PIMPLE/ddtCorr (OF pimpleControl.C:55, default true)
+    bool   ddtCorrNoticed_ = false; // say once if the scheme is one brae has no ddtCorr form for
+
+    // mesh.phi() from the last move (per mesh face, internal then boundary). Held rather than applied at
+    // the move: fvc::makeRelative belongs at the end of the pressure corrector. See makeFluxRelative.
+    std::vector<scalar> meshPhi_, meshPhiPrev_;
+    std::vector<scalar> magSfPrev_;      // face areas at the previous time level (the ddtCorr guard)
+    bool   ddtCorrAreaNoticed_ = false;
+    bool   meshPhiValid_ = false;
     DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
     std::vector<std::pair<label, label>> cycRuns_, amiRuns_;
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)

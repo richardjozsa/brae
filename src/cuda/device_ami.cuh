@@ -150,6 +150,9 @@ void deviceAmiOffDiagSum(const DeviceAMI& ami, DeviceBuffer<scalar>& sumOff);
 void deviceAmiAddH(const DeviceAMI& ami, const DeviceBuffer<scalar>& UkNbr, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& H);
 // interface flux: phi[i] = (w*H[own] + (1-w)*interp(forwardT.H[nbr])) . Sf.
 void deviceAmiFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& Hx, const DeviceBuffer<scalar>& Hy, const DeviceBuffer<scalar>& Hz);
+// fvc::interpolate of a CELL field onto the interface faces: w*psi[own] + (1-w)*interp(psi[nbr]).
+// Needed wherever a face diffusivity is wanted on the interface -- fvc::ddtCorr's interpolate(rAU).
+void deviceAmiFaceValue(const DeviceAMI& ami, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out);
 // continuity: div[own] += phi[i]/V.
 void deviceAmiAddDiv(const DeviceAMI& ami, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div);
 // epsilon setValues: zero the interface off-diagonal for wall-cell owners (their eps is fixed = eps0).
