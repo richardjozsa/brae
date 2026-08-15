@@ -12,7 +12,8 @@ namespace {
 __global__
 void desSigmaKernel(
     int nC, const scalar* __restrict__ gradU, const scalar* __restrict__ V,
-    const scalar* __restrict__ nut, scalar nu, DesHybridCoeffs co, scalar* __restrict__ sigma)
+    const scalar* __restrict__ nut, scalar nu, DesHybridCoeffs co,
+    const scalar* __restrict__ dOpt, scalar* __restrict__ sigma)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -34,7 +35,7 @@ void desSigmaKernel(
     const scalar S     = sqrt(scalar(2)*ss);
     const scalar Omega = sqrt(scalar(2)*ww);
     const scalar tau0  = co.L0 / co.U0;
-    const scalar d     = cbrt(V[c]);   // cubeRootVol, the same filter width the LES model uses
+    const scalar d     = dOpt ? dOpt[c] : cbrt(V[c]);   // the SAME filter width the LES model uses
 
     const scalar half  = scalar(0.5)*(S*S + Omega*Omega);
     const scalar oLim  = co.OmegaLim / tau0;
@@ -105,12 +106,13 @@ void desDivKernel(
 
 void deviceDesHybridSigma(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
                           const DeviceBuffer<scalar>& nut, scalar nu, const DesHybridCoeffs& co,
-                          DeviceBuffer<scalar>& sigma)
+                          DeviceBuffer<scalar>& sigma, const DeviceBuffer<scalar>* delta)
 {
     sigma.resize(nC);
     if (nC == 0) return;
     desSigmaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(),
-                                         nut.size() ? nut.data() : nullptr, nu, co, sigma.data());
+                                         nut.size() ? nut.data() : nullptr, nu, co,
+                                         (delta && delta->size()) ? delta->data() : nullptr, sigma.data());
     cudaCheck(cudaGetLastError(), "desHybridSigma");
 }
 

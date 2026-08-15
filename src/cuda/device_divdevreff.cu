@@ -169,6 +169,46 @@ void tensorDivKernel(
 } // namespace
 
 
+// The two pieces of the stress path the MAXWELL model needs, exported so it does not have to
+// re-implement them: the gaussGrad-corrected BOUNDARY gradient, and the tensor divergence itself
+// (V*fvc::div(T), the source convention brae's momentum assembly uses). Both are the same kernels
+// divDevReff runs; sharing them is what keeps `div(nuM*grad(U))` consistent with
+// `div(nu*dev2(T(grad(U))))` down to the boundary treatment.
+void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
+                         const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB)
+{
+    const int nC = dm.nCells, nB = dm.nBndFaces;
+    DeviceBuffer<scalar> uxb, uyb, uzb;
+    deviceBCValue(dbU.comp[0], Ux, uxb);
+    deviceBCValue(dbU.comp[1], Uy, uyb);
+    deviceBCValue(dbU.comp[2], Uz, uzb);
+    gradB.resize(static_cast<std::size_t>(9) * nB);
+    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+                                      gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
+                                      dbU.comp[0].deltaCoeffs.data(), gradB.data());
+    cudaCheck(cudaGetLastError(), "boundaryGradU");
+}
+
+void deviceTensorDivSource(const DeviceMesh& dm,
+                           const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
+                           DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,
+                           const DeviceCyclic* cyc, const DeviceAMI* ami)
+{
+    const int nC = dm.nCells, nB = dm.nBndFaces;
+    srcX.resize(nC);
+    srcY.resize(nC);
+    srcZ.resize(nC);
+    tensorDivKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
+                                          dm.nei.data(), dm.w.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+                                          dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(),
+                                          Tcell.data(), Tbnd.data(), nB, dm.V.data(), srcX.data(), srcY.data(), srcZ.data());
+    cudaCheck(cudaGetLastError(), "tensorDivSource");
+    if (cyc) interfaceAddTensorDiv(*cyc, Tcell, nC, srcX, srcY, srcZ);
+    if (ami) interfaceAddTensorDiv(*ami, Tcell, nC, srcX, srcY, srcZ);
+}
+
+
 void deviceDivDevReff(
     const DeviceMesh& dm,
     const DeviceVectorBoundary& dbU,

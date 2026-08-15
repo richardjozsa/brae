@@ -60,6 +60,19 @@ inline void readLinearSolverControls(
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         return s ? s->scalarOr("relTol", 0.0) : 0.0;
     };
+    // OF lduMatrix::solver reads maxIter (default 1000) and minIter (default 0) from the same
+    // sub-dictionary. Both change WHERE the solve stops, so an unread `maxIter 10` is not a performance
+    // detail -- see the note in DeviceSimpleControls.
+    auto solverMaxIter = [&](const std::string& f, int def)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        return s ? static_cast<int>(s->scalarOr("maxIter", def)) : def;
+    };
+    auto solverMinIter = [&](const std::string& f, int def)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        return s ? static_cast<int>(s->scalarOr("minIter", def)) : def;
+    };
     // E2/E3 (dict_audit): SAY what brae runs when it is not what the case asked for.
     //
     // A substituted linear solver is not a wrong answer -- it solves the same linear system to the same
@@ -83,9 +96,22 @@ inline void readLinearSolverControls(
         const std::string smoo = s->wordOr("smoother", "");
         const std::string prec = s->wordOr("preconditioner", "");
         if (!want.empty() && !gs && want != braeRuns)
+        {
+            // The usual case: same system, same tolerance, so the CONVERGED answer is the same and only
+            // the iteration count differs. An iteration CAP breaks that premise -- both solvers then stop
+            // where the cap says, not where the tolerance says, and two different solvers stopped at the
+            // same iteration count hold two different residuals. LES/NACA4412 is the live example:
+            // `maxIter 10` on p, and at its impulsive first step OF's GAMG leaves at a residual of 4.26
+            // against an initial 1 while brae's leaves at 2.55. Neither is converged; they cannot agree.
+            const bool capped = s->found("maxIter") && s->scalarOr("maxIter", 1000.0) < 1000.0;
             noticeApproximated("solvers/" + f + " solver",
                                "case asks '" + want + "', brae runs " + braeRuns +
-                               " (same linear system and tolerance -- iteration count and cost differ)");
+                               (capped
+                                ? " AND this entry caps the solve at maxIter " + std::to_string((int)s->scalarOr("maxIter", 1000.0))
+                                  + " -- with a cap the two solvers stop at DIFFERENT residuals, so the fields differ"
+                                    " by however far the solve is from converged, not just in cost"
+                                : " (same linear system and tolerance -- iteration count and cost differ)"));
+        }
         // A smoother entry only means anything to brae when it actually took the smoothSolver path.
         if (!smoo.empty() && !gs)
             noticeIgnored("solvers/" + f + " smoother",
@@ -119,6 +145,14 @@ inline void readLinearSolverControls(
     ctl.tolUFinal = solverTol("UFinal", ctl.tolU);
     ctl.relTolPFinal = solvers && solvers->subDict("pFinal") ? solverRelTol("pFinal") : ctl.relTolP;
     ctl.relTolUFinal = solvers && solvers->subDict("UFinal") ? solverRelTol("UFinal") : ctl.relTolU;
+    ctl.maxIterP = solverMaxIter("p", 1000);
+    ctl.maxIterU = solverMaxIter("U", 1000);
+    ctl.minIterP = solverMinIter("p", 0);
+    ctl.minIterU = solverMinIter("U", 0);
+    ctl.maxIterPFinal = solverMaxIter("pFinal", ctl.maxIterP);
+    ctl.maxIterUFinal = solverMaxIter("UFinal", ctl.maxIterU);
+    ctl.minIterPFinal = solverMinIter("pFinal", ctl.minIterP);
+    ctl.minIterUFinal = solverMinIter("UFinal", ctl.minIterU);
     ctl.gsU = useSymGS("U");
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;

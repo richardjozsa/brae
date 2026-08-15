@@ -54,4 +54,13 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       // it is 4.7e-04 unlimited against 6.7e-08 limited. A factor of 7000.
                       scalar gradULimitK = 0.0);
 
+// Exported for the Maxwell model -- see the definitions in device_divdevreff.cu.
+void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
+                         const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB);
+void deviceTensorDivSource(const DeviceMesh& dm,
+                           const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
+                           DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,
+                           const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr);
+
 } // namespace brae

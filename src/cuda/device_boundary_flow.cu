@@ -210,6 +210,23 @@ void selectMixedKernel(
 }
 
 
+// at inletOutlet faces, put back the zero-gradient (extrapolated) HbyA -- see deviceExtrapolateIOHbyA.
+__global__
+void selectIOKernel(
+    int n,
+    const label* __restrict__ ioMask,
+    const scalar* __restrict__ ex,
+    const scalar* __restrict__ ey,
+    const scalar* __restrict__ ez,
+    scalar* __restrict__ hx,
+    scalar* __restrict__ hy,
+    scalar* __restrict__ hz)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && ioMask[i]) { hx[i] = ex[i]; hy[i] = ey[i]; hz[i] = ez[i]; }
+}
+
+
 // totalPressure (OF totalPressureFvPatchScalarField::updateCoeffs). OF branches on the DIMENSIONS of p:
 //
 //   kinematic p (incompressible):  p = p0 - 0.5*neg(phi)*magSqr(U)
@@ -337,6 +354,106 @@ void deviceUpdatePressureInletOutletVelocity(
 }
 
 
+// wedge updateCoeffs (OF wedgeFvPatchField<vector>::evaluate). The mixed slot already holds the
+// valueFraction d_k = 0.5*(1 - cellT_kk), which is pure geometry; what changes each step is the value,
+//     target_k = (faceT & U_cell)_k
+// and the mixed blend d*ref + (1-d)*U_c reproduces it with
+//     ref_k = (target_k - (1 - d_k)*U_c[k]) / d_k .
+// d_k is exactly zero on the AXIS component -- the rotation leaves it alone -- and there the blend is
+// already pure zeroGradient, which equals target_k, so ref_k is multiplied by zero and left at zero
+// rather than divided by it.
+__global__
+void wedgeUpdateKernel(
+    int n,
+    const label* __restrict__ wdg,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ T,     // 9*n, row-major faceT per face
+    const scalar* __restrict__ vf0, const scalar* __restrict__ vf1, const scalar* __restrict__ vf2,
+    const scalar* __restrict__ Ux, const scalar* __restrict__ Uy, const scalar* __restrict__ Uz,
+    scalar* __restrict__ r0, scalar* __restrict__ r1, scalar* __restrict__ r2)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !wdg[i]) return;
+
+    const int c = fc[i];
+    const scalar u[3] = { Ux[c], Uy[c], Uz[c] };
+    const scalar d[3] = { vf0[i], vf1[i], vf2[i] };
+    scalar* r[3] = { r0 + i, r1 + i, r2 + i };
+    for (int k = 0; k < 3; ++k)
+    {
+        const scalar tgt = T[9*i + 3*k + 0]*u[0] + T[9*i + 3*k + 1]*u[1] + T[9*i + 3*k + 2]*u[2];
+        // ref = u + (tgt - u)/d, NOT (tgt - (1 - d)u)/d. They are the same algebraically and not at all
+        // the same in floating point: d = 0.5*(1 - cos 2th) is ~1.9e-3 for OpenFOAM's recommended 2.5 deg
+        // wedge, so the second form divides the difference of two nearly equal numbers by 2e-3 and
+        // amplifies the cancellation ~500x. The rotation increment (tgt - u) is small and exact, so this
+        // form carries no cancellation at all. Measured on movingCone: the spurious flux through the
+        // wedge planes fell from 3.7e-10 to OpenFOAM's own 1e-11 level.
+        *r[k] = (d[k] > scalar(1e-30)) ? (u[k] + (tgt - u[k]) / d[k]) : u[k];
+    }
+}
+
+void deviceUpdateWedge(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux,
+                       const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz)
+{
+    const int n = dbU.n;
+    if (n == 0 || dbU.comp[0].wedgeMask.size() == 0) return;
+    wedgeUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].wedgeMask.data(), dbU.comp[0].faceCell.data(),
+                                           dbU.comp[0].wedgeT.data(),
+                                           dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
+                                           dbU.comp[2].valueFraction.data(),
+                                           Ux.data(), Uy.data(), Uz.data(),
+                                           dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(),
+                                           dbU.comp[2].refValue.data());
+    cudaCheck(cudaGetLastError(), "updateWedge");
+}
+
+
+namespace {
+// The wedge value of ANY vector field is that field's own rotated cell value -- not a blend against a
+// refValue derived from some other field. OF gets this for free: fvMatrix::H() is constructed with psi's
+// BC types, so H carries wedge patches and H.correctBoundaryConditions() rotates H itself; rAU's wedge is
+// the SCALAR wedge (= zeroGradient), so HbyA_b = rAU_c*(faceT & H_c) = faceT & HbyA_c, and its flux
+// through the wedge plane is then identically zero. Evaluating HbyA through U's refValue instead leaves a
+// residual (faceT & U_c) - (faceT & HbyA_c) on every wedge face, which on movingCone's 3800 of them was a
+// net leak the pressure equation answered with a fictitious inflow at the open end.
+__global__
+void wedgeFaceValueKernel(
+    int n,
+    const label* __restrict__ wdg,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ T,     // 9*n, row-major faceT per face
+    const scalar* __restrict__ fx, const scalar* __restrict__ fy, const scalar* __restrict__ fz,
+    scalar* __restrict__ bx, scalar* __restrict__ by, scalar* __restrict__ bz)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !wdg[i]) return;
+
+    const int c = fc[i];
+    const scalar v[3] = { fx[c], fy[c], fz[c] };
+    scalar* b[3] = { bx + i, by + i, bz + i };
+    for (int k = 0; k < 3; ++k)
+        *b[k] = T[9*i + 3*k + 0]*v[0] + T[9*i + 3*k + 1]*v[1] + T[9*i + 3*k + 2]*v[2];
+}
+} // namespace
+
+void deviceWedgeFaceValue(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& fx,
+    const DeviceBuffer<scalar>& fy,
+    const DeviceBuffer<scalar>& fz,
+    DeviceBuffer<scalar>& bx,
+    DeviceBuffer<scalar>& by,
+    DeviceBuffer<scalar>& bz)
+{
+    const int n = dbU.n;
+    if (n == 0 || dbU.comp[0].wedgeMask.size() == 0) return;
+    wedgeFaceValueKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].wedgeMask.data(), dbU.comp[0].faceCell.data(),
+                                              dbU.comp[0].wedgeT.data(), fx.data(), fy.data(), fz.data(),
+                                              bx.data(), by.data(), bz.data());
+    cudaCheck(cudaGetLastError(), "wedgeFaceValue");
+}
+
+
 void deviceUpdateSymmetry(
     DeviceVectorBoundary& dbU,
     const DeviceBuffer<scalar>& Ux,
@@ -368,6 +485,23 @@ void deviceConstrainSymmetryHbyA(
                                        dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), Hx.data(), Hy.data(), Hz.data(),
                                        hbx.data(), hby.data(), hbz.data());
     cudaCheck(cudaGetLastError(), "constrainSymmetryHbyA");
+}
+
+
+void deviceExtrapolateIOHbyA(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& extx,
+    const DeviceBuffer<scalar>& exty,
+    const DeviceBuffer<scalar>& extz,
+    DeviceBuffer<scalar>& hbx,
+    DeviceBuffer<scalar>& hby,
+    DeviceBuffer<scalar>& hbz)
+{
+    const int n = dbU.n;
+    if (n == 0) return;
+    selectIOKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].ioMask.data(), extx.data(), exty.data(), extz.data(),
+                                        hbx.data(), hby.data(), hbz.data());
+    cudaCheck(cudaGetLastError(), "extrapolateIOHbyA");
 }
 
 

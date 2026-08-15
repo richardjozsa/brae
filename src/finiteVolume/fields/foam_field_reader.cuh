@@ -21,6 +21,15 @@ template <> inline vector readFoamValue<vector>(TokenStream& ts)
     ts.expect(")");
     return v;
 }
+// OF SymmTensor's I/O order, which is also its component order: (xx xy xz yy yz zz).
+template <> inline symmTensor readFoamValue<symmTensor>(TokenStream& ts)
+{
+    ts.expect("(");
+    symmTensor t{ts.nextScalar(), ts.nextScalar(), ts.nextScalar(),
+                 ts.nextScalar(), ts.nextScalar(), ts.nextScalar()};
+    ts.expect(")");
+    return t;
+}
 
 // Skip an unhandled dict entry's tokens up to (not including) its terminating ';', paren-aware so nested "(...)" lists
 // / tables / Function1 entries are consumed whole. initialDepth accounts for a leading '(' the caller already read.
@@ -212,6 +221,22 @@ inline vector readBareFoamValue<vector>(TokenStream& ts, const std::string& firs
     return v;
 }
 
+template <>
+inline symmTensor readBareFoamValue<symmTensor>(TokenStream& ts, const std::string& first)
+{
+    // `first` is already the '('; the six components (xx xy xz yy yz zz) and the ')' remain.
+    (void)first;
+    symmTensor t{};
+    t.xx = ts.nextScalar();
+    t.xy = ts.nextScalar();
+    t.xz = ts.nextScalar();
+    t.yy = ts.nextScalar();
+    t.yz = ts.nextScalar();
+    t.zz = ts.nextScalar();
+    ts.expect(")");
+    return t;
+}
+
 
 template <typename T>
 inline void readValueOrInternal(
@@ -290,6 +315,54 @@ inline void readTimeVaryingMapped(
     p.mapPoints = readBoundaryDataList<vector>(bd + "/points");
     p.mapValues = readBoundaryDataList<T>(bd + "/" + best + "/" + field);
     p.hasMapData = (p.mapPoints.size() == p.mapValues.size() && !p.mapPoints.empty());
+}
+
+// One COMPONENT of a symmTensor field, as a scalar FieldData -- so a `sigma` read from 0/sigma can go
+// through the ordinary scalar machinery (buildField, DeviceBoundary, the scalar transport) six times.
+//
+// The Maxwell tutorials use exactly three boundary kinds on sigma: fixedValue with a value, zeroGradient,
+// and the constraint types (empty/symmetry/cyclic), which carry no value. Anything that DOES carry data
+// this does not split is refused rather than silently dropped -- a fixedGradient sigma boundary quietly
+// becoming zeroGradient is the class of bug that never shows up as an error.
+inline FieldData<scalar> symmTensorComponent(const FieldData<symmTensor>& fd, int k)
+{
+    auto comp = [](const symmTensor& t, int i) -> scalar
+    {
+        switch (i)
+        {
+            case 0: return t.xx;
+            case 1: return t.xy;
+            case 2: return t.xz;
+            case 3: return t.yy;
+            case 4: return t.yz;
+            default: return t.zz;
+        }
+    };
+    FieldData<scalar> out;
+    out.internalUniform      = fd.internalUniform;
+    out.internalUniformValue = comp(fd.internalUniformValue, k);
+    out.internalField.reserve(fd.internalField.size());
+    for (const symmTensor& t : fd.internalField) out.internalField.push_back(comp(t, k));
+
+    for (const PatchFieldData<symmTensor>& p : fd.boundary)
+    {
+        if (p.hasGradient || p.hasInletValue || p.hasRefValue || p.hasValueFraction || p.hasMapData
+         || p.hasNormalRef || p.hasFlowRate || !p.unsupportedFunction1.empty())
+            throw std::runtime_error(
+                "brae: sigma patch '" + p.name + "' is a '" + p.type + "', whose data brae does not know "
+                "how to split into components. The Maxwell stress supports fixedValue, zeroGradient and "
+                "the constraint types; anything else would be read and then dropped.");
+        PatchFieldData<scalar> q;
+        q.name         = p.name;
+        q.type         = p.type;
+        q.hasValue     = p.hasValue;
+        q.valueUniform = p.valueUniform;
+        q.uniformValue = comp(p.uniformValue, k);
+        q.values.reserve(p.values.size());
+        for (const symmTensor& t : p.values) q.values.push_back(comp(t, k));
+        out.boundary.push_back(std::move(q));
+    }
+    return out;
 }
 
 template <typename T>

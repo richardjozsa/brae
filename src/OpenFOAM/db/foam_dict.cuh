@@ -394,6 +394,16 @@ inline std::string expandDictVariables(const std::string& rawIn)
                 std::size_t j = i + 1;
                 bool brace = false;
                 if (j < text.size() && text[j] == '{') { brace = true; ++j; }
+                // OF's SCOPED reference: `${/name}` is "name at the FILE's root scope", and a case does
+                // reach for it -- LES/planeChannel writes
+                //     timeStart  #eval #{ 1.0/3.0 * ${/endTime} #};
+                // in a functionObject, referring up to controlDict's own endTime. brae's variable map is
+                // flat (every entry, whatever its depth, under its own name), so a root-scoped lookup is
+                // the same lookup with the leading '/' removed. Leading `:` is OF's older spelling of the
+                // same thing. NOT handled: `..` parent-relative and multi-level `a/b/c` paths, which
+                // would need a real scope tree -- they fall through unexpanded and are refused downstream
+                // rather than resolved to the wrong entry.
+                while (j < text.size() && (text[j] == '/' || text[j] == ':')) ++j;
                 const std::size_t s = j;
                 // WHICH CHARACTERS BELONG TO THE NAME. OF's word::valid (wordI.H:59) rejects only
                 // whitespace and " ' / ; { }, so a macro name may contain '-' and '.' -- and real cases

@@ -39,6 +39,16 @@ struct DeviceSimpleControls
     //
     // Absent entries fall back to the base ones (OF would FatalError instead; refusing a case that OF
     // runs is worse than solving its last corrector exactly as tightly as the others).
+    // fvSolution solvers.<field>.{maxIter,minIter}. OF's lduMatrix::solver reads both (defaults 1000 and
+    // 0) and they are NOT cosmetic: LES/NACA4412 caps the pressure solve at `maxIter 10`, and on its
+    // impulsive first step GAMG leaves with a residual of 4.26 against an initial 1 -- an unconverged
+    // field by construction. A solver that instead runs to convergence produces a different (better, but
+    // different) answer, and the two cannot be compared on that step at all. minIter forces iterations
+    // even when the initial residual already passes, which is how a case pins down "always do one sweep".
+    int    maxIterU = 1000, maxIterP = 1000, maxIterKE = 1000;
+    int    minIterU = 0,    minIterP = 0,    minIterKE = 0;
+    int    maxIterUFinal = 1000, maxIterPFinal = 1000, maxIterKEFinal = 1000;
+    int    minIterUFinal = 0,    minIterPFinal = 0,    minIterKEFinal = 0;
     scalar tolUFinal = 1e-8, tolPFinal = 1e-7, tolKEFinal = 1e-8;
     scalar relTolUFinal = 0.0, relTolPFinal = 0.0, relTolKEFinal = 0.0;
     // TWO flags, because OF selects the Final entry two different ways and the difference is visible in
@@ -61,6 +71,10 @@ struct DeviceSimpleControls
     // Neither is ever set on the steady path: OF's simpleControl has no Final concept either.
     bool   finalInner = false;   // p        -- last pressure corrector, last non-orth pass
     bool   finalIter  = false;   // U, k/eps -- anywhere in the last outer corrector
+    int    pMaxIter() const { return finalInner ? maxIterPFinal : maxIterP; }
+    int    pMinIter() const { return finalInner ? minIterPFinal : minIterP; }
+    int    uMaxIter() const { return finalIter  ? maxIterUFinal : maxIterU; }
+    int    uMinIter() const { return finalIter  ? minIterUFinal : minIterU; }
     scalar pTol()     const { return finalInner ? tolPFinal     : tolP; }
     scalar pRelTol()  const { return finalInner ? relTolPFinal  : relTolP; }
     scalar uTol()     const { return finalIter  ? tolUFinal     : tolU; }
@@ -80,6 +94,24 @@ struct DeviceSimpleControls
     // capture. Unbounded by construction, which is why cases pair it with `bounded`.
     bool   divULinear = false;
     bool   linearUpwindV = false;// div(phi,U) "linearUpwindV": linearUpwind + OF's vector direction limiter (also sets linearUpwind).
+    // div(phi,U) "limitedLinearV k": OF's NVDVTVDV vector limiter -- ONE limiter per face built from the
+    // whole velocity vector, blending the central and upwind weights IMPLICITLY (no deferred correction).
+    // laminar { model Maxwell; } -- the viscoelastic stress transport. nuM is the polymer viscosity and
+    // lambda its relaxation time; both are material properties, not closure constants, and OF refuses
+    // the model without them.
+    // PIMPLE/momentumPredictor (OF pimpleControl, default TRUE). When off, pimpleFoam still ASSEMBLES
+    // and relaxes UEqn -- rAU and HbyA come from it -- but never solves it: U is updated only by the
+    // pressure corrector. laminar/planarPoiseuille turns it off, and solving anyway made its first step
+    // 56% fast (0.00535 against 0.00343 m/s) because the predictor moved U before the corrector did.
+    bool   momentumPredictor = true;
+    bool   maxwell = false;
+    scalar maxwellNuM = 0.0;
+    scalar maxwellLambda = 0.0;
+    bool   divSigmaVanAlbada = false;   // div(phi,sigma) Gauss vanAlbada (what both Maxwell tutorials name)
+    scalar relaxSigma = 1.0;            // relaxationFactors/equations/sigma (OF sigmaEqn.relax(); absent -> none)
+    bool   gsSigma = false;             // solvers/sigma smoothSolver + a GaussSeidel smoother
+    bool   divULimitedV = false;
+    scalar divUTwoBykV  = 2.0;   // OF limitedLinearLimiter twoByk_ = 2/max(k, SMALL); k = 1 -> 2
     bool   lust = false;         // div(phi,U) "LUST": deferred correction = 0.75*linear + 0.25*linearUpwind (OF LUST.H).
     bool   nonOrth = false;      // laplacian "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction. Set from fvSchemes.
     scalar nonOrthLimit = 1.0;   // snGrad "limited <psi>" coeff (OF fv::limitedSnGrad); 1.0 = "corrected" (unlimited). Set from fvSchemes.
@@ -176,6 +208,11 @@ struct DeviceSimpleControls
     bool exactWallDist = false;
     // div(phi,U) `Gauss DEShybrid <s1> <s2> <delta> ...`: a per-face blend of a low-dissipation scheme
     // and an upwind-biased one, driven by a DES sensor. See deshybrid_coeffs.cuh.
+    // LES `delta maxDeltaxyz`: the filter width is OF's face-normal hmax rather than cubeRootVol.
+    // Every consumer of the filter width (Smagorinsky, WALE, the SA/SST DES length scale, DEShybrid)
+    // must use the SAME one, or the scheme and the model disagree about the resolved scale.
+    bool   lesDeltaMax = false;
+    scalar lesDeltaCoeff = 2.0;
     bool desHybrid = false;
     DesHybridCoeffs desCoeffs;
     WaleCoeffs waleCoeffs;

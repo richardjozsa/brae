@@ -107,8 +107,19 @@ void divLimitedFaceKernel(
         r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
     else
         r = 2.0 * (gradcf / gradf) - 1.0;
-    scalar limiter = twoByk * r;
-    limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
+    // twoByk > 0 selects limitedLinear (limiter = clamp(2/k * r, 0, 1)); twoByk == 0 selects vanAlbada
+    // (limiter = r(r+1)/(r^2+1), vanAlbada.H:85), which the Maxwell tutorials name for div(phi,sigma).
+    // Same NVDTVD r either way -- only the limiter function differs, so they share one kernel.
+    scalar limiter;
+    if (twoByk > 0.0)
+    {
+        limiter = twoByk * r;
+        limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
+    }
+    else
+    {
+        limiter = r * (r + 1.0) / (r*r + 1.0);        // OF vanAlbada: NOT clamped, and it is <= 1 anyway
+    }
     const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
     const scalar W = limiter * cdw[f] + (1.0 - limiter) * pos0;
     const scalar lo = -W * p;
@@ -502,6 +513,39 @@ void deviceDivLimitedVCoeffs(
                                                  dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
                                                  twoByk, upper.data(), lower.data());
     cudaCheck(cudaGetLastError(), "divLimitedVFace");
+    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    cudaCheck(cudaGetLastError(), "diagGather");
+}
+
+
+// Same scheme, taking the PACKED 9-component cell gradient deviceGradU produces (gradU[q*nC + c],
+// q = 3i + j = d(U_j)/d(x_i)) instead of nine separate buffers -- so the caller can reuse the one
+// gradient it already limits with deviceCellLimitGradU, which is the gradient OF's LimitedScheme
+// takes (fvc::grad(phi) -> the gradSchemes `grad(U)` entry).
+void deviceDivLimitedVCoeffs(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>* U,
+    const DeviceBuffer<scalar>& gradU,
+    scalar twoByk,
+    DeviceBuffer<scalar>& diag,
+    DeviceBuffer<scalar>& upper,
+    DeviceBuffer<scalar>& lower)
+{
+    const int nIf = dm.nInternalFaces, nC = dm.nCells;
+    upper.resize(nIf);
+    lower.resize(nIf);
+    diag.resize(nC);
+    const scalar* g = gradU.data();
+    divLimitedVFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(),
+                                                 U[0].data(), U[1].data(), U[2].data(),
+                                                 g + 0*nC, g + 3*nC, g + 6*nC,     // d(U_0)/d{x,y,z}
+                                                 g + 1*nC, g + 4*nC, g + 7*nC,     // d(U_1)/d{x,y,z}
+                                                 g + 2*nC, g + 5*nC, g + 8*nC,     // d(U_2)/d{x,y,z}
+                                                 dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
+                                                 dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                                 twoByk, upper.data(), lower.data());
+    cudaCheck(cudaGetLastError(), "divLimitedVFacePacked");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
     cudaCheck(cudaGetLastError(), "diagGather");
 }

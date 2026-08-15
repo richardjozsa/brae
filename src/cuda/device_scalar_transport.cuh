@@ -169,7 +169,15 @@ void deviceSolveScalarTransport(
     // boundaryManipulate (the epsilon wall function's own setValues) at 267 -- so on a cell claimed by both,
     // the WALL FUNCTION wins. Same three kernels; only the mask and the values differ.
     const DeviceBuffer<label>* fvoSetMask = nullptr,
-    const DeviceBuffer<scalar>* fvoSetVal = nullptr)
+    const DeviceBuffer<scalar>* fvoSetVal = nullptr,
+    // OF limitFuncs: a limited scheme on a NON-SCALAR field builds its limiter from one derived scalar
+    // (magSqr of the tensor), so every component shares a single per-face limiter -- it is not six
+    // independent limiters. Pass that scalar and its gradient here; null means "build it from `field`
+    // itself", which is what every scalar caller wants and leaves them byte-for-byte unchanged.
+    const DeviceBuffer<scalar>* limField = nullptr,
+    const DeviceBuffer<scalar>* limGradX = nullptr,
+    const DeviceBuffer<scalar>* limGradY = nullptr,
+    const DeviceBuffer<scalar>* limGradZ = nullptr)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -220,7 +228,16 @@ void deviceSolveScalarTransport(
             deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK, ifs, nIfs);
         }
     }
-    if (limited) deviceDivLimitedCoeffs(dm, phiInt, field, gx, gy, gz, twoByk, aD, aU, aL);   // Gauss limitedLinear: implicit limited weight
+    if (limited)
+    {
+        const bool sharedLim = limField && limGradX && limGradY && limGradZ;
+        deviceDivLimitedCoeffs(dm, phiInt,
+                               sharedLim ? *limField  : field,
+                               sharedLim ? *limGradX  : gx,
+                               sharedLim ? *limGradY  : gy,
+                               sharedLim ? *limGradZ  : gz,
+                               twoByk, aD, aU, aL);   // Gauss limitedLinear/vanAlbada: implicit limited weight
+    }
     else
     {
         deviceDivUpwindCoeffs(dm, phiInt, aD, aU, aL);

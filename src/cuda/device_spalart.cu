@@ -147,21 +147,138 @@ void saMagSqrKernel(
 __global__
 void saDdesDTildaKernel(
     int nC, const scalar* __restrict__ y, const scalar* __restrict__ V, const scalar* __restrict__ gradU,
-    const scalar* __restrict__ nt, scalar nu, SpalartAllmarasCoeffs co, scalar* __restrict__ dTilda)
+    const scalar* __restrict__ nt, scalar nu, SpalartAllmarasCoeffs co,
+    const scalar* __restrict__ dOpt, const scalar* __restrict__ fdIn, scalar* __restrict__ dTilda)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    const scalar delta = cbrt(V[c]);                                   // LES filter width (cubeRootVol)
+    const scalar delta = dOpt ? dOpt[c] : cbrt(V[c]);                  // LES filter width: the case's `delta`
     scalar g2 = 0;
     for (int k = 0; k < 9; ++k) { const scalar gk = gradU[k*nC + c]; g2 += gk*gk; }   // |gradU|^2 (all 9 components)
     const scalar chi = nt[c]/nu, chi3 = chi*chi*chi, Cv13 = co.Cv1*co.Cv1*co.Cv1;
     const scalar nutc = nt[c] * (chi3 / (chi3 + Cv13));                 // nut = nuTilda*fv1
     const scalar kd2 = fmax(co.kappa*co.kappa*y[c]*y[c], 1e-300);
     const scalar rd = fmin((nutc + nu) / (fmax(sqrt(g2), 1e-300) * kd2), scalar(10));
-    const scalar t8 = scalar(8) * rd;
-    const scalar fd = scalar(1) - tanh(t8*t8*t8);
+    // fd comes in ready-made on the ZDES2020 path (saZdesFdKernel); otherwise it is the standard
+    // shielding, with OF's dictionary-exposed Cd1/Cd2 rather than the literals 8 and 3.
+    const scalar t8 = co.Cd1 * rd;
+    const scalar fd = fdIn ? fdIn[c] : (scalar(1) - tanh(pow(t8, co.Cd2)));
     const scalar lLES = saPsi(chi, co) * co.CDES * delta;              // low-Re-corrected LES length scale
     dTilda[c] = y[c] - fd * fmax(scalar(0), y[c] - lLES);
+}
+
+// |curl U| per CELL, from the packed cell gradient. OF fvc::curl = 2*(*skew(grad U)) with the Hodge dual
+// *T = (T.yz, -T.xz, T.xy), which reduces to the textbook curl once gradU is read OF's way (T_ij = dU_j/dx_i):
+//     curl = (dUz/dy - dUy/dz,  dUx/dz - dUz/dx,  dUy/dx - dUx/dy)
+__global__
+void saMagCurlKernel(int nC, const scalar* __restrict__ gradU, scalar* __restrict__ out)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar g1 = gradU[1*nC + c], g2 = gradU[2*nC + c], g3 = gradU[3*nC + c];
+    const scalar g5 = gradU[5*nC + c], g6 = gradU[6*nC + c], g7 = gradU[7*nC + c];
+    const scalar cx = g5 - g7, cy = g6 - g2, cz = g1 - g3;
+    out[c] = sqrt(cx*cx + cy*cy + cz*cz);
+}
+
+// ...and per BOUNDARY FACE. |curl U| is an expression in grad(U), so its boundary value is whatever
+// grad(U)'s boundary is -- and OF's gaussGrad::correctBoundaryConditions does NOT leave that as the
+// extrapolated cell gradient: it replaces the wall-normal part with the patch snGrad,
+//     gradU_b = gradU_c + n (x) (snGrad - n & gradU_c),   snGrad = (U_b - U_c)*deltaCoeffs
+// which is the entire difference between a no-slip wall having a shear gradient and having none. Same
+// expression as device_divdevreff.cu's gradBKernel and the SST's sstNutBoundaryK.
+__global__
+void saMagCurlBndKernel(
+    int nB, int nC,
+    const label*  __restrict__ fc,
+    const scalar* __restrict__ gradU,
+    const scalar* __restrict__ nx, const scalar* __restrict__ ny, const scalar* __restrict__ nz,
+    const scalar* __restrict__ uxb, const scalar* __restrict__ uyb, const scalar* __restrict__ uzb,
+    const scalar* __restrict__ Ux, const scalar* __restrict__ Uy, const scalar* __restrict__ Uz,
+    const scalar* __restrict__ dc,
+    scalar* __restrict__ out)
+{
+    const int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi >= nB) return;
+    const int c = fc[bi];
+    scalar gc[9];
+    for (int q = 0; q < 9; ++q) gc[q] = gradU[q*nC + c];
+    const scalar nv[3] = { nx[bi], ny[bi], nz[bi] };
+    const scalar sn[3] = { (uxb[bi]-Ux[c])*dc[bi], (uyb[bi]-Uy[c])*dc[bi], (uzb[bi]-Uz[c])*dc[bi] };
+    scalar ngc[3];
+    for (int j = 0; j < 3; ++j)
+        ngc[j] = nv[0]*gc[0*3+j] + nv[1]*gc[1*3+j] + nv[2]*gc[2*3+j];
+    scalar gb[9];
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            gb[i*3+j] = gc[i*3+j] + nv[i]*(sn[j] - ngc[j]);
+    const scalar cx = gb[1*3+2] - gb[2*3+1];
+    const scalar cy = gb[2*3+0] - gb[0*3+2];
+    const scalar cz = gb[0*3+1] - gb[1*3+0];
+    out[bi] = sqrt(cx*cx + cy*cy + cz*cz);
+}
+
+// ZDES2020 shielding (Deck & Renard 2020), OF SpalartAllmarasDDES::fd with `shielding ZDES2020`:
+//
+//     r          = min(nuEff/(max(|gradU|,SMALL) (kappa y)^2), 10)          [the standard DDES ratio]
+//     fdStd      = 1 - tanh((Cd1 r)^Cd2)
+//     GnuTilda   = Cd3 max(grad(nuTilda).n, 0) / (max(|gradU|,SMALL) kappa y)
+//     fdGnuTilda = 1 - tanh((Cd1 GnuTilda)^Cd2)          [* the fP2 factor when usefP2]
+//     GOmega     = -(grad(|curl U|).n) sqrt(nuTilda/max(|gradU|^3, SMALL))
+//     alpha      = (7/6 Cd4 - GOmega)/(Cd4/6)
+//     fR(GOmega) = pos(Cd4 - GOmega)
+//                + 1/(1 + exp(min(-6 alpha/max(1 - alpha^2, SMALL), 50))) pos(4Cd4/3 - GOmega) pos(GOmega - Cd4)
+//     fd         = fdStd (1 - (1 - fdGnuTilda) fR)
+//
+// n is the OUTWARD wall normal of the nearest wall face (OF wallDist::n(), see cellWallDist). The two
+// new gradients are wall-normal derivatives: GnuTilda detects the eddy-viscosity ramp that says "this is
+// still an attached boundary layer" and GOmega the vorticity ramp, and where either says so the second
+// factor pulls fd back towards 0, i.e. back to RANS. pos() is OF's STRICT pos (x > 0), not pos0.
+__global__
+void saZdesFdKernel(
+    int nC,
+    const scalar* __restrict__ y,
+    const scalar* __restrict__ gradU,
+    const scalar* __restrict__ nt,
+    scalar nu,
+    const scalar* __restrict__ wnx, const scalar* __restrict__ wny, const scalar* __restrict__ wnz,
+    const scalar* __restrict__ gnx, const scalar* __restrict__ gny, const scalar* __restrict__ gnz,
+    const scalar* __restrict__ gox, const scalar* __restrict__ goy, const scalar* __restrict__ goz,
+    SpalartAllmarasCoeffs co,
+    scalar* __restrict__ fd)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    constexpr scalar SMALL = scalar(1e-15);
+
+    scalar g2 = 0;
+    for (int k = 0; k < 9; ++k) { const scalar gk = gradU[k*nC + c]; g2 += gk*gk; }
+    const scalar magGradU = sqrt(g2);
+    const scalar chi = nt[c]/nu, chi3 = chi*chi*chi, Cv13 = co.Cv1*co.Cv1*co.Cv1;
+    const scalar nutc = nt[c] * (chi3 / (chi3 + Cv13));
+    const scalar kd2 = fmax(co.kappa*co.kappa*y[c]*y[c], scalar(1e-300));
+    const scalar r = fmin((nutc + nu) / (fmax(magGradU, scalar(1e-300)) * kd2), scalar(10));
+    const scalar fdStd = scalar(1) - tanh(pow(co.Cd1*r, co.Cd2));
+
+    const scalar nvx = wnx[c], nvy = wny[c], nvz = wnz[c];
+    const scalar dNt = fmax(gnx[c]*nvx + gny[c]*nvy + gnz[c]*nvz, scalar(0));
+    const scalar GnuTilda = co.Cd3 * dNt
+                          / fmax(fmax(magGradU, SMALL) * co.kappa * y[c], scalar(1e-300));
+    scalar fdG = scalar(1) - tanh(pow(co.Cd1*GnuTilda, co.Cd2));
+    if (co.usefP2)
+        fdG *= (scalar(1) - tanh(pow(co.Cd1*co.betaZDES*r, co.Cd2))) / fmax(fdStd, SMALL);
+
+    const scalar mg3 = magGradU*magGradU*magGradU;
+    const scalar GOmega = -(gox[c]*nvx + goy[c]*nvy + goz[c]*nvz)
+                        * sqrt(fmax(nt[c], scalar(0)) / fmax(mg3, SMALL));
+    const scalar alpha = (scalar(7)/scalar(6)*co.Cd4 - GOmega) / (co.Cd4/scalar(6));
+    const scalar denom = fmax(scalar(1) - alpha*alpha, SMALL);
+    const scalar fR = ((co.Cd4 - GOmega > scalar(0)) ? scalar(1) : scalar(0))
+                    + scalar(1)/(scalar(1) + exp(fmin(scalar(-6)*alpha/denom, scalar(50))))
+                      * ((scalar(4)*co.Cd4/scalar(3) - GOmega > scalar(0)) ? scalar(1) : scalar(0))
+                      * ((GOmega - co.Cd4 > scalar(0)) ? scalar(1) : scalar(0));
+
+    fd[c] = fdStd * (scalar(1) - (scalar(1) - fdG)*fR);
 }
 
 // SA-IDDES (SpalartAllmarasIDDES, Shur/Spalart/Strelets/Travin 2008): the IMPROVED delayed-DES length scale, adding
@@ -233,7 +350,9 @@ void deviceSpalartAllmarasCorrect(
     bool des,
     bool iddes,
     const DeviceBuffer<scalar>* hmax,
-    const DeviceBuffer<scalar>* hwn)
+    const DeviceBuffer<scalar>* hwn,
+    const DeviceBuffer<scalar>* lesDelta,
+    const DeviceBuffer<scalar>* wallN)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
@@ -245,10 +364,46 @@ void deviceSpalartAllmarasCorrect(
     if (des)
     {
         dTilda.resize(static_cast<std::size_t>(nC));
+        // ZDES2020 shielding needs two wall-normal derivatives that the standard fd does not:
+        // grad(nuTilda).n and grad(|curl U|).n. Both are built here, from the SAME gradU the rest of the
+        // model uses, and both need the wall normal wallN (3 x nC, packed) -- without it the case gets
+        // the standard fd, which is the pre-ZDES behaviour rather than a wrong one.
+        DeviceBuffer<scalar> zfd;
+        if (co.zdes && !iddes && wallN && wallN->size() == static_cast<std::size_t>(3*nC))
+        {
+            DeviceBuffer<scalar> nbv0, gx0, gy0, gz0;
+            deviceBCValue(dbNuTilda, nuTilda, nbv0);
+            deviceGaussGrad(dm, nuTilda, nbv0, gx0, gy0, gz0);          // fvc::grad(nuTilda)
+
+            DeviceBuffer<scalar> mc(static_cast<std::size_t>(nC)), mcb, ox, oy, oz;
+            saMagCurlKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), mc.data());
+            cudaCheck(cudaGetLastError(), "saMagCurl");
+            const int nB = dbU.n;
+            mcb.resize(static_cast<std::size_t>(nB));
+            DeviceBuffer<scalar> ub[3];
+            for (int k = 0; k < 3; ++k) deviceBCValue(dbU.comp[k], k == 0 ? Ux : (k == 1 ? Uy : Uz), ub[k]);
+            saMagCurlBndKernel<<<nBlocks(nB), TPB>>>(nB, nC, dbU.comp[0].faceCell.data(), gradU.data(),
+                                                     dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
+                                                     ub[0].data(), ub[1].data(), ub[2].data(),
+                                                     Ux.data(), Uy.data(), Uz.data(),
+                                                     dbU.comp[0].deltaCoeffs.data(), mcb.data());
+            cudaCheck(cudaGetLastError(), "saMagCurlBnd");
+            deviceGaussGrad(dm, mc, mcb, ox, oy, oz);                   // fvc::grad(mag(curl(U)))
+
+            zfd.resize(static_cast<std::size_t>(nC));
+            const scalar* wn = wallN->data();
+            saZdesFdKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu,
+                                                 wn, wn + nC, wn + 2*nC,
+                                                 gx0.data(), gy0.data(), gz0.data(),
+                                                 ox.data(), oy.data(), oz.data(), co, zfd.data());
+            cudaCheck(cudaGetLastError(), "saZdesFd");
+        }
         if (iddes && hmax && hwn)
             saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax->data(), hwn->data(), co, dTilda.data());
         else
-            saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), dm.V.data(), gradU.data(), nuTilda.data(), nu, co, dTilda.data());
+            saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), dm.V.data(), gradU.data(), nuTilda.data(), nu, co,
+                                                     (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr,
+                                                     zfd.size() ? zfd.data() : nullptr, dTilda.data());
     }
     const DeviceBuffer<scalar>& dScale = des ? dTilda : y;
     DeviceBuffer<scalar> Stilda(static_cast<std::size_t>(nC));
@@ -336,12 +491,30 @@ void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, Dev
 
 // Exported SA-DDES length-scale wrapper: dTilda from y, cubeRootVol(V), |gradU| and nuTilda (a unit-test hook + a future
 // distributed-DES entry). Takes nC + V directly (no DeviceMesh) so it is callable without building a full mesh.
+// Unit-test hook for the ZDES2020 shielding: fd from the eight fields it reads, no mesh required.
+void deviceSAZdesFd(
+    int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& nuTilda, scalar nu,
+    const DeviceBuffer<scalar>& wnx, const DeviceBuffer<scalar>& wny, const DeviceBuffer<scalar>& wnz,
+    const DeviceBuffer<scalar>& gnx, const DeviceBuffer<scalar>& gny, const DeviceBuffer<scalar>& gnz,
+    const DeviceBuffer<scalar>& gox, const DeviceBuffer<scalar>& goy, const DeviceBuffer<scalar>& goz,
+    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& fd)
+{
+    fd.resize(static_cast<std::size_t>(nC));
+    saZdesFdKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu,
+                                         wnx.data(), wny.data(), wnz.data(),
+                                         gnx.data(), gny.data(), gnz.data(),
+                                         gox.data(), goy.data(), goz.data(), co, fd.data());
+    cudaCheck(cudaGetLastError(), "deviceSAZdesFd");
+}
+
+
 void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& V,
     const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
     const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda)
 {
     dTilda.resize(nC);
-    saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), V.data(), gradU.data(), nuTilda.data(), nu, co, dTilda.data());
+    saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), V.data(), gradU.data(), nuTilda.data(), nu, co, nullptr, nullptr, dTilda.data());
     cudaCheck(cudaGetLastError(), "deviceSADDESdTilda");
 }
 

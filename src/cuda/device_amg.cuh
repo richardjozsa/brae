@@ -34,7 +34,7 @@ struct PCGGraphCache {
     // bound. They stay constant per field in the SIMPLE loop (no extra re-capture there), so
     // including them in the key only guards the case where a caller reuses this cache with new
     // controls. Sentinels chosen so the first solve always misses.
-    scalar keyTol = -1.0; scalar keyRelTol = -1.0; int keyMaxIter = -1;
+    scalar keyTol = -1.0; scalar keyRelTol = -1.0; int keyMaxIter = -1; int keyMinIter = -1;
     DeviceBuffer<scalar> pA, Ax, sNormF, sInit, sRes; DeviceBuffer<int> sIter;   // persistent (graph-referenced)
     ~PCGGraphCache();
 };
@@ -134,7 +134,8 @@ void amgGalerkin(AMGData& A, const DeviceBuffer<scalar>& fineDiag, const DeviceB
 // false -> plain injection + standard CG (bit-identical to before); the SIMPLE loop opts in (validated vs OpenFOAM).
 DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const DeviceBuffer<scalar>& b,
                               DeviceBuffer<scalar>& psi, scalar normFactor, scalar tol, scalar relTol, int maxIter,
-                              bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false);
+                              bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false,
+                              int minIter = 0);
 
 // z = M^-1 r : one symmetric AMG V-cycle applied as a PRECONDITIONER (the V-cycle factored out of deviceAMGPCG).
 // Used by the distributed Krylov (deviceParallelAMGPCG) to precondition each rank's LOCAL block with AMG -- the

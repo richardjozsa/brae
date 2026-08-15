@@ -36,7 +36,16 @@ inline std::vector<scalar> cellWallDist(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
-    std::vector<vector>* wallOrigin = nullptr)   // optional: nearest wall-face centre per cell (IDDES wall-normal source)
+    std::vector<vector>* wallOrigin = nullptr,   // optional: nearest wall-face centre per cell (IDDES wall-normal source)
+    // optional: the nearest wall face's OUTWARD unit normal, transported by the same wave.
+    //
+    // This is OF's wallDist::n(), and its direction is not the obvious one: wallDist seeds the wave with
+    // `nbf[patchi] == patches[patchi].nf()` (wallDist.C constructn) and carries that vector along with
+    // the origin (patchDataWave<wallPointData<vector>>), so a cell inherits the nearest wall face's
+    // normal pointing OUT of the domain -- away from the fluid, i.e. roughly opposite to (C - origin).
+    // ZDES2020 takes max(grad(nuTilda) & n, 0) with this n, so the sign is load-bearing: get it backwards
+    // and the shielding fires where it should be dormant.
+    std::vector<vector>* wallNormal = nullptr)
 {
     const std::vector<vector>& C   = g.C();
     const std::vector<vector>& Cf  = g.Cf();
@@ -48,6 +57,7 @@ inline std::vector<scalar> cellWallDist(
 
     std::vector<scalar> y(nCells, nwdGreat);                  // OF wallDist: y initialised to GREAT
     if (wallOrigin) *wallOrigin = C;                          // default: cell centre (degenerate -> IDDES hwn falls back to hmax)
+    if (wallNormal) wallNormal->assign(nCells, vector{0, 0, 0});   // cells the wave never reaches: no wall direction
 
     // the wave seed: every wall-patch face (patchWave::setChangedFaces)
     std::vector<char> isWallFace(nFaces, 0);
@@ -81,18 +91,21 @@ inline std::vector<scalar> cellWallDist(
     // FaceCellWave<wallPoint> front. origin = wall-face centre; distSqr = magSqr(pt - origin).
     const scalar tol = 0.01;                                  // OF FaceCellWave::propagationTol_
     std::vector<vector> faceOrg(nFaces), cellOrg(nCells);
+    std::vector<vector> faceNrm(nFaces), cellNrm(nCells);     // the wall normal riding along with the origin
     std::vector<scalar> faceD2(nFaces, 0.0), cellD2(nCells, 0.0);
     std::vector<char> faceSet(nFaces, 0), cellSet(nCells, 0);
     std::vector<char> faceQ(nFaces, 0), cellQ(nCells, 0);     // already-in-changed-list flags (OF changedFace_/changedCell_)
 
     // wallPoint::update (wallPointI.H): first visit accepts any value; else accept iff strictly closer by > tol.
-    auto update = [&](char& set, scalar& d2cur, vector& orgcur, const vector& pt, const vector& org) -> bool
+    auto update = [&](char& set, scalar& d2cur, vector& orgcur, vector& nrmcur,
+                      const vector& pt, const vector& org, const vector& nrm) -> bool
     {
         const scalar d2 = magSqr(pt - org);
         if (!set)
         {
             d2cur = d2;
             orgcur = org;
+            nrmcur = nrm;
             set = 1;
             return true;
         }
@@ -101,6 +114,7 @@ inline std::vector<scalar> cellWallDist(
         if (diff < 1e-300 || (d2cur > 1e-300 && diff / d2cur < tol)) return false; // improvement too small
         d2cur = d2;
         orgcur = org;
+        nrmcur = nrm;
         return true;
     };
 
@@ -110,6 +124,11 @@ inline std::vector<scalar> cellWallDist(
         if (isWallFace[f])
         {
             faceOrg[f] = Cf[f];
+            {   // the seed datum: this wall face's OUTWARD unit normal (OF patch.nf())
+                const vector& sf = g.Sf()[f];
+                const scalar a = g.magSf()[f];
+                faceNrm[f] = (a > scalar(0)) ? vector{sf.x/a, sf.y/a, sf.z/a} : vector{0, 0, 0};
+            }
             faceD2[f] = 0.0;
             faceSet[f] = 1;
             faceQ[f] = 1;
@@ -123,8 +142,9 @@ inline std::vector<scalar> cellWallDist(
         {
             faceQ[f] = 0;
             const vector org = faceOrg[f];
+            const vector nrm = faceNrm[f];
             const label o = own[f];
-            if (update(cellSet[o], cellD2[o], cellOrg[o], C[o], org) && !cellQ[o])
+            if (update(cellSet[o], cellD2[o], cellOrg[o], cellNrm[o], C[o], org, nrm) && !cellQ[o])
             {
                 cellQ[o] = 1;
                 changedCells.push_back(o);
@@ -132,7 +152,7 @@ inline std::vector<scalar> cellWallDist(
             if (f < nIntF)
             {
                 const label n = nei[f];
-                if (update(cellSet[n], cellD2[n], cellOrg[n], C[n], org) && !cellQ[n])
+                if (update(cellSet[n], cellD2[n], cellOrg[n], cellNrm[n], C[n], org, nrm) && !cellQ[n])
                 {
                     cellQ[n] = 1;
                     changedCells.push_back(n);
@@ -144,10 +164,11 @@ inline std::vector<scalar> cellWallDist(
         {
             cellQ[c] = 0;
             const vector org = cellOrg[c];
+            const vector nrm = cellNrm[c];
             for (label k = cfOff[c]; k < cfOff[c + 1]; ++k)
             {
                 const label f = cfList[k];
-                if (update(faceSet[f], faceD2[f], faceOrg[f], Cf[f], org) && !faceQ[f])
+                if (update(faceSet[f], faceD2[f], faceOrg[f], faceNrm[f], Cf[f], org, nrm) && !faceQ[f])
                 {
                     faceQ[f] = 1;
                     changedFaces.push_back(f);
@@ -218,6 +239,9 @@ inline std::vector<scalar> cellWallDist(
     if (wallOrigin)
         for (label c = 0; c < nCells; ++c)
             if (cellSet[c]) (*wallOrigin)[c] = cellOrg[c];
+    if (wallNormal)
+        for (label c = 0; c < nCells; ++c)
+            if (cellSet[c]) (*wallNormal)[c] = cellNrm[c];
     return y;
 }
 
@@ -239,7 +263,11 @@ inline std::vector<scalar> cellWallDist(
 inline std::vector<scalar> exactCellWallDist(
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& fvp)
+    const std::vector<FvPatch>& fvp,
+    // optional: the outward unit normal of the wall face the nearest point was found on -- OF's
+    // wallDist::n() for this method (`surf.getNormal(info, n)`, the surface normal AT the hit). A case
+    // that writes `nRequired yes` under wallDist is asking for exactly this field; NACA4412 does.
+    std::vector<vector>* wallNormal = nullptr)
 {
     const std::vector<vector>& pts = m.points();
     const std::vector<label>&  fv  = m.faceVerts();
@@ -247,6 +275,7 @@ inline std::vector<scalar> exactCellWallDist(
     const std::vector<vector>& C   = g.C();
     const label nC = m.nCells();
 
+    if (wallNormal) wallNormal->assign(nC, vector{0, 0, 0});
     std::vector<label> wallFace;
     for (const FvPatch& p : fvp)
         if (p.type == "wall")
@@ -342,6 +371,7 @@ inline std::vector<scalar> exactCellWallDist(
         const int cj = clampi((int)std::floor((p.y - lo.y)/hs.y), ny);
         const int ck = clampi((int)std::floor((p.z - lo.z)/hs.z), nz);
         scalar best = nwdGreat;
+        label  bestFace = -1;
         const int rMax = std::max(nx, std::max(ny, nz));
         for (int r = 0; r <= rMax; ++r)
         {
@@ -364,7 +394,7 @@ inline std::vector<scalar> exactCellWallDist(
                         {
                             const label f = wallFace[bucket[b]];
                             const scalar d = pointToFaceDist(p, pts, fv, fo[f], fo[f+1]);
-                            if (d < best) best = d;
+                            if (d < best) { best = d; bestFace = f; }
                         }
                     }
                 }
@@ -380,6 +410,15 @@ inline std::vector<scalar> exactCellWallDist(
             if (best <= std::fmax(guard, scalar(0))) break;
         }
         y[c] = best;
+        if (wallNormal && bestFace >= 0)
+        {
+            const scalar a = g.magSf()[bestFace];
+            if (a > scalar(0))
+            {
+                const vector& sf = g.Sf()[bestFace];
+                (*wallNormal)[c] = vector{sf.x/a, sf.y/a, sf.z/a};
+            }
+        }
     }
     return y;
 }

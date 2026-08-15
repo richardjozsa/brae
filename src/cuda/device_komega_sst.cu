@@ -292,11 +292,11 @@ __global__
 void kOmegaSSTDESfactorKernel(
     int nC, const scalar* __restrict__ k, const scalar* __restrict__ om, const scalar* __restrict__ V,
     const scalar* __restrict__ F1, const scalar* __restrict__ F2, scalar betaStar, scalar CDES1, scalar CDES2,
-    scalar* __restrict__ FDES)
+    const scalar* __restrict__ dOpt, scalar* __restrict__ FDES)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    const scalar delta = cbrt(V[c]);
+    const scalar delta = dOpt ? dOpt[c] : cbrt(V[c]);
     const scalar Lt = sqrt(fmax(k[c], scalar(0))) / fmax(betaStar * om[c], 1e-300);
     const scalar CDES = F1[c]*CDES1 + (scalar(1) - F1[c])*CDES2;
     FDES[c] = fmax((Lt / fmax(CDES*delta, 1e-300)) * (scalar(1) - F2[c]), scalar(1));
@@ -745,11 +745,13 @@ void deviceKReactionSST(
 // Exported kOmegaSST-DDES DES-factor wrapper (single-GPU + unit-test hook): FDES from k/omega, cubeRootVol(V), F1, F2.
 void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
     const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& F2,
-    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES)
+    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES, const DeviceBuffer<scalar>* lesDelta)
 {
     FDES.resize(nC);
     kOmegaSSTDESfactorKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), V.data(), F1.data(), F2.data(),
-                                                   co.betaStar, co.CDES1, co.CDES2, FDES.data());
+                                                   co.betaStar, co.CDES1, co.CDES2,
+                                                   (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr,
+                                                   FDES.data());
     cudaCheck(cudaGetLastError(), "kOmegaSSTDESfactor");
 }
 
@@ -916,7 +918,8 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<label>*  fvoKMask,
     const DeviceBuffer<scalar>* fvoKVal,
     const DeviceBuffer<label>*  fvoEMask,
-    const DeviceBuffer<scalar>* fvoEVal)     // compressible: mu at boundary faces (the +mu of rho*D+mu)
+    const DeviceBuffer<scalar>* fvoEVal,     // compressible: mu at boundary faces (the +mu of rho*D+mu)
+    const DeviceBuffer<scalar>* lesDelta)    // case `delta` (maxDeltaxyz); null = OF's cubeRootVol
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -1011,7 +1014,7 @@ void deviceKOmegaSSTCorrect(
         if (iddes && hmax && hwn)   // kOmegaSST-IDDES: the improved (WMLES) length scale (needs the SST nut + hmax + hwn + gradU + y)
             deviceKOmegaSSTIDDESfactor(nC, k, omega, F1, gradU, nut, y, *hmax, *hwn, nu, co, FDES);
         else                 // kOmegaSST-DDES: the F2-shielded cubeRootVol DES factor
-            deviceKOmegaSSTDESfactor(nC, k, omega, dm.V, F1, F2, co, FDES);
+            deviceKOmegaSSTDESfactor(nC, k, omega, dm.V, F1, F2, co, FDES, lesDelta);
     }
 
     // blends, limited production-by-nu, DomegaEff.

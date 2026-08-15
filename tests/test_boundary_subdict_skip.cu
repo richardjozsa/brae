@@ -12,10 +12,13 @@
 //
 // Leg 2 is the more important half. Once the block parses, `scale` must not be silently dropped: it makes
 // the interface's open area a prescribed function of time (TJunctionSwitching uses it to close a branch),
-// so ignoring it solves a different problem and converges happily to it.
+// so ignoring it solves a different problem and converges happily to it. It used to be REFUSED for that
+// reason; now that brae evaluates it, the leg asserts the parsed table instead -- same requirement, one
+// step further on.
 #include "primitive_mesh.cuh"
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <fstream>
 #include <string>
 
@@ -76,23 +79,36 @@ int main()
         }
     }
 
-    // ---- 2. the same block on a cyclicACMI must REFUSE ----
+    // ---- 2. the same block on a cyclicACMI must be READ, table and all ----
     {
         writeBoundary(dir, scaleBlock, "cyclicACMI");
         PrimitiveMesh m;
-        bool refused = false;
-        std::string msg;
-        try { m.readBoundary(dir); } catch (const std::exception& e) { refused = true; msg = e.what(); }
-        std::printf("  cyclicACMI + scale: %s\n", refused ? "refused" : "ACCEPTED");
-        if (!refused)
+        try { m.readBoundary(dir); }
+        catch (const std::exception& e)
+        { std::printf("  FAIL cyclicACMI + scale threw: %s\n", e.what()); ++failures; }
+        if (m.patches().size() == 2)
         {
-            std::printf("  FAIL a time-varying ACMI scale was accepted and dropped. The interface's open\n"
-                        "       area is then a constant where the case says it opens and closes, and the run\n"
-                        "       converges to the wrong problem without saying so.\n");
-            ++failures;
+            const Function1& f = m.patches()[1].acmiScale;
+            if (f.empty())
+            {
+                std::printf("  FAIL the scale table was dropped. The interface's open area is then a\n"
+                            "       constant where the case says it opens and closes, and the run converges\n"
+                            "       to the wrong problem without saying so.\n");
+                ++failures;
+            }
+            else
+            {
+                // (0 1)(0.2 1)(0.3 0): flat, then a ramp to zero, then clamped below
+                const bool ok = std::fabs(f.value(0.0)  - 1.0) < 1e-12
+                             && std::fabs(f.value(0.2)  - 1.0) < 1e-12
+                             && std::fabs(f.value(0.25) - 0.5) < 1e-12
+                             && std::fabs(f.value(0.3)  - 0.0) < 1e-12
+                             && std::fabs(f.value(9.9)  - 0.0) < 1e-12;
+                std::printf("  cyclicACMI + scale: read (1 -> %.3f at t=0.25 -> 0)\n", (double)f.value(0.25));
+                if (!ok)
+                { std::printf("  FAIL the table does not interpolate as OpenFOAM's does\n"); ++failures; }
+            }
         }
-        else if (msg.find("scale") == std::string::npos)
-        { std::printf("  FAIL the refusal does not mention `scale`: %s\n", msg.c_str()); ++failures; }
     }
 
     // ---- 3. VACUITY GUARD: without the block, the same cyclicACMI patch must parse fine ----

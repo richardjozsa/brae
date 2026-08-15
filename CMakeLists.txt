@@ -91,6 +91,7 @@ add_library(brae_core STATIC
     src/cuda/device_boundary_assembly.cu
     src/cuda/device_boundary_flow.cu
     src/cuda/device_divdevreff.cu
+    src/cuda/device_maxwell.cu
     src/cuda/device_ddt.cu
     src/cuda/device_kepsilon.cu
     src/cuda/device_spalart.cu
@@ -1178,6 +1179,58 @@ target_include_directories(test_fvoptions_sources_key PRIVATE ${BRAE_HEADER_DIRS
 target_link_libraries(test_fvoptions_sources_key PRIVATE brae_core)
 add_test(NAME fvoptions_sources_key COMMAND test_fvoptions_sources_key)
 
+
+add_executable(test_wedge_patch tests/test_wedge_patch.cu)
+target_include_directories(test_wedge_patch PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_wedge_patch PRIVATE brae_core)
+add_test(NAME wedge_patch COMMAND test_wedge_patch)
+
+add_executable(test_wedge_device_coeffs tests/test_wedge_device_coeffs.cu)
+target_include_directories(test_wedge_device_coeffs PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_wedge_device_coeffs PRIVATE brae_core)
+add_test(NAME wedge_device_coeffs COMMAND test_wedge_device_coeffs)
+
+add_executable(test_vol_point_interp tests/test_vol_point_interp.cu)
+target_include_directories(test_vol_point_interp PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_vol_point_interp PRIVATE brae_core)
+add_test(NAME vol_point_interp COMMAND test_vol_point_interp)
+
+add_executable(test_eval_scoped tests/test_eval_scoped.cu)
+target_include_directories(test_eval_scoped PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_eval_scoped PRIVATE brae_core)
+add_test(NAME eval_scoped COMMAND test_eval_scoped)
+
+add_executable(test_maxwell_terms tests/test_maxwell_terms.cu)
+target_include_directories(test_maxwell_terms PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_maxwell_terms PRIVATE brae_core)
+add_test(NAME maxwell_terms COMMAND test_maxwell_terms)
+
+add_executable(test_acmi_scale tests/test_acmi_scale.cu)
+target_include_directories(test_acmi_scale PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_acmi_scale PRIVATE brae_core)
+add_test(NAME acmi_scale COMMAND test_acmi_scale)
+set_tests_properties(acmi_scale PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_zdes_shielding tests/test_zdes_shielding.cu)
+target_include_directories(test_zdes_shielding PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_zdes_shielding PRIVATE brae_core)
+add_test(NAME zdes_shielding COMMAND test_zdes_shielding)
+
+add_executable(test_hbya_inletoutlet tests/test_hbya_inletoutlet.cu)
+target_include_directories(test_hbya_inletoutlet PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_hbya_inletoutlet PRIVATE brae_core)
+add_test(NAME hbya_inletoutlet COMMAND test_hbya_inletoutlet)
+
+add_executable(test_limited_linear_v tests/test_limited_linear_v.cu)
+target_include_directories(test_limited_linear_v PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_limited_linear_v PRIVATE brae_core)
+add_test(NAME limited_linear_v COMMAND test_limited_linear_v)
+
+add_executable(test_max_delta_xyz tests/test_max_delta_xyz.cu)
+target_include_directories(test_max_delta_xyz PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_max_delta_xyz PRIVATE brae_core)
+add_test(NAME max_delta_xyz COMMAND test_max_delta_xyz)
+
 add_executable(test_wale_nut tests/test_wale_nut.cu)
 target_include_directories(test_wale_nut PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_wale_nut PRIVATE brae_core)
@@ -1454,6 +1507,15 @@ add_test(NAME pimple_run
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
                  ${CMAKE_CURRENT_BINARY_DIR}/pimple_run_work)
 set_tests_properties(pimple_run PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
+
+# PIMPLE/momentumPredictor: the same case with the switch on and off must give DIFFERENT fields (and the
+# default must equal `on`). See the header of the script for why the log line is not enough.
+add_test(NAME momentum_predictor
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/momentum_predictor.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/momentum_predictor_work)
+set_tests_properties(momentum_predictor PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 
 # The same transient case run through `brae` itself: the case says `application pimpleFoam`, so the solver
 # registry (solvers/common/solver_dispatch.cuh) must hand it to brae_pimpleFoam and produce the identical

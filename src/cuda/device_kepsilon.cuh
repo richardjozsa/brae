@@ -316,7 +316,10 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<label>*  fvoKMask = nullptr,
                             const DeviceBuffer<scalar>* fvoKVal  = nullptr,
                             const DeviceBuffer<label>*  fvoEMask = nullptr,
-                            const DeviceBuffer<scalar>* fvoEVal  = nullptr);
+                            const DeviceBuffer<scalar>* fvoEVal  = nullptr,
+                            // The case's LES filter width (`delta maxDeltaxyz`); null keeps OF's
+                            // cubeRootVol. Must match what the convection scheme uses.
+                            const DeviceBuffer<scalar>* lesDelta = nullptr);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
@@ -350,10 +353,25 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   bool des = false,   // SpalartAllmarasDDES: DES length-scale limiter on the SA destruction
                                   bool iddes = false,   // SpalartAllmarasIDDES: use the improved (WMLES) length scale (needs hmax+hwn)
                                   const DeviceBuffer<scalar>* hmax = nullptr,   // per-cell maxDeltaxyz (IDDES delta); null -> DDES cubeRootVol
-                                  const DeviceBuffer<scalar>* hwn = nullptr);   // per-cell wall-normal spacing (IDDES delta 3rd term)
+                                  const DeviceBuffer<scalar>* hwn = nullptr,   // per-cell wall-normal spacing (IDDES delta 3rd term)
+                                  // The LES filter width the case selected (`delta maxDeltaxyz`); nullptr
+                                  // keeps OF's default cubeRootVol. Must match what the momentum scheme uses.
+                                  const DeviceBuffer<scalar>* lesDelta = nullptr,
+                                  // The OUTWARD unit normal of the nearest wall face, packed 3 x nC (OF
+                                  // wallDist::n()). Only ZDES2020 shielding reads it; nullptr (or the
+                                  // wrong size) leaves the standard DDES fd in place.
+                                  const DeviceBuffer<scalar>* wallN = nullptr);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
+// ZDES2020 shielding fd from its eight input fields (unit-test/DES hook; the solver path builds the two
+// gradients itself inside deviceSpalartAllmarasCorrect).
+void deviceSAZdesFd(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& gradU,
+                    const DeviceBuffer<scalar>& nuTilda, scalar nu,
+                    const DeviceBuffer<scalar>& wnx, const DeviceBuffer<scalar>& wny, const DeviceBuffer<scalar>& wnz,
+                    const DeviceBuffer<scalar>& gnx, const DeviceBuffer<scalar>& gny, const DeviceBuffer<scalar>& gnz,
+                    const DeviceBuffer<scalar>& gox, const DeviceBuffer<scalar>& goy, const DeviceBuffer<scalar>& goz,
+                    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& fd);
 // SA-DDES length scale dTilda = y - fd*max(0, y - CDES*cubeRootVol(V)); fd = 1 - tanh((8 rd)^3). (Unit-test/DES hook.)
 void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& V,
     const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,

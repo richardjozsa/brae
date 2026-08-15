@@ -6,6 +6,7 @@
 #include "swept_volume.cuh"   // meshPhi + makeRelative (OF fvcMeshPhi)
 #include "device_scalar_transport.cuh"   // deviceSolveScalarTransport: shared with k/epsilon/omega/energy
 #include "device_deshybrid.cuh"   // DEShybrid: per-face blend of linear and linearUpwind (DES sensor)
+#include "device_maxwell.cuh"   // Maxwell viscoelastic stress (laminar { model Maxwell; })
 #include "fan_pressure.cuh"   // applyFixedMean: OF fixedMeanFvPatchField, shared with its test
 #include "brae_notice.cuh"   // never drop an input silently (the ddtCorr scheme gate)
 #include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
@@ -129,9 +130,25 @@ namespace brae {
             dbExtrap_.valueFraction.copyFrom(std::vector<scalar>(ty.size(), 0.0));
             dbExtrap_.mixedMask.copyFrom(std::vector<label>(ty.size(), 0));
         }
-        // any freestreamVelocity/Pressure (mixed) far-field patch present -> run the per-step valueFraction update.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            if (U.boundary[pi]->bcCategory() == 5 || p.boundary[pi]->bcCategory() == 5)
+            if (U.boundary[pi]->wedgeFaceT())   // axisymmetric wedge: the value is the ROTATED cell value
+            {
+                hasWedge_ = true;
+                break;
+            }
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            if (U.boundary[pi]->bcCategory() == 3)   // inletOutlet
+            {
+                hasInletOutletU_ = true;
+                break;
+            }
+        // any freestreamVelocity/Pressure (mixed) far-field patch present -> run the per-step valueFraction update.
+        // A wedge also reports category 5 and must NOT count: its valueFraction is geometry, not a flux sign
+        // (see the mixedMask comment in buildDeviceVectorBoundary), so a purely axisymmetric case has no
+        // per-step valueFraction to update at all.
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            if ((U.boundary[pi]->bcCategory() == 5 && !U.boundary[pi]->wedgeFaceT())
+             || p.boundary[pi]->bcCategory() == 5)
             {
                 hasMixed_ = true;
                 break;
@@ -327,13 +344,34 @@ namespace brae {
                 if (ctl_.sst || ctl_.sa)
                 {
                     std::vector<vector> wallOrigin;                              // nearest wall-face centre (IDDES wall-normal source)
+                    // ZDES2020 shielding reads OF's wallDist::n(), the nearest wall face's OUTWARD unit
+                    // normal, and it must come from the SAME method that produced y -- the wave carries
+                    // the seed face's normal, exactDistance takes the normal at the hit point. A case
+                    // that asks for it writes `nRequired yes` under wallDist (NACA4412 does).
+                    const bool needWallN = ctl_.sa && ctl_.saCoeffs.zdes;
+                    std::vector<vector> wallNormal;
+                    // `delta maxDeltaxyz`: OF's face-normal hmax, computed once (static geometry) and
+                    // shared by the sub-grid model, the DES length scale and DEShybrid.
+                    if (ctl_.lesDeltaMax) lesDelta_.copyFrom(cellMaxDeltaFaceNormal(m, g, ctl_.lesDeltaCoeff));
                     ctorMark("pre-wallDist");
                     // OF wallDist: `meshWave` (the default) or `exactDistance`. IDDES additionally needs
                     // the wall ORIGIN, which only the wave carries, so exactDistance is not offered there.
                     if (ctl_.exactWallDist && !ctl_.iddes)
-                        y_.copyFrom(exactCellWallDist(m, g, fvp));
+                        y_.copyFrom(exactCellWallDist(m, g, fvp, needWallN ? &wallNormal : nullptr));
                     else
-                        y_.copyFrom(cellWallDist(m, g, fvp, ctl_.iddes ? &wallOrigin : nullptr));   // wall distance (SST F1/F2/F3; SA dTilda)
+                        y_.copyFrom(cellWallDist(m, g, fvp, ctl_.iddes ? &wallOrigin : nullptr,
+                                                 needWallN ? &wallNormal : nullptr));   // wall distance (SST F1/F2/F3; SA dTilda)
+                    if (needWallN && wallNormal.size() == static_cast<std::size_t>(nC_))
+                    {
+                        std::vector<scalar> packed(3*static_cast<std::size_t>(nC_));
+                        for (label c = 0; c < nC_; ++c)
+                        {
+                            packed[c]            = wallNormal[c].x;
+                            packed[nC_ + c]      = wallNormal[c].y;
+                            packed[2*nC_ + c]    = wallNormal[c].z;
+                        }
+                        wallN_.copyFrom(packed);
+                    }
                     if (ctl_.iddes)   // IDDES filter widths (maxDeltaxyz + wall-normal spacing), uploaded once at setup
                     {
                         const std::vector<scalar> hmax = cellMaxDeltaXYZ(m);
@@ -416,8 +454,8 @@ namespace brae {
         {
             DeviceBuffer<scalar> gradU;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-            if (ctl_.wale) deviceWaleNut(nC_, gradU, dm.V, ctl_.waleCoeffs, dnut_);
-            else           deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);   // nut = Ck*delta*sqrt(k_sgs)
+            if (ctl_.wale) deviceWaleNut(nC_, gradU, dm.V, ctl_.waleCoeffs, dnut_, &lesDelta_);
+            else           deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_, &lesDelta_);   // nut = Ck*delta*sqrt(k_sgs)
             deviceAlphat(th_, dnut_, tc_);                                    // EddyDiffusivity::correctNut() tail
             return;
         }
@@ -457,9 +495,89 @@ namespace brae {
         deviceAlphat(th_, dnut_, tc_);
     }
 
+    void DeviceSimpleSolver::setMaxwellSigma(const std::vector<GeometricField<scalar>>& sigma,
+                                            const std::vector<FvPatch>& fvp,
+                                            const FvGeometry& g)
+    {
+        if (sigma.size() != 6)
+            throw std::runtime_error("brae: setMaxwellSigma needs the six components of sigma.");
+        for (int k = 0; k < 6; ++k)
+        {
+            sig_[k].copyFrom(sigma[k].internal);
+            dbSig_[k] = buildDeviceBoundary(sigma[k], fvp, g);
+        }
+    }
+
+    // OF laminarModels::Maxwell::correct():
+    //
+    //   P = twoSymm(sigma & gradU) - nuM/lambda*twoSymm(gradU)
+    //   ddt(sigma) + div(phi, sigma) + Sp(1/lambda, sigma) == P
+    //
+    // Six scalar transports sharing one convection matrix and coupled only through the explicit P --
+    // OF's fvSymmTensorMatrix is segregated in exactly the same way, so this is the same solve, not an
+    // approximation of it. No laplacian: the stress equation has no diffusion term at all.
+    void DeviceSimpleSolver::correctMaxwell()
+    {
+        const DeviceMesh& dm = dm_;
+        if (!sig_[0].size())
+            throw std::runtime_error(
+                "brae: laminar model Maxwell selected but the sigma field was never handed to the solver. "
+                "The viscoelastic stress is a TRANSPORTED field with its own initial condition; running "
+                "without it would silently solve a Newtonian fluid.");
+
+        DeviceBuffer<scalar> gradU;
+        deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+        if (ctl_.gradULimitK > 0.0)
+            deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK,
+                                 hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+
+        const scalar rLambda = scalar(1)/ctl_.maxwellLambda;
+        DeviceBuffer<scalar> P[6];
+        deviceMaxwellP(nC_, sig_, gradU, ctl_.maxwellNuM, rLambda, P);
+
+        // div(phi,sigma) is `Gauss vanAlbada` in both tutorials: the NVDTVD ratio built from
+        // magSqr(sigma) (OF's limitFuncs::magSqr for a non-scalar type), so ONE limiter per face serves
+        // all six components -- which is also why the limiter field is built once, out here.
+        DeviceBuffer<scalar> magSig, mgx, mgy, mgz, magBnd;
+        const bool vanAlbada = ctl_.divSigmaVanAlbada;
+        if (vanAlbada)
+        {
+            deviceSymmMagSqr(nC_, sig_, magSig);
+            deviceBCValue(dbExtrap_, magSig, magBnd);
+            deviceGaussGrad(dm, magSig, magBnd, mgx, mgy, mgz);
+        }
+        const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
+        DeviceBuffer<scalar> zeroD(std::vector<scalar>(static_cast<std::size_t>(nC_), scalar(0)));
+        DeviceBuffer<scalar> divU;
+        deviceDiv(dm, phiInt_, phiBnd_, divU);
+        for (int k = 0; k < 6; ++k)
+        {
+            const ScalarDdt sDdt{ ddtc, &sigOld_[k],
+                                  sigOld2_[k].size() ? &sigOld2_[k] : nullptr,
+                                  ddtc.cn ? &sigddt0_[k] : nullptr };
+            deviceSolveScalarTransport(
+                dm, dbSig_[k], sig_[k], "sigma", zeroD, phiInt_, phiBnd_, divU,
+                /*bounded=*/false, /*limited=*/vanAlbada, /*linearUpwind=*/false, /*nonOrth=*/false,
+                /*twoByk=*/scalar(0),   // 0 selects vanAlbada in the shared limiter kernel
+                ctl_.relaxSigma, ctl_.keTol(), ctl_.keRelTol(), ctl_.bicgCheckEvery, /*useGS=*/ctl_.gsSigma,
+                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src)
+                { deviceMaxwellReaction(dm.V, rLambda, P[k], diag, src); },
+                nullptr, nullptr, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, sDdt,
+                nullptr, scalar(0), /*boundPositive=*/false,   // sigma is NOT positive-definite: it has negative components
+                /*fvoSetMask=*/nullptr, /*fvoSetVal=*/nullptr,
+                // the shared magSqr(sigma) limiter -- one per face for all six components (OF limitFuncs)
+                vanAlbada ? &magSig : nullptr, vanAlbada ? &mgx : nullptr,
+                vanAlbada ? &mgy : nullptr, vanAlbada ? &mgz : nullptr);
+        }
+    }
+
     void DeviceSimpleSolver::correctTurbulence()
     {
         const DeviceMesh& dm = dm_;
+        // OF calls turbulence->correct() every outer corrector whatever the model is, and for a laminar
+        // Maxwell fluid THAT is the stress transport -- there is no nut and no k. It runs before the
+        // turbulenceOn gate below, which is a RAS/LES switch and has nothing to say about a material law.
+        if (ctl_.maxwell) { correctMaxwell(); return; }
         clearTurbulenceReport();   // OF-style report: collect this step's turbulence solves (Solving for k/omega/...)
         // OF RASModel `turbulence off` -> correct() returns before anything is solved or updated, so k,
         // epsilon/omega and nut stay at the values they were read with and momentum keeps using them
@@ -493,8 +611,8 @@ namespace brae {
         {              // transport solve (report stays empty -> no "Solving for k/omega" lines), so no ddt(k/omega) either.
             DeviceBuffer<scalar> gradU;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-            if (ctl_.wale) deviceWaleNut(nC_, gradU, dm.V, ctl_.waleCoeffs, dnut_);
-            else           deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);
+            if (ctl_.wale) deviceWaleNut(nC_, gradU, dm.V, ctl_.waleCoeffs, dnut_, &lesDelta_);
+            else           deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_, &lesDelta_);
             return;
         }
         if (ctl_.turbulent)
@@ -511,7 +629,8 @@ namespace brae {
                                              ctl_.nu, ctl_.relaxK, ctl_.keTol(), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
-                                             ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
+                                             ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr, &lesDelta_,
+                                             wallN_.size() ? &wallN_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -533,7 +652,8 @@ namespace brae {
                                        ctl_.gradKLULimitK,   // linearUpwind's named grad(k|eps), not gradSchemes grad(k)
                                        // fvOptions scalarFixedValueConstraint (k / omega)
                                        fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
-                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);   // grad(k)/grad(omega) cellLimited (C2)
+                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,   // grad(k)/grad(omega) cellLimited (C2)
+                                       &lesDelta_);   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
@@ -606,6 +726,7 @@ namespace brae {
                                                   compressible_ ? &rhoBnd_ : nullptr);   // phiBnd_ is a MASS flux
         if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
+        if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // axisymmetric: the rotated cell velocity
         // totalPressure p: recompute refValue = p0 - 0.5*neg(phi)|U_b|^2 from the boundary velocity (deviceBCValue
         // reflects the just-updated U BCs above, e.g. pressureInletOutletVelocity) + the boundary flux.
         if (hasTotalP_)
@@ -715,6 +836,13 @@ namespace brae {
         else
             deviceCopy(nuEff, dnut_);
         deviceAxpy(1.0, nuConst_, nuEff);   // + nu (incompressible) / + mu (compressible, nuConst_ = th_.mu)
+        // Maxwell: the implicit laplacian coefficient is nu0 = nu + nuM (Maxwell.H:98). nut is identically
+        // zero here -- it is a laminar model -- so this is the whole of the difference.
+        if (ctl_.maxwell)
+        {
+            DeviceBuffer<scalar> ones1(std::vector<scalar>(static_cast<std::size_t>(nC_), scalar(1)));
+            deviceAxpy(ctl_.maxwellNuM, ones1, nuEff);
+        }
         // Stage harness: the ASSEMBLED momentum diffusivity, which is what OF's turbulence->muEff() returns.
         // Dumped here rather than at the predictor because this is where it exists; comparing nuConst_
         // (the laminar part alone) against OF's muEff is not a comparison, it is two different quantities.
@@ -830,8 +958,40 @@ namespace brae {
         DeviceBuffer<scalar> ddrX, ddrY, ddrZ;
         // ...with the case's NAMED grad(U) scheme, not a bare Gauss one: OF's divDevReff calls
         // fvc::grad(U) and gets whatever gradSchemes says. See the note on the parameter.
-        deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEff, nuEffBnd, ddrX, ddrY, ddrZ,
+        // MAXWELL splits the coefficient in two. OF's Maxwell::divDevRhoReff is
+        //     div(nuM*grad(U)) + div(sigma) - div(nu*dev2(T(grad(U)))) - laplacian(nu + nuM, U)
+        // so the dev2 transpose term carries the MOLECULAR nu while the implicit laplacian carries
+        // nu0 = nu + nuM. Every other model has one nuEff for both, which is why this is the one place
+        // the two are told apart.
+        const DeviceBuffer<scalar>& ddrNuCell = ctl_.maxwell ? nuConst_ : nuEff;
+        DeviceBuffer<scalar> ddrNuBnd;
+        if (ctl_.maxwell) deviceBCValue(dbExtrap_, nuConst_, ddrNuBnd);
+        deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], ddrNuCell, ctl_.maxwell ? ddrNuBnd : nuEffBnd,
+                         ddrX, ddrY, ddrZ,
                          hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr, ctl_.gradULimitK);
+        // ...and the two terms only Maxwell has. Both are V*fvc::div of a tensor, added to the same
+        // source the dev2 term feeds, with the same sign OF gives them (divDevRhoReff is subtracted from
+        // the momentum equation, and brae's ddr carries that sign already -- see the loop below).
+        if (ctl_.maxwell)
+        {
+            DeviceBuffer<scalar> gU;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            if (ctl_.gradULimitK > 0.0)
+                deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gU, ctl_.gradULimitK,
+                                     hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+            DeviceBuffer<scalar> mX, mY, mZ;
+            deviceDivNuMGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gU, ctl_.maxwellNuM, mX, mY, mZ);
+            deviceAxpy(-1.0, mX, ddrX);   // ddr holds -divDevReff's dev2 half; div(nuM*grad U) enters with the opposite sign
+            deviceAxpy(-1.0, mY, ddrY);
+            deviceAxpy(-1.0, mZ, ddrZ);
+            DeviceBuffer<scalar> sBnd[6];
+            for (int q = 0; q < 6; ++q) deviceBCValue(dbSig_[q], sig_[q], sBnd[q]);
+            DeviceBuffer<scalar> sX, sY, sZ;
+            deviceDivSymmTensor(dm, sig_, sBnd, sX, sY, sZ);
+            deviceAxpy(-1.0, sX, ddrX);
+            deviceAxpy(-1.0, sY, ddrY);
+            deviceAxpy(-1.0, sZ, ddrZ);
+        }
         DeviceBuffer<scalar>* ddr[3] = { &ddrX, &ddrY, &ddrZ };
         if (stageDumpActive() && stageDumpFirstOnly("ddr")) stageDump3("stage_divDevReff", ddrX, ddrY, ddrZ);
 
@@ -846,7 +1006,24 @@ namespace brae {
         // upwind matrix (with linearUpwind's deferred correction added separately below). Same
         // coefficients either way -- only the interpolation weight differs, exactly as OF's
         // gaussConvectionScheme::fvmDiv takes weights from whichever scheme was named.
+        //
+        // `Gauss limitedLinearV k` is the third case and the only one that needs a field: OF's
+        // LimitedScheme builds a per-face limiter from fvc::grad(U) and blends the central and upwind
+        // weights IMPLICITLY (limitedSurfaceInterpolationScheme::weights), so the blend belongs in the
+        // matrix, not in a deferred source. The gradient is the one gradSchemes `grad(U)` names --
+        // fvc::grad(lPhi) inside calcLimiter -- hence the same cellLimited treatment the other
+        // grad(U) consumers get. Uk_ still holds the old velocity here (nothing is solved until the kk
+        // loop below), which is what OF interpolates too.
         if (ctl_.divULinear) deviceDivCentralCoeffs(dm, phiInt_, mDiag, mUp, mLo);
+        else if (ctl_.divULimitedV)
+        {
+            DeviceBuffer<scalar> gradUlv;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUlv, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            if (ctl_.gradULimitK > 0.0)
+                deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUlv, ctl_.gradULimitK,
+                                     hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+            deviceDivLimitedVCoeffs(dm, phiInt_, Uk_, gradUlv, ctl_.divUTwoBykV, mDiag, mUp, mLo);
+        }
         else                 deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
         deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
         deviceAxpy(-1.0,lD,mDiag);
@@ -1073,10 +1250,10 @@ namespace brae {
             if (ctl_.gradULimitK > 0.0)
                 deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK,
                                      hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
-            // delta = the LES filter width the turbulence model itself uses. brae runs cubeRootVol
-            // (V^(1/3)); a case naming another delta already gets the model's own warning at set-up, and
-            // the scheme must agree with the model rather than pick a second, different width.
-            deviceDesHybridSigma(nC_, gradU, dm.V, dnut_, ctl_.nu, ctl_.desCoeffs, desSigma);
+            // delta = the LES filter width the turbulence model itself uses -- lesDelta_ when the case
+            // named one (maxDeltaxyz), else empty and every kernel falls back to cubeRootVol (V^(1/3)).
+            // The scheme must agree with the model rather than pick a second, different width.
+            deviceDesHybridSigma(nC_, gradU, dm.V, dnut_, ctl_.nu, ctl_.desCoeffs, desSigma, &lesDelta_);
         }
         if (ctl_.linearUpwindV) deviceLinearUpwindVCorr(dm, phiInt_, LUx, LUy, LUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
         for (int kk = 0; kk < 3; ++kk)   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136x SLOWER, reverted)
@@ -1172,6 +1349,11 @@ namespace brae {
                 ? deviceLduViewAmi(dm,diagC,mUp,mLo, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(),
                                    ami_.rotational ? ami_.ifCoeffC[kk].data() : ami_.ifCoeff.data())
                 : deviceLduView(dm,diagC,mUp,mLo);
+            // OF UEqn.H: `if (pimple.momentumPredictor()) { solve(UEqn == -fvc::grad(p)); }`. Everything
+            // above this point is the matrix ASSEMBLY, which rAU/HbyA need either way; only the solve is
+            // conditional. Skipping it leaves U exactly as the previous corrector left it, which is what
+            // the case asked for.
+            if (!ctl_.momentumPredictor) continue;
             const scalar nf = deviceNormFactor(mv, Uk_[kk], b, ones_);          // OF residualControl normalisation
             // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver (smoothSolver
             // /GaussSeidel for motorBike). Route through deviceSymGaussSeidel when fvSolution asks for it (robust on
@@ -1182,7 +1364,7 @@ namespace brae {
                 ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf);
             else
             {
-                uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, ctl_.bicgCheckEvery);
+                uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), ctl_.uMaxIter(), ctl_.bicgCheckEvery, ctl_.uMinIter());
                 ur = uperf.initialResidual;
             }
             // keep all 3 components + their final residual / nIter (OF prints Solving for Ux/Uy/Uz each iteration)
@@ -1341,12 +1523,39 @@ namespace brae {
             stageDump("stage_ami_HbyAy", HbyA[1]);
             stageDump("stage_ami_rAU", rAU);
         }
+        // OF's U.correctBoundaryConditions() -- which solve() runs at the end of the momentum predictor
+        // and pEqn.H runs again after the velocity correction. It matters for a WEDGE because its value
+        // is the ROTATED cell velocity: brae holds that as a mixed refValue computed from U, so a
+        // refValue left over from before the predictor is a value for the wrong U. The error is
+        // d*(U_old - U_new) with d = 0.5*(1 - cos 2th) ~ 1.9e-3, which on movingCone's first step (U
+        // starting from zero) put a spurious 4e-11 through every one of the 1900 wedge faces -- summing
+        // to a leak the pressure equation answered with an equal, entirely fictitious inflow at `left`.
+        if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         DeviceBuffer<scalar> hxb,hyb,hzb;
         deviceBCValue(dbU_.comp[0],HbyA[0],hxb);
         deviceBCValue(dbU_.comp[1],HbyA[1],hyb);
         deviceBCValue(dbU_.comp[2],HbyA[2],hzb);
+        // ...and on a wedge the value is HbyA's OWN rotated cell value: the blend above went through a
+        // refValue built from U, which is a different field. OF's H() inherits psi's BC types and rotates
+        // itself, so this is what pEqn.H's fvc::flux(HbyA) sees on the wedge planes -- and it makes that
+        // flux identically zero, as the constraint requires.
+        if (hasWedge_) deviceWedgeFaceValue(dbU_, HbyA[0], HbyA[1], HbyA[2], hxb, hyb, hzb);
         // constrainHbyA at mixed velocity faces (OF resets phiHbyA_b = U_b.Sf at fixesValue patches): use U_b not HbyA_b.
         if (hasMixed_) deviceConstrainMixedHbyA(dbU_, Uk_[0], Uk_[1], Uk_[2], hxb, hyb, hzb);
+        // ...and the reverse at inletOutlet, which OF marks assignable and therefore does NOT constrain:
+        // HbyA_b there is the zero-gradient value it was born with, NOT the clamped inlet velocity. The
+        // evaluation above went through U's descriptor, which on a BACKFLOW face returns inletValue (0),
+        // so phiHbyA_b would be zero on exactly the faces where OF lets the flux through. Measured on
+        // pimpleFoam/RAS/TJunction, whose outlet1 reverses at step 2: p in the boundary-adjacent cell was
+        // 0.54 low and the backflow velocity 3x OF's (U L2 1.0e-01).
+        if (hasInletOutletU_)
+        {
+            DeviceBuffer<scalar> ex, ey, ez;
+            deviceBCValue(dbExtrap_, HbyA[0], ex);
+            deviceBCValue(dbExtrap_, HbyA[1], ey);
+            deviceBCValue(dbExtrap_, HbyA[2], ez);
+            deviceExtrapolateIOHbyA(dbU_, ex, ey, ez, hxb, hyb, hzb);
+        }
         // slip/symmetry: OF constrainHbyA sets HbyA_b = U_b (= U.boundaryField, the slipped velocity) at every
         // non-assignable patch, NOT the projected HbyA. Project the cell U (HbyA_b = U_c - n(n.U_c) = U_b), matching
         // OF byte-for-byte and the mixed path above (both use U_b). Wall flux is still exactly 0 (normal removed).
@@ -1806,7 +2015,7 @@ namespace brae {
                     ? deviceLduViewCyclic(dm,diagCp_,pU_,pL_, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
                     : deviceLduViewAmi(dm,diagCp_,pU_,pL_, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
                 const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
-                pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), 3000);
+                pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.pMinIter());
             }
             else if (compressible_ && ctl_.transonic)
             {
@@ -1818,13 +2027,13 @@ namespace brae {
                 // solver brae already uses for every asymmetric scalar transport.
                 const DeviceLduView pv = deviceLduView(dm, diagCp_, pU_, pL_);
                 const scalar nfp = deviceNormFactor(pv, dp_, bp_, ones_);
-                pp = deviceJacobiBiCGStab(pv, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), 3000, ctl_.pcgCheckEvery);
+                pp = deviceJacobiBiCGStab(pv, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.pcgCheckEvery, ctl_.pMinIter());
             }
             else
             {
                 const scalar nfp = deviceNormFactor(deviceLduView(dm,diagCp_,pU_,pL_), dp_, bp_, ones_);
                 amgGalerkin(amg_, diagCp_, pU_, pL_);                                      // re-coarsen the pressure matrix
-                pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pL_), amg_, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), 3000, ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling);
+                pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pL_), amg_, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling, ctl_.pMinIter());
             }
             if (nonOrthPass == 0) pp0 = pp;   // SIMPLE residualControl uses the FIRST pass's initial residual (OF convention)
         }
@@ -1884,6 +2093,7 @@ namespace brae {
             deviceCorrector(HbyA[kk], rAtU, *gn[kk], Un);
             Uk_[kk]=std::move(Un);
         }
+        if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // pEqn.H's U.correctBoundaryConditions()
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);
@@ -2225,6 +2435,14 @@ namespace brae {
             if (two && Uold_[k].size()) deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (once t-1 exists)
             deviceCopy(Uold_[k], Uk_[k]);                                  // t-1 <- current
         }
+        if (ctl_.maxwell && sig_[0].size())   // fvm::ddt(sigma): the stress carries its own old levels
+        {
+            for (int k = 0; k < 6; ++k)
+            {
+                if (two && sigOld_[k].size()) deviceCopy(sigOld2_[k], sigOld_[k]);
+                deviceCopy(sigOld_[k], sig_[k]);
+            }
+        }
         if (ctl_.turbulent && !ctl_.les)   // turbulence old-time levels for fvm::ddt(k/eps): dk_ = k (or nuTilda), de_ = epsilon|omega. Pure LES nut is algebraic -> no ddt.
         {
             if (two && kOld_.size()) deviceCopy(kOld2_, kOld_);
@@ -2246,6 +2464,8 @@ namespace brae {
         {         // deltaT0 = the PREVIOUS deltaT (deltaT_ not yet overwritten); no-op on the first step (no oldTime.oldTime).
             const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT, deltaT_, ocCoeff_, cnWarm_);
             for (int k = 0; k < 3; ++k) deviceFvmDdtUpdateDdt0(ddtc, Uold_[k], Uold2_[k], Uddt0_[k]);
+            if (ctl_.maxwell && sig_[0].size())
+                for (int k = 0; k < 6; ++k) deviceFvmDdtUpdateDdt0(ddtc, sigOld_[k], sigOld2_[k], sigddt0_[k]);
             if (ctl_.turbulent && !ctl_.les)
             {
                 deviceFvmDdtUpdateDdt0(ddtc, kOld_, kOld2_, kddt0_);

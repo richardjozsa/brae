@@ -40,6 +40,8 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "ami_interface.cuh"
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -55,11 +57,14 @@ constexpr scalar ACMI_TOLERANCE = 1e-10;
 // Scale the coupled/non-overlap face areas of every cyclicACMI interface in `amis`.
 // Call between FvGeometry::buildFaceGeometry and FvGeometry::buildCellGeometry. A no-op (and no
 // scaling flag set) when there is no ACMI interface, so non-ACMI meshes are untouched.
+// `t` is the current time, for the optional per-patch `scale` Function1 (OF cyclicACMIPolyPatch's
+// srcScalePtr_). With no scale entry the value is 1 and this is the geometric mask alone.
 inline void applyACMIAreaScaling(
     const PrimitiveMesh& m,
     FvGeometry& g,
     const std::vector<FvPatch>& fvp,
-    const std::vector<AMIInterface>& amis)
+    const std::vector<AMIInterface>& amis,
+    scalar t = 0)
 {
     std::vector<std::pair<label, scalar>> faceScale;
 
@@ -95,6 +100,14 @@ inline void applyACMIAreaScaling(
                 "brae: cyclicACMI '" + cpl.name + "' mask has " + std::to_string(ai.mask.size()) +
                 " entries for " + std::to_string(cpl.size) + " faces.");
 
+        // OF cyclicACMIPolyPatch::updateAreas:
+        //     scaledMask = min(1 - tol, max(tol, scale(t)*mask))
+        // evaluated once per patch per time step. Note the clamp is applied to the SCALED mask, so a
+        // scale of 0 leaves tol (not 0) coupled and 1 - tol blocked -- the interface closes but the
+        // patch never becomes degenerate.
+        const PatchInfo& pinfo = m.patches()[ai.patch];
+        const scalar sc = pinfo.acmiScale.empty() ? scalar(1) : pinfo.acmiScale.value(t);
+
         for (label i = 0; i < cpl.size; ++i)
         {
             const label fc = cpl.start + i;
@@ -112,13 +125,28 @@ inline void applyACMIAreaScaling(
                     std::to_string(mag(d)) + "). ACMI splits ONE face's area between the two patches, so "
                     "they must be the same face in the same order.");
 
-            const scalar mk = ai.mask[i];
+            const scalar mk = pinfo.acmiScale.empty()
+                            ? ai.mask[i]
+                            : std::min(scalar(1) - ACMI_TOLERANCE,
+                                       std::max(ACMI_TOLERANCE, sc*ai.mask[i]));
             faceScale.emplace_back(fc, std::max(ACMI_TOLERANCE, mk));
             faceScale.emplace_back(
                 fw, scalar(1) - std::min(std::max(mk, ACMI_TOLERANCE), scalar(1) - ACMI_TOLERANCE));
         }
     }
 
+    if (std::getenv("BRAE_AMI_REPORT"))
+        for (const AMIInterface& ai : amis)
+        {
+            if (!ai.acmi) continue;
+            scalar lo = 1e300, hi = -1e300, sum = 0;
+            for (const scalar mk : ai.mask) { lo = std::min(lo, mk); hi = std::max(hi, mk); sum += mk; }
+            std::fprintf(stderr, "ACMI: patch:%s mask min:%g max:%g average:%g  scale(t):%g\n",
+                         fvp[ai.patch].name.c_str(), (double)lo, (double)hi,
+                         (double)(ai.mask.empty() ? 0 : sum/(scalar)ai.mask.size()),
+                         (double)(m.patches()[ai.patch].acmiScale.empty()
+                                  ? scalar(1) : m.patches()[ai.patch].acmiScale.value(t)));
+        }
     if (!faceScale.empty()) g.applyAreaScaling(faceScale);
 }
 
@@ -160,21 +188,32 @@ inline bool meshHasACMI(const PrimitiveMesh& m)
 inline void rebuildGeometryWithACMI(
     const PrimitiveMesh& m,
     FvGeometry& g,
-    const std::vector<FvPatch>& fvp)
+    const std::vector<FvPatch>& fvp,
+    scalar t = 0)
 {
     g.build(m);
     if (!meshHasACMI(m)) return;
     const std::vector<AMIInterface> raw = buildAMIInterfaces(m, g, fvp);
     g.buildFaceGeometry(m);
-    applyACMIAreaScaling(m, g, fvp, raw);
+    applyACMIAreaScaling(m, g, fvp, raw, t);
     g.buildCellGeometry(m);
+}
+
+// True if any cyclicACMI carries a `scale` -- the interface then changes with TIME even on a mesh that
+// never moves, so the geometry has to be rebuilt every step (TJunctionSwitching is static).
+inline bool hasACMITimeScale(const PrimitiveMesh& m)
+{
+    for (const PatchInfo& p : m.patches())
+        if (p.type == "cyclicACMI" && !p.acmiScale.empty()) return true;
+    return false;
 }
 
 inline void buildGeometryPatchesAndAMI(
     const PrimitiveMesh& m,
     FvGeometry& g,
     std::vector<FvPatch>& fvp,
-    std::vector<AMIInterface>& amis)
+    std::vector<AMIInterface>& amis,
+    scalar t = 0)
 {
     g.build(m);
     fvp = buildPatches(m, g);
@@ -191,7 +230,7 @@ inline void buildGeometryPatchesAndAMI(
 
     // Split the duplicated faces' areas, then recompute cell geometry from the scaled areas.
     g.buildFaceGeometry(m);
-    applyACMIAreaScaling(m, g, fvp, raw);   // stashes the pre-scale areas in g for the weights below
+    applyACMIAreaScaling(m, g, fvp, raw, t);   // stashes the pre-scale areas in g for the weights below
     g.buildCellGeometry(m);
 
     // Pass 2: everything downstream of the corrected cell centres -- patch deltaCoeffs, and the AMI's

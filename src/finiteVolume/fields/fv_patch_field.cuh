@@ -5,6 +5,7 @@
 // etc.) come with Phase 3 (assembly). Unsupported types throw, no silent fallback.
 #include "cf_types.cuh"
 #include "fv_patch.cuh"
+#include "wedge_patch.cuh"   // the axisymmetric constraint patch's rotation tensors
 #include "foam_field_reader.cuh"
 #include "cf_pstream.cuh"
 #include "foam_dict.cuh"   // isCoupledInterfaceType
@@ -38,6 +39,11 @@ public:
     // internal cell, valueIC=1, gradIC=0); 1 = fixedValue (fixedValue/noSlip: value=ref, valueIC=0,
     // gradIC=-deltaCoeffs); 2 = calculated (value=ref but extrapolated coeffs).
     virtual int bcCategory() const { return 0; }
+    // wedge (axisymmetric constraint): the HALF-angle and FULL-angle rotation tensors, or null on every
+    // other patch type. The device builder reads them to set the per-component valueFraction and to
+    // recompute the rotated value each step.
+    virtual const tensor* wedgeFaceT() const { return nullptr; }
+    virtual const tensor* wedgeCellT() const { return nullptr; }
     // flowRateInletVelocity: the dict flow rate, so the solver can recompute avgU against the live rho.
     virtual scalar flowRateValue() const { return 0.0; }
 
@@ -400,6 +406,55 @@ template <> inline void SymmetryPlanePatchField<vector>::evaluate(const std::vec
         this->value_[i] = v - n * dot(n, v);
     }
 }
+
+// wedge (OF wedgeFvPatchField) -- the AXISYMMETRIC constraint patch. The mesh is one cell thick in the
+// azimuthal direction and the two bounding planes are related by a rotation about the symmetry axis, so
+// the patch value is the CELL value ROTATED onto the patch plane:
+//
+//     value                  = transform(faceT, patchInternalField)
+//     snGrad                 = (transform(cellT, pif) - pif)*0.5*deltaCoeffs
+//     snGradTransformDiag_k  = 0.5*(1 - cellT_kk)                       [per component]
+//     valueInternalCoeffs_k  = 1 - snGradTransformDiag_k
+//     gradientInternalCoeffs_k = -deltaCoeffs*snGradTransformDiag_k
+//
+// FOR A SCALAR IT IS EXACTLY zeroGradient, and that is not an approximation: OF specialises
+// wedgeFvPatchField<scalar> to return snGrad 0, value = pif and snGradTransformDiag 0 (a scalar has no
+// direction to rotate). Only the VECTOR case carries the rotation -- which is why the coefficients above
+// are per-component SCALARS with the cross-component coupling living entirely in the value.
+template <typename T>
+class WedgePatchField : public fvPatchField<T>
+{
+public:
+    WedgePatchField(const FvPatch& p, const tensor& faceT, const tensor& cellT)
+        : fvPatchField<T>(p), faceT_(faceT), cellT_(cellT) {}
+    void evaluate(const std::vector<T>& internal) override
+    {
+        this->value_ = this->patchInternalField(internal);   // scalar: zeroGradient, exactly as OF
+    }
+    bool fixesValue() const override { return false; }
+    int  bcCategory() const override { return 0; }           // scalar: the device's zeroGradient
+    const tensor* wedgeFaceT() const override { return &faceT_; }
+    const tensor* wedgeCellT() const override { return &cellT_; }
+
+protected:
+    tensor faceT_, cellT_;
+};
+
+// vector: the rotation is real. value = faceT & U_cell.
+template <> inline void WedgePatchField<vector>::evaluate(const std::vector<vector>& internal)
+{
+    for (label i = 0; i < this->patch_.size; ++i)
+    {
+        const vector& v = internal[this->patch_.faceCells[i]];
+        this->value_[i] = vector{faceT_.xx*v.x + faceT_.xy*v.y + faceT_.xz*v.z,
+                                 faceT_.yx*v.x + faceT_.yy*v.y + faceT_.yz*v.z,
+                                 faceT_.zx*v.x + faceT_.zy*v.y + faceT_.zz*v.z};
+    }
+}
+// ...and a vector wedge is a MIXED (Robin) boundary per component, with valueFraction
+// d_k = 0.5*(1 - cellT_kk) -- which reproduces OF's valueInternalCoeffs/gradientInternalCoeffs exactly
+// (mixed gives 1 - vf and -deltaCoeffs*vf). Category 5 is the device's mixed slot.
+template <> inline int WedgePatchField<vector>::bcCategory() const { return 5; }
 
 // Shared storage + read-and-hold value() for the OF calculated / inletOutlet / outletInlet /
 // pressureInletOutletVelocity / mixed family, they differ ONLY in which device category (bcCategory) claims the
@@ -893,6 +948,16 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")
         return std::make_unique<SymmetryPlanePatchField<T>>(p);  // slip = OF basicSymmetry
+    if (d.type == "wedge")   // axisymmetric constraint: the geometry IS the boundary condition
+    {
+        const WedgeGeometry w = wedgeGeometry(p);
+        return std::make_unique<WedgePatchField<T>>(p, w.faceT, w.cellT);
+    }
+    // cellMotion (OF cellMotionFvPatchField): the CELL-motion counterpart of a prescribed point motion.
+    // It holds the value the motion solver put there, so as a boundary condition it is a fixedValue --
+    // which is what OF's cellMotionBoundaryTypes maps a fixed point motion to. Appears in a written
+    // cellMotionU<Cmpt> field, which a restart reads back.
+    if (d.type == "cellMotion")      return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "calculated")      return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // atmBoundaryLayerInlet{Velocity,K,Epsilon,Omega} (OpenFOAM atmBoundaryLayer.C, v2412): Richards-Hoxey log-law
     // profile evaluated per boundary face from the face-centre height z = Cf.zDir - d, a steady fixedValue. Params come

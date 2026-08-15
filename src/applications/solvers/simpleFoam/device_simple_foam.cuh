@@ -174,6 +174,21 @@ public:
     // the correction deliberately turned off.
     void setDdtCorr(bool on) { ddtCorr_ = on; }
 
+    // Maxwell: hand over the six components of the sigma field the driver read from 0/sigma (as six
+    // scalar fields, which is how they are solved). Must be called before the first step when
+    // `laminar { model Maxwell; }` is selected; the solver refuses to run the model without it.
+    void setMaxwellSigma(const std::vector<GeometricField<scalar>>& sigma, const std::vector<FvPatch>& fvp,
+                         const FvGeometry& g);
+    // ...and read it back for writing (six components, cell values).
+    std::vector<std::vector<scalar>> maxwellSigma() const
+    {
+        std::vector<std::vector<scalar>> out;
+        for (int k = 0; k < 6; ++k) out.push_back(sig_[k].host());
+        return out;
+    }
+    // The viscoelastic stress transport, OF Maxwell::correct(). Called from correctTurbulence().
+    void correctMaxwell();
+
     // Overwrite one U patch's refValue -- the device half of movingWallVelocity's updateCoeffs.
     // OF does `vectorField::operator=(Uwall())` on the patch field; this is the same assignment, on the
     // buffers the momentum assembly reads.
@@ -624,6 +639,20 @@ private:
     AMGData amg_;
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_, dk_, de_, dnut_, y_;   // y_ = cell wall distance (SST/SA)
     DeviceBuffer<scalar> hmax_;   // per-cell maxDeltaxyz (IDDES filter width); built only when ctl_.iddes
+    // The LES filter width the case's `delta` entry selects, when it is not cubeRootVol. Empty otherwise,
+    // and every consumer then falls back to cbrt(V) in its own kernel -- so a case that says nothing is
+    // byte-for-byte unchanged. Shared by the sub-grid model, the DES length scale AND the convection
+    // scheme, which must all agree about the resolved scale.
+    DeviceBuffer<scalar> lesDelta_;
+    // Maxwell viscoelastic stress: the six components of sigma with their own boundaries, plus the
+    // per-outer-corrector production. Empty on every other case, and every Maxwell branch is gated on
+    // ctl_.maxwell, so a Newtonian run is untouched.
+    DeviceBuffer<scalar> sig_[6];
+    DeviceBoundary       dbSig_[6];
+    DeviceBuffer<scalar> sigOld_[6], sigOld2_[6], sigddt0_[6];   // fvm::ddt(sigma) old levels (backward/CN)
+    // OF wallDist::n() packed 3 x nC: the nearest wall face's OUTWARD unit normal. Built only for
+    // ZDES2020 shielding, which is the only consumer; empty otherwise.
+    DeviceBuffer<scalar> wallN_;
     DeviceBuffer<scalar> hwn_;    // per-cell wall-normal grid spacing (IDDES delta 3rd term); built only when ctl_.iddes
     // Transient (PIMPLE) state: ddt scheme + time steps + old-time velocity levels (U.oldTime()[.oldTime()]), rotated by
     // advanceTime(). steadyState + empty old-time buffers in the default steady SIMPLE path, where ddt is a no-op.
@@ -733,7 +762,12 @@ private:
     DeviceBuffer<scalar> wfNu_;       // nu = mu_b/rho_b gathered onto wall faces, for omegaWallFunction/G0
     DeviceBuffer<scalar> nutBndAll_;  // nut at boundary faces (wall-function value on walls), for alphat_b
     DeviceBuffer<scalar> prtBnd_;     // per-face Prt: the alphatWallFunction's on its patches, the model's elsewhere
-    bool   hasMixed_ = false;                                  // any freestreamVelocity/Pressure (mixed) patch present
+    // any inletOutlet U patch present -> HbyA must keep its extrapolated boundary there (constrainHbyA
+    // skips assignable patches, and inletOutlet is one). Costs three zero-gradient evaluations per
+    // corrector, so it is gated on the case actually having such a patch.
+    bool   hasInletOutletU_ = false;
+    bool   hasMixed_ = false;
+    bool   hasWedge_ = false;   // any wedge (axisymmetric constraint) U patch -> per-step rotated value                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)
     bool   hasTotalP_ = false;                                 // any totalPressure p patch present (per-step refValue)

@@ -242,7 +242,32 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     else                 buf += c;
                 }
             }
-            bool foundDivU = false;   // require an EXPLICIT div(phi,U); brae does not resolve the divSchemes 'default'
+            // OF looks div(phi,U) up in divSchemes and falls back to the `default` entry when it is not
+            // listed (dictionary lookup with a default); `default none` is the idiom that says "there is
+            // no fallback, name every scheme", and there OF itself throws. brae refused BOTH alike, which
+            // turned an ordinary `default Gauss linear` case (laminar/cylinder2D) into a hard stop over a
+            // scheme it implements. Resolve the default the way OF does by synthesising the statement the
+            // file would have contained, so every branch below sees it as if it had been written out; the
+            // refusal survives for `none` and for no default at all.
+            {
+                bool explicitDivU = false;
+                std::string defaultDiv;
+                for (const Stmt& st : stmts)
+                {
+                    if (st.block != "divSchemes") continue;
+                    if (st.text.find("div(phi,U)") != std::string::npos) explicitDivU = true;
+                    std::size_t b = st.text.find_first_not_of(" \t\n\r");
+                    if (b == std::string::npos) continue;
+                    if (st.text.compare(b, 7, "default") == 0
+                        && (b + 7 >= st.text.size() || std::isspace((unsigned char)st.text[b + 7])))
+                        defaultDiv = st.text.substr(b + 7);
+                }
+                const std::size_t v = defaultDiv.find_first_not_of(" \t\n\r");
+                if (v != std::string::npos) defaultDiv = defaultDiv.substr(v);
+                if (!explicitDivU && !defaultDiv.empty() && defaultDiv.compare(0, 4, "none") != 0)
+                    stmts.push_back({"divSchemes", "div(phi,U) " + defaultDiv});
+            }
+            bool foundDivU = false;   // set by the div(phi,U) branch below (explicit, or resolved from `default`)
             bool warnedLeastSq = false, warnedCellMD = false;   // #14: warn-once on grad schemes brae approximates
             auto hasWord = [](const std::string& s, const std::string& w)   // whole-word match (so "uncorrected" != "corrected")
             {
@@ -404,7 +429,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                             throw std::runtime_error("brae: DEShybrid sigmaMin/sigmaMax must lie in [0,1] (OF checkValues).");
                         continue;   // the generic single-word checks below do not apply
                     }
-                    checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST", "linear"}, {"limitedLinear", "limitedLinearV"});
+                    checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST", "linear", "limitedLinearV"}, {"limitedLinear"});
                     if (ln.find("bounded") != std::string::npos)      ctl.bounded = true;
                     // Gauss LINEAR = central differencing: OF's `linear` scheme returns the plain
                     // geometric weights (linear.H:106), so fvmDiv builds lower=-w*phi, upper=lower+phi
@@ -415,6 +440,19 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (ln.find("linearUpwind") != std::string::npos) ctl.linearUpwind = true;   // linearUpwindV contains this -> upwind matrix + gradients
                     if (ln.find("linearUpwindV") != std::string::npos) ctl.linearUpwindV = true; // + OF vector direction limiter
                     if (ln.find("LUST") != std::string::npos)         ctl.lust = true;   // 0.75 linear + 0.25 linearUpwind
+                    // `Gauss limitedLinearV k`: the vector (NVDVTVDV) limiter. k is the number right after
+                    // the scheme word, and OF REFUSES k outside [0,1] (limitedLinearLimiter's ctor), so do
+                    // the same rather than clamp -- a k of 2 is a typo, not a request.
+                    if (divSchemeWord(ln) == "limitedLinearV")
+                    {
+                        ctl.divULimitedV = true;
+                        const std::size_t w = ln.find("limitedLinearV") + 14;
+                        const scalar k = std::strtod(ln.c_str() + w, nullptr);
+                        if (k < 0.0 || k > 1.0)
+                            throw std::runtime_error("brae: div(phi,U) limitedLinearV coefficient must lie in "
+                                                     "[0,1] (OF limitedLinearLimiter):\n  " + ln);
+                        ctl.divUTwoBykV = 2.0/std::max(k, scalar(1e-15));   // OF twoByk_ = 2/max(k_, SMALL)
+                    }
                     { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradULULimitK = g; }   // linearUpwind's named grad(U)
                 }
                 // grad(U) cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>): k is the first number after
@@ -548,9 +586,9 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                               key + " " + scheme + " -- brae interpolates linearly; only the `default` entry is enforced");
             }
             if (!schemesText.empty() && !foundDivU)
-                throw std::runtime_error("fvSchemes: no explicit div(phi,U) scheme. brae does not resolve the"
-                    " divSchemes 'default' for momentum convection (it would silently run first-order upwind)."
-                    " Add e.g. 'div(phi,U)  bounded Gauss linearUpwind grad(U);'.");
+                throw std::runtime_error("fvSchemes: no div(phi,U) scheme, and the divSchemes `default` is"
+                    " `none` or absent -- so there is nothing to resolve it to, exactly as OpenFOAM would"
+                    " report. Add e.g. 'div(phi,U)  bounded Gauss linearUpwind grad(U);'.");
 
             // What brae CONCLUDED, not what the file said. BRAE_SCHEME_DEBUG used to echo the raw input
             // line -- which is exactly the thing that was ambiguous: a one-line divSchemes looked correct

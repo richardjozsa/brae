@@ -26,6 +26,11 @@ struct DeviceBoundary
     DeviceBuffer<label>  mixedMask;         // 1 if the face is mixed/Robin (freestreamVelocity/Pressure): vf recomputed
     DeviceBuffer<label>  piovMask;          // 1 if the face is pressureInletOutletVelocity (bcType+refValue recomputed)
     DeviceBuffer<label>  symMask;            // 1 if the face is slip/symmetry (per-comp vf=|n_k|, ref recomputed each step)
+    // wedge (axisymmetric constraint): 1 on a wedge face, with that patch's HALF-angle rotation packed
+    // per face (9 per face, row-major). The valueFraction is geometry and set once; only refValue is
+    // recomputed each step, from the rotated cell velocity -- see deviceUpdateWedge.
+    DeviceBuffer<label>  wedgeMask;
+    DeviceBuffer<scalar> wedgeT;             // 9*n, faceT
     DeviceBuffer<label>  tpMask;             // 1 if the face is totalPressure (fixedValue-p, refValue recomputed each step)
     DeviceBuffer<scalar> valueFraction;     // per-face vf for mixed faces (deviceUpdateMixedFreestream); blends 0->1
     // fixedGradient's prescribed normal gradient, per face. ZERO for every other BC, which is what makes
@@ -141,6 +146,17 @@ void deviceUpdateMixedFreestream(DeviceVectorBoundary& dbU, DeviceBoundary& dbP,
 void deviceConstrainMixedHbyA(const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux,
                               const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                               DeviceBuffer<scalar>& hbx, DeviceBuffer<scalar>& hby, DeviceBuffer<scalar>& hbz);
+// The OTHER half of constrainHbyA: the patches OF deliberately does NOT constrain. OF's rule is
+// `!U.boundaryField()[patchi].assignable()`, and inletOutlet overrides assignable() back to TRUE
+// (inletOutletFvPatchField.H:164) even though its mixed base returns false -- so HbyA keeps the value it
+// was born with, the extrapolatedCalculated boundary of rAU*UEqn.H(), i.e. the ADJACENT CELL value.
+// Evaluating HbyA through U's inletOutlet descriptor instead pins phiHbyA_b to the CLAMPED inlet
+// velocity, which on a backflow face is zero: a different pressure equation, not a different rounding.
+// `ext` is HbyA evaluated with a zero-gradient boundary; io faces take it, everything else is untouched.
+void deviceExtrapolateIOHbyA(const DeviceVectorBoundary& dbU,
+                             const DeviceBuffer<scalar>& extx, const DeviceBuffer<scalar>& exty,
+                             const DeviceBuffer<scalar>& extz,
+                             DeviceBuffer<scalar>& hbx, DeviceBuffer<scalar>& hby, DeviceBuffer<scalar>& hbz);
 // constrainHbyA at slip/symmetry faces: HbyA_b = HbyA_c - n(n.HbyA_c) so the wall flux is exactly 0 (no penetration).
 void deviceConstrainSymmetryHbyA(const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Hx,
                                  const DeviceBuffer<scalar>& Hy, const DeviceBuffer<scalar>& Hz,
@@ -159,6 +175,19 @@ void deviceUpdatePressureInletOutletVelocity(DeviceVectorBoundary& dbU, const De
 // gradIC_k = -dc*|n_k|, value = U_c - n(n.U_c), identical to OF's snGradTransformDiag=(|nx|,|ny|,|nz|) coeffs. Call
 // each step before assembly with the previous step's cell velocity (the cross-component n.U is lagged, as in a
 // segregated solve). Reduces bit-exactly to fixedValue-0(normal)+zeroGradient(tangential) for an axis-aligned plane.
+// wedge updateCoeffs (OF wedgeFvPatchField<vector>): per wedge face, ref_k is chosen so that the mixed
+// blend d_k*ref_k + (1 - d_k)*U_c[k] reproduces OF's value transform(faceT, U_cell)[k], with the
+// valueFraction d_k = 0.5*(1 - cellT_kk) already stored. That makes the IMPLICIT coefficients
+// (1 - d_k and -deltaCoeffs*d_k) identical to OF's valueInternalCoeffs/gradientInternalCoeffs, and puts
+// the cross-component rotation where it belongs: in the explicit value.
+void deviceUpdateWedge(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
+                       const DeviceBuffer<scalar>& Uz);
+// b = faceT & f_cell on the wedge faces (other faces untouched) -- for evaluating a field that is NOT the
+// one the wedge refValue was built from, i.e. HbyA. See wedgeFaceValueKernel.
+void deviceWedgeFaceValue(const DeviceVectorBoundary& dbU,
+                          const DeviceBuffer<scalar>& fx, const DeviceBuffer<scalar>& fy,
+                          const DeviceBuffer<scalar>& fz,
+                          DeviceBuffer<scalar>& bx, DeviceBuffer<scalar>& by, DeviceBuffer<scalar>& bz);
 void deviceUpdateSymmetry(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
                           const DeviceBuffer<scalar>& Uz);
 
@@ -194,8 +223,8 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
     const std::vector<FvPatch>& fvp,
     const FvGeometry& g)
 {
-    std::vector<label> ty[3], fc, io, oio, mx, pv, sm;
-    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3];   // rg = fixedGradient, per component
+    std::vector<label> ty[3], fc, io, oio, mx, pv, sm, wdg;
+    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3], wdgT;   // rg = fixedGradient, per component
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
@@ -206,6 +235,14 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
         const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
         const bool sym = f.boundary[pi]->isSymmetry();
+        // wedge: the patch field carries the two rotation tensors; the valueFraction comes from the
+        // FULL-angle one and the per-step refValue from the HALF-angle one.
+        const tensor* wfT = f.boundary[pi]->wedgeFaceT();
+        const tensor* wcT = f.boundary[pi]->wedgeCellT();
+        const bool wedge = (wfT && wcT);
+        const scalar wdgVf[3] = { wedge ? scalar(0.5)*(scalar(1) - wcT->xx) : scalar(0),
+                                  wedge ? scalar(0.5)*(scalar(1) - wcT->yy) : scalar(0),
+                                  wedge ? scalar(0.5)*(scalar(1) - wcT->zz) : scalar(0) };
         const std::vector<vector>& val = f.boundary[pi]->value();   // inletOutlet/mixed: value() = freestreamValue (= refValue)
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         // fixedGradient on a VECTOR field: the gradient is a vector, so it splits per component -- each
@@ -218,7 +255,15 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
             ms.push_back(g.magSf()[fvp[pi].start + i]);
             io.push_back(cat == 3 ? 1 : 0);
             oio.push_back(cat == 4 ? 1 : 0);   // inletOutlet / outletInlet (same flux for all 3 comps)
-            mx.push_back(cat == 5 ? 1 : 0);
+            // A WEDGE is NOT in the mixed mask, even though it reports category 5. It borrows the mixed
+            // (Robin) slot for its COEFFICIENTS only -- its valueFraction d_k = 0.5*(1 - cellT_kk) is pure
+            // geometry, fixed for the run. deviceUpdateMixedFreestream rewrites the valueFraction of every
+            // masked face from the flux sign, so leaving a wedge in here overwrote (0, 1.9e-3, 1.9e-3)
+            // with a flat 1 -- turning the axisymmetric constraint into a fixedValue wall on both wedge
+            // planes. On movingCone that put nuEff*magSf*deltaCoeffs (which scales as 1/r^2 at the axis)
+            // into the momentum diagonal: rAU fell 17x in the first radial row, so U = HbyA - rAU*grad(p)
+            // came out 7x short of OpenFOAM's on a pressure field that agreed to 2%.
+            mx.push_back((cat == 5 && !wedge) ? 1 : 0);
             pv.push_back(cat == 6 ? 1 : 0);
             sm.push_back(sym ? 1 : 0);   // mixed / piov / symmetry masks
             const scalar seedVf = (cat == 5 && vfp) ? (*vfp)[i] : 0.0;
@@ -235,7 +280,22 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
                 rg[0].push_back(gv.x); rg[1].push_back(gv.y); rg[2].push_back(gv.z);
             }
             const scalar rv[3] = { val[i].x, val[i].y, val[i].z };
-            if (sym)   // mixed kernels; vf_k=|n_k|, ref recomputed per step (init = host value v - n(n.v))
+            wdg.push_back(wedge ? 1 : 0);
+            {
+                const tensor T = wedge ? *wfT : tensor{1,0,0,0,1,0,0,0,1};
+                const scalar t9[9] = {T.xx, T.xy, T.xz, T.yx, T.yy, T.yz, T.zx, T.zy, T.zz};
+                for (int q = 0; q < 9; ++q) wdgT.push_back(t9[q]);
+            }
+            if (wedge)   // mixed kernels; vf_k = 0.5*(1 - cellT_kk) (geometry, fixed), ref per step
+            {
+                for (int k = 0; k < 3; ++k)
+                {
+                    ty[k].push_back(5);
+                    vf[k].push_back(wdgVf[k]);
+                    ref[k].push_back(rv[k]);
+                }
+            }
+            else if (sym)   // mixed kernels; vf_k=|n_k|, ref recomputed per step (init = host value v - n(n.v))
             {
                 for (int k = 0; k < 3; ++k)
                 {
@@ -273,6 +333,8 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         db.comp[k].mixedMask.copyFrom(mx);
         db.comp[k].piovMask.copyFrom(pv);
         db.comp[k].symMask.copyFrom(sm);
+        db.comp[k].wedgeMask.copyFrom(wdg);
+        db.comp[k].wedgeT.copyFrom(wdgT);
         db.comp[k].valueFraction.copyFrom(vf[k]);
         db.comp[k].refValue.copyFrom(ref[k]);
         db.comp[k].refGrad.copyFrom(rg[k]);

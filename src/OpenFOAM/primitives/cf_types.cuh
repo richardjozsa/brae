@@ -47,6 +47,31 @@ BRAE_HD inline vector cross(const vector& a, const vector& b)   // OF: a ^ b
 BRAE_HD inline scalar magSqr(const vector& a) { return dot(a, a); }
 BRAE_HD inline scalar mag(const vector& a)    { return std::sqrt(magSqr(a)); }
 
+// Symmetric 3x3 tensor, mirrors OpenFOAM SymmTensor<scalar> and its component ORDER, which is the
+// order the dictionary uses: (xx xy xz yy yz zz). Six numbers, not nine -- a `0/sigma` written
+// `uniform (0 0 0 0 0 0)` is exactly this. Used by the Maxwell viscoelastic stress.
+struct symmTensor
+{
+    scalar xx, xy, xz, yy, yz, zz;
+};
+
+BRAE_HD inline symmTensor operator+(const symmTensor& a, const symmTensor& b)
+{
+    return {a.xx+b.xx, a.xy+b.xy, a.xz+b.xz, a.yy+b.yy, a.yz+b.yz, a.zz+b.zz};
+}
+BRAE_HD inline symmTensor operator-(const symmTensor& a, const symmTensor& b)
+{
+    return {a.xx-b.xx, a.xy-b.xy, a.xz-b.xz, a.yy-b.yy, a.yz-b.yz, a.zz-b.zz};
+}
+BRAE_HD inline symmTensor operator*(scalar s, const symmTensor& a)
+{
+    return {s*a.xx, s*a.xy, s*a.xz, s*a.yy, s*a.yz, s*a.zz};
+}
+BRAE_HD inline scalar magSqr(const symmTensor& a)   // OF magSqr: every off-diagonal counted TWICE
+{
+    return a.xx*a.xx + a.yy*a.yy + a.zz*a.zz + 2*(a.xy*a.xy + a.xz*a.xz + a.yz*a.yz);
+}
+
 // 3x3 tensor, mirrors OpenFOAM Tensor<scalar>. Used for grad(U) and turbulence production.
 struct tensor
 {

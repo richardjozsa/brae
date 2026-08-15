@@ -24,6 +24,12 @@ inline void formatFoamValue(std::ostream& os, scalar v) { os << v; }
 inline void formatFoamValue(std::ostream& os, const vector& v) { os << '(' << v.x << ' ' << v.y << ' ' << v.z << ')'; }
 inline const char* foamListType(scalar) { return "List<scalar>"; }
 inline const char* foamListType(const vector&) { return "List<vector>"; }
+inline void formatFoamValue(std::ostream& os, const symmTensor& t)
+{
+    os << '(' << t.xx << ' ' << t.xy << ' ' << t.xz << ' ' << t.yy << ' ' << t.yz << ' ' << t.zz << ')';
+}
+inline const char* foamListType(const symmTensor&) { return "List<symmTensor>"; }
+inline const char* foamClassName(const symmTensor&) { return "volSymmTensorField"; }
 inline const char* foamClassName(scalar) { return "volScalarField"; }
 inline const char* foamClassName(const vector&) { return "volVectorField"; }
 

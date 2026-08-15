@@ -16,7 +16,7 @@ namespace {
 __global__
 void smagorinskyNutKernel(
     int nC, const scalar* __restrict__ gradU, const scalar* __restrict__ V,
-    SmagorinskyCoeffs co, scalar* __restrict__ nut)
+    SmagorinskyCoeffs co, const scalar* __restrict__ dOpt, scalar* __restrict__ nut)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -24,7 +24,7 @@ void smagorinskyNutKernel(
     scalar t[9];
     for (int q = 0; q < 9; ++q)
         t[q] = gradU[q * nC + c];
-    const scalar delta = cbrt(V[c]);                              // LES filter width (cubeRootVol = V^(1/3))
+    const scalar delta = dOpt ? dOpt[c] : cbrt(V[c]);             // LES filter width: the case's `delta`
     const scalar trD = t[0] + t[4] + t[8];                        // tr(symm gradU) = div(U)
     scalar DD = 0;                                                // D:D = magSqr(symm(gradU))
     for (int i = 0; i < 3; ++i)
@@ -57,7 +57,7 @@ namespace {
 __global__
 void waleNutKernel(
     int nC, const scalar* __restrict__ gradU, const scalar* __restrict__ V,
-    WaleCoeffs co, scalar* __restrict__ nut)
+    WaleCoeffs co, const scalar* __restrict__ dOpt, scalar* __restrict__ nut)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -65,7 +65,7 @@ void waleNutKernel(
     scalar t[9];
     for (int q = 0; q < 9; ++q)
         t[q] = gradU[q * nC + c];
-    const scalar delta = cbrt(V[c]);
+    const scalar delta = dOpt ? dOpt[c] : cbrt(V[c]);
 
     scalar gg[9];                                                  // gradU & gradU
     for (int i = 0; i < 3; ++i)
@@ -97,21 +97,24 @@ void waleNutKernel(
 
 
 void deviceWaleNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
-                   const WaleCoeffs& co, DeviceBuffer<scalar>& nut)
+                   const WaleCoeffs& co, DeviceBuffer<scalar>& nut, const DeviceBuffer<scalar>* delta)
 {
     nut.resize(nC);
     if (nC == 0) return;
-    waleNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co, nut.data());
+    waleNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co,
+        (delta && delta->size()) ? delta->data() : nullptr, nut.data());
     cudaCheck(cudaGetLastError(), "deviceWaleNut");
 }
 
 
 void deviceSmagorinskyNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
-                          const SmagorinskyCoeffs& co, DeviceBuffer<scalar>& nut)
+                          const SmagorinskyCoeffs& co, DeviceBuffer<scalar>& nut,
+                          const DeviceBuffer<scalar>* delta)
 {
     nut.resize(nC);
     if (nC == 0) return;
-    smagorinskyNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co, nut.data());
+    smagorinskyNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co,
+        (delta && delta->size()) ? delta->data() : nullptr, nut.data());
     cudaCheck(cudaGetLastError(), "deviceSmagorinskyNut");
 }
 

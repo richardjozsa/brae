@@ -133,6 +133,82 @@ int main()
         check("an fvSolution with no solver entries is silent", !has(out, "NOTICE"), out);
     }
 
+    // ---- maxIter / minIter: WHERE the solve stops, read from the same sub-dictionary ----
+    //
+    // OF lduMatrix::solver reads both (defaults 1000 and 0). LES/NACA4412 sets `maxIter 10` on p, and on
+    // its impulsive first step OF's GAMG leaves with a final residual of 4.26 against an initial 1 -- an
+    // unconverged field BY CONSTRUCTION. brae ran to its own convergence and got a different (better,
+    // but different) answer, which is most of that case's disagreement. Both entries were sitting in the
+    // dict audit's unread list the whole time.
+    {
+        const std::string dir = writeFvSolution(tmp + "/iters",
+            "    p { solver GAMG; tolerance 1e-6; relTol 0.05; minIter 1; maxIter 10; }\n"
+            "    pFinal { solver GAMG; tolerance 1e-6; relTol 0.01; minIter 2; maxIter 7; }\n"
+            "    U { solver PBiCG; preconditioner DILU; tolerance 1e-5; relTol 0.1; minIter 1; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        DeviceSimpleControls ctl;
+        ctl.turbulent = false;
+        readLinearSolverControls(fv, "epsilon", ctl);
+        check("maxIter p (want 10)", ctl.maxIterP == 10, std::to_string(ctl.maxIterP));
+        check("minIter p (want 1)", ctl.minIterP == 1, std::to_string(ctl.minIterP));
+        check("maxIter pFinal (want 7)", ctl.maxIterPFinal == 7, std::to_string(ctl.maxIterPFinal));
+        check("minIter pFinal (want 2)", ctl.minIterPFinal == 2, std::to_string(ctl.minIterPFinal));
+        check("minIter U (want 1)", ctl.minIterU == 1, std::to_string(ctl.minIterU));
+        // U has no maxIter -> OF's default, and UFinal inherits U's (not the hard-coded default) exactly
+        // as the tolerances do.
+        check("maxIter U defaults to OF's 1000 (want 1000)", ctl.maxIterU == 1000, std::to_string(ctl.maxIterU));
+        check("minIter UFinal inherits U (want 1)", ctl.minIterUFinal == 1, std::to_string(ctl.minIterUFinal));
+        // and the accessors pick the right one per iteration
+        ctl.finalInner = false; check("pMaxIter non-final (want 10)", ctl.pMaxIter() == 10, std::to_string(ctl.pMaxIter()));
+        ctl.finalInner = true;  check("pMaxIter final (want 7)", ctl.pMaxIter() == 7, std::to_string(ctl.pMaxIter()));
+    }
+    {
+        // Negative control: a dict that says nothing leaves OF's defaults, so nothing changes for the
+        // hundreds of cases that never write these entries.
+        const std::string dir = writeFvSolution(tmp + "/noiters",
+            "    p { solver GAMG; tolerance 1e-6; relTol 0.05; }\n"
+            "    U { solver PBiCG; tolerance 1e-5; relTol 0.1; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        DeviceSimpleControls ctl;
+        ctl.turbulent = false;
+        readLinearSolverControls(fv, "epsilon", ctl);
+        check("no maxIter -> 1000 (want 1000)", ctl.maxIterP == 1000, std::to_string(ctl.maxIterP));
+        check("no minIter -> 0 (want 0)", ctl.minIterP == 0, std::to_string(ctl.minIterP));
+        check("no minIter on U -> 0 (want 0)", ctl.minIterU == 0, std::to_string(ctl.minIterU));
+    }
+
+    {
+        // ...and the substitution notice must SAY when a cap is what makes the fields differ.
+        // U, not p, and with a solver name no earlier block used: notice() de-duplicates on the whole
+        // (kind, subject, detail) triple, so reusing either would test the de-dup, not the wording.
+        const std::string dir = writeFvSolution(tmp + "/capped",
+            "    U { solver PBiCGStab; tolerance 1e-6; relTol 0.05; maxIter 10; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        const std::string out = captureStderr(tmp + "/capped.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = false;
+            readLinearSolverControls(fv, "epsilon", ctl);
+        });
+        check("a capped solve says the two solvers stop at different residuals",
+              has(out, "maxIter 10") && has(out, "DIFFERENT residuals"), out);
+    }
+    {
+        // Negative control: no cap -> the plain "same tolerance, cost differs" wording, which is the
+        // claim that actually holds there.
+        const std::string dir = writeFvSolution(tmp + "/uncapped",
+            "    U { solver PCG; tolerance 1e-6; relTol 0.05; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        const std::string out = captureStderr(tmp + "/uncapped.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = false;
+            readLinearSolverControls(fv, "epsilon", ctl);
+        });
+        check("an uncapped solve keeps the cost-only wording",
+              has(out, "iteration count and cost differ") && !has(out, "DIFFERENT residuals"), out);
+    }
+
     std::printf("solver_notices: %d failures\n", failures);
     return failures ? 1 : 0;
 }

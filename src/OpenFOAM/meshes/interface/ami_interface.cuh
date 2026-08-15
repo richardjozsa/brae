@@ -447,6 +447,20 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
                 }
             }
         }
+        // The same report OF prints when it constructs an AMI ("AMI: Patch source sum(weights)
+        // min:.. max:.. average:.."), so brae's coverage can be diffed against OpenFOAM's own log line
+        // for line rather than inferred from a diverging continuity error. Env-gated: OF prints it
+        // unconditionally, but brae's logs are already compared byte-wise by the test harness.
+        if (std::getenv("BRAE_AMI_REPORT") && !ai.weightsSum.empty())
+        {
+            scalar lo = ai.weightsSum[0], hi = ai.weightsSum[0], sum = 0;
+            for (const scalar w : ai.weightsSum) { lo = std::min(lo, w); hi = std::max(hi, w); sum += w; }
+            std::fprintf(stderr,
+                         "AMI: source:%s (%d faces) target:%s (%d faces) sum(weights) min:%g max:%g average:%g%s\n",
+                         S.name.c_str(), (int)S.size, T.name.c_str(), (int)T.size,
+                         (double)lo, (double)hi, (double)(sum/(scalar)ai.weightsSum.size()),
+                         ai.acmi ? "  [ACMI]" : "");
+        }
         out.push_back(std::move(ai));
     }
     return out;

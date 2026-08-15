@@ -4,6 +4,7 @@
 // patches. Internal faces occupy [0, nInternalFaces); boundary faces follow, grouped by
 // patch. owner is non-decreasing (upper-triangular face ordering).
 #include "cf_types.cuh"
+#include "function1.cuh"   // cyclicACMI `scale`: the interface open-area fraction as a function of time
 #include "foam_token_reader.cuh"
 #include <string>
 #include <stdexcept>
@@ -27,7 +28,38 @@ struct PatchInfo
     std::string transform;       // cyclic: "translational" / "rotational" / "unknown"
     vector      rotationAxis{0, 0, 1};    // cyclic rotational: axis direction
     vector      rotationCentre{0, 0, 0};  // cyclic rotational: a point on the axis
+    // cyclicACMI `scale` (OF cyclicACMIPolyPatch: PatchFunction1<scalar>::NewIfPresent(*this, "scale")):
+    // a PRESCRIBED open-area fraction multiplying the geometric overlap mask, re-evaluated every step:
+    //     scaledMask = min(1 - tol, max(tol, scale(t)*mask))
+    // TJunctionSwitching closes a branch with `table ((0 1)(0.2 1)(0.3 0))`. Empty = no scaling, and
+    // then the interface is the geometric overlap alone, exactly as before.
+    Function1   acmiScale;
 };
+
+// A cyclicACMI's `scale` belongs to the PAIR, not to one patch. OF keeps it on the OWNER (the half with
+// the lower patch index, cyclicAMIPolyPatch::owner) and clones it onto the neighbour
+// (cyclicACMIPolyPatch.C:107-110); a scale written on the slave half is discarded with a warning
+// (line 838). Applied after the boundary file is read, and exposed here so a test can drive the same
+// rule on an in-memory mesh instead of a copy of it.
+inline void propagateACMIScale(std::vector<PatchInfo>& patches)
+{
+    for (std::size_t i = 0; i < patches.size(); ++i)
+    {
+        if (patches[i].type != "cyclicACMI") continue;
+        std::size_t nbr = patches.size();
+        for (std::size_t j = 0; j < patches.size(); ++j)
+            if (patches[j].name == patches[i].neighbourPatch) { nbr = j; break; }
+        if (nbr >= patches.size()) continue;             // dangling neighbourPatch: reported elsewhere
+        if (i < nbr)                                     // this half is the owner
+        {
+            if (!patches[i].acmiScale.empty()) patches[nbr].acmiScale = patches[i].acmiScale;
+        }
+        else if (!patches[i].acmiScale.empty() && !patches[nbr].acmiScale.empty())
+        {
+            patches[i].acmiScale = patches[nbr].acmiScale;   // both carry one: the owner's wins
+        }
+    }
+}
 
 class PrimitiveMesh
 {

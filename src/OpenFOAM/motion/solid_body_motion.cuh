@@ -116,7 +116,16 @@ inline MeshMotion readMeshMotion(const std::string& caseDir)
             "supports dynamicMotionSolverFvMesh with a solidBody motionSolver). Running it as a static "
             "mesh would solve a different problem.");
 
-    const std::string solver = d.wordOr("motionSolver", "");
+    // OF motionSolver::New reads the name with getCompat<word>("motionSolver", {{"solver", -1666}}) --
+    // `solver` is the older key and still what several v2412 tutorials write (RAS/
+    // oscillatingInletPeriodicAMI2D among them). Reading only the new one turned an implemented motion
+    // into "motionSolver '' is not implemented".
+    std::string solver = d.wordOr("motionSolver", "");
+    if (solver.empty()) solver = d.wordOr("solver", "");
+    // velocityComponentLaplacian is a DIFFERENT motion solver, handled by its own reader
+    // (velocity_component_laplacian.cuh). Returning inactive here lets the caller try that one instead
+    // of this refusing on its behalf.
+    if (solver == "velocityComponentLaplacian") return mm;
     if (solver != "solidBody")
         throw std::runtime_error(
             "brae: dynamicMeshDict motionSolver '" + solver + "' is not implemented. Only `solidBody` "

@@ -36,7 +36,8 @@
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"       // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuSimpleFoam)
 #include "acmi_area_scaling.cuh"
-#include "solid_body_motion.cuh"   // OF dynamicMeshDict + solidBody transform
+#include "solid_body_motion.cuh"
+#include "velocity_component_laplacian.cuh"   // the SOLVED (Laplace) mesh motion   // OF dynamicMeshDict + solidBody transform
 #include "swept_volume.cuh"        // OF meshPhi / makeRelative / movingWallVelocity
 #include "time_controls.cuh"   // OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT
 #include "brae_time.cuh"
@@ -195,6 +196,12 @@ try
     const TimeControls timeControls = TimeControls::read(controlDict);
     // constant/dynamicMeshDict. Absent -> inactive, so every existing case takes the identical path.
     const MeshMotion meshMotion = readMeshMotion(caseDir);
+    // ...and the OTHER motion solver brae has: velocityComponentLaplacian, which SOLVES for the motion
+    // instead of prescribing it (movingCone's piston). Both readers return inactive on a dict that names
+    // the other one, so exactly one of them can be active.
+    VelocityComponentLaplacianMotion vclMotion;
+    if (std::filesystem::exists(caseDir + "/constant/dynamicMeshDict"))
+        vclMotion = readVelocityComponentLaplacian(readDict(caseDir + "/constant/dynamicMeshDict"));
 
     // ---- PIMPLE + solver controls (fvSolution) ----
     const FoamDict* pimple  = fvSolution.subDict("PIMPLE");
@@ -251,7 +258,7 @@ try
     // buildPatches on a mesh without one.
     FvGeometry g;
     std::vector<FvPatch> fvpBuilt;
-    { std::vector<AMIInterface> amisInit; buildGeometryPatchesAndAMI(m, g, fvpBuilt, amisInit); }
+    { std::vector<AMIInterface> amisInit; buildGeometryPatchesAndAMI(m, g, fvpBuilt, amisInit, startTime); }
     const std::vector<FvPatch> fvp = std::move(fvpBuilt);
     const label nC = m.nCells();
     // startFrom, via the shared resolver -- the same one the other drivers use, and the behaviour OF
@@ -287,10 +294,38 @@ try
     // Whether the coupled-patch flux above survives into the solver: the ctor rebuilds cyc_/ami_ phi from
     // U (right for a fresh start), so a restart has to put the stored values back over the top of it.
     const bool phiHadCoupledValues = std::filesystem::exists(phiPath);
+    // PIMPLE/momentumPredictor: OF assembles UEqn either way (rAU/HbyA come from it) and only skips the
+    // SOLVE. Default true, as pimpleControl's.
+    {
+        const std::string mp = pimple ? pimple->wordOr("momentumPredictor", "yes") : "yes";
+        ctl.momentumPredictor = !(mp == "no" || mp == "false" || mp == "off" || mp == "0");
+        if (!ctl.momentumPredictor)
+            std::printf("  PIMPLE momentumPredictor off: UEqn is assembled (rAU/HbyA) but not solved\n");
+    }
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
     solver.setDdtCorr(ddtCorrOn);
+
+    // Maxwell viscoelastic stress: sigma is a TRANSPORTED symmTensor field with its own initial
+    // condition, read here and handed to the solver as its six components -- which is how it is solved
+    // (OF's fvSymmTensorMatrix is segregated too). Written back at every output time like any other
+    // transported field; a restart that resumed a Newtonian sigma = 0 would be a different problem.
+    std::vector<GeometricField<scalar>> sigmaComp;
+    if (ctl.maxwell)
+    {
+        const std::string sigPath = fieldDir + "/sigma";
+        if (!std::filesystem::exists(sigPath) && !std::filesystem::exists(sigPath + ".gz"))
+            throw std::runtime_error(
+                "brae: laminar model Maxwell needs a `sigma` field in " + fieldDir +
+                ". OpenFOAM reads it MUST_READ for the same reason: the viscoelastic stress is a state "
+                "variable, not something the solver can start from nothing.");
+        const FieldData<symmTensor> sfd = readField<symmTensor>(sigPath);
+        for (int k = 0; k < 6; ++k)
+            sigmaComp.push_back(buildField<scalar>(symmTensorComponent(sfd, k), fvp, nC));
+        for (GeometricField<scalar>& f : sigmaComp) f.evaluateBoundary();
+        solver.setMaxwellSigma(sigmaComp, fvp, g);
+    }
 
     // fvOptions. The momentum sources themselves live in solveMomentumPredictor, which pimpleStep already
     // calls, so this driver only ever had to READ them and hand them over -- it refused instead, which
@@ -342,7 +377,7 @@ try
     // OF createUfIfPresent.H -- the face velocity is constructed at case setup when the mesh is dynamic,
     // before any motion. fvc::ddtCorr's Uf form needs it; without motion there is no Uf and OF uses the
     // phi.oldTime() form instead.
-    if (meshMotion.active) solver.enableUf();
+    if (meshMotion.active || vclMotion.active) solver.enableUf();
     if (phiHadCoupledValues)
     {
         std::vector<std::pair<label, std::vector<scalar>>> ifPhi;
@@ -437,8 +472,30 @@ try
         std::printf("  mesh motion: %zu of %d points move (cellZone '%s', %zu cells)\n",
                     movingPts.size(), (int)m.nPoints(), meshMotion.cellZone.c_str(), it->second.size());
     }
+    // velocityComponentLaplacian state: the cell field being solved (its previous solution is the next
+    // solve's initial guess, as OF's cellMotionU_ is) and the cell->point weights, which are pure
+    // geometry and therefore rebuilt after every move.
+    GeometricField<scalar> cellMotionU;
+    VolPointInterpolation vpi;
+    std::vector<std::pair<label, scalar>> vclConstraints;
+    if (vclMotion.active)
+    {
+        const std::string mpPath = fieldDir + "/" + vclMotion.fieldName;
+        if (!std::filesystem::exists(mpPath) && !std::filesystem::exists(mpPath + ".gz"))
+            throw std::runtime_error(
+                "brae: velocityComponentLaplacian needs the point-motion field '" + vclMotion.fieldName +
+                "' in " + fieldDir + " -- it carries the prescribed wall motion, which is the whole "
+                "boundary condition of the motion equation.");
+        const FieldData<scalar> pmFd = readField<scalar>(mpPath);
+        cellMotionU = buildCellMotionField(pmFd, fvp, nC);
+        vclConstraints = pointMotionConstraints(m, fvp, pmFd);
+        vpi.build(m, g, fvp);
+        std::printf("  mesh motion: velocityComponentLaplacian, component %c, diffusivity (%g %g %g)\n",
+                    "xyz"[vclMotion.cmpt], vclMotion.diffusivity.x, vclMotion.diffusivity.y,
+                    vclMotion.diffusivity.z);
+    }
     std::vector<char> mwvPatch(fvp.size(), 0);
-    if (meshMotion.active)
+    if (meshMotion.active || vclMotion.active)
     {
         const FieldData<vector> uFdM = readField<vector>(fieldDir + "/U");
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -511,6 +568,14 @@ try
                 if (b.first >= 0 && b.first < (label)fvp.size()) ifPhi[fvp[b.first].name] = std::move(b.second);
             writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp,
                               std::max(precision, 17), "[0 3 -1 0 0 0 0]", ifPhi);
+        }
+        if (ctl.maxwell)
+        {
+            const std::vector<std::vector<scalar>> sc = solver.maxwellSigma();
+            std::vector<symmTensor> sig(static_cast<std::size_t>(nC));
+            for (label c = 0; c < nC; ++c)
+                sig[c] = symmTensor{sc[0][c], sc[1][c], sc[2][c], sc[3][c], sc[4][c], sc[5][c]};
+            writeVolField(fieldDir + "/sigma", outDir + "/sigma", sig, fvp, precision);
         }
         if (ctl.les) {   // pure LES Smagorinsky: only the algebraic sub-grid nut (no k/epsilon/omega/nuTilda field)
             writeVolField(fieldDir + "/nut",     outDir + "/nut",     solver.nut(), fvp, precision, solver.nutBoundary());
@@ -652,6 +717,9 @@ try
         deltaT = setInitialDeltaT(deltaT, c0.CoNum, timeControls);
         std::printf("Courant Number mean: %g max: %g\ndeltaT = %g\n", c0.meanCoNum, c0.CoNum, deltaT);
     }
+    // Does any cyclicACMI carry a time `scale`? Then the geometry is rebuilt every step even on a
+    // static mesh; without one, a static mesh keeps the single setup-time build it always had.
+    const bool acmiTimeScale = hasACMITimeScale(m);
     for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
@@ -667,7 +735,7 @@ try
             const std::vector<vector> newPoints =
                 curPoints(points0, oldPoints, movingPts, meshMotion.motion, t);
             m.movePoints(newPoints);
-            rebuildGeometryWithACMI(m, g, fvp);           // host geometry (+ACMI split), then device
+            rebuildGeometryWithACMI(m, g, fvp, t);        // host geometry (+ACMI split at time t), then device
             const std::vector<scalar> mp =
                 solver.moveMesh(m, g, fvp, oldPoints, newPoints, deltaT);
 
@@ -683,6 +751,40 @@ try
 
             // ...and the wall-function geometry, which is a function of the mesh just as much as the AMI
             // weights are. It is rebuilt LAST so it picks up the movingWallVelocity assignment above.
+            solver.refreshWallData(m, g, fvp);
+        }
+        else if (vclMotion.active)
+        {
+            // OF pimpleFoam calls mesh.update() at the same place: the motion is SOLVED on the mesh as
+            // it stands, then the points move, then everything geometric is rebuilt.
+            const std::vector<vector> oldPoints = m.points();
+            const std::vector<vector> newPoints =
+                velocityComponentLaplacianPoints(vclMotion, m, g, fvp, cellMotionU, vpi, vclConstraints, deltaT);
+            m.movePoints(newPoints);
+            rebuildGeometryWithACMI(m, g, fvp, t);
+            const std::vector<scalar> mp = solver.moveMesh(m, g, fvp, oldPoints, newPoints, deltaT);
+            // movingWallVelocity: the wall's own velocity comes from how far ITS faces moved, and on
+            // this solver that is the whole driving force -- movingCone has no inlet, the piston IS the
+            // flow. Same call the solidBody branch makes, for the same reason.
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (!mwvPatch[pi]) continue;
+                const std::vector<vector> Uw = movingWallVelocity(
+                    m, fvp[pi].start, fvp[pi].size, oldPoints, newPoints, mp, g.Sf(), g.magSf(), deltaT);
+                solver.setPatchVelocity(static_cast<label>(pi), Uw);
+            }
+            vpi.build(m, g, fvp);          // the weights are geometry: the mesh just changed
+            solver.refreshWallData(m, g, fvp);
+        }
+        // A cyclicACMI `scale` makes the interface open area a function of TIME, so it changes even
+        // when nothing moves (TJunctionSwitching's mesh is static and its branch closes between
+        // t = 0.2 and t = 0.3). Same rebuild as the moving path, with the points held fixed -- so the
+        // mesh flux is identically zero and only the interface areas and AMI weights change.
+        else if (acmiTimeScale)
+        {
+            const std::vector<vector> pts = m.points();
+            rebuildGeometryWithACMI(m, g, fvp, t);
+            solver.moveMesh(m, g, fvp, pts, pts, deltaT);
             solver.refreshWallData(m, g, fvp);
         }
         const DeviceSimpleResidual r = solver.pimpleStep(deltaT, nOuter, nCorr);
