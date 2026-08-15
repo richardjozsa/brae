@@ -1,7 +1,7 @@
 # cyclicACMI + moving mesh + ddtCorr — state
 
 ## Repo state
-Branch `feat/rhoSimpleFoam`, ctest **208/208**. NOTHING IN THIS DOCUMENT IS COMMITTED YET. The first round is committed (`011334b`); the moving-mesh,
+Branch `feat/rhoSimpleFoam`, ctest **210/210**. NOTHING IN THIS DOCUMENT IS COMMITTED YET. The first round is committed (`011334b`); the moving-mesh,
 `fvc::ddtCorr`, `Uf` and turbulence work below is not. `cyclicACMI` is still REFUSED unless `BRAE_ALLOW_ACMI=1`.
 
 ## Against stock OpenFOAM v2412, oscillatingInletACMI2D, 10 steps, dt 1e-3
@@ -383,13 +383,14 @@ Each meshed with its own scripts, then OpenFOAM and brae run SERIALLY over the s
 
 | Runs in both | n | U (L2 rel) |
 |---|---|---|
+| laminar/planarPoiseuille | 40 | **8.07e-08** (200 steps; the flow IS the fvOptions source) |
 | RAS/pitzDaily | 12225 | 3.48e-03 |
-| laminar/mixerVesselAMI2D | 3072 | 1.01e-02 |
+| laminar/mixerVesselAMI2D | 3072 | 9.03e-03 |
 | RAS/oscillatingInletACMI2D | 10880 | 1.33e-02 |
 | RAS/TJunctionFan | 3875 | 2.77e-02 |
 | LES/periodicPlaneChannel | 60000 | 4.75e-02 |
+| **LES/NACA4412** | **89728** | **7.32e-02** (SA-DDES; brae warns it runs cubeRootVol where the case asks maxDeltaxyz) |
 | RAS/TJunction (+Arrhenius) | 3875 | 1.01e-01 (declared: `limitedLinearV` has no exact kernel) |
-| laminar/planarPoiseuille | 40 | **8.07e-08** (200 steps; the flow IS the fvOptions source) |
 
 **What still blocks the rest**, brae-side:
 
@@ -397,20 +398,17 @@ Each meshed with its own scripts, then OpenFOAM and brae run SERIALLY over the s
 |---|---|
 | `interfaceTrackingFvMesh` (VOF/film) | 2 (contactAngleCavity, sloshing2D) |
 | motion solvers other than `solidBody` | 2 (movingCone, oscillatingInletPeriodicAMI2D) |
-| `binary` writeFormat field files | 1 (NACA4412) |
-| `fixedMean` BC | 1 (wallMountedHump) |
+| **AMG set-up does not complete at 2.3M cells** | 1 (wallMountedHump) -- see below |
 | `Maxwell` viscoelastic laminar model | 1 (planarContraction) |
 | `velocityFilmShell` BC (finite-area film) | 1 (inclinedPlaneFilm) |
 | divSchemes `default` for div(phi,U) | 1 (cylinder2D) -- deliberate |
 | time-varying cyclicACMI `scale` | 1 (TJunctionSwitching) -- deliberate |
 
-**DEShybrid did NOT on its own unblock the two LES tutorials**, which is worth stating plainly because it
-was the reason for doing it. It removed one of TWO blockers from each: NACA4412 now gets through scheme
-parsing and builds its SpalartAllmarasDDES model before dying on a `binary` field file, and
-wallMountedHump reaches its boundary conditions and stops on `fixedMean`. Neither refusal mentions
-DEShybrid any more.
-
-The remaining 12 are OpenFOAM-side or meshing failures in the harness, not brae refusals.
+**wallMountedHump is NOT blocked by fixedMean any more.** That BC is implemented and covered by
+`fixed_mean`; the case now stops earlier, in `buildOrLoadAMG`, which on its 2.3M-cell mesh made no
+progress in **16 minutes** (`BRAE_SETUP_TIMING` shows `pre-AMG` at 0.82 s and nothing after). Nothing in
+this round touched that code -- the wall distance it would reach next never runs. It is the first case in
+the sweep large enough to expose it, and it is a set-up performance/hang problem, not a physics one.
 
 ## Still open
 - **U on the turbulent case, now the laggard at 1.07e-03** while k, epsilon and nut are all ~1e-04 and

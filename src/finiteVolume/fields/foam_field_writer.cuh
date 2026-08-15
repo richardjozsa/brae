@@ -174,6 +174,13 @@ inline void writeVolField(
         }
     }
     std::string header = (ff == std::string::npos) ? "" : text.substr(0, he);
+    // The template may be a BINARY file (OF writeFormat binary; pimpleFoam/LES/NACA4412 ships 0/U that
+    // way). brae writes ASCII, so the header it copies has to say so -- otherwise the written field is
+    // labelled binary and holds text, and nothing, OpenFOAM included, can read it back.
+    {
+        const std::regex fmtRe("format\\s+binary\\s*;");
+        header = std::regex_replace(header, fmtRe, std::string("format      ascii;"));
+    }
     if (derived && derived->object)
     {
         // Rewrite the template's `object <name>;` so the file identifies as what it IS. Some OF readers

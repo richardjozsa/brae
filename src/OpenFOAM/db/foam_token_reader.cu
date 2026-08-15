@@ -3,6 +3,7 @@
 #include "foam_dict.cuh"   // expandDictVariables ($macro expansion) for the expandVars path
 
 #include <fstream>
+#include <algorithm>
 #include <sstream>
 #include <stdexcept>
 #include <cctype>
@@ -47,9 +48,129 @@ std::vector<char> gzSlurp(const std::string& base, std::size_t maxBytes)   // de
 
 namespace {   // file-local parser helpers below
 
+// Rewrite the RAW LIST PAYLOADS of a binary foam file as ASCII, leaving the dictionary structure around
+// them untouched, so the ordinary TokenStream can read the file exactly as it reads an ASCII one.
+//
+// OF's binary format is a hybrid: everything is the usual ASCII dictionary except that a list of a
+// PRIMITIVE type is written as
+//     List<vector> \n 89728 \n ( <89728*3 raw doubles> )
+// Word lists (`inGroups 1(wall)`) stay ASCII even in a binary file, so only the primitive types are
+// transcoded -- rewriting a word list would corrupt it.
+//
+// brae already had binary readers for the polyMesh (points/faces/owner/cellZones), each a dedicated
+// parser. Fields could not reuse those: a field file is a dictionary whose payloads happen to be binary,
+// and it carries #includes, $macros and a boundaryField whose entries the ASCII path already handles.
+// Transcoding here means all of that machinery is reused unchanged, and it covers any binary foam
+// dictionary rather than just the one file type that prompted it.
+// (pimpleFoam/LES/NACA4412 writes 0/U binary; brae stopped with "expected '(' got <raw bytes>".)
+std::size_t foamComponentCount(const std::string& type)
+{
+    if (type == "scalar" || type == "sphericalTensor" || type == "label") return 1;
+    if (type == "vector")     return 3;
+    if (type == "symmTensor") return 6;
+    if (type == "tensor")     return 9;
+    return 0;   // word/string/anything else: NOT a raw payload, leave alone
+}
+
+std::string foamBinaryToAscii(const std::vector<char>& in)
+{
+    std::string out;
+    out.reserve(in.size() + in.size()/2);
+    const std::size_t n = in.size();
+    std::size_t i = 0;
+    while (i < n)
+    {
+        // find the next "List<"
+        std::size_t p = std::string::npos;
+        for (std::size_t q = i; q + 5 <= n; ++q)
+            if (in[q]=='L' && in[q+1]=='i' && in[q+2]=='s' && in[q+3]=='t' && in[q+4]=='<') { p = q; break; }
+        if (p == std::string::npos) { out.append(in.begin()+i, in.end()); break; }
+
+        std::size_t close = p + 5;
+        while (close < n && in[close] != '>') ++close;
+        if (close >= n) { out.append(in.begin()+i, in.end()); break; }
+        const std::string type(in.begin()+p+5, in.begin()+close);
+        const std::size_t nCmpt = foamComponentCount(type);
+
+        std::size_t j = close + 1;                       // just past '>'
+        while (j < n && std::isspace((unsigned char)in[j])) ++j;
+        std::size_t d0 = j;
+        while (j < n && std::isdigit((unsigned char)in[j])) ++j;
+        const bool haveCount = (j > d0);
+        std::size_t count = 0;
+        if (haveCount) count = std::strtoull(std::string(in.begin()+d0, in.begin()+j).c_str(), nullptr, 10);
+        std::size_t k = j;
+        while (k < n && std::isspace((unsigned char)in[k])) ++k;
+
+        // Not a raw primitive payload (a word list, or no `N (` shape): copy through and continue.
+        if (nCmpt == 0 || !haveCount || k >= n || in[k] != '(')
+        {
+            out.append(in.begin()+i, in.begin()+close+1);
+            i = close + 1;
+            continue;
+        }
+
+        const std::size_t width = (type == "label") ? sizeof(int32_t) : sizeof(double);
+        const std::size_t bytes = count * nCmpt * width;
+        if (k + 1 + bytes >= n)   // truncated / not actually binary: leave it be
+        {
+            out.append(in.begin()+i, in.begin()+close+1);
+            i = close + 1;
+            continue;
+        }
+
+        out.append(in.begin()+i, in.begin()+close+1);    // "...List<vector>"
+        out += "\n";
+        out += std::to_string(count);
+        out += "\n(\n";
+        const char* raw = in.data() + k + 1;
+        char buf[64];
+        for (std::size_t e = 0; e < count; ++e)
+        {
+            if (nCmpt > 1) out += '(';
+            for (std::size_t c = 0; c < nCmpt; ++c)
+            {
+                if (c) out += ' ';
+                if (type == "label")
+                {
+                    int32_t v;
+                    std::memcpy(&v, raw + (e*nCmpt + c)*width, sizeof v);
+                    out += std::to_string((long long)v);
+                }
+                else
+                {
+                    double v;
+                    std::memcpy(&v, raw + (e*nCmpt + c)*width, sizeof v);
+                    std::snprintf(buf, sizeof buf, "%.17g", v);
+                    out += buf;
+                }
+            }
+            if (nCmpt > 1) out += ')';
+            out += '\n';
+        }
+        out += ")";
+        i = k + 1 + bytes;                                // the ')' that closes the blob
+        if (i < n && in[i] == ')') ++i;
+    }
+    return out;
+}
+
+// True when the FoamFile header of this buffer says `format binary`.
+bool foamBufferIsBinary(const std::vector<char>& b)
+{
+    const std::size_t lim = std::min<std::size_t>(b.size(), 2048);
+    const std::string head(b.begin(), b.begin() + lim);
+    const std::size_t f = head.find("format");
+    if (f == std::string::npos) return false;
+    const std::size_t e = head.find(';', f);
+    if (e == std::string::npos) return false;
+    return head.substr(f, e - f).find("binary") != std::string::npos;
+}
+
 std::string readWhole(const std::string& path)
 {
     const std::vector<char> b = gzSlurp(path);
+    if (foamBufferIsBinary(b)) return foamBinaryToAscii(b);
     return std::string(b.begin(), b.end());
 }
 

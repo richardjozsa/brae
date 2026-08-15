@@ -367,6 +367,12 @@ try
                         fans.size(), fans.front().curve.size());
         solver.setFanPressure(std::move(fans));
     }
+    {
+        std::vector<DeviceSimpleSolver::FixedMean> fm =
+            collectFixedMean(fieldDir, fvp, {"U", "k", "epsilon", "omega", "nuTilda", "nut"});
+        if (!fm.empty()) std::printf("  fixedMean: %zu pressure patch(es)\n", fm.size());
+        solver.setFixedMean(std::move(fm));
+    }
     solver.setTime(startTime);   // seed p0 at the START time, as OF's constructor does
     // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face masks so it
     // refreshes them each iteration instead of freezing the set-up value.

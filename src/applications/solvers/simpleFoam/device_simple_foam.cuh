@@ -188,6 +188,9 @@ public:
     void refreshWallData(const PrimitiveMesh& m, const FvGeometry& g, const std::vector<FvPatch>& fvp);
     // Read-only view of that data, so a test can assert the refresh actually happened.
     const DeviceWallData& wallData() const { return wall_; }
+    // Read-only view of the pressure boundary, so a test can check a per-step BC's contract (fixedMean's
+    // area-weighted mean) against the values the solver actually imposed.
+    const DeviceBoundary& pressureBoundary() const { return dbP_; }
 
     void advanceTime(scalar deltaT);
     // One PIMPLE time step: advanceTime, then nOuterCorrectors x { momentum predictor (ddt folded in); nCorrectors x
@@ -495,6 +498,16 @@ public:
         }
     };
     void setFanPressure(std::vector<FanPressure> v) { fanP0_ = std::move(v); }
+    // fixedMean (OF fixedMeanFvPatchField): a fixedValue whose face values are the ADJACENT CELL values,
+    // shifted or scaled so their area-weighted mean equals a prescribed one:
+    //     psi   = patchInternalField()
+    //     mean  = sum(magSf*psi)/sum(magSf)
+    //     |target| > SMALL and |mean| > 0.5|target| : psi *= |target|/|mean|
+    //     otherwise                                : psi += (target - mean)
+    // It is built as a plain fixedValue and its refValue recomputed here every step, the same way
+    // codedFixedValue and fanPressure are.
+    struct FixedMean { label start = 0, count = 0; scalar meanValue = 0; };
+    void setFixedMean(std::vector<FixedMean> v) { fixedMean_ = std::move(v); }
     void setTimeVaryingP0(std::vector<TimeVaryingP0> v) { tvP0_ = std::move(v); }
 
     // Build the list from a pressure field's parsed boundary entries. Shared so all three drivers wire
@@ -617,6 +630,7 @@ private:
     DdtScheme ddtScheme_ = DdtScheme::steadyState;
     std::vector<TimeVaryingP0> tvP0_;   // uniformTotalPressure p0(t), empty for constant p0
     std::vector<FanPressure>   fanP0_;  // fanPressure: p0 shifted by the fan curve each step
+    std::vector<FixedMean>     fixedMean_;   // fixedMean: refValue re-derived from the adjacent cells each step
     scalar    deltaT_ = 0, deltaT0_ = 0;
     scalar    ocCoeff_ = 1;         // CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>"); 0=Euler-like, 1=pure CN
     bool      cnWarm_  = false;     // CrankNicolson: the ddt0 recurrence has done its first (Euler-startup) update

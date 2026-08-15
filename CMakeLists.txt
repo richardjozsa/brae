@@ -1203,6 +1203,16 @@ target_include_directories(test_deshybrid PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CU
 target_link_libraries(test_deshybrid PRIVATE brae_core)
 add_test(NAME deshybrid COMMAND test_deshybrid)
 
+add_executable(test_binary_field_read tests/test_binary_field_read.cu)
+target_include_directories(test_binary_field_read PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_binary_field_read PRIVATE brae_core)
+add_test(NAME binary_field_read COMMAND test_binary_field_read)
+
+add_executable(test_fixed_mean tests/test_fixed_mean.cu)
+target_include_directories(test_fixed_mean PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_fixed_mean PRIVATE brae_core)
+add_test(NAME fixed_mean COMMAND test_fixed_mean)
+
 # divDevReff must use the case's NAMED grad(U) scheme, not a bare Gauss one (see the test's header).
 add_executable(test_divdevreff_gradscheme tests/test_divdevreff_gradscheme.cu)
 target_include_directories(test_divdevreff_gradscheme PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)

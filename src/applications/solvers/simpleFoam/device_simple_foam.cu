@@ -6,6 +6,7 @@
 #include "swept_volume.cuh"   // meshPhi + makeRelative (OF fvcMeshPhi)
 #include "device_scalar_transport.cuh"   // deviceSolveScalarTransport: shared with k/epsilon/omega/energy
 #include "device_deshybrid.cuh"   // DEShybrid: per-face blend of linear and linearUpwind (DES sensor)
+#include "fan_pressure.cuh"   // applyFixedMean: OF fixedMeanFvPatchField, shared with its test
 #include "brae_notice.cuh"   // never drop an input silently (the ddtCorr scheme gate)
 #include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
 
@@ -656,6 +657,25 @@ namespace brae {
             deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
             deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz,
                                       compressible_ ? &rhoBnd_ : nullptr);   // p in Pa -> rho-weighted dynamic head
+        }
+        // fixedMean: the face values ARE the adjacent cell values, shifted (or scaled) so their
+        // area-weighted mean hits the prescribed one. That is a patch-wide reduction, so the small
+        // per-boundary-face gather comes back to the host and the sum is done there -- the whole cell
+        // field never moves.
+        if (!fixedMean_.empty())
+        {
+            DeviceBuffer<scalar> pin;
+            deviceGatherPatchInternal(dbP_, dp_, pin);
+            const std::vector<scalar> psi = pin.host();
+            const std::vector<scalar> aSf = dbP_.magSf.host();
+            std::vector<scalar> rv = dbP_.refValue.host();
+            for (const auto& e : fixedMean_)
+            {
+                if (e.start < 0 || e.start + e.count > (label)psi.size()) continue;
+                applyFixedMean(e.meanValue, aSf.data() + e.start, psi.data() + e.start, e.count,
+                               rv.data() + e.start);
+            }
+            dbP_.refValue.copyFrom(rv);
         }
         // NVRTC device-coded BCs (codedFixedValue): run each compiled snippet over its patch faces, overwriting the
         // target field's refValue on the device from position/time/adjacent-cell value. Same updateCoeffs point as the

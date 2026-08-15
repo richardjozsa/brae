@@ -723,6 +723,11 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "Running would silently substitute the patch's `value` entry, so it is refused. Replace it "
             "with a constant, or use codedFixedValue.");
     }
+    // fixedMean: a fixedValue whose face values are the adjacent cell values, shifted or scaled so their
+    // area-weighted mean equals `meanValue` (OF fixedMeanFvPatchField). Seeded from `value`; the solver
+    // recomputes refValue every step, exactly as it does for codedFixedValue and fanPressure.
+    if (d.type == "fixedMean")
+        return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue")
         // uniformFixedValue: steady constant = fixedValue. codedFixedValue: seed with `value`; the NVRTC device kernel
         // (device_coded_bc) OVERWRITES this patch's refValue each step from the compiled `code` snippet (the driver
@@ -795,6 +800,14 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     {
         const auto v = inletOrValue(d);
         return std::make_unique<InletOutletPatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+    }
+    // outletInlet: the same mixed BC with the flux test inverted -- outflow (phi >= 0) takes the
+    // prescribed outletValue, inflow extrapolates. The class and its device category existed already;
+    // nothing constructed it, so a case naming it was refused. (pimpleFoam/LES/NACA4412 uses it.)
+    if (d.type == "outletInlet")
+    {
+        const auto v = inletOrValue(d);   // outletValue is read into the same slot
+        return std::make_unique<OutletInletPatchField<T>>(p, v.uniform, v.uniformValue, v.values);
     }
     // turbulent-inlet BCs (inletOutlet-derived): inflow value computed from U/k by the solver (applyTurbulentInlets);
     // here we build an inletOutlet placeholder from the written `value` so buildField succeeds.

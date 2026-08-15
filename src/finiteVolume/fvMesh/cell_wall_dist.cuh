@@ -285,8 +285,25 @@ inline std::vector<scalar> exactCellWallDist(
     const scalar target = std::cbrt(std::fmax((hi.x-lo.x)*(hi.y-lo.y)*(hi.z-lo.z), scalar(1e-300))
                                     / std::fmax(scalar(nW), scalar(1)));
     const scalar h = std::fmax(target, span * scalar(1e-4));
-    auto dimOf = [&](scalar ext) { return std::max(1, std::min(512, (int)std::floor(ext / h) + 1)); };
-    const int nx = dimOf(hi.x - lo.x), ny = dimOf(hi.y - lo.y), nz = dimOf(hi.z - lo.z);
+    // Size the grid by its TOTAL bucket count, not per axis. A per-axis cap alone lets a 3D mesh ask for
+    // 512^3 buckets -- the offsets array is then over half a gigabyte and its prefix sum dominates the
+    // run. wallMountedHump (2.3M cells) sat in set-up for minutes before this was bounded.
+    auto dimsFor = [&](scalar hh, int& ax, int& ay, int& az)
+    {
+        auto d1 = [&](scalar ext) { return std::max(1, std::min(1024, (int)std::floor(ext / hh) + 1)); };
+        ax = d1(hi.x - lo.x); ay = d1(hi.y - lo.y); az = d1(hi.z - lo.z);
+    };
+    int nx = 1, ny = 1, nz = 1;
+    {
+        scalar hh = h;
+        const double cap = std::max(4.0*double(nW), 1.0e5);
+        for (int it = 0; it < 24; ++it)
+        {
+            dimsFor(hh, nx, ny, nz);
+            if (double(nx)*double(ny)*double(nz) <= cap) break;
+            hh *= std::cbrt(double(nx)*double(ny)*double(nz)/cap)*1.05;
+        }
+    }
     const vector hs{ (hi.x-lo.x)/nx, (hi.y-lo.y)/ny, (hi.z-lo.z)/nz };
     auto gidx = [&](int i, int j, int k) { return (std::size_t)((k*ny + j)*(std::size_t)nx + i); };
     auto clampi = [](int v, int n) { return v < 0 ? 0 : (v >= n ? n - 1 : v); };

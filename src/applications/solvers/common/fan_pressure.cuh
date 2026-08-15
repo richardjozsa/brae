@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cmath>
 #include <algorithm>
 #include <iterator>
 
@@ -126,6 +127,77 @@ inline std::vector<DeviceSimpleSolver::FanPressure> collectFanPressure(
                                          + " -- the fan curve has fewer than two points, so there is nothing to "
                                            "interpolate. Check the `fanCurve` entry.");
             out.push_back(std::move(e));
+        }
+        start += fp.size;
+    }
+    return out;
+}
+
+// OF fixedMeanFvPatchField::updateCoeffs, as a pure function over ONE patch, so the solver and its test
+// share a single copy of the formula:
+//     mean = sum(magSf*psi)/sum(magSf)
+//     |target| > SMALL and |mean| > 0.5*|target| : psi *= |target|/|mean|   (SCALE -- matches the
+//                                                                           MAGNITUDE, keeps psi's sign)
+//     otherwise                                  : psi += (target - mean)   (SHIFT)
+// psi is the patchInternalField (the adjacent cell values); out may alias nothing.
+inline void applyFixedMean(scalar target, const scalar* magSf, const scalar* psi, label n, scalar* out)
+{
+    scalar sA = 0, sV = 0;
+    for (label i = 0; i < n; ++i) { sA += magSf[i]; sV += magSf[i]*psi[i]; }
+    if (!(sA > scalar(0))) return;
+    const scalar mean = sV / sA;
+    const bool scaleIt = std::fabs(target) > scalar(1e-15)
+                      && std::fabs(mean)   > scalar(0.5)*std::fabs(target);
+    for (label i = 0; i < n; ++i)
+        out[i] = scaleIt ? psi[i]*std::fabs(target)/std::fabs(mean) : psi[i] + (target - mean);
+}
+
+// fixedMean, same family: a boundary condition whose per-step value the DRIVER has to read out of the
+// case, because the field parser has no case directory and no way to know which field it belongs to.
+//
+// brae recomputes it for the PRESSURE field only, which is where OF's tutorials use it. On any other
+// field the patch would be built as a plain fixedValue and never updated -- a frozen boundary where the
+// case asked for a maintained mean -- so that is refused rather than run.
+inline std::vector<DeviceSimpleSolver::FixedMean> collectFixedMean(
+    const std::string& timeDir,
+    const std::vector<FvPatch>& patches,
+    const std::vector<std::string>& otherFields)
+{
+    std::vector<DeviceSimpleSolver::FixedMean> out;
+    for (const std::string& f : otherFields)
+    {
+        const std::string path = timeDir + "/" + f;
+        { std::ifstream a(path); if (!a.good()) { std::ifstream g(path + ".gz"); if (!g.good()) continue; } }
+        const FoamDict d = readDict(path);
+        const FoamDict* bf = d.subDict("boundaryField");
+        if (!bf) continue;
+        for (const FvPatch& fp : patches)
+        {
+            const FoamDict* b = bf->subDict(fp.name);
+            if (b && b->wordOr("type", "") == "fixedMean")
+                throw std::runtime_error(
+                    "brae: patch " + fp.name + " of field " + f + " is `fixedMean`, which brae maintains "
+                    "for the pressure only. On any other field it would be built as a plain fixedValue "
+                    "and frozen at its initial value, so the prescribed mean would silently not hold.");
+        }
+    }
+    const std::string pPath = timeDir + "/p";
+    { std::ifstream a(pPath); if (!a.good()) { std::ifstream g(pPath + ".gz"); if (!g.good()) return out; } }
+    const FoamDict pd = readDict(pPath);
+    const FoamDict* bf = pd.subDict("boundaryField");
+    if (!bf) return out;
+    label start = 0;
+    for (const FvPatch& fp : patches)
+    {
+        if (isCoupledInterfaceType(fp.type)) continue;   // DeviceBoundary order skips these
+        const FoamDict* b = bf->subDict(fp.name);
+        if (b && b->wordOr("type", "") == "fixedMean")
+        {
+            DeviceSimpleSolver::FixedMean e;
+            e.start = start;
+            e.count = fp.size;
+            e.meanValue = b->scalarOr("meanValue", 0.0);
+            out.push_back(e);
         }
         start += fp.size;
     }

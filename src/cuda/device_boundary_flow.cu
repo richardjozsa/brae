@@ -392,6 +392,29 @@ void deviceConstrainMixedHbyA(
 }
 
 
+namespace {
+// patchInternalField for EVERY boundary face: out[i] = cellField[faceCell[i]]. OF's
+// fvPatchField::patchInternalField(). Small (nBndFaces), so a caller can pull it to the host and do a
+// patch-wide reduction there without moving the whole cell field.
+__global__
+void gatherPatchInternalKernel(int n, const label* __restrict__ faceCell,
+                               const scalar* __restrict__ cellField, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = cellField[faceCell[i]];
+}
+}   // namespace
+
+void deviceGatherPatchInternal(const DeviceBoundary& db, const DeviceBuffer<scalar>& cellField,
+                               DeviceBuffer<scalar>& out)
+{
+    out.resize(db.n);
+    if (db.n == 0) return;
+    gatherPatchInternalKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), cellField.data(), out.data());
+    cudaCheck(cudaGetLastError(), "gatherPatchInternal");
+}
+
+
 void deviceUpdateTotalPressure(
     DeviceBoundary& db,
     const DeviceBuffer<scalar>& phiB,

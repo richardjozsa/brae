@@ -410,8 +410,9 @@ inline FieldData<T> readField(const std::string& path)
                         }
                         ts.expect(";");
                     }
-                    else if (key == "inletValue")   // inletOutlet inflow value (may be $internalField)
-                    {
+                    else if (key == "inletValue"     // inletOutlet inflow value (may be $internalField)
+                          || key == "outletValue")   // outletInlet OUTflow value -- the same slot, the
+                    {                                // opposite flux branch (see OutletInletPatchField)
                         readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
                         p.hasInletValue = true;
                         ts.expect(";");

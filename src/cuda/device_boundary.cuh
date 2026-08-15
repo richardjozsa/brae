@@ -179,6 +179,11 @@ void deviceUpdateFlowRateInlet(DeviceVectorBoundary& dbU, const DeviceBuffer<sca
                                const DeviceBuffer<scalar>& nx, const DeviceBuffer<scalar>& ny,
                                const DeviceBuffer<scalar>& nz);
 
+// patchInternalField for every boundary face (out[i] = cellField[faceCell[i]]), for BCs whose value is a
+// patch-wide functional of the adjacent cells -- fixedMean is one.
+void deviceGatherPatchInternal(const DeviceBoundary& db, const DeviceBuffer<scalar>& cellField,
+                               DeviceBuffer<scalar>& out);
+
 void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& Uxb,
                                const DeviceBuffer<scalar>& Uyb, const DeviceBuffer<scalar>& Uzb,
                                const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at the face

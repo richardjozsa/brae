@@ -339,7 +339,40 @@ inline std::string expandDictVariables(const std::string& rawIn)
         }
         std::string val;
         std::size_t j = i + 1;
-        for (; j < toks.size() && toks[j] != ";" && toks[j] != "{" && toks[j] != "}"; ++j) { if (!val.empty()) val += ' '; val += toks[j]; }
+        std::string prev;
+        for (; j < toks.size() && toks[j] != ";" && toks[j] != "}"; ++j)
+        {
+            if (toks[j] == "{")
+            {
+                // A '{' straight after a #directive is that directive's BODY, not a sub-dictionary:
+                //     internalField   uniform #eval{ 3.0/1520000.0 };
+                // Stopping here recorded the value as "uniform #eval", so every `$internalField` expanded
+                // to a #eval with no expression -- and the directive expander (which runs AFTER macros,
+                // because #eval bodies may themselves reference macros) then rejected it with a message
+                // pointing at the USE site, several patches away from the definition. That is how
+                // pimpleFoam/LES/NACA4412's 0/nut failed while its 0/k, written the same way, did not.
+                if (!prev.empty() && prev[0] == '#')
+                {
+                    int d = 1;
+                    if (!val.empty()) val += ' ';
+                    val += '{';
+                    for (++j; j < toks.size() && d > 0; ++j)
+                    {
+                        if      (toks[j] == "{") ++d;
+                        else if (toks[j] == "}") --d;
+                        val += ' ';
+                        val += toks[j];
+                    }
+                    --j;                 // the loop's own ++j steps past the closing '}'
+                    prev = "}";
+                    continue;
+                }
+                break;                   // a genuine sub-dictionary ends the value
+            }
+            if (!val.empty()) val += ' ';
+            val += toks[j];
+            prev = toks[j];
+        }
         // Skip a self-reference like `z0 $z0;` (an inner-scope entry that pulls from an outer variable of the SAME
         // name -- OF scoping). In brae's flat var map this would overwrite the real outer value with an unresolvable
         // self-ref, so keep the outer definition (e.g. `z0 uniform 0.1;` from an #include'd ABLConditions).
