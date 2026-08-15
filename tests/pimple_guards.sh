@@ -69,14 +69,35 @@ mkcase "$WORK/mrf"
 printf 'FoamFile { version 2.0; format ascii; class dictionary; object MRFProperties; }\nMRF1\n{\n    cellZone rotor;\n    active yes;\n    origin (0 0 0);\n    axis (0 0 1);\n    omega 104.72;\n}\n' > "$WORK/mrf/constant/MRFProperties"
 refuses active_mrf_zone "$WORK/mrf" "does not apply MRF yet"
 
-# 3. fvOptions in either of the two places OpenFOAM looks.
-mkcase "$WORK/fvopt_system"
-printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nmomentumSource { type meanVelocityForce; }\n' > "$WORK/fvopt_system/system/fvOptions"
-refuses fvoptions_in_system "$WORK/fvopt_system" "does not apply fvOptions yet"
+# 3. fvOptions. The blanket "transient does not apply fvOptions" refusal is GONE -- the momentum sources
+#    live in solveMomentumPredictor, which pimpleStep already calls, so the driver reads them and hands
+#    them over (planarPoiseuille agrees with OpenFOAM to 7.9e-08 on a flow that IS the source). What must
+#    still refuse is a source brae cannot apply, and a TIME WINDOW it cannot honour -- brae bakes every
+#    source into one set of buffers, so it cannot switch one on mid-run.
+mkcase "$WORK/fvopt_unsupported"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nheat { type semiImplicitSourceNotAThing; }\n' > "$WORK/fvopt_unsupported/system/fvOptions"
+refuses fvoptions_unsupported_source "$WORK/fvopt_unsupported" "SILENTLY dropped"
 
-mkcase "$WORK/fvopt_constant"
-printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nporosity { type explicitPorositySource; }\n' > "$WORK/fvopt_constant/constant/fvOptions"
-refuses fvoptions_in_constant "$WORK/fvopt_constant" "does not apply fvOptions yet"
+# A vectorSemiImplicitSource with NEITHER `sources` nor `injectionRateSuSp`: nothing to apply, so loud.
+mkcase "$WORK/fvopt_nokeys"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nmomentumSource { type vectorSemiImplicitSource; selectionMode all; }\n' > "$WORK/fvopt_nokeys/constant/fvOptions"
+refuses fvoptions_no_source_keys "$WORK/fvopt_nokeys" "neither a \`sources\`"
+
+# A window that does not cover the run must refuse rather than apply the source throughout.
+mkcase "$WORK/fvopt_window"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nmomentumSource { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; timeStart 5000; duration 1; sources { U ((5 0 0) 0); } }\n' > "$WORK/fvopt_window/constant/fvOptions"
+refuses fvoptions_time_window "$WORK/fvopt_window" "does not cover this run"
+
+# ...and a SUPPORTED, always-on source must NOT be refused -- the mirror-image bug of the old blanket stop.
+mkcase "$WORK/fvopt_ok"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nmomentumSource { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; sources { U ((5 0 0) 0); } }\n' > "$WORK/fvopt_ok/constant/fvOptions"
+"$BIN" -case "$WORK/fvopt_ok" > "$WORK/fvopt_ok.log" 2>&1
+if grep -qE -e "fvOptions|SILENTLY dropped" "$WORK/fvopt_ok.log"; then
+    echo "FAIL: fvoptions_supported_runs -- a supported always-on source was refused"
+    grep -m2 -E "fvOptions|SILENTLY" "$WORK/fvopt_ok.log"; fail=1
+else
+    echo "ok:   fvoptions_supported_runs"
+fi
 
 # 4. An INACTIVE MRF zone is not a refusal -- OpenFOAM cases routinely ship one switched off, and refusing those
 #    would be the mirror-image bug (stopping a case brae can solve perfectly well).
@@ -93,7 +114,7 @@ fi
 #    which is exactly how we know the guards let it through rather than the run being stopped early.
 mkcase "$WORK/clean"
 "$BIN" -case "$WORK/clean" > "$WORK/clean.log" 2>&1
-if grep -qE -e "does not apply (MRF|fvOptions) yet|adjustTimeStep yes is not supported" "$WORK/clean.log"; then
+if grep -qE -e "does not apply MRF yet|SILENTLY dropped|adjustTimeStep yes is not supported" "$WORK/clean.log"; then
     echo "FAIL: clean_case -- a guard fired on a case with none of the unsupported features"
     sed -n '1,8p' "$WORK/clean.log"; fail=1
 else

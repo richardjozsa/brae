@@ -780,10 +780,19 @@ void deviceCellLimitGradU(
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
     DeviceBuffer<scalar>& gradU,
-    scalar kc)
+    scalar kc,
+    const DeviceCyclic* cyc,
+    const DeviceAMI* ami)
 {
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+    // The AMI-interpolated (and rotated) neighbour velocity, once for all three components.
+    DeviceBuffer<scalar> amiNbr[3];
+    if (ami && ami->n > 0)
+    {
+        if (ami->rotational) deviceAmiInterpolateVec(*ami, Ux, Uy, Uz, amiNbr[0], amiNbr[1], amiNbr[2]);
+        else for (int j = 0; j < 3; ++j) deviceAmiInterpolate(*ami, *U[j], amiNbr[j]);
+    }
     for (int j = 0; j < 3; ++j)
     {
         DeviceBuffer<scalar> gx(nC), gy(nC), gz(nC);
@@ -792,7 +801,22 @@ void deviceCellLimitGradU(
         cudaMemcpyAsync(gz.data(), gradU.data()+(std::size_t)(6+j)*nC, nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         DeviceBuffer<scalar> ubv;
         deviceBCValue(dbU.comp[j], *U[j], ubv);
-        deviceCellLimitGrad(dm, *U[j], ubv, gx, gy, gz, kc);
+        // The coupled patches join the limiter's range, exactly as in the momentum predictor -- an
+        // interface cell limited as if the interface were not there is the defect this whole path
+        // turned on. See CellLimitInterface.
+        CellLimitInterface ifs[2];
+        int nIfs = 0;
+        DeviceBuffer<scalar> cycNbr;
+        if (cyc && cyc->n > 0)
+        {
+            deviceCyclicNbrValue(*cyc, *U[j], Ux, Uy, Uz, j, cycNbr);
+            ifs[nIfs++] = { cyc->n, cyc->ownCell.data(), cycNbr.data(),
+                            cyc->dOwnX.data(), cyc->dOwnY.data(), cyc->dOwnZ.data() };
+        }
+        if (ami && ami->n > 0)
+            ifs[nIfs++] = { ami->n, ami->ownCell.data(), amiNbr[j].data(),
+                            ami->dOwnX.data(), ami->dOwnY.data(), ami->dOwnZ.data() };
+        deviceCellLimitGrad(dm, *U[j], ubv, gx, gy, gz, kc, ifs, nIfs);
         cudaMemcpyAsync(gradU.data()+(std::size_t)j*nC,     gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         cudaMemcpyAsync(gradU.data()+(std::size_t)(3+j)*nC, gy.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         cudaMemcpyAsync(gradU.data()+(std::size_t)(6+j)*nC, gz.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
@@ -898,7 +922,7 @@ void deviceKOmegaSSTCorrect(
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);   // interface-aware grad(U)
-    if (gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK);   // grad(U) cellLimited (OF)
+    if (gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);   // grad(U) cellLimited (OF)
     DeviceBuffer<scalar> GbyNu0;
     deviceGByNuFromGradU(gradU, nC, GbyNu0);
     DeviceBuffer<scalar> G;
@@ -949,7 +973,8 @@ void deviceKOmegaSSTCorrect(
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
     deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
-    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data());
+    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data(),
+                                          wall.wallW.size() ? wall.wallW.data() : nullptr);
 
     // CDkOmega from grad(k), grad(omega); F1, F2.
     DeviceBuffer<scalar> kbv;

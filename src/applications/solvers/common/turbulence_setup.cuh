@@ -82,13 +82,25 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES" || saIddes);
                 const bool sstDes = (model == "kOmegaSSTDDES" || model == "kOmegaSSTDES" || sstIddes);
                 const bool smag   = (model == "Smagorinsky");
-                if (!saDes && !sstDes && !smag)
+                const bool wale   = (model == "WALE");
+                if (!saDes && !sstDes && !smag && !wale)
                     throw std::runtime_error("brae: unsupported LESModel '" + model
-                        + "' (Smagorinsky, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES/IDDES)");
+                        + "' (Smagorinsky, WALE, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES/IDDES)");
                 const std::string delta = les->wordOr("delta", "cubeRootVol");
                 if (!saIddes && !sstIddes && delta != "cubeRootVol")   // IDDES computes its own (maxDeltaxyz-based) length scale internally
                     std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
                 const FoamDict* dc = les->subDict(model + "Coeffs");
+                if (wale)   // WALE: the other ALGEBRAIC sub-grid nut. Same slot as Smagorinsky -- no transport
+                {           // scalar, no DES limiter -- only the velocity scale differs (see WaleCoeffs).
+                    ctl.les = true;
+                    ctl.wale = true;
+                    if (dc) { ctl.waleCoeffs.Ck = dc->scalarOr("Ck", ctl.waleCoeffs.Ck);
+                              ctl.waleCoeffs.Ce = dc->scalarOr("Ce", ctl.waleCoeffs.Ce);
+                              ctl.waleCoeffs.Cw = dc->scalarOr("Cw", ctl.waleCoeffs.Cw); }
+                    std::printf("  WALE (LES, delta=cubeRootVol): Ck=%.4g Cw=%.4g\n",
+                                ctl.waleCoeffs.Ck, ctl.waleCoeffs.Cw);
+                    return;
+                }
                 if (smag)   // pure LES Smagorinsky: ALGEBRAIC sub-grid nut (no transport scalar, no DES length-scale limiter)
                 {
                     ctl.les = true;

@@ -7,6 +7,7 @@
 #include "komega_sst_coeffs.cuh"
 #include "spalart_coeffs.cuh"
 #include "smagorinsky_coeffs.cuh"
+#include "deshybrid_coeffs.cuh"
 #include <string>
 
 namespace brae {
@@ -167,6 +168,17 @@ struct DeviceSimpleControls
     bool   les = false;                            // pure LES Smagorinsky (simulationType LES): ALGEBRAIC sub-grid nut,
                                                    // NO transport scalar (no k/epsilon/omega/nuTilda). Mutually exclusive with sa/sst/des.
     SmagorinskyCoeffs smagCoeffs;                  // Smagorinsky coeffs (default = OF Ck=0.094, Ce=1.048); read from LES.SmagorinskyCoeffs.
+    // WALE: the same algebraic-LES slot, a different velocity scale. `les` stays the flag for
+    // "nut is algebraic, there is no transport scalar"; this only picks which formula fills it.
+    bool wale = false;
+    // fvSchemes wallDist `method exactDistance`: the true Euclidean distance to the wall surface, rather
+    // than OF's default connectivity-propagated meshWave. Different y => a different F1/F2/dTilda.
+    bool exactWallDist = false;
+    // div(phi,U) `Gauss DEShybrid <s1> <s2> <delta> ...`: a per-face blend of a low-dissipation scheme
+    // and an upwind-biased one, driven by a DES sensor. See deshybrid_coeffs.cuh.
+    bool desHybrid = false;
+    DesHybridCoeffs desCoeffs;
+    WaleCoeffs waleCoeffs;
     NutWall nutWall = NutWall::Nutk;               // nut wall function, read from the 0/nut wall BC TYPE (not the model),
                                                    // so nutUBlended/nutUSpalding are honoured on kEpsilon/kOmegaSST like OF.
     scalar atmZ0 = 0.0;                            // atmNutkWallFunction roughness length z0 (>0 -> rough-wall nut on the

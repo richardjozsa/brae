@@ -96,6 +96,7 @@ add_library(brae_core STATIC
     src/cuda/device_spalart.cu
     src/cuda/device_komega_sst.cu
     src/cuda/device_smagorinsky.cu
+    src/cuda/device_deshybrid.cu
     src/cuda/device_generalized_newtonian.cu
     src/cuda/device_coded_bc.cu
     src/cuda/device_energy.cu
@@ -1131,6 +1132,88 @@ add_test(NAME cyclic_poisson COMMAND test_cyclic_poisson ${CMAKE_CURRENT_SOURCE_
 # meshPhi / fvc::makeRelative: a fluid moving WITH the mesh must have zero relative flux, on the
 # cyclicACMI interface faces as much as anywhere else (see the test's header).
 # fvc::ddtCorr: the ddt flux correction pimpleFoam adds to phiHbyA (see the test's header).
+# fvc::correctUf: Sf & Uf == phi, and why phi + mesh.phi() cannot stand in for it (see the header).
+# A cyclicACMI non-overlap patch is a wall only where it is closed (see the test's header).
+add_executable(test_acmi_wall_gate tests/test_acmi_wall_gate.cu)
+target_include_directories(test_acmi_wall_gate PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_acmi_wall_gate PRIVATE brae_core)
+add_test(NAME acmi_wall_gate COMMAND test_acmi_wall_gate)
+set_tests_properties(acmi_wall_gate PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_wall_data_refresh tests/test_wall_data_refresh.cu)
+target_include_directories(test_wall_data_refresh PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_wall_data_refresh PRIVATE brae_core)
+add_test(NAME wall_data_refresh COMMAND test_wall_data_refresh)
+set_tests_properties(wall_data_refresh PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_cell_limit_interface tests/test_cell_limit_interface.cu)
+target_include_directories(test_cell_limit_interface PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_cell_limit_interface PRIVATE brae_core)
+add_test(NAME cell_limit_interface COMMAND test_cell_limit_interface)
+set_tests_properties(cell_limit_interface PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_scalar_interface_corr tests/test_scalar_interface_corr.cu)
+target_include_directories(test_scalar_interface_corr PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_scalar_interface_corr PRIVATE brae_core)
+add_test(NAME scalar_interface_corr COMMAND test_scalar_interface_corr)
+set_tests_properties(scalar_interface_corr PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_kepsilon_production_and_blend tests/test_kepsilon_production_and_blend.cu)
+target_include_directories(test_kepsilon_production_and_blend PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_kepsilon_production_and_blend PRIVATE brae_core)
+add_test(NAME kepsilon_production_and_blend COMMAND test_kepsilon_production_and_blend)
+
+add_executable(test_near_wall_dist_combined tests/test_near_wall_dist_combined.cu)
+target_include_directories(test_near_wall_dist_combined PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_near_wall_dist_combined PRIVATE brae_core)
+add_test(NAME near_wall_dist_combined COMMAND test_near_wall_dist_combined)
+
+add_executable(test_boundary_subdict_skip tests/test_boundary_subdict_skip.cu)
+target_include_directories(test_boundary_subdict_skip PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_boundary_subdict_skip PRIVATE brae_core)
+add_test(NAME boundary_subdict_skip COMMAND test_boundary_subdict_skip)
+
+add_executable(test_fvoptions_sources_key tests/test_fvoptions_sources_key.cu)
+target_include_directories(test_fvoptions_sources_key PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_fvoptions_sources_key PRIVATE brae_core)
+add_test(NAME fvoptions_sources_key COMMAND test_fvoptions_sources_key)
+
+add_executable(test_wale_nut tests/test_wale_nut.cu)
+target_include_directories(test_wale_nut PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_wale_nut PRIVATE brae_core)
+add_test(NAME wale_nut COMMAND test_wale_nut)
+
+add_executable(test_gz_field_write tests/test_gz_field_write.cu)
+target_include_directories(test_gz_field_write PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_gz_field_write PRIVATE brae_core)
+add_test(NAME gz_field_write COMMAND test_gz_field_write)
+
+add_executable(test_exact_wall_dist tests/test_exact_wall_dist.cu)
+target_include_directories(test_exact_wall_dist PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_exact_wall_dist PRIVATE brae_core)
+add_test(NAME exact_wall_dist COMMAND test_exact_wall_dist)
+
+add_executable(test_fan_pressure tests/test_fan_pressure.cu)
+target_include_directories(test_fan_pressure PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_fan_pressure PRIVATE brae_core)
+add_test(NAME fan_pressure COMMAND test_fan_pressure)
+
+add_executable(test_deshybrid tests/test_deshybrid.cu)
+target_include_directories(test_deshybrid PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_deshybrid PRIVATE brae_core)
+add_test(NAME deshybrid COMMAND test_deshybrid)
+
+# divDevReff must use the case's NAMED grad(U) scheme, not a bare Gauss one (see the test's header).
+add_executable(test_divdevreff_gradscheme tests/test_divdevreff_gradscheme.cu)
+target_include_directories(test_divdevreff_gradscheme PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_divdevreff_gradscheme PRIVATE brae_core)
+add_test(NAME divdevreff_gradscheme COMMAND test_divdevreff_gradscheme)
+
+add_executable(test_correct_uf tests/test_correct_uf.cu)
+target_include_directories(test_correct_uf PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_correct_uf PRIVATE brae_core)
+add_test(NAME correct_uf COMMAND test_correct_uf)
+
 add_executable(test_ddt_corr tests/test_ddt_corr.cu)
 target_include_directories(test_ddt_corr PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_ddt_corr PRIVATE brae_core)

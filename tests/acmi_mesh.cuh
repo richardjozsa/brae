@@ -35,8 +35,14 @@ constexpr scalar ACMI_CELL_VOL = 0.25*0.1;   // 1 (x) * 0.25 (y) * 0.1 (z)
 
 // nonOverlap1: override the nonOverlapPatch NAME of ACMI1_couple. Used by the area-scaling test to
 // point it at a patch that is the right size but the wrong surface, which must be refused.
+// frontBackEmpty: put the z-normal faces on an `empty` patch instead of folding them into `walls`, as a
+// real 2D case does. Off by default so every existing fixture is byte-for-byte unchanged. It matters for
+// one question only: with them as walls, EVERY cell touches a wall, so a test asking "is this cell near a
+// wall" can never see a cell whose only wall face is the ACMI blockage -- and that is exactly the cell
+// the blockage gate exists for.
 inline PrimitiveMesh twoBlockACMI(scalar dy, bool withBlockage = false,
-                                  const char* nonOverlap1 = "ACMI1_blockage")
+                                  const char* nonOverlap1 = "ACMI1_blockage",
+                                  bool frontBackEmpty = false)
 {
     const label NY = ACMI_NY;
     std::vector<vector> pts;
@@ -123,13 +129,29 @@ inline PrimitiveMesh twoBlockACMI(scalar dy, bool withBlockage = false,
         const label c0   = blk ? NY : 0;
         quad(pt(base,1,0,0), pt(base,1,0,1), pt(base,0,0,1), pt(base,0,0,0), c0, -1);
         quad(pt(base,0,NY,0), pt(base,0,NY,1), pt(base,1,NY,1), pt(base,1,NY,0), c0+NY-1, -1);
-        for (label j = 0; j < NY; ++j)
-        {
-            quad(pt(base,0,j+1,0), pt(base,1,j+1,0), pt(base,1,j,0), pt(base,0,j,0), c0+j, -1);
-            quad(pt(base,0,j,1), pt(base,1,j,1), pt(base,1,j+1,1), pt(base,0,j+1,1), c0+j, -1);
-        }
+        if (!frontBackEmpty)
+            for (label j = 0; j < NY; ++j)
+            {
+                quad(pt(base,0,j+1,0), pt(base,1,j+1,0), pt(base,1,j,0), pt(base,0,j,0), c0+j, -1);
+                quad(pt(base,0,j,1), pt(base,1,j,1), pt(base,1,j+1,1), pt(base,0,j+1,1), c0+j, -1);
+            }
     }
     endPatch();
+    if (frontBackEmpty)
+    {
+        beginPatch("frontAndBack", "empty");
+        for (int blk = 0; blk < 2; ++blk)
+        {
+            const label base = blk ? bB : bA;
+            const label c0   = blk ? NY : 0;
+            for (label j = 0; j < NY; ++j)
+            {
+                quad(pt(base,0,j+1,0), pt(base,1,j+1,0), pt(base,1,j,0), pt(base,0,j,0), c0+j, -1);
+                quad(pt(base,0,j,1), pt(base,1,j,1), pt(base,1,j+1,1), pt(base,0,j+1,1), c0+j, -1);
+            }
+        }
+        endPatch();
+    }
 
     for (PatchInfo& p : patches)
     {

@@ -87,12 +87,16 @@ public:
     label faceSize(label f)  const { return faceOffsets_[f + 1] - faceOffsets_[f]; }
     label faceVert(label f, label k) const { return faceVerts_[faceOffsets_[f] + k]; }
 
+    // Public so a test can exercise the boundary parse on its own: the patch dictionary has grown
+    // enough shapes (sub-dictionaries, wordLists, ACMI keys) to be worth testing without having to
+    // synthesise a whole consistent polyMesh around it.
+    void readBoundary(const std::string& dir);
+
 private:
     void readPoints(const std::string& dir);
     void readFaces(const std::string& dir);
     void readOwner(const std::string& dir);
     void readNeighbour(const std::string& dir);
-    void readBoundary(const std::string& dir);
     // Binary mesh cache (BRAE_MESH_CACHE): the ASCII polyMesh parse is the #1 startup cost (millions of string tokens).
     // On a warm run we reload the parsed topology from a binary blob (raw fread of the POD arrays), like OpenFOAM
     // reusing its decomposePar processor* dirs. Auto-invalidated when the polyMesh/owner file is newer than the cache.

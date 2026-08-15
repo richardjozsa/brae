@@ -121,6 +121,24 @@ inline void interfaceAddLinUpwindCorr(const DeviceAMI& ami, int comp, const Devi
                                       DeviceBuffer<scalar>& corr)
 { deviceAmiAddLinUpwindCorr(ami, comp, gUx, gUy, gUz, corr); }
 
+// ...and their SCALAR forms, for the turbulence/energy transport.
+inline void interfaceAddLinUpwindCorr(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& gx,
+                                      const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
+                                      DeviceBuffer<scalar>& corr)
+{ deviceCyclicAddLinUpwindCorr(cyc, gx, gy, gz, corr); }
+inline void interfaceAddLinUpwindCorr(const DeviceAMI& ami, const DeviceBuffer<scalar>& gx,
+                                      const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
+                                      DeviceBuffer<scalar>& corr)
+{ deviceAmiAddLinUpwindCorr(ami, gx, gy, gz, corr); }
+inline void interfaceAddLapCorr(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& gammaCell,
+                                const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+                                const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& corr)
+{ deviceCyclicAddLapCorr(cyc, gammaCell, gx, gy, gz, corr); }
+inline void interfaceAddLapCorr(const DeviceAMI& ami, const DeviceBuffer<scalar>& gammaCell,
+                                const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+                                const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& corr)
+{ deviceAmiAddLapCorr(ami, gammaCell, gx, gy, gz, corr); }
+
 // velocity non-orthogonal Laplacian correction (component comp, rotated neighbour reconstruction).
 inline void interfaceAddLapCorr(const DeviceCyclic& cyc, int comp, const DeviceBuffer<scalar>& gammaCell,
                                 const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy,

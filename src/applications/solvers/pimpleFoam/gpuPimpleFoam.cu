@@ -40,6 +40,7 @@
 #include "swept_volume.cuh"        // OF meshPhi / makeRelative / movingWallVelocity
 #include "time_controls.cuh"   // OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT
 #include "brae_time.cuh"
+#include "fan_pressure.cuh"   // fanPressure: the fan curve + direction, read where caseDir is known
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include <cctype>
 #include <cmath>
@@ -166,11 +167,27 @@ try
         throw std::runtime_error(
             "constant/MRFProperties has an active zone, and brae's transient solver does not apply MRF yet "
             "(the steady solver does). Marching this case would silently drop the rotation.");
-    for (const std::string& fvo : {caseDir + "/system/fvOptions", caseDir + "/constant/fvOptions"})
-        if (std::filesystem::exists(fvo))
-            throw std::runtime_error(
-                fvo + " is present, and brae's transient solver does not apply fvOptions yet (the steady solver "
-                "does). Marching this case would silently drop those sources.");
+    // fvOptions PRE-FLIGHT, before the mesh: refuse what cannot be applied, and any time window brae
+    // cannot honour. The sources themselves are read after the geometry (they need cell volumes) and
+    // handed to the solver, whose momentum predictor has applied them all along.
+    {
+        const FvOptionsPreflight pf = preflightFvOptions(caseDir);
+        if (!pf.unsupported.empty())
+        {
+            std::string msg = "fvOptions contains source(s) brae cannot apply (they would be SILENTLY dropped -> wrong physics):";
+            for (const auto& u : pf.unsupported) msg += "\n  - " + u;
+            throw std::runtime_error(msg);
+        }
+        for (const auto& w : pf.windows)
+            if (w.start > startTime || w.start + w.duration < endTime)
+                throw std::runtime_error(
+                    "fvOptions source '" + w.name + "' is active only for t in ["
+                    + std::to_string(w.start) + ", " + std::to_string(w.start + w.duration)
+                    + "], which does not cover this run [" + std::to_string(startTime) + ", "
+                    + std::to_string(endTime) + "]. brae applies its fvOptions for the whole run, so it "
+                    "would impose this source outside its window. Shorten the run to the window, or "
+                    "remove timeStart/duration if the source is meant to be always on.");
+    }
 
     // adjustTimeStep: Courant-limited dt, via the SHARED cfdTools module (OF readTimeControls /
     // CourantNo / setInitialDeltaT / setDeltaT). Previously refused outright, which cost 11 of the 35
@@ -274,6 +291,58 @@ try
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
     solver.setDdtCorr(ddtCorrOn);
+
+    // fvOptions. The momentum sources themselves live in solveMomentumPredictor, which pimpleStep already
+    // calls, so this driver only ever had to READ them and hand them over -- it refused instead, which
+    // cost pimpleFoam/laminar/planarPoiseuille and pimpleFoam/LES/periodicPlaneChannel.
+    //
+    // What a transient driver must add over the steady one is the TIME WINDOW. OF's cellSetOption is
+    // active only for timeStart <= t <= timeStart + duration; steady has no time and ignores it, but
+    // marching a windowed source outside its window is exactly the silent wrong physics the refusal
+    // existed to prevent. brae bakes every source into one set of buffers, so it cannot switch an
+    // individual one on and off mid-run: a window that does not cover the whole run is refused, and one
+    // that does is applied unconditionally, which is the same thing OF computes.
+    FvOptionsData fvo;
+    {
+        std::map<std::string, std::vector<label>> fvoZones;
+        {
+            std::ifstream a(caseDir + "/system/fvOptions"), b(caseDir + "/constant/fvOptions");
+            if (a.good() || b.good()) fvoZones = readCellZones(caseDir + "/constant/polyMesh");
+        }
+        fvo = readFvOptions(caseDir, fvoZones, g.V(), nC, g.C());
+        if (!fvo.unsupported.empty())
+        {
+            std::string msg = "fvOptions contains source(s) brae cannot apply (they would be SILENTLY dropped -> wrong physics):";
+            for (const auto& u : fvo.unsupported) msg += "\n  - " + u;
+            throw std::runtime_error(msg);
+        }
+        for (const auto& w : fvo.windows)
+            if (w.start > startTime || w.start + w.duration < endTime)
+                throw std::runtime_error(
+                    "fvOptions source '" + w.name + "' is active only for t in ["
+                    + std::to_string(w.start) + ", " + std::to_string(w.start + w.duration)
+                    + "], which does not cover this run [" + std::to_string(startTime) + ", "
+                    + std::to_string(endTime) + "]. brae applies its fvOptions for the whole run, so it "
+                    "would impose this source outside its window. Shorten the run to the window, or "
+                    "remove timeStart/duration if the source is meant to be always on.");
+    }
+
+    if (!fvo.empty())
+    {
+        solver.setFvOptions(fvo);
+        if (fvo.rotor.active)
+            solver.setRotorDisk(buildDeviceRotorDisk(fvo.rotor, g.C(), g.Sf(), m.owner(), m.neighbour(), m.nInternalFaces()));
+        std::printf("  fvOptions: %d source(s)%s%s%s%s%s%s%s\n", fvo.count, fvo.hasMomentum ? " momentum" : "",
+                    fvo.porActive ? " DarcyForchheimer-porosity" : "", fvo.mvfActive ? " meanVelocityForce" : "",
+                    fvo.limUActive ? " limitVelocity" : "", fvo.adActive ? " actuationDiskSource" : "",
+                    fvo.rotor.active ? " rotorDiskSource" : "", fvo.vdcActive ? " velocityDampingConstraint" : "");
+    }
+    else std::printf("  No finite volume options present\n");
+
+    // OF createUfIfPresent.H -- the face velocity is constructed at case setup when the mesh is dynamic,
+    // before any motion. fvc::ddtCorr's Uf form needs it; without motion there is no Uf and OF uses the
+    // phi.oldTime() form instead.
+    if (meshMotion.active) solver.enableUf();
     if (phiHadCoupledValues)
     {
         std::vector<std::pair<label, std::vector<scalar>>> ifPhi;
@@ -289,6 +358,15 @@ try
     // measured on pimpleFoam/RAS/TJunction as inlet p FALLING 9.32 -> 8.62 where the table asks
     // for 13.09 -> 15.11, i.e. a case that runs and silently ignores the prescribed ramp.
     solver.setTimeVaryingP0(DeviceSimpleSolver::collectTimeVaryingP0(pFd, fvp));
+    // fanPressure: the curve lives in the case (often an external file), so it is read here rather than in
+    // the field parser, which has no case directory. Empty for every case that has no fan patch.
+    {
+        std::vector<DeviceSimpleSolver::FanPressure> fans = collectFanPressure(caseDir, fieldDir, fvp);
+        if (!fans.empty())
+            std::printf("  fanPressure: %zu patch(es), fan curve with %zu points\n",
+                        fans.size(), fans.front().curve.size());
+        solver.setFanPressure(std::move(fans));
+    }
     solver.setTime(startTime);   // seed p0 at the START time, as OF's constructor does
     // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face masks so it
     // refreshes them each iteration instead of freezing the set-up value.
@@ -596,6 +674,10 @@ try
                     m, fvp[pi].start, fvp[pi].size, oldPoints, newPoints, mp, g.Sf(), g.magSf(), deltaT);
                 solver.setPatchVelocity(static_cast<label>(pi), Uw);
             }
+
+            // ...and the wall-function geometry, which is a function of the mesh just as much as the AMI
+            // weights are. It is rebuilt LAST so it picks up the movingWallVelocity assignment above.
+            solver.refreshWallData(m, g, fvp);
         }
         const DeviceSimpleResidual r = solver.pimpleStep(deltaT, nOuter, nCorr);
         // OF order: the Courant number is evaluated on the flux the step just produced, and deltaT for

@@ -245,9 +245,31 @@ void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const D
 void deviceGaussGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
                      DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
 
+// The COUPLED-PATCH half of cellLimitedGrad, which brae's addressing cannot see on its own.
+//
+// A cyclic/cyclicAMI/cyclicACMI face is a boundary face to brae (DeviceBoundary skips it, so it is in
+// neither dm.bndCellStart nor Ubnd) but an INTERNAL one to OF's limiter: cellLimitedGrad::calcGrad folds
+// psf.patchNeighbourField() into maxVsf/minVsf for every coupled patch, and its second loop limits the
+// extrapolation to EVERY boundary face, coupled ones included. Without this an interface cell is limited
+// as though the interface were not there.
+//
+// nbrVal is this component's neighbour value per interface face, already interpolated (AMI) and rotated
+// (rotational cyclic) by the caller -- the rotation machinery lives there and is not duplicated here.
+struct CellLimitInterface
+{
+    int n = 0;
+    const label*  ownCell = nullptr;
+    const scalar* nbrVal  = nullptr;
+    const scalar* dOwnX   = nullptr;   // Cf - C[own], the extrapolation vector for this face
+    const scalar* dOwnY   = nullptr;
+    const scalar* dOwnZ   = nullptr;
+};
+
 // cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>) applied to one component's gradient (gx,gy,gz in/out).
+// With no interfaces this is the single-kernel path it has always been, bit for bit.
 void deviceCellLimitGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& U, const DeviceBuffer<scalar>& Ubnd,
-                         DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz, scalar k);
+                         DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz, scalar k,
+                         const CellLimitInterface* ifs = nullptr, int nIfs = 0);
 
 // G4: fvm matrix assembly on device, produces the raw lduMatrix coefficients (diag/upper/lower), the
 // boundary internalCoeffs/boundaryCoeffs are folded by the solver (G5). gammafInt / phiInt are nIf-sized.

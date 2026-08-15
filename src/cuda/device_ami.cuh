@@ -189,6 +189,13 @@ void deviceAmiAddLinUpwindCorr(const DeviceAMI& ami, int comp, const DeviceBuffe
                                const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz, DeviceBuffer<scalar>& corr);
 // non-orth laplacian correction (momentum, component comp): src[own] -= gammaFace*magSf*(corrVec.grad(U_comp)_face);
 // neighbour grad rotated as a TENSOR R.gradU.R^T then AMI-interpolated. gammaCell = nuEff per cell.
+// SCALAR overloads (k/epsilon/omega/nuTilda/he): one gradient, never rotated across the interface.
+void deviceAmiAddLinUpwindCorr(const DeviceAMI& ami, const DeviceBuffer<scalar>& gx,
+                               const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
+                               DeviceBuffer<scalar>& corr);
+void deviceAmiAddLapCorr(const DeviceAMI& ami, const DeviceBuffer<scalar>& gammaCell,
+                         const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+                         const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& corr);
 void deviceAmiAddLapCorr(const DeviceAMI& ami, int comp, const DeviceBuffer<scalar>& gammaCell,
                          const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz,
                          DeviceBuffer<scalar>& corr);

@@ -178,6 +178,14 @@ void deviceCyclicZeroWallIfCoeff(DeviceCyclic& cyc, const DeviceBuffer<label>& i
 // pressure-correction flux: phi[j] -= ifCoeff[j]*(p[nbr]-p[own])  (the snGrad(p) flux across the periodic face).
 void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p);
 // gaussGrad contribution: grad[own] += Sf_j * (w*psi[own]+(1-w)*psi[nbr]) / V[own].
+// fvc::interpolate of a CELL field onto the cyclic faces: w*psi[own] + (1-w)*psi[nbr].
+void deviceCyclicFaceValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out);
+// OF patchNeighbourField() for a cyclic patch: the raw neighbour cell value per face (rotated by forwardT
+// on a rotational cyclic, which is why it takes all three components). For cellLimitedGrad's range.
+void deviceCyclicNbrValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& cell,
+                          const DeviceBuffer<scalar>& c0, const DeviceBuffer<scalar>& c1,
+                          const DeviceBuffer<scalar>& c2, int comp, DeviceBuffer<scalar>& out);
+
 void deviceCyclicAddGrad(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& psi, const DeviceBuffer<scalar>& V,
                          DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
 // linearUpwind deferred correction at the cyclic interface (component comp). Mirrors deviceLinearUpwindCorr but
@@ -193,6 +201,13 @@ void deviceCyclicAddLinUpwindCorr(const DeviceCyclic& cyc, int comp,
 // caller does relaxSrc -= src (mirrors the internal deviceLaplacianCorr). The neighbour gradient ROTATES as a tensor:
 // grad((forwardT.U)_comp) = (forwardT . gradU[nbr] . forwardT^T)[comp][:], so it needs ALL 3 component gradients.
 // gammaCell = nuEff per cell (interpolated to the face by w). corr is the SAME buffer the internal corr was written to.
+// SCALAR overloads (k/epsilon/omega/nuTilda/he): one gradient, never rotated across the interface.
+void deviceCyclicAddLinUpwindCorr(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& gx,
+                                  const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
+                                  DeviceBuffer<scalar>& corr);
+void deviceCyclicAddLapCorr(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& gammaCell,
+                            const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+                            const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& corr);
 void deviceCyclicAddLapCorr(const DeviceCyclic& cyc, int comp, const DeviceBuffer<scalar>& gammaCell,
                             const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy,
                             const DeviceBuffer<scalar>* gUz, DeviceBuffer<scalar>& corr);

@@ -177,4 +177,32 @@ void deviceDdtCorrFlux(
     DeviceBuffer<scalar>&       outInt,      // += the correction
     DeviceBuffer<scalar>&       outBnd);
 
+// fvc::correctUf (fvcMeshPhi.C) -- the face velocity a moving-mesh pimpleFoam carries alongside phi:
+//
+//     Uf  = fvc::interpolate(U);
+//     n   = Sf/magSf;
+//     Uf += n*(phi/magSf - (n & Uf));
+//
+// i.e. the interpolated cell velocity with its NORMAL component replaced by the one the conservative flux
+// implies. `phi` must be the ABSOLUTE flux -- OF calls this at the end of pEqn.H, before makeRelative.
+//
+// `faceIdx` maps entry i to its index in Sf/magSf: pass the boundary gather (dm.bndGFace) for boundary
+// faces, and nullptr when the arrays are already in the caller's own order (internal faces, or an
+// interface whose Sf is stored per interface face).
+void deviceCorrectUf(
+    int n, const label* faceIdx,
+    const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,
+    const DeviceBuffer<scalar>& magSf, const DeviceBuffer<scalar>& phi,
+    DeviceBuffer<scalar>& ufx, DeviceBuffer<scalar>& ufy, DeviceBuffer<scalar>& ufz);   // in: interp(U), out: Uf
+
+// Sf & Uf, per face. This is EulerDdtScheme::fvcDdtUfCorr's phiUf0 -- the CURRENT Sf dotted into the
+// STORED face velocity, which is what makes the Uf form exact on a mesh whose areas change (a rotating
+// mesh, or a cyclicACMI whose overlap mask rescales its coupled areas every step) where phi + mesh.phi()
+// is only an approximation of it.
+void deviceDotSf(
+    int n, const label* faceIdx,
+    const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,
+    const DeviceBuffer<scalar>& ufx, const DeviceBuffer<scalar>& ufy, const DeviceBuffer<scalar>& ufz,
+    DeviceBuffer<scalar>& out);
+
 }  // namespace brae

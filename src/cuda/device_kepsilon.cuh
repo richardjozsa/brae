@@ -52,7 +52,8 @@ void deviceGByNuFromGradU(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffe
 // turbulence strain S2 + production, which OF computes from fvc::grad(U) = the (cellLimited) grad(U) scheme.
 void deviceCellLimitGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                           const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                          DeviceBuffer<scalar>& gradU, scalar kc);
+                          DeviceBuffer<scalar>& gradU, scalar kc,
+                          const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr);
 
 // nut = Cmu k^2 / eps.
 void deviceNut(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut,
@@ -66,14 +67,26 @@ void deviceBoundField(const DeviceMesh& dm, DeviceBuffer<scalar>& x, scalar floo
 struct DeviceWallData
 {
     int nWF = 0;
+    // isWallCell: "this cell's epsilon/omega is FIXED by a wall function". Not the same question as
+    // "does this cell touch a wall patch", and the difference is a cyclicACMI. Its non-overlap patch is
+    // a wall of area (1-mask)*A, so a fully OPEN one is a wall face with no wall behind it, and OF does
+    // not constrain its cell -- cyclicACMIFvPatchField::manipulateMatrix redirects to the non-overlap
+    // patch with weights (1-mask), and epsilonWallFunction only constrains where weight > 1e-5.
+    // See buildDeviceWallData for what counting them anyway cost.
     DeviceBuffer<label>  wfCell, isWallCell;
+    // ...and the weight itself, for the partially blocked faces in between: OF blends rather than
+    // switches, G[c] = (1-w)*G[c] + w*G0[c] and the same for epsilon (epsilonWallFunction.C:592).
+    DeviceBuffer<scalar> wallW;
     DeviceBuffer<scalar> wfY, wfDc, wfUwx, wfUwy, wfUwz, invNw;
 };
+// The wall velocity comes in per patch rather than from a GeometricField, because on a MOVING mesh the
+// two can disagree: `movingWallVelocity` is assigned into the solver's device boundary after the move
+// (setPatchVelocity), and the host field is not what the solver imposes. See refreshWallData.
 inline DeviceWallData buildDeviceWallData(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp,
-    const GeometricField<vector>& U)
+    const std::vector<std::vector<vector>>& wallU)
 {
     const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
     std::vector<label> wfCell;
@@ -82,7 +95,7 @@ inline DeviceWallData buildDeviceWallData(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         if (fvp[pi].type == "wall")
         {
-            const std::vector<vector>& uv = U.boundary[pi]->value();
+            const std::vector<vector>& uv = wallU[pi];
             for (label i = 0; i < fvp[pi].size; ++i)
             {
                 const label c = fvp[pi].faceCells[i];
@@ -103,6 +116,37 @@ inline DeviceWallData buildDeviceWallData(
             invNw[c] = 1.0 / nw[c];
             isW[c] = 1;
         }
+    // THE ACMI NON-OVERLAP WALL IS ONLY A WALL WHERE IT IS CLOSED.
+    //
+    // A cyclicACMI carries a coincident wall (its nonOverlapPatch) whose area is (1-mask)*A, so on the
+    // covered part of the interface it is a `wall` patch with essentially zero area -- and brae counted
+    // every one of its faces as a wall face. That put the near-wall epsilon on cells that are not near a
+    // wall at all, and worse, deviceSolveScalarTransport zeroes the AMI off-diagonal for wall cells
+    // (their value is fixed), so epsilon lost its interface coupling entirely.
+    //
+    // OF gates it: cyclicACMIFvPatchField::manipulateMatrix hands the non-overlap patch field a weight
+    // of (1-mask) and epsilonWallFunction acts only where that exceeds tolerance_ = 1e-5, blending
+    // rather than switching in between. The weight is exactly the patch's areaFraction, which brae
+    // already has as scaled/raw |Sf| -- 1 on every ordinary wall, since rawMagSf falls back to magSf.
+    //
+    // Measured on pimpleFoam/RAS/oscillatingInletACMI2D, one step from OpenFOAM's own t=0.01: epsilon on
+    // the channel's interface column was 8.20x OF's and the duct's covered band 4.09x, with the fully
+    // blocked cells already correct to 3.9e-06 -- the giveaway that this was about which faces count as
+    // wall, not about the wall function itself.
+    constexpr scalar ACMI_WALL_TOL = 1e-5;   // OF epsilonWallFunctionFvPatchScalarField::tolerance_
+    std::vector<scalar> wallW(m.nCells(), 0.0);
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        if (fvp[pi].type == "wall")
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const label f = fvp[pi].start + i;
+                const scalar raw = g.rawMagSf(f);
+                const scalar frac = raw > scalar(0) ? g.magSf()[f]/raw : scalar(1);   // OF areaFraction()
+                const label c = fvp[pi].faceCells[i];
+                if (frac > wallW[c]) wallW[c] = frac;
+            }
+    for (label c = 0; c < m.nCells(); ++c)
+        if (wallW[c] <= ACMI_WALL_TOL) isW[c] = 0;   // a wall face with no wall behind it
     DeviceWallData w;
     w.nWF = static_cast<int>(wfCell.size());
     w.wfCell.copyFrom(wfCell);
@@ -113,7 +157,22 @@ inline DeviceWallData buildDeviceWallData(
     w.wfUwz.copyFrom(wuz);
     w.invNw.copyFrom(invNw);
     w.isWallCell.copyFrom(isW);
+    w.wallW.copyFrom(wallW);
     return w;
+}
+
+// Convenience overload: take the wall velocities off a U field's boundary. This is the construction-time
+// path, where the host field and the device boundary still agree.
+inline DeviceWallData buildDeviceWallData(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    const GeometricField<vector>& U)
+{
+    std::vector<std::vector<vector>> wallU(fvp.size());
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        if (fvp[pi].type == "wall") wallU[pi] = U.boundary[pi]->value();
+    return buildDeviceWallData(m, g, fvp, wallU);
 }
 
 // epsilonWallFunction near-wall values: eps0 = (1/nWall) Cmu^.75 k^1.5/(kappa y); G0 = (1/nWall)(nutw+nu)*
@@ -206,6 +265,10 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             // OF `grad(k)`/`grad(epsilon)` cellLimited coefficient (0 = unlimited); see the
                             // kOmegaSST declaration below for why this is distinct from gradULimitK.
                             scalar gradScalarLimitK = 0.0,
+                            // OF `grad(U)` cellLimited coefficient. kEpsilon::correct() builds its
+                            // production from fvc::grad(U), which resolves that entry; leaving it
+                            // unlimited makes the production term too large wherever the limiter bites.
+                            scalar gradULimitK = 0.0,
                             // fvOptions scalarFixedValueConstraint on k / epsilon (OF eqn.setValues).
                             // Applied BEFORE the eps wall function, per kEpsilon.C:266-267.
                             const DeviceBuffer<label>*  fvoKMask = nullptr,

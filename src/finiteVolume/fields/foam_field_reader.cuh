@@ -25,8 +25,29 @@ template <> inline vector readFoamValue<vector>(TokenStream& ts)
 // Skip an unhandled dict entry's tokens up to (not including) its terminating ';', paren-aware so nested "(...)" lists
 // / tables / Function1 entries are consumed whole. initialDepth accounts for a leading '(' the caller already read.
 // Leaves the ';' in place for the caller's ts.expect(";"). Single source for the reader's 3 table/skip fallbacks.
-inline void skipToSemicolon(TokenStream& ts, int initialDepth = 0)
+// Skip an entry's VALUE. Returns true if it consumed a sub-dictionary (which has no trailing ';', so the
+// caller must not expect one) and false for an ordinary value terminated by ';'.
+//
+// Brace tracking is not decoration. A patch entry can carry a sub-DICTIONARY value -- fanPressure's
+//     fanCurve { type table; file "<constant>/FluxVsdP.dat"; }
+// is one -- and a paren-only scan stops at the ';' INSIDE that block. The block's own '}' is then taken
+// for the patch's, and every later patch of the field is swallowed: the failure surfaced as "no
+// boundaryField entry for patch outlet1" on pimpleFoam/RAS/TJunctionFan, naming a patch that is plainly
+// there and pointing nowhere near the fanCurve two entries above it. The polyMesh boundary parser had the
+// identical bug for cyclicACMI's `scaleCoeffs` block.
+inline bool skipToSemicolon(TokenStream& ts, int initialDepth = 0)
 {
+    if (initialDepth == 0 && ts.peek() == "{")   // sub-dictionary value: skip it balanced, no ';' follows
+    {
+        ts.expect("{");
+        for (int d = 1; d > 0; )
+        {
+            const std::string t = ts.next();
+            if      (t == "{") ++d;
+            else if (t == "}") --d;
+        }
+        return true;
+    }
     int depth = initialDepth;
     while (!(depth == 0 && ts.peek() == ";"))
     {
@@ -34,6 +55,7 @@ inline void skipToSemicolon(TokenStream& ts, int initialDepth = 0)
         if (s == "(") ++depth;
         else if (s == ")") --depth;
     }
+    return false;
 }
 
 template <typename T>
@@ -611,8 +633,9 @@ inline FieldData<T> readField(const std::string& path)
                     }
                     else
                     {
-                        skipToSemicolon(ts);                 // skip any other (unhandled) entry up to its ';' (paren-aware)
-                        ts.expect(";");
+                        // skip any other (unhandled) entry: a plain value up to its ';', or a whole
+                        // sub-dictionary (which carries no ';' of its own)
+                        if (!skipToSemicolon(ts)) ts.expect(";");
                     }
                 }
                 ts.expect("}");

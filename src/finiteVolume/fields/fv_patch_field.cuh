@@ -741,7 +741,11 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // that p0 comes from a Function1 (uniformTotalPressureFvPatchScalarField.C:149 samples it every
     // updateCoeffs). The face treatment is identical: p_b = p0 - 0.5*neg(phi)*magSqr(U). So it builds
     // the same patch field, and the solver refreshes p0 per step from the table.
-    if (d.type == "totalPressure" || d.type == "uniformTotalPressure")   // p0 read into the inletValue slot
+    // fanPressure is totalPressure with p0 shifted by a fan curve: OF's updateCoeffs computes the patch
+    // volumetric flow rate, looks up the pressure rise, and calls totalPressure::updateCoeffs(p0 - dir*pdFan)
+    // (fanPressureFvPatchScalarField.C). The FACE treatment is identical, so it builds the same patch field
+    // seeded with p0, and the solver shifts p0 per step. Same split as uniformTotalPressure above.
+    if (d.type == "totalPressure" || d.type == "uniformTotalPressure" || d.type == "fanPressure")   // p0 read into the inletValue slot
     {
         // OF has three branches. brae implements the two that share one expression (kinematic, and the
         // compressible low-speed form with rho). The isentropic branch a named psi selects is different

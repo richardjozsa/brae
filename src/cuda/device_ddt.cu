@@ -148,4 +148,60 @@ void deviceDdtCorrFlux(
     }
 }
 
+namespace {
+__global__ void correctUfK(int n, const label* __restrict__ idx,
+                           const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy,
+                           const scalar* __restrict__ Sfz, const scalar* __restrict__ magSf,
+                           const scalar* __restrict__ phi,
+                           scalar* __restrict__ ux, scalar* __restrict__ uy, scalar* __restrict__ uz)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int f = idx ? (int)idx[i] : i;
+    const scalar ms = magSf[f];
+    if (!(ms > scalar(0))) return;              // a zero-area face (an uncovered ACMI face) has no normal
+    const scalar nx = Sfx[f]/ms, ny = Sfy[f]/ms, nz = Sfz[f]/ms;
+    const scalar nu = nx*ux[i] + ny*uy[i] + nz*uz[i];
+    const scalar c  = phi[i]/ms - nu;
+    ux[i] += nx*c;  uy[i] += ny*c;  uz[i] += nz*c;
+}
+
+__global__ void dotSfK(int n, const label* __restrict__ idx,
+                       const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy,
+                       const scalar* __restrict__ Sfz, const scalar* __restrict__ ux,
+                       const scalar* __restrict__ uy, const scalar* __restrict__ uz,
+                       scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int f = idx ? (int)idx[i] : i;
+    out[i] = Sfx[f]*ux[i] + Sfy[f]*uy[i] + Sfz[f]*uz[i];
+}
+}   // namespace
+
+void deviceCorrectUf(
+    int n, const label* faceIdx,
+    const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,
+    const DeviceBuffer<scalar>& magSf, const DeviceBuffer<scalar>& phi,
+    DeviceBuffer<scalar>& ufx, DeviceBuffer<scalar>& ufy, DeviceBuffer<scalar>& ufz)
+{
+    if (n <= 0 || (int)phi.size() < n || (int)ufx.size() < n) return;
+    correctUfK<<<nBlocks(n), TPB>>>(n, faceIdx, Sfx.data(), Sfy.data(), Sfz.data(), magSf.data(),
+                                    phi.data(), ufx.data(), ufy.data(), ufz.data());
+    cudaCheck(cudaGetLastError(), "correctUf");
+}
+
+void deviceDotSf(
+    int n, const label* faceIdx,
+    const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,
+    const DeviceBuffer<scalar>& ufx, const DeviceBuffer<scalar>& ufy, const DeviceBuffer<scalar>& ufz,
+    DeviceBuffer<scalar>& out)
+{
+    out.resize(n);
+    if (n <= 0 || (int)ufx.size() < n) return;
+    dotSfK<<<nBlocks(n), TPB>>>(n, faceIdx, Sfx.data(), Sfy.data(), Sfz.data(),
+                                ufx.data(), ufy.data(), ufz.data(), out.data());
+    cudaCheck(cudaGetLastError(), "dotSf");
+}
+
 }  // namespace brae

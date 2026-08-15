@@ -104,6 +104,14 @@ struct FvOptionsData
     std::vector<ActuationDisk> adDisks;
     RotorDiskParams     rotor;                      // rotorDiskSource (BEM); geometry built later from the mesh
     int  count = 0;                      // number of options read (0 => no file / empty => all hooks no-op)
+    // OF fv::cellSetOption's TIME WINDOW: a source is active only while
+    //     timeStart <= t <= timeStart + duration
+    // and unconditionally when `timeStart` is absent (OF's default timeStart_ = -1, see
+    // cellSetOption::inTimeLimits). The STEADY solver has no time and ignores these; a TRANSIENT driver
+    // cannot, because applying a windowed source outside its window is wrong physics that still
+    // converges. Recorded per source so the driver can decide.
+    struct TimeWindow { std::string name; scalar start = -1; scalar duration = 0; };
+    std::vector<TimeWindow> windows;   // only sources that actually SET timeStart
     // Sources whose NAME brae recognizes but that it CANNOT apply here (unsupported selectionMode cellSet, a
     // parsed-but-unapplied scalarSemiImplicitSource, or an unknown type). Recorded instead of silently dropped;
     // the single-GPU driver throws on a non-empty list so a valid-looking case never runs with wrong physics. The
@@ -131,6 +139,64 @@ inline const FoamDict& coeffsOf(const FoamDict& opt, const std::string& type)
 } // namespace fvoptions_detail
 
 // Read fvOptions for a case. `zones` = cellZone name -> cells (readCellZones). `V` = cell volumes. Absent file -> empty.
+// Dict-only PRE-FLIGHT: the source types, their time windows, and whether a semi-implicit source has any
+// numbers to read -- all without a mesh. readFvOptions needs cell volumes and so can only run once the
+// polyMesh is in, which is far too late to refuse a case: the driver should stop before paying for the
+// mesh, and a guard fixture without one should still see the refusal it is testing for.
+struct FvOptionsPreflight
+{
+    bool present = false;
+    std::vector<std::string> unsupported;
+    std::vector<FvOptionsData::TimeWindow> windows;
+};
+
+inline FvOptionsPreflight preflightFvOptions(const std::string& caseDir)
+{
+    FvOptionsPreflight pf;
+    std::string path = caseDir + "/system/fvOptions";
+    {
+        std::ifstream f(path);
+        if (!f.good())
+        {
+            path = caseDir + "/constant/fvOptions";
+            std::ifstream g(path);
+            if (!g.good()) return pf;
+        }
+    }
+    pf.present = true;
+    const FoamDict d = readDict(path);
+    for (const auto& s : d.subs)
+    {
+        const FoamDict& opt = s.second;
+        const std::string type = opt.wordOr("type", "");
+        const std::string act  = opt.wordOr("active", "yes");
+        if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;
+        static const char* supported[] = {
+            "vectorSemiImplicitSource", "explicitPorositySource", "meanVelocityForce", "limitVelocity",
+            "actuationDiskSource", "rotorDisk", "rotorDiskSource", "velocityDampingConstraint",
+            "limitTemperature", "fixedTemperatureConstraint", "scalarFixedValueConstraint" };
+        bool ok = false;
+        for (const char* t : supported) if (type == t) { ok = true; break; }
+        if (!ok)
+        {
+            pf.unsupported.push_back("source '" + s.first + "' has unsupported type '" + type + "'");
+            continue;
+        }
+        const FoamDict& co = fvoptions_detail::coeffsOf(opt, type);
+        if (type == "vectorSemiImplicitSource"
+            && !co.subDict("injectionRateSuSp") && !opt.subDict("injectionRateSuSp")
+            && !co.subDict("sources")           && !opt.subDict("sources"))
+            pf.unsupported.push_back(
+                "source '" + s.first + "' (" + type + ") has neither a `sources` nor an "
+                "`injectionRateSuSp` sub-dictionary, so brae found nothing to apply");
+        const scalar ts = opt.scalarOr("timeStart", -1e300);
+        if (ts > -1e299 && ts >= scalar(0))
+            pf.windows.push_back({s.first, ts, opt.scalarOr("duration", 0.0)});
+    }
+    return pf;
+}
+
+
 inline FvOptionsData readFvOptions(
     const std::string& caseDir,
     const std::map<std::string, std::vector<label>>& zonesIn,
@@ -183,6 +249,11 @@ inline FvOptionsData readFvOptions(
         const bool isFixS = (type == "scalarFixedValueConstraint");
         const std::string act = opt.wordOr("active", "yes");
         if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;   // inactive -> skip (OF)
+        {   // the time window, if this source sets one (-1e300 sentinel = the key is absent)
+            const scalar ts = opt.scalarOr("timeStart", -1e300);
+            if (ts > -1e299 && ts >= scalar(0))
+                fo.windows.push_back({s.first, ts, opt.scalarOr("duration", 0.0)});
+        }
         if (!isVec && !isSca && !isPor && !isMvf && !isLim && !isAd && !isRot && !isVdc && !isLimT && !isFixT && !isFixS)
         {
             fo.unsupported.push_back("source '" + s.first + "' has unsupported type '" + type + "'");
@@ -592,9 +663,23 @@ inline FvOptionsData readFvOptions(
             Vsel += V[c];
         const scalar VDash = absolute ? (Vsel > 0 ? Vsel : 1.0) : 1.0;
 
+        // OF SemiImplicitSource::readCoeffs: `injectionRateSuSp` is the 2112-and-earlier spelling, kept for
+        // compatibility, and `sources` is the current one -- findDict the old, else subDict the new. brae
+        // looked only for the old name, so a modern case (pimpleFoam/laminar/planarPoiseuille writes
+        // `sources { U ((5 0 0) 0); }`) fell through the `continue` below and the source vanished with the
+        // driver printing "No finite volume options present". A silently dropped body force is exactly what
+        // the transient refusal existed to prevent, so the miss must be LOUD, not a skip.
         const FoamDict* inj = co.subDict("injectionRateSuSp");
         if (!inj) inj = opt.subDict("injectionRateSuSp");
-        if (!inj) continue;
+        if (!inj) inj = co.subDict("sources");
+        if (!inj) inj = opt.subDict("sources");
+        if (!inj)
+        {
+            fo.unsupported.push_back(
+                "source '" + s.first + "' (" + type + ") has neither a `sources` nor an "
+                "`injectionRateSuSp` sub-dictionary, so brae found nothing to apply");
+            continue;
+        }
 
         ++fo.count;
         if (isVec)   // momentum: field "U"

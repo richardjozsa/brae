@@ -1,5 +1,7 @@
 // cf GPU offload: explicit divDevReff stress source. Tensors packed component-major (i*3+j)*n + cell.
 #include "device_divdevreff.cuh"
+#include "device_kepsilon.cuh"   // deviceCellLimitGradU (the named grad(U) scheme)
+#include "stage_dump.cuh"   // sigma comparison against OF (ACMI trace)
 #include "device_blas.cuh"
 #include <cuda_runtime.h>
 
@@ -180,7 +182,8 @@ void deviceDivDevReff(
     DeviceBuffer<scalar>& srcZ,
     const DeviceCyclic* cyc,
     const DeviceAMI* ami,
-    const DeviceProcStress* proc)
+    const DeviceProcStress* proc,
+    scalar gradULimitK)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
@@ -227,6 +230,10 @@ void deviceDivDevReff(
         *ub[i] = std::move(bval);
     }
 
+    // ...then LIMIT it, if the case named a limited grad(U). OF applies cellLimitedGrad to the base
+    // Gauss gradient AFTER the coupled-patch contributions are in, which is exactly here.
+    if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);
+
     // sigma cell
     DeviceBuffer<scalar> sigmaC(static_cast<std::size_t>(9) * nC);
     sigmaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuCell.data(), sigmaC.data());
@@ -270,6 +277,11 @@ void deviceDivDevReff(
         }
     }
 
+    if (stageDumpActive() && stageDumpFirstOnly("ddrSigma"))
+    {   // sigma = nuEff*dev2(T(grad(U))) per cell, the input to the tensor divergence. Packed 9*nC,
+        // [q*nC + c] with q = 3*row + col, so it can be compared against OF's volTensorField directly.
+        stageDump("stage_ddr_sigma", sigmaC);
+    }
     // tensor divergence (= V*fvc::div)
     srcX.resize(nC);
     srcY.resize(nC);

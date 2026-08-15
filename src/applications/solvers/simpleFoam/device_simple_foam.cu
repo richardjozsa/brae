@@ -5,6 +5,7 @@
 #include "device_simple_foam.cuh"
 #include "swept_volume.cuh"   // meshPhi + makeRelative (OF fvcMeshPhi)
 #include "device_scalar_transport.cuh"   // deviceSolveScalarTransport: shared with k/epsilon/omega/energy
+#include "device_deshybrid.cuh"   // DEShybrid: per-face blend of linear and linearUpwind (DES sensor)
 #include "brae_notice.cuh"   // never drop an input silently (the ddtCorr scheme gate)
 #include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
 
@@ -326,7 +327,12 @@ namespace brae {
                 {
                     std::vector<vector> wallOrigin;                              // nearest wall-face centre (IDDES wall-normal source)
                     ctorMark("pre-wallDist");
-                    y_.copyFrom(cellWallDist(m, g, fvp, ctl_.iddes ? &wallOrigin : nullptr));   // wall distance (SST F1/F2/F3; SA dTilda)
+                    // OF wallDist: `meshWave` (the default) or `exactDistance`. IDDES additionally needs
+                    // the wall ORIGIN, which only the wave carries, so exactDistance is not offered there.
+                    if (ctl_.exactWallDist && !ctl_.iddes)
+                        y_.copyFrom(exactCellWallDist(m, g, fvp));
+                    else
+                        y_.copyFrom(cellWallDist(m, g, fvp, ctl_.iddes ? &wallOrigin : nullptr));   // wall distance (SST F1/F2/F3; SA dTilda)
                     if (ctl_.iddes)   // IDDES filter widths (maxDeltaxyz + wall-normal spacing), uploaded once at setup
                     {
                         const std::vector<scalar> hmax = cellMaxDeltaXYZ(m);
@@ -409,7 +415,8 @@ namespace brae {
         {
             DeviceBuffer<scalar> gradU;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-            deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);   // nut = Ck*delta*sqrt(k_sgs)
+            if (ctl_.wale) deviceWaleNut(nC_, gradU, dm.V, ctl_.waleCoeffs, dnut_);
+            else           deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);   // nut = Ck*delta*sqrt(k_sgs)
             deviceAlphat(th_, dnut_, tc_);                                    // EddyDiffusivity::correctNut() tail
             return;
         }
@@ -425,7 +432,8 @@ namespace brae {
             DeviceBuffer<scalar> gradU;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU,
                         hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-            if (ctl_.gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK);   // OF grad(U) cellLimited (validate correctNut)
+            if (ctl_.gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK,
+                                                          hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);   // OF grad(U) cellLimited (validate correctNut)
             DeviceBuffer<scalar> S2;
             deviceS2(gradU, nC_, S2);
             DeviceBuffer<scalar> F2;
@@ -484,7 +492,8 @@ namespace brae {
         {              // transport solve (report stays empty -> no "Solving for k/omega" lines), so no ddt(k/omega) either.
             DeviceBuffer<scalar> gradU;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-            deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);
+            if (ctl_.wale) deviceWaleNut(nC_, gradU, dm.V, ctl_.waleCoeffs, dnut_);
+            else           deviceSmagorinskyNut(nC_, gradU, dm.V, ctl_.smagCoeffs, dnut_);
             return;
         }
         if (ctl_.turbulent)
@@ -545,6 +554,7 @@ namespace brae {
                                       nutBndAll_.size() ? &nutBndAll_ : nullptr,   // nut_b -> DkEff/DepsEff(patchi)
                                       compressible_ ? &muBnd_ : nullptr,
                                       ctl_.gradKLULimitK,   // linearUpwind's named grad(k|eps)
+                                      ctl_.gradULimitK,     // kEpsilon::correct()'s own fvc::grad(U) -> gradSchemes grad(U)
                                       // fvOptions scalarFixedValueConstraint (OF eqn.setValues per field)
                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);
@@ -607,6 +617,31 @@ namespace brae {
                 for (const auto& e : tvP0_)
                 {
                     const scalar v = e.f.value(time_);
+                    for (label i = 0; i < e.count; ++i)
+                    {
+                        const label f = e.start + i;
+                        if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
+                    }
+                }
+                dbP_.p0.copyFrom(p0h);
+            }
+            // fanPressure: the fan's operating point depends on the flow it is currently passing, so p0
+            // has to be re-derived from THIS step's boundary flux before the total-pressure update runs.
+            // OF does the same inside fanPressureFvPatchScalarField::updateCoeffs, which then defers to
+            // totalPressure with the shifted p0.
+            if (!fanP0_.empty())
+            {
+                const std::vector<scalar> phih = phiBnd_.host();
+                std::vector<scalar> p0h = dbP_.p0.host();
+                for (const auto& e : fanP0_)
+                {
+                    scalar sum = 0;
+                    for (label i = 0; i < e.count; ++i)
+                    {
+                        const label f = e.start + i;
+                        if (f >= 0 && f < (label)phih.size()) sum += phih[f];
+                    }
+                    const scalar v = e.p0 - e.dir * e.dp(std::max(e.dir * sum, scalar(0)));
                     for (label i = 0; i < e.count; ++i)
                     {
                         const label f = e.start + i;
@@ -773,8 +808,12 @@ namespace brae {
             deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
         // explicit divDevReff stress (uses the incoming U; coupled across the 3 components)
         DeviceBuffer<scalar> ddrX, ddrY, ddrZ;
-        deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEff, nuEffBnd, ddrX, ddrY, ddrZ, hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+        // ...with the case's NAMED grad(U) scheme, not a bare Gauss one: OF's divDevReff calls
+        // fvc::grad(U) and gets whatever gradSchemes says. See the note on the parameter.
+        deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], nuEff, nuEffBnd, ddrX, ddrY, ddrZ,
+                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr, ctl_.gradULimitK);
         DeviceBuffer<scalar>* ddr[3] = { &ddrX, &ddrY, &ddrZ };
+        if (stageDumpActive() && stageDumpFirstOnly("ddr")) stageDump3("stage_divDevReff", ddrX, ddrY, ddrZ);
 
         DeviceBuffer<scalar> pbv;
         deviceBCValue(dbP_, dp_, pbv);
@@ -822,6 +861,17 @@ namespace brae {
         if (hasAMI_)
         {
             interfaceAssembleMomentum(ami_, nuEff, mDiag);
+            if (stageDumpActive() && stageDumpFirstOnly("amiNuEff"))
+            {   // the interface diffusivity the momentum laplacian uses: fvc::interpolate(nuEff) there
+                DeviceBuffer<scalar> tmpF, tmpN;
+                deviceAmiFaceValue(ami_, nuEff, tmpF);
+                deviceAmiInterpolate(ami_, nuEff, tmpN);
+                stageDump("stage_ami_nuEffFace", tmpF);
+                stageDump("stage_ami_nuEffNbr", tmpN);
+                stageDump("stage_ami_nuEffCell", nuEff);
+                stageDump("stage_ami_ifCoeffMom", ami_.ifCoeff);   // the MOMENTUM off-diagonal
+                stageDump("stage_ami_phiMom", ami_.phi);           // the flux its upwinding reads
+            }
             amiSumOff.copyFrom(std::vector<scalar>(nC_, 0.0));
             interfaceOffDiagSum(ami_, amiSumOff);
             if (ami_.rotational) interfaceScaleImplicit(ami_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
@@ -908,6 +958,7 @@ namespace brae {
         // cellLimited scheme. LUx/LUy/LUz below select between them so the unlimited path costs nothing.
         DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
         DeviceBuffer<scalar> gLUx[3], gLUy[3], gLUz[3];
+        DeviceBuffer<scalar> cycNbr[3], amiNbr[3];   // interface neighbour value per face, for the limiter
         const bool limitLU = (ctl_.gradULULimitK > 0.0);
         DeviceBuffer<scalar> amiURot[3];   // rotated AMI-interp of the CURRENT U (gradient face value + linearUpwind/non-orth nbr)
         if ((ctl_.linearUpwind || ctl_.lust || ctl_.nonOrth) && hasAMI_ && ami_.rotational)
@@ -943,7 +994,30 @@ namespace brae {
                     deviceCopy(gLUx[l], gUx[l]);
                     deviceCopy(gLUy[l], gUy[l]);
                     deviceCopy(gLUz[l], gUz[l]);
-                    deviceCellLimitGrad(dm, Uk_[l], ubv, gLUx[l], gLUy[l], gLUz[l], ctl_.gradULULimitK);
+                    // ...and the limiter has to SEE the interface. A coupled face is invisible to brae's
+                    // boundary addressing but internal to OF's cellLimitedGrad, so without this an
+                    // interface cell is limited as if its interface neighbour did not exist. Measured on
+                    // oscillatingInletACMI2D, laminar + linearUpwind, 10 free steps: 1.9e-03 against
+                    // OpenFOAM with the interface omitted here and 2.0e-09 with the same case run on an
+                    // UNLIMITED grad(U) -- which is how the limiter, not the linearUpwind correction,
+                    // was identified. 91% of the squared error sat on the 136 interface cells.
+                    CellLimitInterface ifs[2];
+                    int nIfs = 0;
+                    if (hasCyclic_ && cyc_.n > 0)
+                    {
+                        deviceCyclicNbrValue(cyc_, Uk_[l], Usnap[0], Usnap[1], Usnap[2], l, cycNbr[l]);
+                        ifs[nIfs++] = { cyc_.n, cyc_.ownCell.data(), cycNbr[l].data(),
+                                        cyc_.dOwnX.data(), cyc_.dOwnY.data(), cyc_.dOwnZ.data() };
+                    }
+                    if (hasAMI_ && ami_.n > 0)
+                    {
+                        if (ami_.rotational) deviceCopy(amiNbr[l], amiURot[l]);
+                        else                 deviceAmiInterpolate(ami_, Uk_[l], amiNbr[l]);
+                        ifs[nIfs++] = { ami_.n, ami_.ownCell.data(), amiNbr[l].data(),
+                                        ami_.dOwnX.data(), ami_.dOwnY.data(), ami_.dOwnZ.data() };
+                    }
+                    deviceCellLimitGrad(dm, Uk_[l], ubv, gLUx[l], gLUy[l], gLUz[l], ctl_.gradULULimitK,
+                                        ifs, nIfs);
                 }
             }
         // actuationDiskSource (Froude): T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), Uref = mean U over the monitor cells
@@ -967,6 +1041,23 @@ namespace brae {
         const DeviceBuffer<scalar>* LUx = limitLU ? gLUx : gUx;
         const DeviceBuffer<scalar>* LUy = limitLU ? gLUy : gUy;
         const DeviceBuffer<scalar>* LUz = limitLU ? gLUz : gUz;
+        // DEShybrid: the DES sensor is a function of the CURRENT velocity gradient, nut and the filter
+        // width, so sigma is rebuilt once per assembly and shared by the three components. Its gradient is
+        // OF's fvc::grad(U), i.e. the gradSchemes `grad(U)` entry -- the same one kEpsilon's production
+        // takes, and limited when that entry says cellLimited.
+        DeviceBuffer<scalar> desSigma;
+        if (ctl_.desHybrid)
+        {
+            DeviceBuffer<scalar> gradU;
+            deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+            if (ctl_.gradULimitK > 0.0)
+                deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK,
+                                     hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+            // delta = the LES filter width the turbulence model itself uses. brae runs cubeRootVol
+            // (V^(1/3)); a case naming another delta already gets the model's own warning at set-up, and
+            // the scheme must agree with the model rather than pick a second, different width.
+            deviceDesHybridSigma(nC_, gradU, dm.V, dnut_, ctl_.nu, ctl_.desCoeffs, desSigma);
+        }
         if (ctl_.linearUpwindV) deviceLinearUpwindVCorr(dm, phiInt_, LUx, LUy, LUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
         for (int kk = 0; kk < 3; ++kk)   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136x SLOWER, reverted)
         {
@@ -1000,7 +1091,8 @@ namespace brae {
             if (ctl_.linearUpwind || ctl_.lust)   // deferred correction: source -= div(phi * grad(U_kk)_upwind.(Cf-C_up))
             {
                 DeviceBuffer<scalar> corr;
-                if (ctl_.linearUpwindV) corr = std::move(corrV[kk]);                          // vector-limited (computed once above)
+                if (ctl_.desHybrid)     deviceDesHybridCorr(dm, phiInt_, desSigma, Uk_[kk], LUx[kk], LUy[kk], LUz[kk], corr);
+                else if (ctl_.linearUpwindV) corr = std::move(corrV[kk]);                     // vector-limited (computed once above)
                 else                    deviceLinearUpwindCorr(dm, phiInt_, LUx[kk], LUy[kk], LUz[kk], corr);
                 if (hasCyclic_) interfaceAddLinUpwindCorr(cyc_, kk, LUx, LUy, LUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
                 if (hasAMI_)    interfaceAddLinUpwindCorr(ami_, kk, LUx, LUy, LUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
@@ -1779,6 +1871,9 @@ namespace brae {
         // motion. phiHbyA is an ABSOLUTE flux (fvc::flux(HbyA)), so phi = phiHbyA - pEqn.flux() is too;
         // the next corrector rebuilds it absolute again, so this runs per corrector exactly as OF does.
         // No-op on a static mesh.
+        // pEqn.H's last two lines, in order: correct the face velocity from the ABSOLUTE flux, THEN make
+        // the flux relative. Swapping them would feed Uf a relative flux and lose the mesh motion twice.
+        correctUf();
         makeFluxRelative(fvp_, dm_.nInternalFaces);
     }
 
@@ -1864,9 +1959,6 @@ namespace brae {
         // 2. meshPhi = sweptVol/deltaT, per face (OF fvMesh::movePoints stores this as mesh.phi()).
         //    KEPT, not applied here. See makeFluxRelative() for where fvc::makeRelative belongs and why
         //    doing it at the move was wrong.
-        // The PREVIOUS step's mesh flux, kept because fvc::ddtCorr needs the old flux ABSOLUTE (see
-        // advanceTime): phi.oldTime() was made relative with it at the end of that step.
-        meshPhiPrev_ = std::move(meshPhi_);
         meshPhi_ = meshPhi(m, oldPoints, newPoints, deltaT);
         meshPhiValid_ = true;
         if (stageDumpActive())
@@ -1958,6 +2050,52 @@ namespace brae {
         onInterface(amiRuns_, fAmi);
     }
 
+    // fvc::correctUf(Uf, U, phi) -- fvcMeshPhi.C. Uf = fvc::interpolate(U) with its NORMAL component
+    // replaced by the one the conservative flux implies:  Uf += n*(phi/magSf - (n & Uf)).
+    // phi must be ABSOLUTE here, which is why this runs before makeFluxRelative, as in pEqn.H.
+    void DeviceSimpleSolver::enableUf()
+    {
+        ufActive_ = true;
+        const DeviceMesh& dm = dm_;
+        for (int k = 0; k < 3; ++k)
+        {
+            // Construction is the plain interpolation -- NO flux correction. OF's Uf(fvc::interpolate(U))
+            // is only made consistent with phi by the first correctUf at the end of step 1's pressure
+            // corrector. Getting this wrong shows up only at step 1, where Uf.oldTime() is this value.
+            deviceInterpolate(dm, Uk_[k], UfInt_[k]);
+            deviceBCValue(dbU_.comp[k], Uk_[k], UfBnd_[k]);
+            if (hasAMI_)    deviceAmiFaceValue(ami_, Uk_[k], UfAmi_[k]);
+            if (hasCyclic_) deviceCyclicFaceValue(cyc_, Uk_[k], UfCyc_[k]);
+            deviceCopy(UfOldInt_[k], UfInt_[k]);        // oldTime() bootstraps to the field itself
+            deviceCopy(UfOldBnd_[k], UfBnd_[k]);
+            if (hasAMI_)    deviceCopy(UfOldAmi_[k], UfAmi_[k]);
+            if (hasCyclic_) deviceCopy(UfOldCyc_[k], UfCyc_[k]);
+        }
+    }
+
+    void DeviceSimpleSolver::correctUf()
+    {
+        if (!ufActive_) return;
+        const DeviceMesh& dm = dm_;
+        for (int k = 0; k < 3; ++k)
+        {
+            deviceInterpolate(dm, Uk_[k], UfInt_[k]);            // fvc::interpolate(U), internal faces
+            deviceBCValue(dbU_.comp[k], Uk_[k], UfBnd_[k]);      // ...and U_b on the ordinary patches
+            if (hasAMI_)    deviceAmiFaceValue(ami_, Uk_[k], UfAmi_[k]);      // ...and the coupled ones,
+            if (hasCyclic_) deviceCyclicFaceValue(cyc_, Uk_[k], UfCyc_[k]);   //    where it is the interp
+        }
+        deviceCorrectUf(dm.nInternalFaces, nullptr, dm.Sfx, dm.Sfy, dm.Sfz, dm.magSf, phiInt_,
+                        UfInt_[0], UfInt_[1], UfInt_[2]);
+        deviceCorrectUf(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx, dm.Sfy, dm.Sfz, dm.magSf, phiBnd_,
+                        UfBnd_[0], UfBnd_[1], UfBnd_[2]);
+        if (hasAMI_)
+            deviceCorrectUf(ami_.n, nullptr, ami_.Sfx, ami_.Sfy, ami_.Sfz, ami_.magSf, ami_.phi,
+                            UfAmi_[0], UfAmi_[1], UfAmi_[2]);
+        if (hasCyclic_)
+            deviceCorrectUf(cyc_.n, nullptr, cyc_.Sfx, cyc_.Sfy, cyc_.Sfz, cyc_.magSf, cyc_.phi,
+                            UfCyc_[0], UfCyc_[1], UfCyc_[2]);
+    }
+
     void DeviceSimpleSolver::makeFluxRelative(const std::vector<FvPatch>& fvp, label nInternalFaces)
     {
         if (!meshPhiValid_ || meshPhi_.empty()) return;
@@ -2032,6 +2170,32 @@ namespace brae {
         }
     }
 
+    // See the header for why. The wall velocities are taken from dbU_ rather than from a host U field
+    // because on a moving mesh those two disagree: movingWallVelocity is assigned straight into the
+    // device boundary by setPatchVelocity, so dbU_ is what the solver actually imposes.
+    void DeviceSimpleSolver::refreshWallData(
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<FvPatch>& fvp)
+    {
+        const std::vector<scalar> rvx = dbU_.comp[0].refValue.host();
+        const std::vector<scalar> rvy = dbU_.comp[1].refValue.host();
+        const std::vector<scalar> rvz = dbU_.comp[2].refValue.host();
+        std::vector<std::vector<vector>> wallU(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (fvp[pi].type != "wall") continue;
+            wallU[pi].resize(fvp[pi].size);
+            const std::size_t st = static_cast<std::size_t>(patchStart_[pi]);
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const std::size_t f = st + static_cast<std::size_t>(i);
+                if (f < rvx.size()) wallU[pi][i] = vector{rvx[f], rvy[f], rvz[f]};
+            }
+        }
+        wall_ = buildDeviceWallData(m, g, fvp, wallU);
+    }
+
     void DeviceSimpleSolver::advanceTime(scalar deltaT)
     {
         const bool cn  = (ddtScheme_ == DdtScheme::CrankNicolson);
@@ -2096,43 +2260,42 @@ namespace brae {
             deviceCopy(amiFluxUold_, ami_.phi);
             deviceCopy(ami_.phi, amiPhiOld_);
         }
-        // ...and the old flux fvc::ddtCorr wants is the ABSOLUTE one. pimpleFoam passes Uf on a moving
-        // mesh, and the Uf form's phiCorr uses (Sf & Uf.oldTime()) where this uses phi.oldTime(). Those
-        // are not the same field: fvc::correctUf builds Uf from the flux BEFORE fvc::makeRelative, so
+        // ...and on a MOVING mesh the old flux fvc::ddtCorr wants is not phi.oldTime() at all.
+        // pimpleFoam passes fvc::ddtCorr(U, phi, Uf), which takes the Uf form whenever the mesh is
+        // dynamic, and that form reads
         //
-        //     (Sf & Uf.oldTime())  ==  phi.oldTime() + mesh.phi() of the step that stored it
+        //     phiUf0 = mesh.Sf() & Uf.oldTime()          (EulerDdtScheme::fvcDdtUfCorr)
         //
-        // verified on the moving oscillatingInletACMI2D to 2.7e-10 (L2) over the internal faces. That is
-        // why brae carries no Uf: adding back the previous step's meshPhi is the same quantity, and one
-        // surfaceVectorField cheaper. It is exact only while Sf is unchanged between the two steps --
-        // true for a translating mesh, NOT for a rotating one, where Sf turns under the stored Uf.
-        // A no-op on a static mesh, where meshPhiPrev_ is empty.
-        applyMeshPhi(fvp_, meshPhiPrev_, scalar(+1), phiOldInt_, phiOldBnd_, cycPhiOld_, amiPhiOld_);
-        // ...and SAY when that identity does not hold. It is exact only while Sf is the same at both time
-        // levels; OF dots the CURRENT Sf into the stored Uf, so any face whose area changed between the
-        // steps gets a different number. A cyclicACMI changes them by construction -- the overlap mask
-        // rescales the coupled areas every step -- and a rotating mesh changes them everywhere.
-        // Measured on the moving oscillatingInletACMI2D: step 1 exact (4.0e-07), then the error grows to
-        // 5.1e-03 by step 10 and sits on the interface columns, which is this and nothing else.
-        if (!ddtCorrAreaNoticed_ && ddtCorr_ && !meshPhiPrev_.empty() && !magSfPrev_.empty())
+        // -- the CURRENT face areas dotted into the face velocity stored at the previous time level. It
+        // is also the denominator of the coupling coefficient, not phi.oldTime(), so both halves of the
+        // correction come from it.
+        //
+        // These differ whenever Sf changes between the two levels. On a translating mesh they do not,
+        // and phi.oldTime() + mesh.phi() reproduces phiUf0 to 2.7e-10 -- which is what brae used to do.
+        // A cyclicACMI breaks that: the overlap mask rescales the coupled areas every step. Measured on
+        // the moving oscillatingInletACMI2D, the shortcut was exact at step 1 and 5.1e-03 out by step 10,
+        // all of it on the interface columns.
+        if (ufActive_)
         {
-            const std::vector<scalar> nowSf = dm_.magSf.host();
-            scalar worst = 0;
-            for (std::size_t f = 0; f < nowSf.size() && f < magSfPrev_.size(); ++f)
-                worst = std::fmax(worst, std::fabs(nowSf[f] - magSfPrev_[f]));
-            if (worst > scalar(1e-12))
+            const DeviceMesh& dm = dm_;
+            for (int k = 0; k < 3; ++k)   // age Uf, as runTime++ ages every registered field
             {
-                ddtCorrAreaNoticed_ = true;
-                char buf[420];
-                std::snprintf(buf, sizeof(buf),
-                    "brae reconstructs OpenFOAM's Uf-based fvc::ddtCorr from phi + mesh.phi(), which is "
-                    "exact only while the face areas hold still; %g of area moved between steps (a "
-                    "cyclicACMI mask, or a rotating mesh), so the correction is approximate on those "
-                    "faces. Static meshes are unaffected.", (double)worst);
-                noticeApproximated("PIMPLE/ddtCorr (moving mesh)", buf);
+                deviceCopy(UfOldInt_[k], UfInt_[k]);
+                deviceCopy(UfOldBnd_[k], UfBnd_[k]);
+                if (hasAMI_)    deviceCopy(UfOldAmi_[k], UfAmi_[k]);
+                if (hasCyclic_) deviceCopy(UfOldCyc_[k], UfCyc_[k]);
             }
+            deviceDotSf(dm.nInternalFaces, nullptr, dm.Sfx, dm.Sfy, dm.Sfz,
+                        UfOldInt_[0], UfOldInt_[1], UfOldInt_[2], phiOldInt_);
+            deviceDotSf(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx, dm.Sfy, dm.Sfz,
+                        UfOldBnd_[0], UfOldBnd_[1], UfOldBnd_[2], phiOldBnd_);
+            if (hasAMI_)
+                deviceDotSf(ami_.n, nullptr, ami_.Sfx, ami_.Sfy, ami_.Sfz,
+                            UfOldAmi_[0], UfOldAmi_[1], UfOldAmi_[2], amiPhiOld_);
+            if (hasCyclic_)
+                deviceDotSf(cyc_.n, nullptr, cyc_.Sfx, cyc_.Sfy, cyc_.Sfz,
+                            UfOldCyc_[0], UfOldCyc_[1], UfOldCyc_[2], cycPhiOld_);
         }
-        magSfPrev_ = dm_.magSf.host();
         deltaT0_ = deltaT_;
         deltaT_  = deltaT;
     }

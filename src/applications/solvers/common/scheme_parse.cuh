@@ -176,7 +176,7 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
 // y feeds kOmegaSST's F1/F2/F3 blending and Spalart-Allmaras' dTilda destruction term (~1/y^2), so a
 // different wall distance is a different turbulence model, not a detail. Absent means meshWave, which
 // is OF's own default.
-inline void checkWallDistMethod(const std::string& caseDir)
+inline void checkWallDistMethod(const std::string& caseDir, DeviceSimpleControls& ctl)
 {
     const std::string all = readFileExpanded(caseDir + "/system/fvSchemes");
     const std::string blk = fvSchemesBlock(all, "wallDist");
@@ -191,16 +191,18 @@ inline void checkWallDistMethod(const std::string& caseDir)
     if (a == std::string::npos) return;
     w = w.substr(a, b - a + 1);
     if (w == "meshWave") return;
+    if (w == "exactDistance") { ctl.exactWallDist = true; return; }
     throw std::runtime_error(
         "brae: fvSchemes wallDist method '" + w + "' is not implemented; brae computes OF's default "
-        "meshWave. The wall distance feeds kOmegaSST F1/F2/F3 and Spalart-Allmaras dTilda (~1/y^2), so "
-        "running meshWave instead would be a different turbulence model, not an approximation.");
+        "meshWave (and `exactDistance`). The wall distance feeds kOmegaSST F1/F2/F3 and "
+        "Spalart-Allmaras dTilda (~1/y^2), so running a different method would be a different turbulence "
+        "model, not an approximation.");
 }
 
 inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleControls& ctl)
 {
     // Refuse an unimplemented wall-distance method here, where every solver already passes.
-    checkWallDistMethod(caseDir);
+    checkWallDistMethod(caseDir, ctl);
 
             std::string schemesText = readFileExpanded(caseDir + "/system/fvSchemes");   // $var expanded ($turbulence)
             // Statements are ';'-terminated and each one belongs to a SUB-DICTIONARY. Both halves matter.
@@ -356,6 +358,52 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 if (inDiv && ln.find("div(phi,U)") != std::string::npos)
                 {
                     foundDivU = true;
+                    // DEShybrid takes POSITIONAL arguments -- two sub-schemes, the delta field name, then
+                    // six or seven numbers (DEShybrid.H's Istream constructor). Parsed here rather than
+                    // through checkDiv, whose vocabulary is single-word schemes.
+                    if (hasWord(ln, "DEShybrid"))
+                    {
+                        ctl.desHybrid = true;
+                        const std::size_t p0 = ln.find("DEShybrid") + 9;
+                        // OF blends scheme1 (low dissipation) with scheme2 (upwind-biased). brae implements
+                        // the pair every DES tutorial uses; anything else would silently run a different
+                        // discretisation, so it is named.
+                        const std::string rest = ln.substr(p0);
+                        if (!hasWord(rest, "linear") || !hasWord(rest, "linearUpwind"))
+                            throw std::runtime_error(
+                                "brae: div(phi,U) Gauss DEShybrid blends two named schemes; brae implements "
+                                "`linear` (scheme 1) with `linearUpwind` (scheme 2), which is what the "
+                                "OpenFOAM DES tutorials use. This case asks for something else:\n  " + ln);
+                        ctl.linearUpwind = true;   // scheme 2 supplies the gradient reconstruction
+                        { const scalar g = luGradLimit(rest); if (g >= 0.0) ctl.gradULULimitK = g; }
+                        // the numbers, in OF's read order: CDES U0 L0 sigmaMin sigmaMax OmegaLim [nutLim]
+                        std::vector<scalar> num;
+                        for (const char* c = rest.c_str(); *c; )
+                        {
+                            if (std::isdigit((unsigned char)*c)
+                                || ((*c == '-' || *c == '.') && std::isdigit((unsigned char)c[1])))
+                            {
+                                char* e = nullptr;
+                                num.push_back(std::strtod(c, &e));
+                                c = e ? e : c + 1;
+                            }
+                            else ++c;
+                        }
+                        if (num.size() < 6)
+                            throw std::runtime_error(
+                                "brae: div(phi,U) Gauss DEShybrid needs at least six coefficients (CDES U0 L0 "
+                                "sigmaMin sigmaMax OmegaLim [nutLim]); found " + std::to_string(num.size())
+                                + " in:\n  " + ln);
+                        DesHybridCoeffs& d = ctl.desCoeffs;
+                        d.CDES = num[0]; d.U0 = num[1]; d.L0 = num[2];
+                        d.sigmaMin = num[3]; d.sigmaMax = num[4]; d.OmegaLim = num[5];
+                        d.nutLim = (num.size() > 6) ? num[6] : scalar(1);
+                        if (d.U0 <= 0 || d.L0 <= 0)
+                            throw std::runtime_error("brae: DEShybrid U0 and L0 must be > 0 (OF checkValues).");
+                        if (d.sigmaMin < 0 || d.sigmaMin > 1 || d.sigmaMax < 0 || d.sigmaMax > 1)
+                            throw std::runtime_error("brae: DEShybrid sigmaMin/sigmaMax must lie in [0,1] (OF checkValues).");
+                        continue;   // the generic single-word checks below do not apply
+                    }
                     checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST", "linear"}, {"limitedLinear", "limitedLinearV"});
                     if (ln.find("bounded") != std::string::npos)      ctl.bounded = true;
                     // Gauss LINEAR = central differencing: OF's `linear` scheme returns the plain

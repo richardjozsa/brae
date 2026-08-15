@@ -234,11 +234,13 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
     for (label p = 0; p < np; ++p)
     {
         PatchInfo pi;
+        bool acmiScale = false;   // cyclicACMI `scale`: a Function1 that opens/closes the interface over time
         pi.name = ts.next();
         ts.expect("{");
         while (ts.peek() != "}")
         {
             const std::string key = ts.next();
+            if (key == "scale") acmiScale = true;
             if      (key == "type")           { pi.type  = ts.next();      ts.expect(";"); }
             else if (key == "nFaces")         { pi.size  = ts.nextLabel(); ts.expect(";"); }
             else if (key == "startFace")      { pi.start = ts.nextLabel(); ts.expect(";"); }
@@ -255,9 +257,34 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
                 ts.expect(")");
                 ts.expect(";");
             }
+            // An unsupported key whose value is a sub-DICTIONARY, e.g. cyclicACMI's
+            //     scale table; scaleCoeffs { values 3((0 1)(0.2 1)(0.3 0)); }
+            // Skipping to the next ';' lands INSIDE the block (on the list's terminator), after which the
+            // block's own '}' is mistaken for the patch's and every later patch is off by one -- the real
+            // error being reported miles away as "expected '{' got <the next patch's name>", which is how
+            // pimpleFoam/RAS/TJunctionSwitching failed to load at all. Skip balanced braces instead.
+            else if (ts.peek() == "{")
+            {
+                ts.expect("{");
+                for (int depth = 1; depth > 0; )
+                {
+                    const std::string t = ts.next();
+                    if      (t == "{") ++depth;
+                    else if (t == "}") --depth;
+                }
+            }
             else { while (ts.peek() != ";") ts.next(); ts.expect(";"); }  // skip remaining unsupported keys
         }
         ts.expect("}");
+        // ...and having survived the parse, REFUSE it rather than run it as a plain cyclicACMI. `scale`
+        // makes the interface's open area a function of time (TJunctionSwitching closes a branch with
+        // it); ignoring that silently would solve a different problem and converge happily.
+        if (acmiScale && pi.type == "cyclicACMI")
+            throw std::runtime_error(
+                "brae: patch '" + pi.name + "' is a cyclicACMI with a `scale` entry, which makes its open "
+                "area a prescribed function of time. brae applies only the geometric overlap mask, so "
+                "running this would quietly solve a case whose interface never opens or closes. Remove "
+                "the scale/scaleCoeffs entries to run the fixed-overlap problem instead.");
         patches_.push_back(std::move(pi));
     }
     ts.expect(")");

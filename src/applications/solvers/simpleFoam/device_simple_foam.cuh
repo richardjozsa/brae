@@ -155,6 +155,14 @@ public:
     // patches (cyc_/ami_.phi), which brae never reached. Called at the end of each pressure corrector,
     // where OF's pEqn.H calls it; a no-op until moveMesh has supplied a meshPhi. See the definition.
     void makeFluxRelative(const std::vector<FvPatch>& fvp, label nInternalFaces);
+    // fvc::correctUf(Uf, U, phi) -- rebuild the face velocity from the current U and the ABSOLUTE flux.
+    // Called at the end of each pressure corrector, before makeFluxRelative, exactly as pEqn.H does.
+    void correctUf();
+    // OF createUfIfPresent.H: the face velocity exists only on a dynamic mesh, and is constructed as
+    // fvc::interpolate(U) at case setup -- BEFORE any motion, which is why the driver calls this once
+    // before the time loop rather than letting the first mesh move trigger it. No mesh motion, no Uf,
+    // and fvc::ddtCorr falls back to its phi.oldTime() form exactly as OF's does.
+    void enableUf();
     // phi +/- mesh.phi() applied to one set of flux buffers (internal, boundary, cyclic, AMI).
     // sign -1 = fvc::makeRelative, +1 = fvc::makeAbsolute.
     void applyMeshPhi(const std::vector<FvPatch>& fvp, const std::vector<scalar>& mp, scalar sign,
@@ -170,6 +178,16 @@ public:
     // OF does `vectorField::operator=(Uwall())` on the patch field; this is the same assignment, on the
     // buffers the momentum assembly reads.
     void setPatchVelocity(label patchi, const std::vector<vector>& Uw);
+
+    // Rebuild the wall-function geometry from the CURRENT mesh. Everything in DeviceWallData is a
+    // function of the geometry -- the near-wall distance, the face deltaCoeffs, and (the reason this
+    // exists) the cyclicACMI area fractions that decide which non-overlap faces count as wall at all.
+    // A sliding ACMI re-splits those areas every step, so a set built once at construction is stale
+    // from the second step on. Call after the mesh has moved AND after any movingWallVelocity patch has
+    // been assigned, since the wall velocities are read back out of the device boundary.
+    void refreshWallData(const PrimitiveMesh& m, const FvGeometry& g, const std::vector<FvPatch>& fvp);
+    // Read-only view of that data, so a test can assert the refresh actually happened.
+    const DeviceWallData& wallData() const { return wall_; }
 
     void advanceTime(scalar deltaT);
     // One PIMPLE time step: advanceTime, then nOuterCorrectors x { momentum predictor (ddt folded in); nCorrectors x
@@ -451,6 +469,32 @@ public:
     // p0_->value(time) every step (uniformTotalPressureFvPatchScalarField.C:149). One entry per patch
     // that declared a non-constant p0; a constant p0 needs none and keeps the value set at read time.
     struct TimeVaryingP0 { label start = 0, count = 0; Function1 f; };
+    // fanPressure: p0 is shifted every step by the fan's pressure rise at the CURRENT patch flow rate.
+    //   volFlowRate = dir*sum(phi_patch),  dir = -1 for `direction in`, +1 for `out`
+    //   p0_eff      = p0 - dir*fanCurve(max(volFlowRate, 0))
+    // (fanPressureFvPatchScalarField::updateCoeffs, which then defers to totalPressure with that p0.)
+    // The curve is (flowRate, deltaP) pairs, linearly interpolated and CLAMPED outside its range, which is
+    // OF's `outOfBounds clamp` default for a table.
+    struct FanPressure
+    {
+        label  start = 0, count = 0;
+        scalar p0 = 0, dir = -1;
+        std::vector<std::pair<scalar, scalar>> curve;
+        scalar dp(scalar q) const
+        {
+            if (curve.empty()) return 0;
+            if (q <= curve.front().first) return curve.front().second;
+            if (q >= curve.back().first)  return curve.back().second;
+            for (std::size_t i = 1; i < curve.size(); ++i)
+                if (q <= curve[i].first)
+                {
+                    const scalar t = (q - curve[i-1].first) / (curve[i].first - curve[i-1].first);
+                    return curve[i-1].second + t*(curve[i].second - curve[i-1].second);
+                }
+            return curve.back().second;
+        }
+    };
+    void setFanPressure(std::vector<FanPressure> v) { fanP0_ = std::move(v); }
     void setTimeVaryingP0(std::vector<TimeVaryingP0> v) { tvP0_ = std::move(v); }
 
     // Build the list from a pressure field's parsed boundary entries. Shared so all three drivers wire
@@ -468,6 +512,9 @@ public:
         label start = 0;
         for (const FvPatch& fp : patches)
         {
+            // dbP_.p0 is in DeviceBoundary face order, which SKIPS the coupled patches -- so the running
+            // offset has to skip them too, or every entry after a cyclic/AMI patch addresses the wrong faces.
+            if (isCoupledInterfaceType(fp.type)) continue;
             for (const auto& b : pFd.boundary)
             {
                 if (b.name != fp.name || !b.hasP0Function1) continue;
@@ -569,6 +616,7 @@ private:
     // advanceTime(). steadyState + empty old-time buffers in the default steady SIMPLE path, where ddt is a no-op.
     DdtScheme ddtScheme_ = DdtScheme::steadyState;
     std::vector<TimeVaryingP0> tvP0_;   // uniformTotalPressure p0(t), empty for constant p0
+    std::vector<FanPressure>   fanP0_;  // fanPressure: p0 shifted by the fan curve each step
     scalar    deltaT_ = 0, deltaT0_ = 0;
     scalar    ocCoeff_ = 1;         // CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>"); 0=Euler-like, 1=pure CN
     bool      cnWarm_  = false;     // CrankNicolson: the ddt0 recurrence has done its first (Euler-startup) update
@@ -699,9 +747,21 @@ private:
 
     // mesh.phi() from the last move (per mesh face, internal then boundary). Held rather than applied at
     // the move: fvc::makeRelative belongs at the end of the pressure corrector. See makeFluxRelative.
-    std::vector<scalar> meshPhi_, meshPhiPrev_;
-    std::vector<scalar> magSfPrev_;      // face areas at the previous time level (the ddtCorr guard)
-    bool   ddtCorrAreaNoticed_ = false;
+    std::vector<scalar> meshPhi_;
+    // Uf -- the FACE VELOCITY a moving-mesh pimpleFoam carries beside phi (createUfIfPresent.H, made
+    // whenever mesh.dynamic()). Held in brae's four flux compartments: internal faces, non-coupled
+    // boundary faces, and the two interfaces. Updated by fvc::correctUf at the end of every pressure
+    // corrector, aged into *Old_ at the top of each step, and read by fvc::ddtCorr as
+    // phiUf0 = Sf_current & Uf.oldTime().
+    //
+    // WHY IT EXISTS RATHER THAN A SHORTCUT. phi + mesh.phi() reproduces phiUf0 exactly while Sf holds
+    // still, and that covered a translating mesh -- but a cyclicACMI rescales its coupled face areas
+    // every step from the overlap mask, and a rotating mesh turns Sf under the stored Uf. On the moving
+    // oscillatingInletACMI2D the shortcut was exact at step 1 and 5.1e-03 off by step 10, all of it on
+    // the interface columns. Carrying the real field removes the approximation instead of announcing it.
+    DeviceBuffer<scalar> UfInt_[3], UfBnd_[3], UfAmi_[3], UfCyc_[3];
+    DeviceBuffer<scalar> UfOldInt_[3], UfOldBnd_[3], UfOldAmi_[3], UfOldCyc_[3];
+    bool   ufActive_ = false;            // set once the mesh-motion path has run: OF's mesh.dynamic()
     bool   meshPhiValid_ = false;
     DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
     std::vector<std::pair<label, label>> cycRuns_, amiRuns_;

@@ -8,6 +8,7 @@
 #include "cf_types.cuh"
 #include "foam_field_reader.cuh"   // readField -> FieldData/PatchFieldData (resolves includes/macros/$internalField)
 #include "foam_dict.cuh"           // compileFoamRegex, isConstraintPatchType (same matching as buildField)
+#include "foam_token_reader.cuh"   // gzSlurp: the template field may be gzipped (OF writeCompression on)
 #include "fv_patch.cuh"            // FvPatch (name / type / inGroups)
 #include <fstream>
 #include <iomanip>
@@ -138,9 +139,22 @@ inline void writeVolField(
     const std::vector<T>& computedBoundary = {},
     const DerivedFieldSpec* derived = nullptr)
 {
-    std::ifstream in(origPath);
-    if (!in) throw std::runtime_error("writeVolField: cannot read " + origPath);
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // The ORIGINAL field is re-read here as a template: its FoamFile header, dimensions and boundaryField
+    // shape are echoed into the new time directory. It may be gzipped -- OF writes `U.gz` whenever
+    // writeCompression is on, and pimpleFoam/LES/periodicPlaneChannel ships its 0/ that way -- so this has
+    // to go through gzSlurp like every other read, not a bare ifstream. The reader side already did;
+    // only the writer still opened the file directly, and the run died at its FIRST write having done all
+    // the solving.
+    std::string text;
+    try
+    {
+        const std::vector<char> b = gzSlurp(origPath);
+        text.assign(b.begin(), b.end());
+    }
+    catch (const std::exception&)
+    {
+        throw std::runtime_error("writeVolField: cannot read " + origPath + " (nor " + origPath + ".gz)");
+    }
 
     // FoamFile header block (verbatim, it holds no directives) + the dimensions line.
     const std::size_t ff = text.find("FoamFile");

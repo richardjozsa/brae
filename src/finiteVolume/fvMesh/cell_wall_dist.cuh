@@ -221,4 +221,150 @@ inline std::vector<scalar> cellWallDist(
     return y;
 }
 
+// OF wallDist `method exactDistance` (patchDistMethods::exact): the TRUE Euclidean distance from every
+// cell centre to the nearest point on the WALL SURFACE, not the connectivity-propagated wave above.
+//
+// OF triangulates the wall patches into a distributedTriSurfaceMesh and calls findNearest on an octree.
+// brae measures to the face POLYGON instead, via the same pointToFaceDist (OF face::nearestPoint's
+// centre-fan) that nearWallDist uses. For a PLANAR face the two agree exactly -- any correct
+// triangulation of a planar polygon covers the same point set, so the nearest point is the same. They can
+// differ on a WARPED face, where the triangulations disagree about the surface between the vertices; that
+// is a genuine, small difference and is noted rather than hidden.
+//
+// WHY A GRID. Brute force is O(nCells * nWallFaces) and the cases that ask for exactDistance are not
+// small: pimpleFoam/LES/wallMountedHump is 2.3M cells. Wall faces are bucketed into a uniform grid, and
+// each query expands in Chebyshev rings until the searched box is guaranteed to contain the answer --
+// exact, not approximate, because the stopping bound is the distance from the query point to the OUTSIDE
+// of the box already searched, and every face is bucketed into every grid cell its bounding box touches.
+inline std::vector<scalar> exactCellWallDist(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
+    const std::vector<vector>& pts = m.points();
+    const std::vector<label>&  fv  = m.faceVerts();
+    const std::vector<label>&  fo  = m.faceOffsets();
+    const std::vector<vector>& C   = g.C();
+    const label nC = m.nCells();
+
+    std::vector<label> wallFace;
+    for (const FvPatch& p : fvp)
+        if (p.type == "wall")
+            for (label i = 0; i < p.size; ++i) wallFace.push_back(p.start + i);
+
+    std::vector<scalar> y(nC, 0.0);
+    if (wallFace.empty()) return y;   // no walls -> OF leaves y at its initial value
+
+    // per-face bounding box + the overall one
+    const label nW = static_cast<label>(wallFace.size());
+    std::vector<vector> bLo(nW), bHi(nW);
+    vector lo{ nwdGreat,  nwdGreat,  nwdGreat};
+    vector hi{-nwdGreat, -nwdGreat, -nwdGreat};
+    for (label w = 0; w < nW; ++w)
+    {
+        const label f = wallFace[w];
+        vector a{ nwdGreat,  nwdGreat,  nwdGreat};
+        vector b{-nwdGreat, -nwdGreat, -nwdGreat};
+        for (label j = fo[f]; j < fo[f + 1]; ++j)
+        {
+            const vector& q = pts[fv[j]];
+            a.x = std::fmin(a.x, q.x); a.y = std::fmin(a.y, q.y); a.z = std::fmin(a.z, q.z);
+            b.x = std::fmax(b.x, q.x); b.y = std::fmax(b.y, q.y); b.z = std::fmax(b.z, q.z);
+        }
+        bLo[w] = a; bHi[w] = b;
+        lo.x = std::fmin(lo.x, a.x); lo.y = std::fmin(lo.y, a.y); lo.z = std::fmin(lo.z, a.z);
+        hi.x = std::fmax(hi.x, b.x); hi.y = std::fmax(hi.y, b.y); hi.z = std::fmax(hi.z, b.z);
+    }
+    // pad so a degenerate (planar/2D) extent still has a positive cell size
+    const scalar span = std::fmax(std::fmax(hi.x - lo.x, hi.y - lo.y), std::fmax(hi.z - lo.z, scalar(1e-30)));
+    const scalar pad  = 1e-6 * span;
+    lo.x -= pad; lo.y -= pad; lo.z -= pad;
+    hi.x += pad; hi.y += pad; hi.z += pad;
+
+    // ~1 face per grid cell, capped so the grid itself stays small
+    const scalar target = std::cbrt(std::fmax((hi.x-lo.x)*(hi.y-lo.y)*(hi.z-lo.z), scalar(1e-300))
+                                    / std::fmax(scalar(nW), scalar(1)));
+    const scalar h = std::fmax(target, span * scalar(1e-4));
+    auto dimOf = [&](scalar ext) { return std::max(1, std::min(512, (int)std::floor(ext / h) + 1)); };
+    const int nx = dimOf(hi.x - lo.x), ny = dimOf(hi.y - lo.y), nz = dimOf(hi.z - lo.z);
+    const vector hs{ (hi.x-lo.x)/nx, (hi.y-lo.y)/ny, (hi.z-lo.z)/nz };
+    auto gidx = [&](int i, int j, int k) { return (std::size_t)((k*ny + j)*(std::size_t)nx + i); };
+    auto clampi = [](int v, int n) { return v < 0 ? 0 : (v >= n ? n - 1 : v); };
+
+    // CSR bucket: every face into every grid cell its bbox touches (count, then fill)
+    std::vector<label> cnt((std::size_t)nx*ny*nz + 1, 0);
+    auto range = [&](label w, int* i0, int* i1, int* j0, int* j1, int* k0, int* k1)
+    {
+        *i0 = clampi((int)std::floor((bLo[w].x - lo.x)/hs.x), nx);
+        *i1 = clampi((int)std::floor((bHi[w].x - lo.x)/hs.x), nx);
+        *j0 = clampi((int)std::floor((bLo[w].y - lo.y)/hs.y), ny);
+        *j1 = clampi((int)std::floor((bHi[w].y - lo.y)/hs.y), ny);
+        *k0 = clampi((int)std::floor((bLo[w].z - lo.z)/hs.z), nz);
+        *k1 = clampi((int)std::floor((bHi[w].z - lo.z)/hs.z), nz);
+    };
+    for (label w = 0; w < nW; ++w)
+    {
+        int i0,i1,j0,j1,k0,k1; range(w,&i0,&i1,&j0,&j1,&k0,&k1);
+        for (int k = k0; k <= k1; ++k) for (int j = j0; j <= j1; ++j) for (int i = i0; i <= i1; ++i)
+            ++cnt[gidx(i,j,k) + 1];
+    }
+    for (std::size_t q = 1; q < cnt.size(); ++q) cnt[q] += cnt[q-1];
+    std::vector<label> bucket(cnt.back());
+    { std::vector<label> at(cnt.begin(), cnt.end() - 1);
+      for (label w = 0; w < nW; ++w)
+      {
+          int i0,i1,j0,j1,k0,k1; range(w,&i0,&i1,&j0,&j1,&k0,&k1);
+          for (int k = k0; k <= k1; ++k) for (int j = j0; j <= j1; ++j) for (int i = i0; i <= i1; ++i)
+              bucket[at[gidx(i,j,k)]++] = w;
+      } }
+
+    for (label c = 0; c < nC; ++c)
+    {
+        const vector& p = C[c];
+        const int ci = clampi((int)std::floor((p.x - lo.x)/hs.x), nx);
+        const int cj = clampi((int)std::floor((p.y - lo.y)/hs.y), ny);
+        const int ck = clampi((int)std::floor((p.z - lo.z)/hs.z), nz);
+        scalar best = nwdGreat;
+        const int rMax = std::max(nx, std::max(ny, nz));
+        for (int r = 0; r <= rMax; ++r)
+        {
+            // the shell at Chebyshev radius r (r = 0 is the query's own cell)
+            const int i0 = ci - r, i1 = ci + r, j0 = cj - r, j1 = cj + r, k0 = ck - r, k1 = ck + r;
+            for (int k = k0; k <= k1; ++k)
+            {
+                if (k < 0 || k >= nz) continue;
+                const bool kEdge = (k == k0 || k == k1);
+                for (int j = j0; j <= j1; ++j)
+                {
+                    if (j < 0 || j >= ny) continue;
+                    const bool jEdge = (j == j0 || j == j1);
+                    const int step = (kEdge || jEdge) ? 1 : (i1 - i0 == 0 ? 1 : i1 - i0);
+                    for (int i = i0; i <= i1; i += step)
+                    {
+                        if (i < 0 || i >= nx) continue;
+                        const std::size_t gi = gidx(i,j,k);
+                        for (label b = cnt[gi]; b < cnt[gi+1]; ++b)
+                        {
+                            const label f = wallFace[bucket[b]];
+                            const scalar d = pointToFaceDist(p, pts, fv, fo[f], fo[f+1]);
+                            if (d < best) best = d;
+                        }
+                    }
+                }
+            }
+            // STOP when the box already searched provably contains the nearest face. Any face not yet
+            // seen lies outside that box, so it is at least this far away.
+            const scalar bx = lo.x + (i0    )*hs.x, bX = lo.x + (i1 + 1)*hs.x;
+            const scalar by = lo.y + (j0    )*hs.y, bY = lo.y + (j1 + 1)*hs.y;
+            const scalar bz = lo.z + (k0    )*hs.z, bZ = lo.z + (k1 + 1)*hs.z;
+            const scalar guard = std::fmin(std::fmin(std::fmin(p.x - bx, bX - p.x),
+                                                     std::fmin(p.y - by, bY - p.y)),
+                                           std::fmin(p.z - bz, bZ - p.z));
+            if (best <= std::fmax(guard, scalar(0))) break;
+        }
+        y[c] = best;
+    }
+    return y;
+}
+
 } // namespace brae

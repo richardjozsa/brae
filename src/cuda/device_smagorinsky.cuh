@@ -13,4 +13,8 @@ namespace brae {
 void deviceSmagorinskyNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
                           const SmagorinskyCoeffs& co, DeviceBuffer<scalar>& nut);
 
+// WALE (OF LESModels::WALE::correctNut): the other ALGEBRAIC sub-grid nut, same inputs as Smagorinsky.
+void deviceWaleNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
+                   const WaleCoeffs& co, DeviceBuffer<scalar>& nut);
+
 } // namespace brae

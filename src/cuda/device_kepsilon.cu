@@ -648,6 +648,7 @@ void deviceKEpsilonCorrect(
     const DeviceBuffer<scalar>* nutBnd,       // nut at boundary FACES -> DkEff/DepsEff(patchi), as OF's laplacian uses
     const DeviceBuffer<scalar>* muBnd,
     scalar gradScalarLimitK,
+    scalar gradULimitK,
                             const DeviceBuffer<label>*  fvoKMask,
                             const DeviceBuffer<scalar>* fvoKVal,
                             const DeviceBuffer<label>*  fvoEMask,
@@ -656,12 +657,19 @@ void deviceKEpsilonCorrect(
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
     DeviceBuffer<scalar> gByNu, rCmu, magS;
-    if (co.realizable)   // realizableKE: needs the full gradU tensor for rCmu/magS (deviceGbyNu only returns gByNu)
+    // THE NAMED grad(U) SCHEME. OF's kEpsilon::correct() opens with `tmp<volTensorField> tgradU =
+    // fvc::grad(U)`, which resolves gradSchemes `grad(U)` -- `cellLimited Gauss linear 1` on any case
+    // that says so. kOmegaSST's brae path has honoured that for a long time; kEpsilon's never did, and
+    // an UNLIMITED production gradient is larger exactly where the limiter would have bitten. Measured
+    // on pimpleFoam/RAS/oscillatingInletACMI2D, step 1: GbyNu peaked at 1.9e+04 against OpenFOAM's
+    // 3.6e+03 in the inlet channel, a factor of 5 on the production term itself.
+    if (co.realizable || gradULimitK > scalar(0))
     {
         DeviceBuffer<scalar> gradU;
         deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);
+        if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);
         deviceGByNuFromGradU(gradU, nC, gByNu);
-        deviceRealizableStrain(gradU, k, eps, co.A0, nC, rCmu, magS);
+        if (co.realizable) deviceRealizableStrain(gradU, k, eps, co.A0, nC, rCmu, magS);
     }
     else deviceGbyNu(dm, dbU, Ux, Uy, Uz, gByNu, ami, cyc);   // interface-aware grad(U) for production
     DeviceBuffer<scalar> G;
@@ -682,6 +690,7 @@ void deviceKEpsilonCorrect(
         // Only the components separate those two.
         DeviceBuffer<scalar> gradUd;
         deviceGradU(dm, dbU, Ux, Uy, Uz, gradUd, ami, cyc);
+        if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradUd, gradULimitK, cyc, ami);
         const std::vector<scalar> hT = gradUd.host();
         go << "# cell gByNu k eps nut g0..g8 (OF-convention gradU, column i = grad(U_i))\n";
         for (int c = 0; c < nC; ++c)
@@ -718,7 +727,26 @@ void deviceKEpsilonCorrect(
     else deviceCopy(divU, divPhi);
     DeviceBuffer<scalar> eps0, G0;
     deviceWallEpsG0(wall, k, Ux, Uy, Uz, nu, eps0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
-    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data());
+    // BRAE_DUMP_TERMS: the wall-function inputs, BEFORE the override rewrites eps/eps0. eps0 is the raw
+    // near-wall value invNw*Cmu^.75*k^1.5/(kappa*y), so a disagreement with OF here is one of invNw
+    // (the corner weighting, 1/nWallFaces), y, or k -- and the three are separable only side by side.
+    if (const char* wd = std::getenv("BRAE_DUMP_TERMS"))
+    {
+        static int wCall = 0;
+        const int wi = wCall++;
+        std::error_code wec; std::filesystem::create_directories(wd, wec);
+        char wfn[512]; std::snprintf(wfn, sizeof wfn, "%s/wall_%04d", wd, wi);
+        std::ofstream wo(wfn); wo.precision(10);
+        const std::vector<scalar> hE0 = eps0.host(), hG0 = G0.host(), hW = wall.wallW.size() ? wall.wallW.host() : std::vector<scalar>(nC, 1.0);
+        const std::vector<scalar> hInv = wall.invNw.host(), hE = eps.host(), hK = k.host();
+        const std::vector<label>  hIs = wall.isWallCell.host();
+        wo << "# cell isWall wallW invNw eps0 G0 epsIn k\n";
+        for (int c = 0; c < nC; ++c)
+            wo << c << ' ' << (int)hIs[c] << ' ' << hW[c] << ' ' << hInv[c] << ' '
+               << hE0[c] << ' ' << hG0[c] << ' ' << hE[c] << ' ' << hK[c] << '\n';
+    }
+    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data(),
+                                          wall.wallW.size() ? wall.wallW.data() : nullptr);
 
     // epsilon equation (loose solve) with the near-wall setValues constraint
     // DepsilonEff = nut/sigmaEps + nu. OF's laplacian is alpha*rho*DepsilonEff, so compressible wants
