@@ -27,6 +27,7 @@ import subprocess
 import sys
 
 BRAE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEMANDED = set()
 
 # Types brae REFUSES on purpose, with the reason. A refusal is a supported outcome -- the port says
 # what it cannot do and stops -- so these are tracked separately from silent gaps. Keep the reason
@@ -61,7 +62,10 @@ DIVERGENT = {
 
 
 def sh(cmd):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout
+    # errors="replace": OpenFOAM tutorials ship binary and gzipped field files, and one undecodable
+    # byte in a 0/ directory would otherwise abort the whole inventory.
+    r = subprocess.run(cmd, shell=True, capture_output=True)
+    return r.stdout.decode("utf-8", errors="replace")
 
 
 def typenames(paths):
@@ -122,6 +126,46 @@ def brae_strings(relpaths=None, pattern=None):
     return _ALL_BRAE_STRINGS
 
 
+def demanded(tutroot, category):
+    """Type names the tutorials write FOR THIS CATEGORY, scoped to the dictionaries that select it.
+
+    Scoping matters more than it sounds. A scan over every file in every tutorial reported `Gamma` (a
+    limiter) as demanded because it appears in a finite-area faSchemes; `midPoint` because a sampling
+    dict names it; `coded` and `viscousDissipation` because they are function objects, not fvOptions;
+    and `fan` as a boundary condition because it is a PATCH NAME whose type is fixedFluxPressure. Four
+    of the six "actionable" entries were noise, which is worse than no list at all -- a manifest that
+    cries wolf gets ignored exactly when it is right.
+
+    So each category reads only where OpenFOAM would look for it."""
+    if not os.path.isdir(tutroot):
+        return set()
+    # (file glob, regex capturing the selected name)
+    scopes = {
+        "fvPatchField":   ([r"0/*", r"0.orig/*"],           r"\btype\s+([A-Za-z][A-Za-z0-9_]*)\s*;"),
+        "ddtScheme":      ([r"system/fvSchemes"],           r"ddtSchemes[^}]*?default\s+([A-Za-z][A-Za-z0-9_]*)"),
+        "limitedScheme":  ([r"system/fvSchemes"],           r"Gauss\s+([A-Za-z][A-Za-z0-9_]*)"),
+        "RASModel":       ([r"constant/turbulenceProperties*", r"constant/momentumTransport*"],
+                                                            r"RASModel\s+([A-Za-z][A-Za-z0-9_]*)\s*;"),
+        "LESModel":       ([r"constant/turbulenceProperties*", r"constant/momentumTransport*"],
+                                                            r"LESModel\s+([A-Za-z][A-Za-z0-9_]*)\s*;"),
+        "LESdelta":       ([r"constant/turbulenceProperties*", r"constant/momentumTransport*"],
+                                                            r"\bdelta\s+([A-Za-z][A-Za-z0-9_]*)\s*;"),
+        "fvOption":       ([r"constant/fvOptions", r"system/fvOptions"],
+                                                            r"\btype\s+([A-Za-z][A-Za-z0-9_]*)\s*;"),
+        "dynamicFvMesh":  ([r"constant/dynamicMeshDict"],    r"dynamicFvMesh\s+([A-Za-z][A-Za-z0-9_]*)\s*;"),
+        "motionSolver":   ([r"constant/dynamicMeshDict"],    r"(?:motionSolver|solver)\s+([A-Za-z][A-Za-z0-9_]*)\s*;"),
+    }
+    globs, rx = scopes.get(category, ([], None))
+    if not rx:
+        return set()
+    out = set()
+    for gl in globs:
+        # every tutorial case, at any nesting depth, that has this dictionary
+        txt = sh(f"find {tutroot} -path '*/{gl}' -type f -exec cat {{}} + 2>/dev/null")
+        out |= set(re.findall(rx, txt, re.S))
+    return out
+
+
 def build(ofsrc):
     fv = f"{ofsrc}/finiteVolume"
     tm = f"{ofsrc}/TurbulenceModels"
@@ -178,6 +222,7 @@ def main():
     if not os.path.isdir(a.of):
         sys.exit(f"OpenFOAM src not found: {a.of}")
 
+    tutroot = os.path.join(os.path.dirname(a.of.rstrip('/')), "tutorials/incompressible/pimpleFoam")
     cats = build(a.of)
     lines = [
         "# pimpleFoam coverage manifest",
@@ -188,21 +233,23 @@ def main():
         "pimpleFoam can therefore select from a case dictionary. `missing` means brae does not name it",
         "anywhere: a case using it must be REFUSED at startup, never run to a plausible wrong answer.",
         "",
-        "| category | OF types | named | refused | divergent | **missing** |",
-        "|---|---|---|---|---|---|",
+        "| category | OF types | named | refused | divergent | missing | **demanded** |",
+        "|---|---|---|---|---|---|---|",
     ]
     detail = []
     for name, (of, br) in cats.items():
         refused = set(REFUSED.get(name, {}))
         divergent = set(DIVERGENT.get(name, {}))
         named = (of & br) | refused | divergent
-        missing = sorted(of - named)
+        missingSet = of - named
+        missing = sorted(missingSet)
+        want = missingSet & demanded(tutroot, name)
         lines.append(f"| `{name}` | {len(of)} | {len(of & br)} | {len(refused & of)} | "
-                     f"{len(divergent & of)} | **{len(missing)}** |")
-        detail.append((name, missing, sorted(refused & of), sorted(divergent & of)))
+                     f"{len(divergent & of)} | {len(missing)} | **{len(want)}** |")
+        detail.append((name, missing, sorted(refused & of), sorted(divergent & of), sorted(want)))
 
     lines += ["", "## Missing, by category", ""]
-    for name, missing, refused, divergent in detail:
+    for name, missing, refused, divergent, want in detail:
         lines.append(f"### `{name}` -- {len(missing)} missing")
         lines.append("")
         if refused:
@@ -211,7 +258,11 @@ def main():
         if divergent:
             lines.append("Deliberately divergent: " + ", ".join(f"`{x}`" for x in divergent))
             lines.append("")
-        lines.append(", ".join(f"`{m}`" for m in missing) if missing else "_none_")
+        if want:
+            lines.append("**Demanded by a tutorial** (the actionable work list): "
+                         + ", ".join(f"`{w}`" for w in want))
+            lines.append("")
+        lines.append("All missing: " + (", ".join(f"`{m}`" for m in missing) if missing else "_none_"))
         lines.append("")
 
     os.makedirs(os.path.dirname(a.out), exist_ok=True)

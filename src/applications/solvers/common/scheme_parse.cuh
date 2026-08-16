@@ -455,6 +455,28 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     }
                     { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradULULimitK = g; }   // linearUpwind's named grad(U)
                 }
+                // div(phi,sigma) -- the Maxwell viscoelastic stress transport. Both Maxwell tutorials
+                // write `Gauss vanAlbada`, and brae HAS that limiter, but nothing ever SET the flag that
+                // switches it on: divSigmaVanAlbada was declared, defaulted false, read once in
+                // correctMaxwell, and assigned nowhere. The stress equation therefore ran UNLIMITED
+                // while the case asked for a TVD limiter, and neither tutorial caught it because both
+                // flows are smooth enough that the limiter barely engages -- the same false comfort a
+                // degenerate Bird-Carreau parameterisation gave on TJunctionArrhenius.
+                //
+                // Found by the coverage manifest, not by a case: `vanAlbada` appeared as a type the
+                // tutorials DEMAND and brae never names in a quoted comparison, which is exactly the
+                // signature of a control that is plumbed but never selected.
+                if (inDiv && ln.find("div(phi,sigma)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    if (sw == "vanAlbada") ctl.divSigmaVanAlbada = true;
+                    else if (!sw.empty() && sw != "linear" && sw != "upwind")
+                        throw std::runtime_error(
+                            "brae: div(phi,sigma) scheme '" + sw + "' is not implemented (brae has "
+                            "`vanAlbada`, `linear` and `upwind`). The limiter bounds the viscoelastic "
+                            "stress transport, so substituting another one solves a different "
+                            "equation:\n  " + ln);
+                }
                 // grad(U) cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>): k is the first number after
                 // "cellLimited" (the basicScheme between has no digits). 0 = unlimited. cellMDLimited not yet handled.
                 if (inGrad && ln.find("grad(U)") != std::string::npos && hasWord(ln, "cellLimited"))
