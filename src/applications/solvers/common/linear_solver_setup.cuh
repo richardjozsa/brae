@@ -18,6 +18,7 @@
 // Everything here is read-only on the dicts and writes only into ctl.
 
 #include "solver_controls.cuh"
+#include <regex>
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"   // noticeApproximated / noticeIgnored
 #include <algorithm>
@@ -238,6 +239,41 @@ inline void readLinearSolverControls(
 // reused k's factor for epsilon/omega, so `omega 0.4` was ignored and omega ran at k's factor).
 //
 // Call AFTER the turbulence model is read: it branches on ctl.sa/ctl.sst to pick the field names.
+// OF looks a relaxation factor up with keyType::REGEX (solution.C:341,383), which is the ONLY reason the
+// near-universal PIMPLE idiom
+//     relaxationFactors { equations { U 0.8; ".*Final" 1; } }
+// does anything: on the last outer corrector OF appends "Final" to the name (GeometricField::relax and
+// fvMatrix::relax both go through psi.select(isFinalIteration())), so "UFinal" matches ".*Final" and the
+// final corrector runs UNRELAXED. Match the name literally first, then by regex, exactly as OF does.
+// pOnly reproduces the filter in OF's legacy branch (solution.C:82-100): when relaxationFactors is the
+// FLAT form, only keys beginning `p` or `rho` become FIELD relaxation, while the whole dict becomes
+// EQUATION relaxation. Without the filter a flat `{ ".*" 0.7; }` would field-relax pFinal, which OF
+// does not do -- its fieldRelaxDict_ never receives that key, so relax() is skipped entirely.
+inline bool relaxLookup(const FoamDict* d, const std::string& name, scalar& out, bool pOnly = false)
+{
+    if (!d) return false;
+    auto eligible = [pOnly](const std::string& k)
+    { return !pOnly || k.rfind("p", 0) == 0 || k.rfind("rho", 0) == 0; };
+    // A LITERAL probe, deliberately not d->found(): FoamDict's own lookup is regex-aware, so `found("p")`
+    // is satisfied by a `".*"` key and the eligibility filter below would never get a say.
+    bool literal = false;
+    for (const auto& lv : d->leaves) if (lv.first == name) { literal = true; break; }
+    if (literal && eligible(name)) { out = d->scalarOr(name, scalar(1)); return true; }
+    bool hit = false;
+    for (const auto& lv : d->leaves)
+    {
+        const std::string& key = lv.first;
+        if (key.find_first_of("()|*?[].^$") == std::string::npos) continue;   // plain word, already tried
+        if (!eligible(key)) continue;
+        try
+        {
+            if (std::regex_match(name, compileFoamRegex(key))) { out = d->scalarOr(key, scalar(1)); hit = true; }
+        }
+        catch (const std::regex_error&) { /* not a usable regex -> not a match, as OF treats it */ }
+    }
+    return hit;
+}
+
 inline void readRelaxationFactors(const FoamDict& fvSolution, DeviceSimpleControls& ctl)
 {
     const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
@@ -258,7 +294,30 @@ inline void readRelaxationFactors(const FoamDict& fvSolution, DeviceSimpleContro
     ctl.relaxU   = eqSrc  ? eqSrc->scalarOr("U", 1.0) : 1.0;
     ctl.relaxK   = eqSrc  ? eqSrc->scalarOr(kName, 1.0) : 1.0;
     ctl.relaxEps = eqSrc  ? eqSrc->scalarOr(sName, 1.0) : 1.0;
-    ctl.relaxP   = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
+    // p goes through the filtered lookup too, not scalarOr: FoamDict's lookup is regex-aware, so on the
+    // LEGACY flat form a catch-all `".*" 0.7;` would otherwise field-relax the pressure. OF's legacy
+    // branch never copies that key into fieldRelaxDict_, so it relaxes the equations only.
+    ctl.relaxP   = 1.0;
+    relaxLookup(fldSrc, "p", ctl.relaxP, /*pOnly*/!fld);
+    // ...and the FINAL-corrector factors, which brae had no notion of: it applied the ordinary factor on
+    // every outer corrector including the last. OF does not, and in PIMPLE that is not a matter of
+    // convergence rate -- the final corrector is what makes the step satisfy momentum and continuity
+    // together, so relaxing it leaves a residue that the next step inherits. Measured on LES/vortexShed
+    // (`relaxationFactors { nuTilda 0.8; U 0.8; p 0.8; ".*Final" 1.0; }`): the outer loop's initial
+    // pressure residual GREW corrector by corrector (0.208 -> 0.256 -> 0.311 -> 0.354) instead of
+    // falling, contLocal ran 1e-7 -> 40 over twenty steps, and |U| reached 1.29e+06 against OpenFOAM's
+    // 0.0435. Absent from the dict -> no Final entry -> fall back to the ordinary factor, which is also
+    // what OF does (the lookup simply misses and relax() is skipped for that name).
+    // NO MATCH MEANS NO RELAXATION, which is not the same as "reuse the ordinary factor". OF's relax()
+    // is guarded -- `if (relaxField(name)) relax(factor)` in GeometricField::relax, and the identical
+    // shape in fvMatrix::relax -- so on the final corrector, where the name carries the "Final" suffix,
+    // an unmatched name means relax() is never called and the factor is effectively 1. That is why a
+    // PIMPLE case with a bare `equations { U 0.7; }` still ends each step with an unrelaxed corrector.
+    // Steady SIMPLE is untouched: finalIter is only ever true inside the PIMPLE outer loop.
+    ctl.relaxUFinal = 1.0;   relaxLookup(eqSrc,  "UFinal",                     ctl.relaxUFinal);
+    ctl.relaxKFinal = 1.0;   relaxLookup(eqSrc,  kName + std::string("Final"), ctl.relaxKFinal);
+    ctl.relaxEpsFinal = 1.0; relaxLookup(eqSrc,  sName + "Final",              ctl.relaxEpsFinal);
+    ctl.relaxPFinal = 1.0;   relaxLookup(fldSrc, "pFinal", ctl.relaxPFinal, /*pOnly*/!fld);
 
     // A relaxation factor <= 0 divides by zero in the diagonal-relaxation kernel (Inf diag -> NaN). OF's
     // fvMatrix::relax skips relaxation for alpha <= 0; match that (treat as 1.0 = no under-relaxation) + warn.

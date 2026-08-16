@@ -639,7 +639,10 @@ private:
     // meanVelocityForce: accumulated pressure gradient gradP_ driving the mean velocity to Ubar (channel flow).
     bool   mvfActive_ = false;
     vector mvfFlowDir_{0,0,0};
-    scalar mvfUbarMag_ = 0, mvfRelax_ = 1.0, mvfGradP_ = 0, mvfVtot_ = 0;
+    // meanVelocityForce keeps TWO gradients, exactly as OF does (meanVelocityForce.C:146-247), and the
+    // pair is not an implementation detail -- collapsing them into one accumulator makes the channel
+    // diverge. See the constrain step in the momentum assembly.
+    scalar mvfUbarMag_ = 0, mvfRelax_ = 1.0, mvfGradP0_ = 0, mvfDGradP_ = 0, mvfVtot_ = 0;
     DeviceBuffer<scalar> mvfMaskV_, mvfMask01_;   // V (and 1) in the zone, 0 else (= V / ones for selectionMode all)
     bool   limUActive_ = false;
     scalar limUMax_ = 0;
@@ -743,6 +746,8 @@ private:
     std::vector<label> patchStart_;   // DeviceBoundary face offset per patch
     DeviceBuffer<scalar> nutBndFile_;   // nut's own boundaryField (OF reads nut_b from here, not cells)
     bool hasNutCalc_ = false;
+    bool hasNutFixed_ = false;
+    DeviceBuffer<label> nutFixedMask_;   // 0 where nut's BC fixes a value on a non-wall patch
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces
     // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
     // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed
@@ -860,6 +865,7 @@ private:
     DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
     std::vector<std::pair<label, label>> cycRuns_, amiRuns_;
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)
+    bool   amiNonConforming_ = false;                           // ...and a face with >1 partner -> BiCGStab (see below)
     DeviceAMI    ami_;                                          // cyclicAMI weighted-stencil coupling (translational path)
 };
 

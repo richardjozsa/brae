@@ -147,23 +147,45 @@ inline MeshMotion readMeshMotion(const std::string& caseDir)
                                  "points of a named zone and will not guess which cells move.");
 
     const std::string fn = c.wordOr("solidBodyMotionFunction", d.wordOr("solidBodyMotionFunction", ""));
+    // OF solidBodyMotionFunction::New stores SBMFCoeffs_(dict.optionalSubDict(typeName + "Coeffs")):
+    // the FUNCTION's coefficients live in `<function>Coeffs`, nested inside solidBodyCoeffs, not beside
+    // `cellZone`. brae read them from solidBodyCoeffs directly, found nothing, and took the defaults --
+    // amplitude (0 0 0) and omega 0. The motion function was still RECOGNISED, so nothing refused and
+    // nothing warned: the case simply ran with a mesh that never moved.
+    //
+    // Measured on pimpleFoam/RAS/oscillatingInletPeriodicAMI2D, whose channel should oscillate at
+    // amplitude*omega = 0.5*3.14 = 1.57: OpenFOAM's moving walls carried U up to 1.5699 on 223 of 272
+    // faces while brae's were identically zero, and 0 of 22356 mesh points moved on any step.
+    const FoamDict* fc = fn.empty() ? nullptr : c.subDict(fn + "Coeffs");
+    const FoamDict& k = fc ? *fc : c;
     auto vec3 = [](const std::vector<scalar>& v, vector dflt) {
         return v.size() >= 3 ? vector{v[v.size()-3], v[v.size()-2], v[v.size()-1]} : dflt;
+    };
+    // A recognised motion that evaluates to NO motion is nearly always a coefficient that was not found,
+    // which is exactly the failure above. Refuse instead of running a silently static mesh.
+    auto checkLive = [&](bool live, const std::string& what)
+    {
+        if (!live)
+            throw std::runtime_error(
+                "brae: solidBodyMotionFunction '" + fn + "' has " + what + ", so the mesh would not move "
+                "at all. That is almost always a coefficient brae failed to find -- OpenFOAM keeps them "
+                "in a `" + fn + "Coeffs` sub-dictionary. Refused rather than run as a static mesh.");
     };
     if (fn == "oscillatingLinearMotion")
     {
         mm.motion.kind          = SolidBodyMotion::Kind::OscillatingLinear;
-        mm.motion.amplitude     = vec3(c.scalarListOr("amplitude", d.scalarListOr("amplitude", {})), vector{0,0,0});
-        mm.motion.omega         = c.scalarOr("omega", d.scalarOr("omega", 0.0));
-        mm.motion.phaseShift    = c.scalarOr("phaseShift", d.scalarOr("phaseShift", 0.0));
-        mm.motion.verticalShift = vec3(c.scalarListOr("verticalShift", d.scalarListOr("verticalShift", {})), vector{0,0,0});
+        mm.motion.amplitude     = vec3(k.scalarListOr("amplitude", c.scalarListOr("amplitude", d.scalarListOr("amplitude", {}))), vector{0,0,0});
+        mm.motion.omega         = k.scalarOr("omega", c.scalarOr("omega", d.scalarOr("omega", 0.0)));
+        mm.motion.phaseShift    = k.scalarOr("phaseShift", c.scalarOr("phaseShift", d.scalarOr("phaseShift", 0.0)));
+        mm.motion.verticalShift = vec3(k.scalarListOr("verticalShift", c.scalarListOr("verticalShift", d.scalarListOr("verticalShift", {}))), vector{0,0,0});
+        checkLive(mag(mm.motion.amplitude) > 0 && mm.motion.omega != 0, "zero amplitude or zero omega");
     }
     else if (fn == "rotatingMotion")
     {
         mm.motion.kind   = SolidBodyMotion::Kind::Rotating;
-        mm.motion.origin = vec3(c.scalarListOr("origin", d.scalarListOr("origin", {})), vector{0,0,0});
-        mm.motion.axis   = vec3(c.scalarListOr("axis",   d.scalarListOr("axis",   {})), vector{0,0,1});
-        mm.motion.omega  = c.scalarOr("omega", d.scalarOr("omega", 0.0));
+        mm.motion.origin = vec3(k.scalarListOr("origin", d.scalarListOr("origin", {})), vector{0,0,0});
+        mm.motion.axis   = vec3(k.scalarListOr("axis",   d.scalarListOr("axis",   {})), vector{0,0,1});
+        mm.motion.omega  = k.scalarOr("omega", c.scalarOr("omega", d.scalarOr("omega", 0.0)));
     }
     else
         throw std::runtime_error(

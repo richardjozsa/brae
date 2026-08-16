@@ -132,12 +132,173 @@ inline scalar overlapArea(const std::vector<vec2>& a, const std::vector<vec2>& b
 // the ACMI override: on oscillatingInletACMI2D at t = 0.292 the log says average 0.7578655102 over 40
 // faces (30 covered / 1 blended / 9 uncovered = (30 + 0.3146)/40) while the weights the run then solves
 // with are 1 on all 31 non-empty faces.
+// UNIFORM-GRID BROAD PHASE over the target patch's face bounding boxes.
+//
+// The sweep this feeds used to test EVERY source face against EVERY target face. That is O(nSrc*nTgt),
+// and on pimpleFoam/RAS/propeller -- 18496 against 18720 faces -- it is 3.5e8 polygon-overlap tests per
+// direction, per direction pair, rebuilt every moving time step. The case never reached its first time
+// step in ten minutes. OpenFOAM does not do this: it walks an advancing front from a seed face, which
+// is O(n) and is why OF meshes the same interface in seconds.
+//
+// A uniform grid is chosen over the LBVH the GPU literature favours (Karras' Morton-code radix tree)
+// for one reason: AMI patches are surfaces with near-uniform face sizes, which is the case a uniform
+// grid handles as well as a hierarchy and with a fraction of the code. It is also the shape that ports
+// to the device unchanged -- flat arrays, a CSR of cell -> faces, and per-source-face queries that are
+// completely independent of each other. An LBVH is the better answer only if face sizes span orders of
+// magnitude on one patch, which an AMI pair does not.
+//
+// It is a BROAD PHASE and nothing else: it discards pairs whose bounding boxes cannot touch, and every
+// surviving pair goes through exactly the same projection and clip as before. The weights it produces
+// are therefore bit-identical to the brute-force ones -- which is the gate it has to pass, because a
+// search that MISSES a pair silently loses that face's coverage instead of failing.
+namespace ami_detail {
+struct FaceGrid
+{
+    vector lo{0,0,0}, hi{0,0,0};
+    scalar inv = 1;                       // 1 / cell size
+    label  nx = 1, ny = 1, nz = 1;
+    scalar pad = 0;                       // query inflation: see the note in query()
+    std::vector<label> off, idx;          // CSR: cell -> target-face list
+    std::vector<vector> bbLo, bbHi;       // per target face, its own bounding box
+
+    label cellOf(label ix, label iy, label iz) const { return (iz*ny + iy)*nx + ix; }
+    label clampi(scalar v, scalar o, label n) const
+    {
+        const long k = (long)std::floor((v - o)*inv);
+        return (label)std::min<long>(std::max<long>(k, 0), (long)n - 1);
+    }
+
+    void build(const std::vector<std::vector<vector>>& polys)
+    {
+        const std::size_t n = polys.size();
+        bbLo.assign(n, vector{0,0,0});
+        bbHi.assign(n, vector{0,0,0});
+        if (!n) { off.assign(2, 0); return; }
+        lo = vector{ 1e300, 1e300, 1e300};
+        hi = vector{-1e300,-1e300,-1e300};
+        scalar diagSum = 0;
+        for (std::size_t j = 0; j < n; ++j)
+        {
+            vector a{ 1e300, 1e300, 1e300}, b{-1e300,-1e300,-1e300};
+            for (const vector& v : polys[j])
+            {
+                a.x = std::min(a.x, v.x); a.y = std::min(a.y, v.y); a.z = std::min(a.z, v.z);
+                b.x = std::max(b.x, v.x); b.y = std::max(b.y, v.y); b.z = std::max(b.z, v.z);
+            }
+            bbLo[j] = a; bbHi[j] = b;
+            lo.x = std::min(lo.x, a.x); lo.y = std::min(lo.y, a.y); lo.z = std::min(lo.z, a.z);
+            hi.x = std::max(hi.x, b.x); hi.y = std::max(hi.y, b.y); hi.z = std::max(hi.z, b.z);
+            diagSum += mag(b - a);
+        }
+        // Cell size = the MEAN face bounding-box diagonal. Smaller cells shrink the candidate lists but
+        // make a face span more of them; the mean face size is the standard balance and needs no tuning.
+        const scalar cell = std::max(diagSum/(scalar)n, scalar(1e-300));
+        inv = scalar(1)/cell;
+        // A BARE AABB TEST IS NOT A VALID BROAD PHASE HERE, and finding out cost a run.
+        //
+        // The narrow phase projects each pair onto the plane perpendicular to their pair normal, which
+        // DISCARDS any separation along that normal -- the same property that lets two box faces a box
+        // length apart project onto each other perfectly. So two faces on a CURVED interface, sitting at
+        // slightly different radii, overlap in projection while their 3-D boxes do not touch at all.
+        // Rejecting those pairs is not conservative, it is wrong: on RAS/rotatingFanInRoom (a cylindrical
+        // AMI) the un-padded grid dropped mean coverage to 0.5512 with 3312 of 6984 source faces under
+        // 99% -- caught by the coverage refusal rather than by a wrong answer, which is the one piece of
+        // luck in it.
+        //
+        // Padding by one mean face size restores them. It is a bound, not a fudge: on a well-formed AMI
+        // the two patches are nominally coincident, so a normal offset above one face size means the
+        // pair could not share area anyway.
+        pad = cell;
+        auto dim = [&](scalar l, scalar h)
+        {
+            const long k = (long)std::floor((h - l)*inv) + 1;
+            return (label)std::min<long>(std::max<long>(k, 1), 512);   // cap: memory, not accuracy
+        };
+        nx = dim(lo.x, hi.x); ny = dim(lo.y, hi.y); nz = dim(lo.z, hi.z);
+        // recompute inv so the capped dimensions still cover the box
+        const scalar sx = (hi.x-lo.x)/(scalar)nx, sy = (hi.y-lo.y)/(scalar)ny, sz = (hi.z-lo.z)/(scalar)nz;
+        inv = scalar(1)/std::max(std::max(std::max(sx, sy), sz), scalar(1e-300));
+        nx = dim(lo.x, hi.x); ny = dim(lo.y, hi.y); nz = dim(lo.z, hi.z);
+
+        const label nCell = nx*ny*nz;
+        std::vector<label> count((std::size_t)nCell + 1, 0);
+        auto span = [&](std::size_t j, label& x0, label& x1, label& y0, label& y1, label& z0, label& z1)
+        {
+            x0 = clampi(bbLo[j].x, lo.x, nx); x1 = clampi(bbHi[j].x, lo.x, nx);
+            y0 = clampi(bbLo[j].y, lo.y, ny); y1 = clampi(bbHi[j].y, lo.y, ny);
+            z0 = clampi(bbLo[j].z, lo.z, nz); z1 = clampi(bbHi[j].z, lo.z, nz);
+        };
+        for (std::size_t j = 0; j < n; ++j)
+        {
+            label x0,x1,y0,y1,z0,z1; span(j,x0,x1,y0,y1,z0,z1);
+            for (label z=z0; z<=z1; ++z) for (label y=y0; y<=y1; ++y) for (label x=x0; x<=x1; ++x)
+                ++count[(std::size_t)cellOf(x,y,z) + 1];
+        }
+        off.assign((std::size_t)nCell + 1, 0);
+        for (label c = 0; c < nCell; ++c) off[(std::size_t)c+1] = off[(std::size_t)c] + count[(std::size_t)c+1];
+        idx.assign((std::size_t)off[(std::size_t)nCell], 0);
+        std::vector<label> cur(off.begin(), off.end() - 1);
+        for (std::size_t j = 0; j < n; ++j)
+        {
+            label x0,x1,y0,y1,z0,z1; span(j,x0,x1,y0,y1,z0,z1);
+            for (label z=z0; z<=z1; ++z) for (label y=y0; y<=y1; ++y) for (label x=x0; x<=x1; ++x)
+                idx[(std::size_t)cur[(std::size_t)cellOf(x,y,z)]++] = (label)j;
+        }
+    }
+
+    // Candidate target faces whose bounding box overlaps `a`..`b`. De-duplicated: a face spanning
+    // several cells appears in each of them.
+    void query(const vector& a, const vector& b, std::vector<label>& out, std::vector<char>& seen) const
+    {
+        out.clear();
+        if (idx.empty()) return;
+        const vector qa{a.x - pad, a.y - pad, a.z - pad};
+        const vector qb{b.x + pad, b.y + pad, b.z + pad};
+        const label x0 = clampi(qa.x, lo.x, nx), x1 = clampi(qb.x, lo.x, nx);
+        const label y0 = clampi(qa.y, lo.y, ny), y1 = clampi(qb.y, lo.y, ny);
+        const label z0 = clampi(qa.z, lo.z, nz), z1 = clampi(qb.z, lo.z, nz);
+        for (label z=z0; z<=z1; ++z) for (label y=y0; y<=y1; ++y) for (label x=x0; x<=x1; ++x)
+        {
+            const label c = cellOf(x,y,z);
+            for (label k = off[(std::size_t)c]; k < off[(std::size_t)c+1]; ++k)
+            {
+                const label j = idx[(std::size_t)k];
+                if (seen[(std::size_t)j]) continue;
+                // exact AABB test: the grid only bounds the search, it does not decide overlap
+                if (bbHi[(std::size_t)j].x < qa.x || bbLo[(std::size_t)j].x > qb.x) continue;
+                if (bbHi[(std::size_t)j].y < qa.y || bbLo[(std::size_t)j].y > qb.y) continue;
+                if (bbHi[(std::size_t)j].z < qa.z || bbLo[(std::size_t)j].z > qb.z) continue;
+                seen[(std::size_t)j] = 1;
+                out.push_back(j);
+            }
+        }
+        for (const label j : out) seen[(std::size_t)j] = 0;
+    }
+};
+}   // namespace ami_detail
+
+
 inline std::vector<AMIInterface> buildAMIInterfaces(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp)
 {
     using namespace ami_detail;
+    // The image count of a periodic AMI is a property of the PAIR, not of a direction.
+    //
+    // Each direction runs its own adaptive tiling loop and would otherwise stop as soon as ITS coverage
+    // closed, so ami1->ami2 could settle on 1 image while ami2->ami1 took 2 -- stencils of different
+    // extent for the same interface. Memoising K on the pair makes the second direction reuse the
+    // first's count exactly; the coverage refusal below still catches a genuine shortfall.
+    //
+    // OpenFOAM does not need this because it builds ONE AMI per pair, on the owner, and the neighbour
+    // direction reuses that addressing transposed. brae builds both directions -- which is what lets it
+    // treat every interface uniformly -- so the pair has to agree on K explicitly.
+    //
+    // NOTE: this is an addressing guard, not a symmetry fix. The pressure operator is not self-adjoint
+    // across ANY non-conforming AMI, periodic or not, in brae and in OpenFOAM alike; that is handled by
+    // selecting BiCGStab rather than PCG (device_simple_foam.cu, and test_interface_invariants_real).
+    std::map<std::pair<label, label>, label> periodicImages;
     std::map<std::string, label> nameToIdx;
     for (label pi = 0; pi < (label)fvp.size(); ++pi) nameToIdx[fvp[pi].name] = pi;
     const std::vector<PatchInfo>& pinfo = m.patches();
@@ -368,13 +529,63 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
         // ACCUMULATES into stencil/tgtCov, which is what makes the periodic tiling a repeat of the same
         // computation rather than a special case of it -- OF's AMIInterpolation::append concatenates the
         // per-image addressing and adds the weight sums, exactly this.
+        // BRAE_AMI_BRUTE=1 restores the exhaustive sweep. It exists so the broad phase can be proved
+        // to change nothing: the two must produce identical weights, and a search that quietly drops a
+        // pair would otherwise show up only as a slightly-wrong answer somewhere downstream.
+        static const bool bruteForceEnv = std::getenv("BRAE_AMI_BRUTE") != nullptr;
+        // THE BROAD PHASE ASSUMES THE TWO PATCHES ARE NOMINALLY COINCIDENT, and enforces it rather than
+        // hoping. Its padding tolerates a normal offset of about one face -- enough for the radius
+        // difference on a curved interface, which is what a real AMI has. It cannot tolerate patches
+        // that are genuinely far apart, because the narrow phase PROJECTS the separation away and would
+        // still find them overlapping.
+        //
+        // A real cyclicAMI/ACMI pair is coincident by construction, so this holds. What does not hold is
+        // a pair whose sides are a domain apart and rely entirely on the projection -- which is exactly
+        // what the periodic-AMI unit fixture builds, and refusing to notice would have made the grid
+        // silently drop every pair. So: measure the offset, and fall back to the exhaustive sweep when
+        // the assumption fails. Correct always, fast whenever the geometry allows it.
+        bool bruteForce = bruteForceEnv;
+        if (!bruteForce)
+        {
+            vector cs{0,0,0}, ct{0,0,0};
+            for (label i = 0; i < S.size; ++i) cs += g.Cf()[S.start+i];
+            for (label j = 0; j < T.size; ++j) ct += g.Cf()[T.start+j];
+            if (S.size && T.size)
+            {
+                const vector d = mapTtoS(ct/(scalar)T.size) - cs/(scalar)S.size;
+                scalar meanFace = 0;
+                for (label i = 0; i < S.size; ++i) meanFace += std::sqrt(g.rawMagSf(S.start+i));
+                meanFace /= (scalar)S.size;
+                // One face: the same tolerance the padding provides. Beyond it the grid cannot be
+                // trusted to find the pair, so the exhaustive sweep takes over.
+                if (mag(d) > meanFace) bruteForce = true;
+            }
+        }
+        std::vector<label> cand;
+        std::vector<char>  seen(static_cast<std::size_t>(T.size), 0);
         auto accumulate = [&](const std::vector<std::vector<vector>>& tgtPoly)
         {
+        ami_detail::FaceGrid grid;
+        if (!bruteForce) grid.build(tgtPoly);
         for (label i = 0; i < S.size; ++i)
         {
             const scalar srcArea = g.rawMagSf(S.start+i);   // RAW: see the note on the signature
-            for (label j = 0; j < T.size; ++j)
+            // Candidate target faces: those whose bounding box can touch this source face's. Everything
+            // else cannot overlap by any amount, so skipping it is exact, not approximate.
+            if (!bruteForce)
             {
+                vector a{ 1e300, 1e300, 1e300}, b{-1e300,-1e300,-1e300};
+                for (const vector& v : srcW[i])
+                {
+                    a.x = std::min(a.x, v.x); a.y = std::min(a.y, v.y); a.z = std::min(a.z, v.z);
+                    b.x = std::max(b.x, v.x); b.y = std::max(b.y, v.y); b.z = std::max(b.z, v.z);
+                }
+                grid.query(a, b, cand, seen);
+            }
+            const label nCand = bruteForce ? T.size : (label)cand.size();
+            for (label c = 0; c < nCand; ++c)
+            {
+                const label j = bruteForce ? c : cand[(std::size_t)c];
                 // per-pair projection normal (OF: -nSrc + nTgt, reversed target subtracts)
                 // OF: n = -srcNormal + tgtNormal. The two AMI patches face EACH OTHER, so the mapped
                 // target normal opposes the source one and the sum is ~ -2*nSrc -- a well-defined
@@ -451,9 +662,14 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
             // because image +k of the target against the source is image -k of the source against the
             // target.
             scalar srcSum = meanCov(stencil), tgtSum = meanTgt();
+            const std::pair<label, label> pairKey(std::min(ai.patch, ai.nbrPatch),
+                                                  std::max(ai.patch, ai.nbrPatch));
+            const auto known = periodicImages.find(pairKey);
+            const label fixedK = (known == periodicImages.end()) ? -1 : known->second;
             label  k = 0, iter = 0;
             while (iter < perMaxIter
-                && ((scalar(1) - srcSum > perTol) || (scalar(1) - tgtSum > perTol)))
+                && (fixedK >= 0 ? (k < fixedK)
+                                : ((scalar(1) - srcSum > perTol) || (scalar(1) - tgtSum > perTol))))
             {
                 ++k;
                 for (const label kk : { -k, k })
@@ -470,6 +686,7 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
                 tgtSum = meanTgt();
                 ++iter;
             }
+            if (fixedK < 0) periodicImages[pairKey] = k;   // this direction sets the pair's image count
             if (std::getenv("BRAE_AMI_REPORT"))
                 std::printf("AMI periodic: %s <-> %s  images:+/-%d  iters:%d  srcSum:%g tgtSum:%g\n",
                             S.name.c_str(), T.name.c_str(), (int)k, (int)iter,

@@ -22,6 +22,9 @@ enum class NutWall { Nutk, Spalding, Blended, NutU };   // NutU = nutUWallFuncti
 struct DeviceSimpleControls
 {
     scalar nu = 1e-5, relaxU = 0.7, relaxP = 0.3, relaxK = 0.7, relaxEps = 0.7;
+    // The same factors on the LAST outer corrector (OF's ".*Final" idiom). Default to the ordinary
+    // factor so a case without Final entries behaves exactly as before.
+    scalar relaxUFinal = 0.7, relaxPFinal = 0.3, relaxKFinal = 0.7, relaxEpsFinal = 0.7;
     vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
     scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
     scalar relTolU = 0.0, relTolP = 0.0, relTolKE = 0.0;   // solver relTol (fvSolution solvers.{U,p,k,epsilon}.relTol). 0 = abs tol.
@@ -78,6 +81,10 @@ struct DeviceSimpleControls
     int    uMinIter() const { return finalIter  ? minIterUFinal : minIterU; }
     scalar pTol()     const { return finalInner ? tolPFinal     : tolP; }
     scalar pRelTol()  const { return finalInner ? relTolPFinal  : relTolP; }
+    scalar uRelax()   const { return finalIter  ? relaxUFinal   : relaxU; }
+    scalar pRelax()   const { return finalIter  ? relaxPFinal   : relaxP; }
+    scalar kRelax()   const { return finalIter  ? relaxKFinal   : relaxK; }
+    scalar epsRelax() const { return finalIter  ? relaxEpsFinal : relaxEps; }
     scalar uTol()     const { return finalIter  ? tolUFinal     : tolU; }
     scalar uRelTol()  const { return finalIter  ? relTolUFinal  : relTolU; }
     scalar keTol()    const { return finalIter  ? tolKEFinal    : tolKE; }

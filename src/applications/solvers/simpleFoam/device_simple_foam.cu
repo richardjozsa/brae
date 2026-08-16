@@ -48,6 +48,28 @@ namespace brae {
         // weighted CSR stencil (device_ami); the assembly mirrors the cyclic path with the AMI interpolation.
         const std::vector<AMIInterface> amis = buildAMIInterfaces(m, g, fvp);
         hasAMI_ = !amis.empty();
+        // IS THE INTERFACE CONFORMING? -- i.e. does every source face have exactly ONE partner?
+        //
+        // This decides the pressure SOLVER, because it decides whether the pressure operator is
+        // self-adjoint. The interface contributes ifCoeff_i*w_ij to A[c_i][c_j] and the reverse entry
+        // comes from the other direction as ifCoeff_j*w_ji; with w_ij = overlap/|Sf_i| those agree only
+        // when deltaCoeffs_i == deltaCoeffs_j. deltaCoeffs is 1/(nf & delta) with
+        // delta = patchD - Sum_j w_ij*nbrD_j, so the moment a face has more than one partner its delta
+        // is a WEIGHTED AVERAGE over a different set of partners than the reverse direction averages,
+        // and the two no longer match. Measured (test_interface_invariants_real): a conforming pair
+        // comes out at 4e-16 and 4e-15, a non-conforming one at 1.3e-01 -- fourteen orders apart, so
+        // this is structural and not round-off.
+        //
+        // This is NOT a brae defect to be normalised away: OpenFOAM computes cyclicAMI deltaCoeffs per
+        // side by the same formula and inherits the same asymmetry, which is why its AMI tutorials ship
+        // GAMG or PBiCGStab for p and none of them ship PCG. The defect was solving it with Jacobi-PCG
+        // regardless -- and CG does not merely lose efficiency on a non-symmetric operator, it fails to
+        // converge: on pimpleFoam/RAS/oscillatingInletPeriodicAMI2D every solve ran to the 50-iteration
+        // cap with the residual GROWING (1.00 -> 1.32) where OF's GAMG converged in 12. Same failure and
+        // same remedy as the transonic pressure matrix below.
+        for (const AMIInterface& a : amis)
+            if (a.nbrCell.size() > a.ownCell.size()) { amiNonConforming_ = true; break; }
+        if (std::getenv("BRAE_AMI_PCG")) amiNonConforming_ = false;   // attribution escape hatch
         if (hasCyclic_ || hasAMI_) ctl_.useGraph = false;   // V-cycle graph replay not interface-safe; minor perf only.
         ctorMark("enter");
         dm_   = buildDeviceMesh(m, g, fvp);
@@ -90,7 +112,7 @@ namespace brae {
         }
         if (nut)
         {
-            std::vector<label> cm;
+            std::vector<label> cm, fx;
             // nut's OWN boundaryField, in DeviceBoundary face order. OF evaluates a non-wall patch's
             // nut from this, never from the adjacent cell -- extrapolating is 607x wrong at a
             // `calculated` inlet (rhosimplefoam-ground-truth-port.md section 3).
@@ -98,16 +120,30 @@ namespace brae {
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
                 if (isCoupledInterfaceType(fvp[pi].type)) continue;
-                const bool calc = (fvp[pi].type != "wall") && (nut->boundary[pi]->bcCategory() == 2);
+                const int nutCat = nut->boundary[pi]->bcCategory();
+                const bool calc = (fvp[pi].type != "wall") && (nutCat == 2);
+                // A non-wall `fixedValue` nut patch is NOT a `calculated` one and must not be lumped in
+                // with it: `calculated` means "correctNut filled this in", so Cmu*k_b^2/eps_b is right
+                // there, while `fixedValue` means the case PINNED it -- conventionally to 0 -- and the
+                // read value is the only correct answer. brae used the adjacent CELL nut at such a patch.
+                // Traced against the OF oracle on pimpleFoam/RAS/oscillatingInletPeriodicAMI2D: nu is
+                // 1e-06 but Cmu*k^2/eps is 7.03e-04 in the first cell, so the inlet's momentum
+                // internalCoeffs came out 704x OpenFOAM's (predicted 704.1, measured 703.1) -- which is
+                // where that case's H(), and everything downstream of it, went wrong.
+                const bool nutFixed = (fvp[pi].type != "wall") && (nutCat == 1);
+                if (nutFixed) hasNutFixed_ = true;
                 if (calc) hasNutCalc_ = true;
                 const std::vector<scalar>& pv = nut->boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     cm.push_back(calc ? 1 : 0);
+                    // 0 marks "take nut's own read value here" -- the sense deviceSelectFixedFlux uses.
+                    fx.push_back(nutFixed ? 0 : 1);
                     nb.push_back(pv[i]);
                 }
             }
             if (hasNutCalc_) nutCalcMask_.copyFrom(cm);
+            if (hasNutFixed_) nutFixedMask_.copyFrom(fx);
             nutBndFile_.copyFrom(nb);
         }
         {
@@ -645,7 +681,7 @@ namespace brae {
             const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr, ddtc.cn ? &gammaIntddt0_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
-                                             ctl_.nu, ctl_.relaxK, ctl_.keTol(), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
+                                             ctl_.nu, ctl_.kRelax(), ctl_.keTol(), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr, &lesDelta_,
@@ -653,7 +689,7 @@ namespace brae {
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                       phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.keTol(), ctl_.boundedK, ctl_.boundedEps,
+                                       phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(), ctl_.kRelax(), ctl_.keTol(), ctl_.boundedK, ctl_.boundedEps,
                                        ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery,
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
@@ -675,13 +711,13 @@ namespace brae {
                                        &lesDelta_);   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                             ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps,
+                                             ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(),
                                              ctl_.keTol(), ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
                                              ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, reDdt, giDdt);   // LM transition ddt
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
-                                      phiInt_, phiBnd_, ctl_.nu, ctl_.relaxEps, ctl_.relaxK, ctl_.keTol(), ctl_.boundedK, ctl_.boundedEps,
+                                      phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(), ctl_.kRelax(), ctl_.keTol(), ctl_.boundedK, ctl_.boundedEps,
                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery,
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
@@ -958,6 +994,10 @@ namespace brae {
                                          gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
                                          nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
                 }
+                // ...then pin the faces whose nut BC fixes a value to that value. Last, so it overrides
+                // whatever the wall/calculated evaluation left there.
+                if (hasNutFixed_ && nutBndFile_.size() == nutBnd.size())
+                    deviceSelectFixedFlux(nutFixedMask_, nutBndFile_, nutBnd);
                 addWallNutToMuEff(nutBnd, nuEffBnd);
             }
         }
@@ -1136,7 +1176,7 @@ namespace brae {
         // to the assembled diagonal BEFORE relax -- OF assembles fvm::ddt into UEqn, then UEqn.relax(). No-op for SIMPLE.
         deviceFvmDdtDiag(dm.V, ddtc, 1.0, mDiag);
         DeviceBuffer<scalar> delta;   // mDiagR is now a member
-        deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.relaxU, mDiagR, delta,
+        deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.uRelax(), mDiagR, delta,
                         hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
                         hasSym_ ? iCmaxMag.data() : nullptr,
                         hasSym_ ? iCmin.data() : nullptr);
@@ -1292,6 +1332,11 @@ namespace brae {
             {
                 stageDump(std::string("stage_UIC") + char('0' + kk), iC[kk]);
                 stageDump(std::string("stage_UBC") + char('0' + kk), bCb[kk]);
+                // ...and U's evaluated boundary values, the quantity bC is built FROM. Without it a bC
+                // mismatch cannot be attributed: a wrong wall velocity and a wrong coefficient formed
+                // from a right one look identical downstream.
+                { DeviceBuffer<scalar> ubv; deviceBCValue(dbU_.comp[kk], Uk_[kk], ubv);
+                  stageDump(std::string("stage_Ubnd") + char('0' + kk), ubv); }
             }
             deviceHadamard(relaxSrc[kk], delta, Uk_[kk]);
             deviceAxpy(1.0, *ddr[kk], relaxSrc[kk]);                                  // += explicit divDevReff stress
@@ -1336,7 +1381,7 @@ namespace brae {
             if (bf != 0.0) deviceAxpy(bf, dm.V, relaxSrc[kk]);   // += V*g
             if (hasFvoMom_) deviceAxpy(1.0, fvoMomSu_[kk], relaxSrc[kk]);   // == fvOptions(U): explicit momentum source Su*V
             if (por_.active) deviceFvoPorositySource(por_, kk, ctl_.nu, dm.V, Uk_[0], Uk_[1], Uk_[2], relaxSrc[kk]);  // porosity anisotropic remainder
-            if (mvfActive_) deviceAxpy((kk==0?mvfFlowDir_.x:kk==1?mvfFlowDir_.y:mvfFlowDir_.z)*mvfGradP_, mvfMaskV_, relaxSrc[kk]);  // meanVelocityForce body force (flowDir*gradP*V)
+            if (mvfActive_) deviceAxpy((kk==0?mvfFlowDir_.x:kk==1?mvfFlowDir_.y:mvfFlowDir_.z)*(mvfGradP0_ + mvfDGradP_), mvfMaskV_, relaxSrc[kk]);  // meanVelocityForce body force (OF addSup: flowDir*(gradP0+dGradP)*V)
             // actuationDisk: OF adds T*diskDir DIRECTLY to eqn.source() (= eqn -= ., opposite cf's relaxSrc convention,
             // which mirrors meanVelocityForce's eqn += Su) -> relaxSrc -= (V/Vtot)*T*diskDir (a momentum sink/turbine).
             for (std::size_t di = 0; di < adDisks_.size(); ++di)   // turbines superpose into relaxSrc
@@ -1391,6 +1436,16 @@ namespace brae {
             else if (kk == 1) { res.Uy = ur; res.UyFinal = uperf.finalResidual; res.UyIters = uperf.nIterations; }
             else              { res.Uz = ur; res.UzFinal = uperf.finalResidual; res.UzIters = uperf.nIterations; }
         }
+        // meanVelocityForce CONSTRAIN -- OF meanVelocityForce::constrain (meanVelocityForce.C:246-247):
+        //     gradP0_ += dGradP_;  dGradP_ = 0.0;
+        // once per momentum-matrix build, AFTER addSup has already used gradP0_ + dGradP_ above (OF adds
+        // the source while constructing UEqn and constrains it immediately afterwards, so the two agree).
+        //
+        // This is what bounds the accumulation. correct() may run several times against one matrix -- OF
+        // calls it after the momentum predictor and again after U = HbyA - rAU*grad(p) -- and each call
+        // OVERWRITES dGradP_, so only the last increment before this line is ever banked. Without it the
+        // driving gradient compounds every corrector and the channel diverges rather than holding Ubar.
+        if (mvfActive_) { mvfGradP0_ += mvfDGradP_; mvfDGradP_ = 0; }
     }
 
     void DeviceSimpleSolver::correctPressureVelocity(DeviceSimpleResidual& res)
@@ -1465,23 +1520,6 @@ namespace brae {
         }
         else
             deviceCopy(rAtU, rAU);
-        // meanVelocityForce.correct (after the predictor, before H()/HbyA, like OF fvOptions.correct(U) in UEqn.H):
-        // dGradP = relax*(|Ubar| - magUbarAve)/rAUave; accumulate gradP_; correct U += flowDir*rAU*dGradP. Reductions
-        // and the body force/correction use maskV/mask01 so selectionMode all (whole field) and cellZone both work.
-        if (mvfActive_)
-        {
-            const scalar magUbarAve = (mvfFlowDir_.x*deviceDot(Uk_[0], mvfMaskV_) + mvfFlowDir_.y*deviceDot(Uk_[1], mvfMaskV_)
-                                     + mvfFlowDir_.z*deviceDot(Uk_[2], mvfMaskV_)) / mvfVtot_;
-            const scalar rAUave = deviceDot(rAU, mvfMaskV_) / mvfVtot_;
-            const scalar dGradP = mvfRelax_ * (mvfUbarMag_ - magUbarAve) / rAUave;
-            mvfGradP_ += dGradP;
-            if (std::getenv("BRAE_MVF_DEBUG")) std::printf("    mvf: magUbarAve=%.6g rAUave=%.6g dGradP=%.6g gradP=%.6g\n", magUbarAve, rAUave, dGradP, mvfGradP_);
-            DeviceBuffer<scalar> rAUm;
-            deviceHadamard(rAUm, rAU, mvfMask01_);              // rAU in the selection, 0 else
-            deviceAxpy(mvfFlowDir_.x*dGradP, rAUm, Uk_[0]);
-            deviceAxpy(mvfFlowDir_.y*dGradP, rAUm, Uk_[1]);
-            deviceAxpy(mvfFlowDir_.z*dGradP, rAUm, Uk_[2]);
-        }
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);   // limitVelocity on the predictor U (OF fvOptions.correct) -> feeds H()/HbyA
         // slip/symmetry H() consistency term: OF UEqn.H() adds (cmptAv(iC) - iC_cmpt)*psi_cmpt per component, where
         // cmptAv = mean of the 3 boundary internalCoeffs (fvMatrix::H + addCmptAvBoundaryDiag). Zero for every
@@ -1538,6 +1576,11 @@ namespace brae {
         if (hasAMI_ && stageDumpActive() && stageDumpFirstOnly("amiPhiHbyA"))
         {
             stageDump("stage_ami_phiHbyA", ami_.phi);
+            // ...and the CYCLIC faces. These live outside both the internal-face array and the
+            // DeviceBoundary, so neither existing dump sees them -- which is exactly why a stage
+            // comparison showed div(phiHbyA) wrong on the interface cells while every dumped input
+            // looked fine. An undumped quantity is an untested one.
+            if (hasCyclic_) stageDump("stage_cyc_phiHbyA", cyc_.phi);
             stageDump("stage_ami_HbyAx", HbyA[0]);
             stageDump("stage_ami_HbyAy", HbyA[1]);
             stageDump("stage_ami_rAU", rAU);
@@ -2081,7 +2124,14 @@ namespace brae {
                     ? deviceLduViewCyclic(dm,diagCp_,pU_,pL_, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
                     : deviceLduViewAmi(dm,diagCp_,pU_,pL_, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
                 const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
-                pp = deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.pMinIter());
+                // A NON-CONFORMING AMI makes this operator non-self-adjoint (see the constructor), and CG
+                // requires symmetry. Conforming interfaces -- every plain cyclic, and an AMI whose two
+                // sides happen to match 1:1 -- stay on PCG, which is both faster and the path all the
+                // existing cyclic cases are validated on.
+                pp = amiNonConforming_
+                   ? deviceJacobiBiCGStab(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(),
+                                          ctl_.pcgCheckEvery, ctl_.pMinIter())
+                   : deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.pMinIter());
             }
             else if (compressible_ && ctl_.transonic)
             {
@@ -2108,7 +2158,7 @@ namespace brae {
         res.pFinal = pp.finalResidual;
         res.pIters = pp.nIterations;
         if (std::getenv("BRAE_SOLVER_DEBUG")) std::printf("    p %s iters=%d  init=%.2e final=%.2e\n",
-                                                        (hasCyclic_||hasAMI_) ? "Jacobi-PCG" : ((compressible_ && ctl_.transonic) ? "Jacobi-BiCGStab" : "AMG-PCG"), pp.nIterations, pp.initialResidual, pp.finalResidual);
+                                                        (hasCyclic_||hasAMI_) ? (amiNonConforming_ ? "Jacobi-BiCGStab (non-conforming AMI)" : "Jacobi-PCG") : ((compressible_ && ctl_.transonic) ? "Jacobi-BiCGStab" : "AMG-PCG"), pp.nIterations, pp.initialResidual, pp.finalResidual);
         const DeviceLduView pview = deviceLduView(dm,diagCp_,pU_,pL_);
         DeviceBuffer<scalar> pfi;
         deviceMatrixFluxInternal(pview, dp_, pfi);
@@ -2141,8 +2191,8 @@ namespace brae {
             pTraceNote(pTraceIt_, "p_finalResidual",   pp.finalResidual);
             pTraceNote(pTraceIt_, "p_nIterations",     pp.nIterations);
         }
-        deviceScale(dp_, ctl_.relaxP);
-        deviceAxpy(1.0 - ctl_.relaxP, pPrev, dp_);
+        deviceScale(dp_, ctl_.pRelax());
+        deviceAxpy(1.0 - ctl_.pRelax(), pPrev, dp_);
         if (stageDumpActive() && stageDumpFirstOnly("pRelaxed")) stageDump("stage_pRelaxed", dp_);
         if (pTraceActive()) pTraceDump("P4_pRelaxed", pTraceIt_, dp_);   // after p.relax()
         DeviceBuffer<scalar> pbv2;
@@ -2163,6 +2213,44 @@ namespace brae {
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);
+        // meanVelocityForce.correct -- OF pimpleFoam pEqn.H's LAST fvOptions.correct(U), i.e. after
+        // U = HbyA - rAU*grad(p), next to limitVelocity (the other fvOptions constraint applied here).
+        //
+        // THE POSITION IS THE POINT. This ran before H()/HbyA was built, so HbyA was formed from the
+        // corrected velocity and the corrector U = HbyA - rAU*grad(p) then overwrote it -- the step
+        // ended with the mean velocity wherever the pressure solve left it rather than pinned at Ubar.
+        // The source kept driving to make up a deficit that the next correction had already erased, so
+        // the mean climbed anyway: 0.386 against OpenFOAM's 0.129 with Ubar = 0.1335. Applying it last,
+        // as OF does, is what actually holds the mean.
+        // dGradP = relax*(|Ubar| - magUbarAve)/rAUave; accumulate gradP_; correct U += flowDir*rAU*dGradP. Reductions
+        // and the body force/correction use maskV/mask01 so selectionMode all (whole field) and cellZone both work.
+        if (mvfActive_)
+        {
+            const scalar magUbarAve = (mvfFlowDir_.x*deviceDot(Uk_[0], mvfMaskV_) + mvfFlowDir_.y*deviceDot(Uk_[1], mvfMaskV_)
+                                     + mvfFlowDir_.z*deviceDot(Uk_[2], mvfMaskV_)) / mvfVtot_;
+            const scalar rAUave = deviceDot(rAU, mvfMaskV_) / mvfVtot_;
+            const scalar dGradP = mvfRelax_ * (mvfUbarMag_ - magUbarAve) / rAUave;
+            // ASSIGN, never accumulate -- OF meanVelocityForce::correct sets dGradP_ outright
+            // (meanVelocityForce.C:170), so a second correct() in the same matrix REPLACES the first
+            // rather than adding to it. Only constrain() folds an increment into the running total, and
+            // it does so once per momentum-matrix build.
+            //
+            // brae accumulated on every call. With OF's own call pattern -- correct(U) after the
+            // momentum predictor AND again after U = HbyA - rAU*grad(p) -- that is two increments
+            // banked per step where OF banks one, so the driving pressure gradient grew about twice as
+            // fast as the flow could respond. The result is a feedback loop that oscillates with
+            // GROWING amplitude rather than settling: measured on LES/periodicPlaneChannel, gradP went
+            // 0.116 -> 0.229 -> -0.143 -> -0.382 -> 0.600 while the mean velocity it is supposed to
+            // pin at Ubar = 0.1335 ran away to 1.476 -- eleven times the target, L2rel(U) = 1.00e+01
+            // against OpenFOAM, which held 0.129 throughout.
+            mvfDGradP_ = dGradP;
+            if (std::getenv("BRAE_MVF_DEBUG")) std::printf("    mvf: magUbarAve=%.6g rAUave=%.6g dGradP=%.6g gradP=%.6g\n", magUbarAve, rAUave, dGradP, mvfGradP0_ + mvfDGradP_);
+            DeviceBuffer<scalar> rAUm;
+            deviceHadamard(rAUm, rAU, mvfMask01_);              // rAU in the selection, 0 else
+            deviceAxpy(mvfFlowDir_.x*dGradP, rAUm, Uk_[0]);
+            deviceAxpy(mvfFlowDir_.y*dGradP, rAUm, Uk_[1]);
+            deviceAxpy(mvfFlowDir_.z*dGradP, rAUm, Uk_[2]);
+        }
         // ...and the last line of OF's pEqn.H: make the flux this corrector produced relative to the mesh
         // motion. phiHbyA is an ABSOLUTE flux (fvc::flux(HbyA)), so phi = phiHbyA - pEqn.flux() is too;
         // the next corrector rebuilds it absolute again, so this runs per corrector exactly as OF does.

@@ -1185,10 +1185,28 @@ target_include_directories(test_wedge_patch PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_
 target_link_libraries(test_wedge_patch PRIVATE brae_core)
 add_test(NAME wedge_patch COMMAND test_wedge_patch)
 
+add_executable(test_ami_broad_phase tests/test_ami_broad_phase.cu)
+target_include_directories(test_ami_broad_phase PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_ami_broad_phase PRIVATE brae_core)
+add_test(NAME ami_broad_phase COMMAND test_ami_broad_phase)
+
 add_executable(test_courant_device tests/test_courant_device.cu)
 target_include_directories(test_courant_device PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_courant_device PRIVATE brae_core)
 add_test(NAME courant_device COMMAND test_courant_device)
+
+add_executable(test_relaxation_final tests/test_relaxation_final.cu)
+target_include_directories(test_relaxation_final PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_relaxation_final PRIVATE brae_core)
+add_test(NAME relaxation_final COMMAND test_relaxation_final)
+add_executable(test_mean_velocity_force tests/test_mean_velocity_force.cu)
+target_include_directories(test_mean_velocity_force PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mean_velocity_force PRIVATE brae_core)
+add_test(NAME mean_velocity_force COMMAND test_mean_velocity_force)
+add_executable(test_interface_invariants_real tests/test_interface_invariants_real.cu)
+target_include_directories(test_interface_invariants_real PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_interface_invariants_real PRIVATE brae_core)
+add_test(NAME interface_invariants_real COMMAND test_interface_invariants_real)
 
 add_executable(test_interface_invariants tests/test_interface_invariants.cu)
 target_include_directories(test_interface_invariants PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)

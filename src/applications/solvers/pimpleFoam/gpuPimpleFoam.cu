@@ -28,6 +28,7 @@
 #include "mrf_read.cuh"             // readMRFProperties: only to REFUSE an MRF case (not applied transient yet)
 #include "linear_solver_setup.cuh"   // readLinearSolverControls: shared with gpuSimpleFoam/gpuRhoSimpleFoam
 #include "dict_audit.cuh"
+#include <regex>
 #include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
@@ -558,10 +559,33 @@ try
     std::vector<char> mwvPatch(fvp.size(), 0);
     if (meshMotion.active || vclMotion.active)
     {
+        // OF's boundaryField keys are keyTypes: a literal name, or a REGEX. The field reader already
+        // resolves them that way, so U's patch fields are built correctly -- but this detection compared
+        // the dictionary key to the patch name as a plain string, so a case that groups its patches
+        //     "(RUBLADE.*|RUHUB)" { type movingWallVelocity; ... }
+        // had the right boundary condition on the field and no moving-wall velocity assigned to it.
+        // On RAS/axialTurbine that left the rotating runner's blade and hub walls carrying exactly zero
+        // flux where OpenFOAM carries +-5e-05 per face, and it is invisible from the outside: the patch
+        // type in the written output is right, because the FIELD was right all along.
+        //
+        // Same rule as FoamDict's lookup: a literal match wins, otherwise the LAST matching regex.
         const FieldData<vector> uFdM = readField<vector>(fieldDir + "/U");
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::string* hit = nullptr;
             for (const auto& b : uFdM.boundary)
-                if (b.name == fvp[pi].name && b.type == "movingWallVelocity") { mwvPatch[pi] = 1; break; }
+                if (b.name == fvp[pi].name) { hit = &b.type; break; }      // literal wins
+            if (!hit)
+                for (const auto& b : uFdM.boundary)
+                {
+                    try
+                    {
+                        if (std::regex_match(fvp[pi].name, compileFoamRegex(b.name))) hit = &b.type;
+                    }
+                    catch (const std::regex_error&) {}                     // a name that is not a regex
+                }
+            if (hit && *hit == "movingWallVelocity") mwvPatch[pi] = 1;
+        }
         std::printf("  mesh motion: solidBody on cellZone '%s'\n", meshMotion.cellZone.c_str());
     }
 
