@@ -247,6 +247,9 @@ void epsReactionKernel(
     scalar C2,
     scalar C3,
     scalar Cmu,
+    int    rng,           // RNGkEpsilon: production coefficient (C1 - R) instead of C1
+    scalar eta0,
+    scalar beta,
     scalar* __restrict__ diag,
     scalar* __restrict__ source,
     const scalar* __restrict__ rho)   // compressible: OF weights EVERY RHS term by alpha*rho
@@ -259,8 +262,18 @@ void epsReactionKernel(
     //      - fvm::Sp(C2*alpha*rho*eps/k, eps)
     const scalar rw = rho ? rho[c] : scalar(1);
     const scalar sp = ((2.0/3.0) * C1 - C3) * divU[c];   // OF SuSp(((2/3)C1 - C3)*divU, eps)
+    // RNGkEpsilon.C: the G production alone carries (C1 - R). gByNu IS OF's S2 (= dev(twoSymm(gradU)) &&
+    // gradU, the same contraction G/nut is built from), so eta needs nothing the standard path does not
+    // already compute. The SuSp term above keeps the plain C1, exactly as OF writes it.
+    scalar C1p = C1;
+    if (rng)
+    {
+        const scalar eta = sqrt(fabs(gByNu[c])) * k[c] / eps[c];
+        const scalar R   = (eta * (scalar(1) - eta / eta0)) / (beta * eta * eta * eta + scalar(1));
+        C1p = C1 - R;
+    }
     diag[c]   += rw * V[c] * (C2 * eps[c] / k[c] + fmax(sp, 0.0));
-    source[c] += rw * (V[c] * (C1 * Cmu * k[c] * gByNu[c]) - V[c] * fmin(sp, 0.0) * eps[c]);
+    source[c] += rw * (V[c] * (C1p * Cmu * k[c] * gByNu[c]) - V[c] * fmin(sp, 0.0) * eps[c]);
 }
 
 
@@ -519,7 +532,9 @@ void deviceEpsReaction(
     const DeviceBuffer<scalar>* rho)
 {
     epsReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), eps.data(), k.data(), gByNu.data(), divU.data(),
-                                                   co.C1, co.C2, co.C3, co.Cmu, diag.data(), source.data(),
+                                                   co.C1, co.C2, co.C3, co.Cmu,
+                                                   co.rng ? 1 : 0, co.eta0, co.beta,
+                                                   diag.data(), source.data(),
                                                    rho ? rho->data() : nullptr);
     cudaCheck(cudaGetLastError(), "epsReaction");
 }

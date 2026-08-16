@@ -17,6 +17,15 @@ struct KEpsilonCoeffs
     // C1=max(eta/(5+eta),0.43)*magS*eps, destruction C2*eps^2/(k+sqrt(nu*eps)). Defaults A0=4, C2=1.9, sigmaEps=1.2.
     bool   realizable = false;
     scalar A0 = 4.0;
+    // RNGkEpsilon (OF RAS/RNGkEpsilon): standard k-epsilon with renormalisation-group coefficients and ONE
+    // extra term -- the epsilon production coefficient becomes (C1 - R) instead of C1, with
+    //     eta = sqrt(|S2|)*k/epsilon,   R = eta*(1 - eta/eta0)/(1 + beta*eta^3)
+    // R is a strain-rate-dependent SINK at high strain (eta > eta0) and a source below it, which is what
+    // lets RNG handle separated and swirling flow that the standard model over-predicts. The SuSp divU
+    // term keeps the plain C1 -- OF applies (C1 - R) to the G production alone.
+    bool   rng  = false;
+    scalar eta0 = 4.38;
+    scalar beta = 0.012;
 };
 
 } // namespace brae

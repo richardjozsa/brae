@@ -235,8 +235,9 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             ctl.sst = (model == "kOmegaSST") || ctl.lm;
             ctl.sa  = (model == "SpalartAllmaras");
             const bool rke = (model == "realizableKE");
-            if (model != "kEpsilon" && !rke && !ctl.sst && !ctl.sa)
-                throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
+            const bool rng = (model == "RNGkEpsilon");
+            if (model != "kEpsilon" && !rke && !rng && !ctl.sst && !ctl.sa)
+                throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, RNGkEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
             if (ctl.sa)
             {
                 // Spalart-Allmaras: OF defaults (coeffs read from RAS.SpalartAllmarasCoeffs would override; not needed here).
@@ -274,6 +275,35 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                     }
                     std::printf("  realizableKECoeffs: A0=%.4g C2=%.4g sigmak=%.4g sigmaEps=%.4g kappa=%.4g E=%.4g (variable Cmu)\n",
                                 c.A0, c.C2, c.sigmaK, c.sigmaEps, c.kappa, c.E);
+                }
+                else if (rng)
+                {
+                    // RNGkEpsilon: EVERY coefficient differs from the standard model, not just the extra R
+                    // term -- Cmu 0.0845 (not 0.09) feeds nut and the nut wall functions too, so reading
+                    // the RNG model with kEpsilon's defaults would be wrong even where R happens to vanish.
+                    c.rng = true;
+                    c.Cmu = 0.0845;
+                    c.C1 = 1.42;
+                    c.C2 = 1.68;
+                    c.C3 = -0.33;
+                    c.sigmaK = 0.71942;
+                    c.sigmaEps = 0.71942;
+                    if (const FoamDict* rgc = ras ? ras->subDict("RNGkEpsilonCoeffs") : nullptr)
+                    {
+                        c.Cmu = rgc->scalarOr("Cmu", c.Cmu);
+                        c.C1 = rgc->scalarOr("C1", c.C1);
+                        c.C2 = rgc->scalarOr("C2", c.C2);
+                        c.C3 = rgc->scalarOr("C3", c.C3);
+                        c.sigmaK = rgc->scalarOr("sigmak", c.sigmaK);
+                        c.sigmaEps = rgc->scalarOr("sigmaEps", c.sigmaEps);
+                        c.eta0 = rgc->scalarOr("eta0", c.eta0);
+                        c.beta = rgc->scalarOr("beta", c.beta);
+                        c.kappa = rgc->scalarOr("kappa", c.kappa);
+                        c.E = rgc->scalarOr("E", c.E);
+                    }
+                    std::printf("  RNGkEpsilonCoeffs: Cmu=%.4g C1=%.4g C2=%.4g C3=%.4g sigmak=%.5g sigmaEps=%.5g "
+                                "eta0=%.4g beta=%.4g kappa=%.4g E=%.4g\n",
+                                c.Cmu, c.C1, c.C2, c.C3, c.sigmaK, c.sigmaEps, c.eta0, c.beta, c.kappa, c.E);
                 }
                 else
                 {

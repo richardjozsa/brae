@@ -1185,6 +1185,11 @@ target_include_directories(test_wedge_patch PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_
 target_link_libraries(test_wedge_patch PRIVATE brae_core)
 add_test(NAME wedge_patch COMMAND test_wedge_patch)
 
+add_executable(test_rng_kepsilon tests/test_rng_kepsilon.cu)
+target_include_directories(test_rng_kepsilon PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rng_kepsilon PRIVATE brae_core)
+add_test(NAME rng_kepsilon COMMAND test_rng_kepsilon)
+
 add_executable(test_wedge_device_coeffs tests/test_wedge_device_coeffs.cu)
 target_include_directories(test_wedge_device_coeffs PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_wedge_device_coeffs PRIVATE brae_core)
