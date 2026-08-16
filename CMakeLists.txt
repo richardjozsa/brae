@@ -1185,6 +1185,21 @@ target_include_directories(test_wedge_patch PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_
 target_link_libraries(test_wedge_patch PRIVATE brae_core)
 add_test(NAME wedge_patch COMMAND test_wedge_patch)
 
+add_executable(test_periodic_ami tests/test_periodic_ami.cu)
+target_include_directories(test_periodic_ami PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_periodic_ami PRIVATE brae_core)
+add_test(NAME periodic_ami COMMAND test_periodic_ami)
+
+add_executable(test_coupled_patch_refusal tests/test_coupled_patch_refusal.cu)
+target_include_directories(test_coupled_patch_refusal PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_coupled_patch_refusal PRIVATE brae_core)
+add_test(NAME coupled_patch_refusal COMMAND test_coupled_patch_refusal)
+
+add_executable(test_correct_phi tests/test_correct_phi.cu)
+target_include_directories(test_correct_phi PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_correct_phi PRIVATE brae_core)
+add_test(NAME correct_phi COMMAND test_correct_phi)
+
 add_executable(test_rng_kepsilon tests/test_rng_kepsilon.cu)
 target_include_directories(test_rng_kepsilon PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_rng_kepsilon PRIVATE brae_core)

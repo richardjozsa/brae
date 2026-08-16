@@ -454,6 +454,32 @@ void deviceWedgeFaceValue(
 }
 
 
+namespace {
+// OF correctUphiBCs: phi_b = U_b & Sf on every patch whose U field FIXES its value. `adjustable` is the
+// adjustPhi mask, which is already !fixesValue() over the same face order -- so the faces to overwrite
+// are exactly the zeros. Kept as its own kernel rather than folded into the flux computation: the
+// unmasked faces must keep the flux the Sf&Uf remap just gave them.
+__global__
+void selectFixedFluxKernel(int n, const label* __restrict__ adjustable,
+                           const scalar* __restrict__ phiFixed, scalar* __restrict__ phiB)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || adjustable[i]) return;
+    phiB[i] = phiFixed[i];
+}
+} // namespace
+
+void deviceSelectFixedFlux(const DeviceBuffer<label>& adjustable,
+                           const DeviceBuffer<scalar>& phiFixed,
+                           DeviceBuffer<scalar>& phiB)
+{
+    const int n = static_cast<int>(phiB.size());
+    if (n == 0 || static_cast<int>(adjustable.size()) != n || static_cast<int>(phiFixed.size()) != n) return;
+    selectFixedFluxKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), phiFixed.data(), phiB.data());
+    cudaCheck(cudaGetLastError(), "selectFixedFlux");
+}
+
+
 void deviceUpdateSymmetry(
     DeviceVectorBoundary& dbU,
     const DeviceBuffer<scalar>& Ux,

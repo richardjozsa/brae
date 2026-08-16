@@ -104,6 +104,16 @@ struct DeviceSimpleControls
     // pressure corrector. laminar/planarPoiseuille turns it off, and solving anyway made its first step
     // 56% fast (0.00535 against 0.00343 m/s) because the predictor moved U before the corrector did.
     bool   momentumPredictor = true;
+    // PIMPLE/correctPhi (OF createDyMControls.H, default = mesh.dynamic()). After the mesh moves, the
+    // stored flux belongs to the OLD geometry: OF rebuilds the ABSOLUTE flux from the mapped surface
+    // velocity (phi = Sf & Uf) and then PROJECTS it divergence-free by solving a pcorr Poisson, before
+    // any momentum or pressure equation sees it. Skipping it leaves the step starting from a flux that
+    // does not satisfy continuity on the mesh it is about to be used on.
+    bool   correctPhi = false;
+    // fvSolution solvers.pcorr -- OF's own tutorials give it a LOOSE tolerance (0.02) and relTol 0,
+    // because the projection only has to remove the mapping error, not converge a pressure field.
+    scalar tolPcorr = 0.02, relTolPcorr = 0.0;
+    int    maxIterPcorr = 1000;
     bool   maxwell = false;
     scalar maxwellNuM = 0.0;
     scalar maxwellLambda = 0.0;

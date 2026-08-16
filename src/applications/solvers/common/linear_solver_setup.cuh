@@ -148,6 +148,12 @@ inline void readLinearSolverControls(
     ctl.maxIterP = solverMaxIter("p", 1000);
     ctl.maxIterU = solverMaxIter("U", 1000);
     ctl.minIterP = solverMinIter("p", 0);
+    // pcorr (CorrectPhi). The tutorials spell the key as the regex "pcorr.*"; FoamDict already does OF's
+    // regex-keyword lookup, so this finds it either way. Defaults are OF's lduMatrix ones, not p's --
+    // a case that asks for correctPhi without a pcorr entry gets a converged projection, not p's relTol.
+    ctl.tolPcorr = solverTol("pcorr", 1e-6);
+    ctl.relTolPcorr = solverRelTol("pcorr");
+    ctl.maxIterPcorr = solverMaxIter("pcorr", 1000);
     ctl.minIterU = solverMinIter("U", 0);
     ctl.maxIterPFinal = solverMaxIter("pFinal", ctl.maxIterP);
     ctl.maxIterUFinal = solverMaxIter("UFinal", ctl.maxIterU);

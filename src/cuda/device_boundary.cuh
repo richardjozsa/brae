@@ -190,6 +190,9 @@ void deviceWedgeFaceValue(const DeviceVectorBoundary& dbU,
                           DeviceBuffer<scalar>& bx, DeviceBuffer<scalar>& by, DeviceBuffer<scalar>& bz);
 void deviceUpdateSymmetry(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
                           const DeviceBuffer<scalar>& Uz);
+// OF correctUphiBCs: overwrite phiB on the faces where `adjustable` is 0 (i.e. U fixesValue) with phiFixed.
+void deviceSelectFixedFlux(const DeviceBuffer<label>& adjustable, const DeviceBuffer<scalar>& phiFixed,
+                           DeviceBuffer<scalar>& phiB);
 
 // totalPressure updateCoeffs (OF totalPressureFvPatchScalarField, incompressible rho=none/psi=none): per face
 // refValue = p0 - 0.5*neg(phi_b)*magSqr(U_b)  (inflow phi<0 -> p0 - dynamic head; outflow -> p0). bcType stays

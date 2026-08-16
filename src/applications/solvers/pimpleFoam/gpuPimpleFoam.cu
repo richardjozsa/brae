@@ -302,6 +302,16 @@ try
         if (!ctl.momentumPredictor)
             std::printf("  PIMPLE momentumPredictor off: UEqn is assembled (rAU/HbyA) but not solved\n");
     }
+    // PIMPLE/correctPhi: OF createDyMControls.H defaults it to mesh.dynamic(), i.e. ON whenever a motion
+    // solver is active. brae mirrors that -- a case that moves its mesh and says nothing gets the
+    // projection, as it does in OpenFOAM, and a case that says `correctPhi no` opts out.
+    {
+        const bool dyn = meshMotion.active || vclMotion.active;
+        const std::string cp = pimple ? pimple->wordOr("correctPhi", dyn ? "yes" : "no") : (dyn ? "yes" : "no");
+        ctl.correctPhi = dyn && !(cp == "no" || cp == "false" || cp == "off" || cp == "0");
+        if (ctl.correctPhi)
+            std::printf("  PIMPLE correctPhi on: phi is rebuilt from Uf and projected divergence-free after each mesh move\n");
+    }
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
@@ -752,6 +762,7 @@ try
             // ...and the wall-function geometry, which is a function of the mesh just as much as the AMI
             // weights are. It is rebuilt LAST so it picks up the movingWallVelocity assignment above.
             solver.refreshWallData(m, g, fvp);
+            if (ctl.correctPhi) solver.correctPhi(fvp, ctl.nNonOrth);   // OF pimpleFoam.C, after the move
         }
         else if (vclMotion.active)
         {
@@ -775,6 +786,9 @@ try
             }
             vpi.build(m, g, fvp);          // the weights are geometry: the mesh just changed
             solver.refreshWallData(m, g, fvp);
+            // OF pimpleFoam.C: correctPhi runs AFTER the mesh move and after U's boundary has been
+            // refreshed -- correctUphiBCs reads the moving-wall velocity this step just assigned.
+            if (ctl.correctPhi) solver.correctPhi(fvp, ctl.nNonOrth);
         }
         // A cyclicACMI `scale` makes the interface open area a function of TIME, so it changes even
         // when nothing moves (TJunctionSwitching's mesh is static and its branch closes between

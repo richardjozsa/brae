@@ -89,6 +89,37 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
                 "another region), so running without it would solve the regions as if they were "
                 "unconnected and converge to a wrong answer. See docs/roadmap.md.");
         }
+        // ANY OTHER COUPLED PATCH. A patch that names a `neighbourPatch` is declaring itself half of a
+        // coupled pair: its face values come from the other side, not from a boundary condition. brae
+        // builds that coupling for cyclic, cyclicAMI and cyclicACMI. Reaching here with any other such
+        // type means the pair would be solved as two ORDINARY boundaries -- silently decoupled.
+        //
+        // This is not hypothetical. `cyclicPeriodicAMI` (an AMI whose sides span different sectors, tiled
+        // by repeatedly applying a periodic transform) got through exactly that way, and the reason it
+        // was silent is worth keeping: its mesh entry carries `inGroups 1(cyclicAMI)`, so the FIELD side
+        // matched setConstraintTypes' cyclicAMI entry and built a cyclicAMI patch field, while the MESH
+        // side tested the real type and skipped it. The field believed it was coupled; nothing coupled
+        // it. On pimpleFoam/RAS/oscillatingInletPeriodicAMI2D the downstream half of the interface came
+        // out with U identically zero on all 96 faces and carried no flux at all (OpenFOAM: 1.0e-01),
+        // and on RAS/axialTurbine the four rotor-stator connections passed flux without conserving it
+        // (RUOUTLET +5.19e-03 against DTINLET -4.64e-03, an 11% imbalance where OF matches to 1e-5) --
+        // a turbine solved as three disconnected components, converging to a plausible wrong answer.
+        //
+        // Tested on the mesh type rather than a name list of everything unimplemented: the marker is
+        // structural, so a coupled type nobody has thought of yet is refused too, which is the whole
+        // point. Deliberately no environment override -- there is nothing here that is right-but-slow.
+        if (!pi.neighbourPatch.empty()
+         && pi.type != "cyclic" && pi.type != "cyclicAMI" && pi.type != "cyclicACMI"
+         && pi.type != "cyclicPeriodicAMI"
+         && pi.type != "processor" && pi.type != "processorCyclic")
+        {
+            throw std::runtime_error(
+                "brae: patch '" + pi.name + "' is type '" + pi.type + "', which names a neighbourPatch ('"
+                + pi.neighbourPatch + "') and is therefore one half of a COUPLED interface that brae does "
+                "not implement. brae couples cyclic, cyclicAMI and cyclicACMI. Running anyway would solve "
+                "the two sides as unconnected boundaries and converge to a wrong answer with no message, "
+                "so it is refused instead. See docs/roadmap.md.");
+        }
         FvPatch p;
         p.name     = pi.name;
         p.type     = pi.type;

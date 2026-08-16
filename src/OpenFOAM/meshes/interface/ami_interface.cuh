@@ -157,7 +157,8 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
     for (label pi = 0; pi < (label)fvp.size(); ++pi)
     {
         const bool isACMI = (fvp[pi].type == "cyclicACMI");
-        if (fvp[pi].type != "cyclicAMI" && !isACMI) continue;
+        const bool isPeriodic = (fvp[pi].type == "cyclicPeriodicAMI");
+        if (fvp[pi].type != "cyclicAMI" && !isACMI && !isPeriodic) continue;
         AMIInterface ai;
         ai.acmi = isACMI;
         ai.patch = pi;
@@ -196,7 +197,14 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
         // With the inferred period the patches are re-aligned, the mask is identically 1 for all time,
         // the blockage wall gets zero area, and the sliding channel NEVER CLOSES -- a case that runs
         // clean and is entirely wrong.
-        if (!ai.acmi)
+        // cyclicPeriodicAMI is excluded for the SAME reason cyclicACMI is, and the evidence looked the
+        // same: its two sides are CO-LOCATED (a rotor-stator station, or a sliding inlet against the duct
+        // it slides along) and any centroid offset between them is the sector mismatch the periodic
+        // tiling exists to cover -- not a period to subtract. Inferring one re-aligns the patches, the
+        // raw overlap then comes out fully covered, the tiling loop runs ZERO images because it has
+        // nothing left to do, and the interface silently couples the wrong faces to each other. That is
+        // exactly what the first run showed: `images:0 srcSum:1` on a patch pair that needs images.
+        if (!ai.acmi && !isPeriodic)
         {
             vector cS{0,0,0}, cT{0,0,0};
             for (label i = 0; i < S.size; ++i) cS += g.Cf()[S.start+i];
@@ -268,11 +276,100 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
             return out;
         };
 
+        // ---- cyclicPeriodicAMI: the transform that TILES this interface ----------------------------
+        // OF cyclicPeriodicAMIPolyPatch::resetAMI. A periodic AMI's two sides need not span the same
+        // sector -- oscillatingInletPeriodicAMI2D pairs 40 faces against 96, axialTurbine a guide-vane
+        // passage against a runner passage -- so the overlap of the two patches AS THEY SIT covers only
+        // part of each. OF closes the gap by applying the transform of a NAMED periodic patch to one
+        // side repeatedly, accumulating the extra overlaps, until the weights sum to 1.
+        //
+        // Coupling a source face to the periodic IMAGE of a target face is exact, not an approximation:
+        // the transform is a symmetry of the solution, so the value at the image IS the value at the
+        // face. That is the whole basis of the patch type.
+        //
+        // The periodic patch is itself a coupled pair (`cyclic` in the 2D case, a rotational `cyclicAMI`
+        // in the turbine), and its transform is read the same way this function reads its own.
+        bool     perRot = false;
+        vector   perSep{0,0,0};
+        tensor   perT{1,0,0,0,1,0,0,0,1}, perTinv{1,0,0,0,1,0,0,0,1};
+        vector   perCtr{0,0,0};
+        label    perMaxIter = 0;
+        scalar   perTol = scalar(1e-4);
+        if (isPeriodic)
+        {
+            const std::string ppName = pinfo[pi].periodicPatch;
+            const auto pit = nameToIdx.find(ppName);
+            if (ppName.empty() || pit == nameToIdx.end())
+                throw std::runtime_error(
+                    "brae: cyclicPeriodicAMI patch '" + fvp[pi].name + "' names periodicPatch '" + ppName
+                    + "', which is not a patch of this mesh. Without its transform the interface cannot be "
+                      "tiled and the two sides would coupled only where they happen to overlap.");
+            const label ppi = pit->second;
+            const auto pnit = nameToIdx.find(pinfo[ppi].neighbourPatch);
+            if (pnit == nameToIdx.end())
+                throw std::runtime_error(
+                    "brae: periodicPatch '" + ppName + "' has no neighbourPatch, so it defines no transform.");
+            const FvPatch& P = fvp[ppi];
+            const FvPatch& Q = fvp[pnit->second];
+            perMaxIter = pinfo[pi].maxIter;
+            perTol     = pinfo[pi].matchTolerance;
+            perRot     = (pinfo[ppi].transform == "rotational");
+            if (perRot)
+            {
+                const vector ax = pinfo[ppi].rotationAxis / mag(pinfo[ppi].rotationAxis);
+                perCtr = pinfo[ppi].rotationCentre;
+                // The pitch angle, from the two halves' MEAN azimuth about the axis. Face 0 of each half
+                // would do only if the two were ordered to match; a cyclicAMI periodic patch is under no
+                // such obligation, and here it is exactly the patch that is not.
+                auto meanPerp = [&](const FvPatch& X)
+                {
+                    vector acc{0,0,0};
+                    for (label i = 0; i < X.size; ++i)
+                    {
+                        const vector r = g.Cf()[X.start+i] - perCtr;
+                        const vector perp = r - dot(r, ax)*ax;
+                        const scalar mp = mag(perp);
+                        if (mp > scalar(0)) acc += perp/mp;
+                    }
+                    return acc;
+                };
+                const vector u = meanPerp(P), v = meanPerp(Q);
+                const scalar ang = std::atan2(dot(cross(u, v), ax), dot(u, v));
+                perT    = rotationTensor(ax, ang);
+                perTinv = rotationTensor(ax, -ang);
+            }
+            else
+            {
+                vector cP{0,0,0}, cQ{0,0,0};
+                for (label i = 0; i < P.size; ++i) cP += g.Cf()[P.start+i];
+                for (label j = 0; j < Q.size; ++j) cQ += g.Cf()[Q.start+j];
+                perSep = cQ/(scalar)Q.size - cP/(scalar)P.size;
+            }
+        }
+        // Move a point by k periods (k may be negative). Rotational transforms are about the periodic
+        // patch's own axis and centre, which need not be the AMI's.
+        auto periodShift = [&](const vector& p, label k) -> vector
+        {
+            vector q = p;
+            for (label t = 0; t < k; ++t)
+                q = perRot ? (dot(q - perCtr, transpose(perT)) + perCtr) : (q + perSep);
+            for (label t = 0; t > k; --t)
+                q = perRot ? (dot(q - perCtr, transpose(perTinv)) + perCtr) : (q - perSep);
+            return q;
+        };
+
         // faceAreaWeightAMI: per src face, overlap-area against every tgt face (brute force; OF uses an advancing
         // front, same result). weight = overlap/srcMagSf; weightsSum = coverage fraction.
         ai.ownCell = S.faceCells;
         ai.srcOffset.assign(S.size + 1, 0);
         std::vector<std::vector<std::pair<label,scalar>>> stencil(S.size);   // per src face: (tgtFace j, weight)
+        std::vector<scalar> tgtCov(T.size, scalar(0));                       // per tgt face: coverage fraction
+        // One pass of the overlap sweep against a given set of (already source-frame) target polygons.
+        // ACCUMULATES into stencil/tgtCov, which is what makes the periodic tiling a repeat of the same
+        // computation rather than a special case of it -- OF's AMIInterpolation::append concatenates the
+        // per-image addressing and adds the weight sums, exactly this.
+        auto accumulate = [&](const std::vector<std::vector<vector>>& tgtPoly)
+        {
         for (label i = 0; i < S.size; ++i)
         {
             const scalar srcArea = g.rawMagSf(S.start+i);   // RAW: see the note on the signature
@@ -298,9 +395,78 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
 
                 const vector orig = srcW[i][0];
                 const scalar ov = overlapArea(projectPair(srcW[i], e1, e2, orig),
-                                              projectPair(tgtW[j], e1, e2, orig));
-                if (ov > 1e-14 * srcArea) stencil[i].push_back({ j, ov / srcArea });
+                                              projectPair(tgtPoly[j], e1, e2, orig));
+                if (ov > 1e-14 * srcArea)
+                {
+                    stencil[i].push_back({ j, ov / srcArea });
+                    const scalar ta = g.rawMagSf(T.start+j);
+                    if (ta > scalar(0)) tgtCov[j] += ov / ta;
+                }
             }
+        }
+        };
+        accumulate(tgtW);                       // the untransformed overlap: OF's first AMI.calculate()
+
+        // ---- the tiling loop, OF cyclicPeriodicAMIPolyPatch::resetAMI ------------------------------
+        // Relative offset k means "the source displaced by k periods relative to the target"; OF gets it
+        // by transforming one side's POINTS and pairing against the other side's originals, alternating
+        // which side moves. Here the source stays put and the target images move the other way, which is
+        // the same relative geometry and needs only one polygon set rebuilt per image.
+        //
+        // OF's direction logic is reproduced rather than simplified: it starts outward, and FLIPS as soon
+        // as a step stops paying (srcSumDiffNew < srcSumDiff, or no gain at all). That is what makes the
+        // images come out as 0, +1, -1, +2, ... instead of marching off in one direction -- and on a
+        // patch whose neighbour lies on the other side, marching the wrong way finds nothing at all and
+        // burns every iteration before the loop gives up.
+        if (isPeriodic && perMaxIter > 0)
+        {
+            auto meanCov = [&](const std::vector<std::vector<std::pair<label,scalar>>>& st)
+            {
+                scalar acc = 0;
+                for (const auto& v : st) { scalar t = 0; for (const auto& e : v) t += e.second; acc += t; }
+                return st.empty() ? scalar(1) : acc/(scalar)st.size();
+            };
+            auto meanTgt = [&]()
+            {
+                scalar acc = 0;
+                for (const scalar c : tgtCov) acc += c;
+                return tgtCov.empty() ? scalar(1) : acc/(scalar)tgtCov.size();
+            };
+            scalar srcSum = meanCov(stencil), tgtSum = meanTgt();
+            scalar srcSumDiff = 0;
+            bool   direction = true;            // OF: nTransforms_ starts at 0, so direction = (0 >= 0)
+            label  kPos = 0, kNeg = 0;
+            label  iter = 0;
+            while (iter < perMaxIter
+                && ((scalar(1) - srcSum > perTol) || (scalar(1) - tgtSum > perTol)))
+            {
+                const label k = direction ? -(++kNeg) : (++kPos);
+                std::vector<std::vector<vector>> shifted(T.size);
+                for (label j = 0; j < T.size; ++j)
+                {
+                    shifted[j].reserve(tgtW[j].size());
+                    for (const vector& v : tgtW[j]) shifted[j].push_back(periodShift(v, k));
+                }
+                accumulate(shifted);
+                const scalar srcSumNew = meanCov(stencil);
+                const scalar srcSumDiffNew = srcSumNew - srcSum;
+                if (srcSumDiffNew < srcSumDiff || srcSumDiffNew < scalar(1e-30))
+                {
+                    direction = !direction;
+                    srcSumDiff = srcSumDiffNew;
+                }
+                srcSum = srcSumNew;
+                tgtSum = meanTgt();
+                ++iter;
+            }
+            if (std::getenv("BRAE_AMI_REPORT"))
+                std::printf("AMI periodic: %s <-> %s  images:%d(+%d/-%d) iters:%d  srcSum:%g tgtSum:%g\n",
+                            S.name.c_str(), T.name.c_str(), (int)(kPos + kNeg), (int)kPos, (int)kNeg,
+                            (int)iter, (double)srcSum, (double)tgtSum);
+        }
+
+        for (label i = 0; i < S.size; ++i)
+        {
             scalar s = 0;
             for (auto& e : stencil[i]) s += e.second;
             ai.weightsSum.push_back(s);

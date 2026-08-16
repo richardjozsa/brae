@@ -38,7 +38,7 @@ inline std::regex compileFoamRegex(const std::string& pat)
 inline bool isConstraintPatchType(const std::string& t)
 {
     return t == "empty" || t == "symmetryPlane" || t == "symmetry" || t == "wedge" || t == "cyclic"
-        || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicSlip" || t == "processor"
+        || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicPeriodicAMI" || t == "cyclicSlip" || t == "processor"
         || t == "processorCyclic" || t == "nonuniformTransformCyclic";
     // NOTE: "overset" is deliberately NOT here. It is a coupled patch whose fvPatchField cannot be
     // synthesised from the mesh type -- treating it as a constraint made an unsupported overset case run
@@ -55,7 +55,7 @@ inline bool isConstraintPatchType(const std::string& t)
 // skipped -- it carries the uncovered fraction and needs its real boundary condition.
 inline bool isCoupledInterfaceType(const std::string& t)
 {
-    return t == "cyclic" || t == "cyclicAMI" || t == "cyclicACMI";
+    return t == "cyclic" || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicPeriodicAMI";
 }
 
 struct FoamDict

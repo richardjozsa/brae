@@ -24,6 +24,13 @@ struct PatchInfo
     // overlap fraction splits the area between them (cyclicACMIPolyPatch.C:226,252). Empty for
     // every other patch type.
     std::string nonOverlapPatch;
+    // cyclicPeriodicAMI: the coupled patch whose transform TILES this interface. The two sides of a
+    // periodic AMI need not span the same sector, so OF covers the target by applying this patch's
+    // transform to the source repeatedly until the weights sum to 1 (cyclicPeriodicAMIPolyPatch::
+    // resetAMI). maxIter bounds that loop (OF default 36); matchTolerance is when to stop (OF 1e-4).
+    std::string periodicPatch;
+    label       maxIter = 36;
+    scalar      matchTolerance = 1e-4;
     std::vector<std::string> inGroups;  // polyBoundaryMesh groups this patch belongs to (boundaryField group match)
     std::string transform;       // cyclic: "translational" / "rotational" / "unknown"
     vector      rotationAxis{0, 0, 1};    // cyclic rotational: axis direction

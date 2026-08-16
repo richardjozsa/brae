@@ -58,6 +58,25 @@ namespace brae {
         for (const auto& a : amis)    amiRuns_.push_back({a.patch, (label)a.ownCell.size()});
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
         dbP_  = buildDeviceBoundary(p, fvp, g);
+        // pcorr's boundary, for CorrectPhi. OF builds it as zeroGradient EVERYWHERE except the patches
+        // where p itself fixes a value, which become fixedValue 0 (CorrectPhi.C:56-70). It is p's
+        // geometry with p's types thrown away, so it is built here beside dbP_ rather than derived at
+        // the call site -- the two must see the same patch order or the flux correction lands on the
+        // wrong faces.
+        {
+            GeometricField<scalar> pc;
+            pc.internal.assign(static_cast<std::size_t>(m.nCells()), scalar(0));
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (p.boundary[pi]->fixesValue())
+                    pc.boundary.push_back(std::make_unique<FixedValuePatchField<scalar>>(
+                        fvp[pi], true, scalar(0), std::vector<scalar>{}));
+                else
+                    pc.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(fvp[pi]));
+            }
+            pc.evaluateBoundary();
+            dbPcorr_ = buildDeviceBoundary(pc, fvp, g);
+        }
         wall_ = buildDeviceWallData(m, g, fvp, U);
         {   // DeviceBoundary face offset of each patch, for setPatchVelocity
             label st = 0;
@@ -2324,6 +2343,149 @@ namespace brae {
         if (hasCyclic_)
             deviceCorrectUf(cyc_.n, nullptr, cyc_.Sfx, cyc_.Sfy, cyc_.Sfz, cyc_.magSf, cyc_.phi,
                             UfCyc_[0], UfCyc_[1], UfCyc_[2]);
+    }
+
+    // OF CorrectPhi (finiteVolume/cfdTools/general/CorrectPhi/CorrectPhi.C) together with the pimpleFoam.C
+    // lines that wrap it:
+    //
+    //     phi = mesh.Sf() & Uf();          // absolute flux from the MAPPED surface velocity
+    //     CorrectPhi(U, phi, p, rAUf = 1, divU = 0, pimple);
+    //     fvc::makeRelative(phi, U);
+    //
+    // WHY IT EXISTS. When the mesh moves, the stored phi was computed on the OLD face areas. Reusing it
+    // is not a small error on a rotating or sliding interface, where a face's Sf changes direction as
+    // well as size: the momentum equation convects with a flux that does not close, and the pressure
+    // equation is then asked to fix a continuity error that is really a geometry error. On brae the
+    // symptom was unmistakable -- the two worst cases in the pimpleFoam sweep were exactly the two whose
+    // continuity residual ran away (axialTurbine contLocal 2.0, oscillatingInletPeriodicAMI2D 3.4).
+    //
+    // Uf IS THE INPUT, not phi. That is the whole point: Uf is a face VELOCITY, so remapping it onto the
+    // new Sf gives a flux consistent with the new geometry, which the old flux is not. This is why the
+    // solver refuses to run the projection unless Uf is being maintained.
+    scalar DeviceSimpleSolver::correctPhi(const std::vector<FvPatch>& fvp, int nNonOrth)
+    {
+        const DeviceMesh& dm = dm_;
+        if (!ufActive_ || dm.nCells <= 0) return 0;
+
+        // ---- phi = Sf & Uf, on every face family the mesh has ---------------------------------------
+        deviceDotSf(dm.nInternalFaces, nullptr, dm.Sfx, dm.Sfy, dm.Sfz,
+                    UfInt_[0], UfInt_[1], UfInt_[2], phiInt_);
+        deviceDotSf(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx, dm.Sfy, dm.Sfz,
+                    UfBnd_[0], UfBnd_[1], UfBnd_[2], phiBnd_);
+        if (hasAMI_)    deviceDotSf(ami_.n, nullptr, ami_.Sfx, ami_.Sfy, ami_.Sfz,
+                                    UfAmi_[0], UfAmi_[1], UfAmi_[2], ami_.phi);
+        if (hasCyclic_) deviceDotSf(cyc_.n, nullptr, cyc_.Sfx, cyc_.Sfy, cyc_.Sfz,
+                                    UfCyc_[0], UfCyc_[1], UfCyc_[2], cyc_.phi);
+
+        // ---- correctUphiBCs: phi_b = U_b & Sf wherever U fixes its value ----------------------------
+        // OF sets this BEFORE the projection so the prescribed wall/inlet flux is what pcorr has to work
+        // around, not something it is free to correct away. adjustMask_ is already !fixesValue(), built
+        // from the same patch order as phiBnd_.
+        {
+            DeviceBuffer<scalar> ubx, uby, ubz, phiFix;
+            deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
+            deviceBCValue(dbU_.comp[1], Uk_[1], uby);
+            deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
+            deviceBoundaryFlux(dm, ubx, uby, ubz, phiFix);
+            deviceSelectFixedFlux(adjustMask_, phiFix, phiBnd_);
+        }
+
+        // ---- pcorr.needReference(): adjustPhi on the RELATIVE flux, as OF does ----------------------
+        // The bracket matters. adjustPhi enforces global continuity, and on a moving mesh the quantity
+        // that has to balance is the flux RELATIVE to the mesh -- the absolute one legitimately does not
+        // sum to zero when the domain volume is changing. OF makes it relative, adjusts, makes it
+        // absolute again (CorrectPhi.C:79-84); dropping the round trip would push the volume-change rate
+        // into the adjustment.
+        if (ctl_.needRef && meshPhiValid_ && !meshPhi_.empty())
+        {
+            applyMeshPhi(fvp, meshPhi_, scalar(-1), phiInt_, phiBnd_, cyc_.phi, ami_.phi);
+            deviceAdjustPhi(adjustMask_, phiBnd_);
+            applyMeshPhi(fvp, meshPhi_, scalar(+1), phiInt_, phiBnd_, cyc_.phi, ami_.phi);
+        }
+        else if (ctl_.needRef)
+        {
+            deviceAdjustPhi(adjustMask_, phiBnd_);
+        }
+
+        // ---- the pcorr Poisson: laplacian(1, pcorr) == div(phi) -------------------------------------
+        // rAUf is the dimensioned scalar 1 in pimpleFoam's correctPhi.H, so the diffusivity is unity on
+        // every face and in every cell -- not rAU. Using rAU here would still project the flux, but to a
+        // different weighting than OF's, and the difference does not vanish with mesh refinement.
+        DeviceBuffer<scalar> onesF, onesC, pcorr;
+        onesF.copyFrom(std::vector<scalar>(static_cast<std::size_t>(std::max(dm.nInternalFaces, 0)), scalar(1)));
+        onesC.copyFrom(std::vector<scalar>(static_cast<std::size_t>(nC_), scalar(1)));
+        pcorr.copyFrom(std::vector<scalar>(static_cast<std::size_t>(nC_), scalar(0)));
+
+        DeviceSolverPerf pr{};
+        const int nPasses = std::max(nNonOrth, 0) + 1;
+        for (int pass = 0; pass < nPasses; ++pass)
+        {
+            DeviceBuffer<scalar> pcD, pcU, pcL, pcIC, pcBC, diagC, b, divPhi, ffc;
+            deviceLaplacianCoeffs(dm, onesF, pcD, pcU, pcL, ctl_.nonOrth);
+            deviceBCLaplacianCoeffs(dbPcorr_, onesC, pcIC, pcBC);
+            deviceDiv(dm, phiInt_, phiBnd_, divPhi);
+            if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, divPhi);
+            if (hasAMI_)    interfaceAddDiv(ami_, dm.V, divPhi);
+            deviceFoldPressure(dm, pcD, divPhi, pcIC, pcBC, diagC, b);
+            if (hasCyclic_) interfaceAssembleLaplacian(cyc_, onesC, diagC, /*addToDiag*/true);
+            if (hasAMI_)    interfaceAssembleLaplacian(ami_, onesC, diagC, /*addToDiag*/true);
+
+            DeviceBuffer<scalar> ffcCyc, ffcAmi;
+            if (ctl_.nonOrth && pass > 0)   // pass 0 has pcorr == 0, so its gradient contributes nothing
+            {
+                DeviceBuffer<scalar> gx, gy, gz, pbv, sc;
+                deviceBCValue(dbPcorr_, pcorr, pbv);
+                deviceGaussGrad(dm, pcorr, pbv, gx, gy, gz);
+                if (hasCyclic_) interfaceAddGrad(cyc_, pcorr, dm.V, gx, gy, gz);
+                if (hasAMI_)    interfaceAddGrad(ami_, pcorr, dm.V, gx, gy, gz);
+                deviceLaplacianCorrFlux(dm, onesF, gx, gy, gz, ffc);
+                deviceFaceDivSource(dm, ffc, sc);
+                deviceAxpy(1.0, sc, b);
+                if (hasCyclic_) interfaceLapCorrP(cyc_, onesC, gx, gy, gz, b, ffcCyc);
+                if (hasAMI_)    interfaceLapCorrP(ami_, onesC, gx, gy, gz, b, ffcAmi);
+            }
+            // pcorr inherits p's reference requirement exactly: its patches are fixedValue wherever p's
+            // fix a value, so it is singular in precisely the cases p is.
+            if (ctl_.needRef)
+            {
+                if (hasCyclic_ || hasAMI_)
+                {
+                    const scalar eps = -1e-10 * (deviceSumMag(diagC) / nC_);
+                    deviceAxpy(eps, ones_, diagC);
+                }
+                else deviceSetReference(diagC, b, ctl_.pRefCell, scalar(0));
+            }
+            // Jacobi-PCG, not the AMG path p uses: amgGalerkin re-coarsens the shared hierarchy in place,
+            // and pcorr is a unit-diffusivity Poisson solved to a loose tolerance once per mesh move --
+            // not worth handing it p's hierarchy and then rebuilding that for p on the next line.
+            const DeviceLduView pv = (hasCyclic_ || hasAMI_)
+                ? (hasCyclic_
+                    ? deviceLduViewCyclic(dm, diagC, pcU, pcL, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
+                    : deviceLduViewAmi(dm, diagC, pcU, pcL, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data()))
+                : deviceLduView(dm, diagC, pcU, pcL);
+            const scalar nf = deviceNormFactor(pv, pcorr, b, ones_);
+            const DeviceSolverPerf r = deviceJacobiPCG(pv, b, pcorr, nf, ctl_.tolPcorr, ctl_.relTolPcorr,
+                                                        ctl_.maxIterPcorr, 0);
+            if (pass == 0) pr = r;
+
+            if (pass == nPasses - 1)   // OF: phi -= pcorrEqn.flux() on the FINAL non-orthogonal pass only
+            {
+                DeviceBuffer<scalar> fi, fb;
+                deviceMatrixFluxInternal(pv, pcorr, fi);
+                deviceAxpy(-1.0, fi, phiInt_);
+                if (ffc.size()) deviceAxpy(-1.0, ffc, phiInt_);
+                deviceMatrixFluxBoundary(dbPcorr_, pcIC, pcBC, pcorr, fb);
+                deviceAxpy(-1.0, fb, phiBnd_);
+                if (hasCyclic_) interfaceCorrectFlux(cyc_, pcorr);   // cyc_.phi -= ifCoeff*(pcorr_nbr - pcorr_own)
+                if (hasAMI_)    interfaceCorrectFlux(ami_, pcorr);
+                if (ffcCyc.size()) deviceAxpy(-1.0, ffcCyc, cyc_.phi);
+                if (ffcAmi.size()) deviceAxpy(-1.0, ffcAmi, ami_.phi);
+            }
+        }
+
+        // ---- pimpleFoam.C: make the flux relative to the mesh motion --------------------------------
+        makeFluxRelative(fvp, dm.nInternalFaces);
+        return pr.initialResidual;
     }
 
     void DeviceSimpleSolver::makeFluxRelative(const std::vector<FvPatch>& fvp, label nInternalFaces)

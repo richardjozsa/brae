@@ -163,6 +163,10 @@ public:
     // before the time loop rather than letting the first mesh move trigger it. No mesh motion, no Uf,
     // and fvc::ddtCorr falls back to its phi.oldTime() form exactly as OF's does.
     void enableUf();
+    // OF CorrectPhi (finiteVolume/cfdTools/general/CorrectPhi) + the pimpleFoam.C lines that wrap it.
+    // Call after the mesh has moved and U's boundary has been refreshed, before the momentum predictor.
+    // Returns the initial continuity residual of the pcorr solve (div(phi) before the projection).
+    scalar correctPhi(const std::vector<FvPatch>& fvp, int nNonOrth);
     // phi +/- mesh.phi() applied to one set of flux buffers (internal, boundary, cyclic, AMI).
     // sign -1 = fvc::makeRelative, +1 = fvc::makeAbsolute.
     void applyMeshPhi(const std::vector<FvPatch>& fvp, const std::vector<scalar>& mp, scalar sign,
@@ -586,6 +590,8 @@ private:
     DeviceMesh dm_;
     DeviceVectorBoundary dbU_;
     DeviceBoundary dbP_, dbK_, dbEps_, dbExtrap_, dbReThetat_, dbGammaInt_;   // dbReThetat_/dbGammaInt_: kOmegaSSTLM
+    // pcorr (OF CorrectPhi): p's geometry, zeroGradient except fixedValue 0 where p fixes a value.
+    DeviceBoundary dbPcorr_;
     DeviceWallData wall_;
     DeviceMRF mrf_;                       // optional rotating zone (inactive by default)
     // fvOptions (empty by default -> no-op). Momentum source per component (relaxSrc) + implicit Sp (diagonal);
