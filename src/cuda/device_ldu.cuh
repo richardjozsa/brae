@@ -121,6 +121,39 @@ inline DeviceLduView deviceLduViewCyclic(
     return {dm.nCells, dm.nInternalFaces, diag.data(), upper.data(), lower.data(), dm.owner.data(), dm.nei.data(),
             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), nCyc, cycOwn, cycNbr, cycCoeff};
 }
+// BOTH interfaces at once. A mesh may carry cyclic AND cyclicAMI patches -- pimpleFoam/RAS/
+// oscillatingInletPeriodicAMI2D has a y-periodic `cyclic` pair on the sliding channel and a
+// cyclicPeriodicAMI joining it to the duct -- and the view has always had room for both. Picking one
+// with a ternary (`hasCyclic_ ? cyclicView : amiView`) silently DROPS the other's off-diagonal while
+// leaving its diagonal folded into `diag` and its flux in the RHS, which is not a lossy approximation
+// but an inconsistent linear system: the pressure solve on that case ran to its 50-iteration cap every
+// time with the final residual ABOVE the initial one (1.00 -> 5.14), and continuity never closed --
+// contGlobal pinned at -0.33 for the whole run, 0.1 of mass in and 0.013 out.
+inline DeviceLduView deviceLduViewCyclicAmi(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& diag,
+    const DeviceBuffer<scalar>& upper,
+    const DeviceBuffer<scalar>& lower,
+    int nCyc,
+    const label* cycOwn,
+    const label* cycNbr,
+    const scalar* cycCoeff,
+    int nAmi,
+    const label* amiOwn,
+    const label* amiOff,
+    const label* amiNbr,
+    const scalar* amiW,
+    const scalar* amiIfc)
+{
+    DeviceLduView v = deviceLduViewCyclic(dm, diag, upper, lower, nCyc, cycOwn, cycNbr, cycCoeff);
+    v.nAmi = nAmi;
+    v.amiOwn = amiOwn;
+    v.amiOff = amiOff;
+    v.amiNbr = amiNbr;
+    v.amiW = amiW;
+    v.amiIfc = amiIfc;
+    return v;
+}
 // Same view, augmented with a cyclicAMI interface (the weighted CSR stencil over nAmi source faces). deviceAmul
 // applies the weighted off-diagonal; the matching diagonal contribution must already be folded into `diag`.
 inline DeviceLduView deviceLduViewAmi(

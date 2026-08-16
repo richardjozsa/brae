@@ -88,7 +88,13 @@ void deviceFvmDdt(
 namespace {
 // One face. Written once and used for both the internal and the boundary sweep so the two cannot drift:
 // the only difference between them is where phi_old and rAU_face come from.
-__device__ __forceinline__ scalar ddtCorrFace(scalar phiOld, scalar fluxUold, scalar rAUf, scalar rDeltaT)
+// `phiCorrEff` is the quantity actually corrected; it equals phiCorr for Euler and carries backward's
+// two-level combination otherwise. It is a SEPARATE argument because OF computes the coupling coefficient
+// from the single old level -- fvcDdtPhiCoeff(U.oldTime(), Sf & Uf.oldTime()) -- and then applies that
+// coefficient to the scheme's own multi-level correction. Folding the combination into the coefficient
+// too would change the limiter, not just the term it limits.
+__device__ __forceinline__ scalar ddtCorrFace(scalar phiOld, scalar fluxUold, scalar phiCorrEff,
+                                              scalar rAUf, scalar rDeltaT)
 {
     const scalar phiCorr = phiOld - fluxUold;
     // ddtScheme<Type>::fvcDdtPhiCoeff, the ddtPhiCoeff_ < 0 branch (the default -- v2412 never reads
@@ -96,24 +102,26 @@ __device__ __forceinline__ scalar ddtCorrFace(scalar phiOld, scalar fluxUold, sc
     //     coeff = 1 - min(mag(phiCorr)/(mag(phi) + SMALL), 1)
     // SMALL is Foam::SMALL = 1e-15 in double precision.
     const scalar coeff = scalar(1) - fmin(fabs(phiCorr)/(fabs(phiOld) + scalar(1e-15)), scalar(1));
-    return rAUf*coeff*rDeltaT*phiCorr;
+    return rAUf*coeff*rDeltaT*phiCorrEff;
 }
 
 __global__ void ddtCorrIntK(int nIf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUf,
-                            scalar rDeltaT, scalar* out)
+                            const scalar* phiCorrEff, scalar rDeltaT, scalar* out)
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nIf) return;
-    out[f] += ddtCorrFace(phiOld[f], fluxUold[f], rAUf[f], rDeltaT);
+    const scalar eff = phiCorrEff ? phiCorrEff[f] : (phiOld[f] - fluxUold[f]);
+    out[f] += ddtCorrFace(phiOld[f], fluxUold[f], eff, rAUf[f], rDeltaT);
 }
 
 __global__ void ddtCorrBndK(int nBf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUb,
-                            const scalar* mask, scalar rDeltaT, scalar* out)
+                            const scalar* mask, const scalar* phiCorrEff, scalar rDeltaT, scalar* out)
 {
     const int b = blockIdx.x*blockDim.x + threadIdx.x;
     if (b >= nBf) return;
     if (mask[b] == scalar(0)) return;   // fixesValue / cyclicAMI: OF sets the coupling coefficient to 0
-    out[b] += ddtCorrFace(phiOld[b], fluxUold[b], rAUb[b], rDeltaT);
+    const scalar eff = phiCorrEff ? phiCorrEff[b] : (phiOld[b] - fluxUold[b]);
+    out[b] += ddtCorrFace(phiOld[b], fluxUold[b], eff, rAUb[b], rDeltaT);
 }
 }   // namespace
 
@@ -128,13 +136,17 @@ void deviceDdtCorrFlux(
     const DeviceBuffer<scalar>& coeffMask,
     scalar                      rDeltaT,
     DeviceBuffer<scalar>&       outInt,
-    DeviceBuffer<scalar>&       outBnd)
+    DeviceBuffer<scalar>&       outBnd,
+    const DeviceBuffer<scalar>* phiCorrEffInt,
+    const DeviceBuffer<scalar>* phiCorrEffBnd)
 {
     const int nIf = nInternalFaces;
     if (nIf > 0 && (int)phiOldInt.size() >= nIf && (int)fluxUoldInt.size() >= nIf
         && (int)rAUf.size() >= nIf && (int)outInt.size() >= nIf)
     {
         ddtCorrIntK<<<nBlocks(nIf), TPB>>>(nIf, phiOldInt.data(), fluxUoldInt.data(), rAUf.data(),
+                                           (phiCorrEffInt && (int)phiCorrEffInt->size() >= nIf)
+                                               ? phiCorrEffInt->data() : nullptr,
                                            rDeltaT, outInt.data());
         cudaCheck(cudaGetLastError(), "ddtCorrInt");
     }
@@ -143,7 +155,10 @@ void deviceDdtCorrFlux(
         && (int)rAUbnd.size() >= nBf && (int)coeffMask.size() >= nBf)
     {
         ddtCorrBndK<<<nBlocks(nBf), TPB>>>(nBf, phiOldBnd.data(), fluxUoldBnd.data(), rAUbnd.data(),
-                                           coeffMask.data(), rDeltaT, outBnd.data());
+                                           coeffMask.data(),
+                                           (phiCorrEffBnd && (int)phiCorrEffBnd->size() >= nBf)
+                                               ? phiCorrEffBnd->data() : nullptr,
+                                           rDeltaT, outBnd.data());
         cudaCheck(cudaGetLastError(), "ddtCorrBnd");
     }
 }

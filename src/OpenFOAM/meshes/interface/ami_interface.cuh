@@ -432,37 +432,48 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
                 for (const scalar c : tgtCov) acc += c;
                 return tgtCov.empty() ? scalar(1) : acc/(scalar)tgtCov.size();
             };
+            // THE IMAGE SET IS SYMMETRIC (+k AND -k together), which is NOT how OF walks it. OF builds
+            // the AMI once, on the OWNER side only, and the neighbour direction reuses that same
+            // addressing transposed -- so its one-directional search can stop the moment the owner is
+            // covered. brae builds the two directions INDEPENDENTLY (that is what makes a conforming
+            // cyclicAMI work without an owner/neighbour concept), and two independent adaptive searches
+            // do not stop at the same place: measured here, ami1 closed after 2 images and ami2 after 1.
+            //
+            // Different image sets mean the two directions are not transposes, so the interface block of
+            // the pressure matrix is ASYMMETRIC -- and brae solves an interface pressure system with
+            // Jacobi-PCG, which requires symmetry. It did not merely lose accuracy: every solve ran to
+            // its 50-iteration cap and the FINAL residual came out above the initial one (1.00 -> 5.14
+            // on step 1). Continuity then never closed: contGlobal pinned at -0.33 for the whole run,
+            // 0.1 of mass entering and 0.013 leaving.
+            //
+            // Adding images in +/- pairs costs nothing when one side of the pair does not overlap (it
+            // contributes no stencil entries) and makes the two directions transposes by construction,
+            // because image +k of the target against the source is image -k of the source against the
+            // target.
             scalar srcSum = meanCov(stencil), tgtSum = meanTgt();
-            scalar srcSumDiff = 0;
-            bool   direction = true;            // OF: nTransforms_ starts at 0, so direction = (0 >= 0)
-            label  kPos = 0, kNeg = 0;
-            label  iter = 0;
+            label  k = 0, iter = 0;
             while (iter < perMaxIter
                 && ((scalar(1) - srcSum > perTol) || (scalar(1) - tgtSum > perTol)))
             {
-                const label k = direction ? -(++kNeg) : (++kPos);
-                std::vector<std::vector<vector>> shifted(T.size);
-                for (label j = 0; j < T.size; ++j)
+                ++k;
+                for (const label kk : { -k, k })
                 {
-                    shifted[j].reserve(tgtW[j].size());
-                    for (const vector& v : tgtW[j]) shifted[j].push_back(periodShift(v, k));
+                    std::vector<std::vector<vector>> shifted(T.size);
+                    for (label j = 0; j < T.size; ++j)
+                    {
+                        shifted[j].reserve(tgtW[j].size());
+                        for (const vector& v : tgtW[j]) shifted[j].push_back(periodShift(v, kk));
+                    }
+                    accumulate(shifted);
                 }
-                accumulate(shifted);
-                const scalar srcSumNew = meanCov(stencil);
-                const scalar srcSumDiffNew = srcSumNew - srcSum;
-                if (srcSumDiffNew < srcSumDiff || srcSumDiffNew < scalar(1e-30))
-                {
-                    direction = !direction;
-                    srcSumDiff = srcSumDiffNew;
-                }
-                srcSum = srcSumNew;
+                srcSum = meanCov(stencil);
                 tgtSum = meanTgt();
                 ++iter;
             }
             if (std::getenv("BRAE_AMI_REPORT"))
-                std::printf("AMI periodic: %s <-> %s  images:%d(+%d/-%d) iters:%d  srcSum:%g tgtSum:%g\n",
-                            S.name.c_str(), T.name.c_str(), (int)(kPos + kNeg), (int)kPos, (int)kNeg,
-                            (int)iter, (double)srcSum, (double)tgtSum);
+                std::printf("AMI periodic: %s <-> %s  images:+/-%d  iters:%d  srcSum:%g tgtSum:%g\n",
+                            S.name.c_str(), T.name.c_str(), (int)k, (int)iter,
+                            (double)srcSum, (double)tgtSum);
         }
 
         for (label i = 0; i < S.size; ++i)

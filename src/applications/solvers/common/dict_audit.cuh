@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +75,58 @@ inline void auditWalk(
 }
 
 }   // namespace detail
+
+// PREFLIGHT: an unread key in the ALGORITHM-CONTROL block is FATAL, not a notice.
+//
+// auditDict above reports and does not throw, for a good reason -- an unread key elsewhere may belong to
+// another tool. That reasoning does not extend to fvSolution's PIMPLE/SIMPLE sub-dictionary. Every entry
+// there selects part of the pressure-velocity algorithm, none of them belong to anyone else, and reading
+// one and ignoring it means brae is running a DIFFERENT ALGORITHM than the case asked for -- silently,
+// and with a converged-looking field at the end.
+//
+// This is not hypothetical. `turbOnFinalIterOnly` defaults to TRUE in OpenFOAM's pimpleControl, so
+// turbulence is corrected once per time step on the final outer corrector. brae corrected it on EVERY
+// outer corrector and never read the key. A 30-case tutorial sweep did not catch it, because most
+// tutorials use nOuterCorrectors 1, where the two cadences are the same; the cases that would have shown
+// it (vortexShed 5, propeller 2, axialTurbine 10) were failing for what looked like other reasons.
+// `residualControl`, `solveFlow`, `SIMPLErho` and `moveMeshOuterCorrectors` are the same shape.
+//
+// So the rule for this one block is inverted: brae must consume every key or refuse. A gap becomes a
+// startup error naming the key, never a discovery made halfway through a simulation.
+inline void preflightAlgorithmControls(const FoamDict& fvSolution, const std::string& dictName)
+{
+    const FoamDict* alg = fvSolution.subDict(dictName);
+    if (!alg) return;
+    // Controls brae consumes CONDITIONALLY, so an unread one is not a gap. Each needs a reason, and the
+    // reason has to be that OpenFOAM ignores it under the same condition -- otherwise this list is just a
+    // way to silence the check. Keep it short: anything added here stops being enforced.
+    auto conditional = [](const std::string& k)
+    {
+        //  pRefCell/pRefValue : read only when the pressure needs a reference (no fixedValue-p patch).
+        //                       OpenFOAM's setRefCell does nothing on a case with a fixed-pressure
+        //                       boundary either, so an unread pair there is inert in both codes.
+        //  transonic          : consumed by the COMPRESSIBLE pEqn. Incompressible pimpleFoam never reads
+        //                       it in OpenFOAM either -- a case that sets it is setting a no-op.
+        return k == "pRefCell" || k == "pRefValue" || k == "transonic";
+    };
+    std::vector<std::string> unread;
+    for (const auto& l : alg->leaves)
+        if (!alg->queried.count(l.first) && !conditional(l.first)) unread.push_back(l.first);
+    for (const auto& sb : alg->subs)
+        if (!alg->queried.count(sb.first)) unread.push_back(sb.first + " (sub-dictionary)");
+    if (unread.empty()) return;
+
+    std::string msg = "brae: system/fvSolution " + dictName + " contains "
+                    + std::to_string(unread.size()) + " entr"
+                    + (unread.size() == 1 ? "y" : "ies") + " brae never read:";
+    for (const std::string& k : unread) msg += "\n    " + dictName + "/" + k;
+    msg += "\n  Every entry in this block selects part of the pressure-velocity algorithm, so running "
+           "with one ignored means solving a different algorithm than the case specifies -- which "
+           "converges to a plausible wrong answer instead of failing. Refused at startup rather than "
+           "discovered mid-run. Implement the control, or delete it from the case if it is not wanted.";
+    throw std::runtime_error(msg);
+}
+
 
 // Name every entry in `d` that brae never looked up. `label` is the file, e.g. "system/fvSolution".
 // `partial` marks a report taken from a run that STOPPED EARLY -- see DictAuditScope.

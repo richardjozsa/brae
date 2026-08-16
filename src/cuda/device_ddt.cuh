@@ -175,7 +175,9 @@ void deviceDdtCorrFlux(
     const DeviceBuffer<scalar>& coeffMask,   // per boundary face: 0 at fixesValue/coupled, else 1
     scalar                      rDeltaT,
     DeviceBuffer<scalar>&       outInt,      // += the correction
-    DeviceBuffer<scalar>&       outBnd);
+    DeviceBuffer<scalar>&       outBnd,
+    const DeviceBuffer<scalar>* phiCorrEffInt = nullptr,   // backward: the two-level correction
+    const DeviceBuffer<scalar>* phiCorrEffBnd = nullptr);
 
 // fvc::correctUf (fvcMeshPhi.C) -- the face velocity a moving-mesh pimpleFoam carries alongside phi:
 //

@@ -203,6 +203,7 @@ try
     if (std::filesystem::exists(caseDir + "/constant/dynamicMeshDict"))
         vclMotion = readVelocityComponentLaplacian(readDict(caseDir + "/constant/dynamicMeshDict"));
 
+
     // ---- PIMPLE + solver controls (fvSolution) ----
     const FoamDict* pimple  = fvSolution.subDict("PIMPLE");
     const int nOuter   = pimple ? std::max(1, pimple->intOr("nOuterCorrectors", 1)) : 1;
@@ -302,6 +303,51 @@ try
         if (!ctl.momentumPredictor)
             std::printf("  PIMPLE momentumPredictor off: UEqn is assembled (rAU/HbyA) but not solved\n");
     }
+    // PIMPLE loop contract (OF pimpleControl::read). Defaults are OpenFOAM's, not brae's convenience:
+    // turbOnFinalIterOnly TRUE, solveFlow TRUE, SIMPLErho FALSE.
+    {
+        auto yes = [](const std::string& v) { return !(v == "no" || v == "false" || v == "off" || v == "0"); };
+        ctl.turbOnFinalIterOnly = pimple ? yes(pimple->wordOr("turbOnFinalIterOnly", "yes")) : true;
+        ctl.solveFlow           = pimple ? yes(pimple->wordOr("solveFlow", "yes")) : true;
+        ctl.simpleRho           = pimple ? yes(pimple->wordOr("SIMPLErho", "no")) : false;
+        ctl.moveMeshOuterCorrectors = pimple ? yes(pimple->wordOr("moveMeshOuterCorrectors", "no")) : false;
+        if (ctl.moveMeshOuterCorrectors)
+            std::printf("  PIMPLE moveMeshOuterCorrectors on: the mesh moves before EVERY outer corrector\n");
+        // dynamicFvMesh::controlledUpdate -- OF's timeControl with the "update" prefix. Read here, where
+        // ctl exists, rather than beside the motion-solver parse further up.
+        if (std::filesystem::exists(caseDir + "/constant/dynamicMeshDict"))
+        {
+            const FoamDict dmd = readDict(caseDir + "/constant/dynamicMeshDict");
+            ctl.meshUpdateControl  = dmd.wordOr("updateControl", "always");
+            ctl.meshUpdateInterval = (int)dmd.scalarOr("updateInterval", 1.0);
+            if (ctl.meshUpdateControl != "always")
+                std::printf("  dynamicMeshDict updateControl %s interval %d\n",
+                            ctl.meshUpdateControl.c_str(), ctl.meshUpdateInterval);
+        }
+        if (!ctl.turbOnFinalIterOnly)
+            std::printf("  PIMPLE turbOnFinalIterOnly off: turbulence corrected on EVERY outer corrector\n");
+        if (!ctl.solveFlow) std::printf("  PIMPLE solveFlow off: the momentum/pressure solve is skipped\n");
+        // residualControl: outer-loop convergence. Parsed as OF does -- each entry is a field name whose
+        // sub-dict carries `tolerance` (absolute) and/or `relTol`.
+        if (const FoamDict* rc = pimple ? pimple->subDict("residualControl") : nullptr)
+        {
+            for (const auto& e : rc->subs)
+            {
+                DeviceSimpleControls::OuterResidualControl o;
+                o.field  = e.first;
+                o.absTol = e.second.scalarOr("tolerance", 0.0);
+                o.relTol = e.second.scalarOr("relTol", 0.0);
+                ctl.outerResidualControl.push_back(o);
+            }
+            if (!ctl.outerResidualControl.empty())
+            {
+                std::printf("  PIMPLE residualControl:");
+                for (const auto& o : ctl.outerResidualControl)
+                    std::printf(" %s(tol=%.3g relTol=%.3g)", o.field.c_str(), (double)o.absTol, (double)o.relTol);
+                std::printf("\n");
+            }
+        }
+    }
     // PIMPLE/correctPhi: OF createDyMControls.H defaults it to mesh.dynamic(), i.e. ON whenever a motion
     // solver is active. brae mirrors that -- a case that moves its mesh and says nothing gets the
     // projection, as it does in OpenFOAM, and a case that says `correctPhi no` opts out.
@@ -312,6 +358,11 @@ try
         if (ctl.correctPhi)
             std::printf("  PIMPLE correctPhi on: phi is rebuilt from Uf and projected divergence-free after each mesh move\n");
     }
+    // PREFLIGHT the algorithm block before anything is built. Every control brae intends to honour has
+    // been read by this point, so whatever is left in PIMPLE is a control it would ignore -- and an
+    // ignored algorithm control is a different algorithm, not a smaller one. See
+    // preflightAlgorithmControls: this is the check that would have caught turbOnFinalIterOnly.
+    preflightAlgorithmControls(fvSolution, "PIMPLE");
     DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                               (ctl.turbulent && !ctl.les) ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa && !ctl.les) ? &tf.eps : nullptr,
                               ctl.turbulent ? &tf.nut : nullptr, ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
@@ -733,10 +784,22 @@ try
     for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
-        // OF pimpleFoam.C:139-160 -- the mesh moves at the START of the step, before the equations,
-        // and phi is made relative immediately after. points0 (the ORIGINAL positions) are transformed
-        // by an absolute function of t, never the current points: OF's points0MotionSolver does the
-        // same, and transforming incrementally would compound round-off over a run.
+        // OF pimpleFoam.C:139-160 -- the mesh update is INSIDE the PIMPLE outer loop, guarded by
+        // `pimple.firstIter() || moveMeshOuterCorrectors`. So it is a callback handed to pimpleStep
+        // rather than a block that runs before it: with moveMeshOuterCorrectors set, every outer
+        // corrector re-moves the mesh and re-assembles on the new geometry. points0 (the ORIGINAL
+        // positions) are transformed by an absolute function of t, never the current points -- OF's
+        // points0MotionSolver does the same, and transforming incrementally would compound round-off.
+        //
+        // dynamicFvMesh::controlledUpdate gates the whole thing on updateControl/updateInterval; with
+        // the default `always` this fires every step, which is what every brae case has used so far.
+        const auto meshUpdate = [&](int /*outerIter*/)
+        {
+        const bool doUpdate =
+            (ctl.meshUpdateControl == "always")
+         || (ctl.meshUpdateControl == "timeStep"
+             && ctl.meshUpdateInterval > 0 && (timeIndex % ctl.meshUpdateInterval) == 0);
+        if (!doUpdate) return;
         if (meshMotion.active)
         {
             const std::vector<vector> oldPoints = m.points();
@@ -801,7 +864,10 @@ try
             solver.moveMesh(m, g, fvp, pts, pts, deltaT);
             solver.refreshWallData(m, g, fvp);
         }
-        const DeviceSimpleResidual r = solver.pimpleStep(deltaT, nOuter, nCorr);
+        };   // meshUpdate
+        const bool anyMotion = meshMotion.active || vclMotion.active || acmiTimeScale;
+        const DeviceSimpleResidual r =
+            solver.pimpleStep(deltaT, nOuter, nCorr, anyMotion ? meshUpdate : std::function<void(int)>());
         // OF order: the Courant number is evaluated on the flux the step just produced, and deltaT for
         // the NEXT step follows from it (CourantNo.H then setDeltaT.H, both at the top of the loop).
         if (timeControls.adjustTimeStep)

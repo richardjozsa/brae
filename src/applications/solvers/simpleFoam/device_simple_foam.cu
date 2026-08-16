@@ -1594,28 +1594,44 @@ namespace brae {
         // face gets nothing from it in either code -- which is why chasing the ACMI flux profile kept
         // landing on the inlet instead of the interface.
         //
-        // Uf, DELIBERATELY NOT IMPLEMENTED. pimpleFoam passes fvc::ddtCorr(U, phi, Uf) and that
-        // dispatches to the Uf form on a dynamic mesh, where phiCorr uses (Sf & Uf.oldTime()) in place of
-        // phi.oldTime() -- they differ only in that Sf is the CURRENT area against an old face velocity.
-        // Measured against OpenFOAM's own written Uf on the moving oscillatingInletACMI2D: the two forms
-        // agree to 9.0e-10 on a translating mesh, because Sf barely changes. A ROTATING AMI would not be
-        // so kind, so this is a known limit, not a proof.
+        // Uf: IMPLEMENTED, and not here. pimpleFoam passes fvc::ddtCorr(U, phi, Uf), which dispatches to
+        // the Uf form on a dynamic mesh -- phiCorr uses (Sf & Uf.oldTime()), the CURRENT face areas
+        // against the OLD face velocity, in place of the stored phi.oldTime(). brae supplies that by
+        // BUILDING phiOldInt_/phiOldBnd_ from Uf.oldTime() whenever Uf is active (see the ufActive_
+        // block in moveMesh's old-field aging), so the kernel below needs no Uf argument and this term
+        // is already the moving-mesh form. Leaving the old "deliberately not implemented" note here sent
+        // a later audit hunting a defect that had already been fixed a thousand lines away.
         if (ddtCorr_ && ddtScheme_ != DdtScheme::steadyState && deltaT_ > 0
             && phiOldInt_.size() == phiHi.size())
         {
-            if (ddtScheme_ != DdtScheme::Euler)
+            // backward's fvc::ddtCorr. Transcribed from backwardDdtScheme::fvcDdtPhiCorr and
+            // ::fvcDdtUfCorr, which are algebraically the same term -- they differ only in whether the
+            // old flux is phi.oldTime() or (Sf & Uf.oldTime()), and brae already builds phiOld from Uf
+            // on a moving mesh, so one code path serves both. 13 of OpenFOAM's 35 pimpleFoam tutorials
+            // select `backward`, and brae omitted this term for every one of them.
+            const bool backwardCorr = (ddtScheme_ == DdtScheme::backward)
+                                   && ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_).coefft00 > scalar(0)
+                                   && phiOld2Int_.size() == phiOldInt_.size()
+                                   && Uold2_[0].size() == Uold_[0].size();
+            if (ddtScheme_ == DdtScheme::CrankNicolson)
             {
-                // backward/CrankNicolson each have their OWN fvcDdtPhiCorr (extra old levels and
-                // coefficients). Running the Euler form under them would be a silent approximation, so
-                // say so and leave the term out, which is what brae did for every scheme until now.
+                // CrankNicolson's fvcDdtUfCorr carries its own off-centred ddt0 recurrence, not just an
+                // extra old level, so it is not this shape. Omitted with a notice rather than run under
+                // backward's or Euler's form, which would be a silent substitution.
                 if (!ddtCorrNoticed_)
                 {
                     ddtCorrNoticed_ = true;
                     noticeIgnored("PIMPLE/ddtCorr",
-                                  "brae implements fvc::ddtCorr only for the Euler ddt scheme; this case "
-                                  "uses another, so the correction is omitted (OF would apply its "
-                                  "scheme-specific form)");
+                                  "brae implements fvc::ddtCorr for the Euler and backward ddt schemes; "
+                                  "this case uses CrankNicolson, whose form carries the off-centred ddt0 "
+                                  "recurrence, so the correction is omitted");
                 }
+            }
+            else if (ddtScheme_ != DdtScheme::Euler && !backwardCorr)
+            {
+                // backward on its FIRST transient step has no second old level yet, and OF falls back to
+                // Euler there (coefft00 is 0).
+                // Nothing to report: this is backward's own first-step fallback to Euler.
             }
             else
             {
@@ -1630,8 +1646,31 @@ namespace brae {
                 // OpenFOAM's own fvc::interpolate(rAU)*fvc::ddtCorr without unpicking it from phiHbyA.
                 const bool dumpDdt = stageDumpActive() && stageDumpFirstOnly("ddtCorr");
                 if (dumpDdt) { stageDump("stage_ddtCorr_pre", phiHi); stageDump("stage_ddtCorr_preB", phiHb); }
+                // backward's fvcDdtUfCorr (backwardDdtScheme.C): the corrected quantity is
+                //     (coefft0*phi_o - coefft00*phi_oo) - (coefft0*fluxU_o - coefft00*fluxU_oo)
+                // while the coupling coefficient stays on the SINGLE old level. coefft0/coefft00 are the
+                // same pair the implicit ddt source already uses, rebuilt here from the same ddtCoeffs() call.
+                DeviceBuffer<scalar> effInt, effBnd, fUo2Int, fUo2Bnd;
+                if (backwardCorr)
+                {
+                    deviceVectorFlux(dm, Uold2_[0], Uold2_[1], Uold2_[2], fUo2Int);
+                    DeviceBuffer<scalar> u2b[3];
+                    for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uold2_[k], u2b[k]);
+                    deviceBoundaryFlux(dm, u2b[0], u2b[1], u2b[2], fUo2Bnd);
+                    const DdtCoeffs dc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
+                    const scalar c0 = dc.coefft0, c00 = dc.coefft00;
+                    deviceCopy(effInt, phiOldInt_);   deviceScale(effInt, c0);
+                    deviceAxpy(-c00, phiOld2Int_, effInt);
+                    deviceAxpy(-c0,  fUoInt,      effInt);
+                    deviceAxpy(+c00, fUo2Int,     effInt);
+                    deviceCopy(effBnd, phiOldBnd_);   deviceScale(effBnd, c0);
+                    deviceAxpy(-c00, phiOld2Bnd_, effBnd);
+                    deviceAxpy(-c0,  fUoBnd,      effBnd);
+                    deviceAxpy(+c00, fUo2Bnd,     effBnd);
+                }
                 deviceDdtCorrFlux(dm.nInternalFaces, phiOldInt_, phiOldBnd_, fUoInt, fUoBnd,
-                                  rAUfDdt, rAUbDdt, ddtCorrBndMask_, scalar(1)/deltaT_, phiHi, phiHb);
+                                  rAUfDdt, rAUbDdt, ddtCorrBndMask_, scalar(1)/deltaT_, phiHi, phiHb,
+                                  backwardCorr ? &effInt : nullptr, backwardCorr ? &effBnd : nullptr);
                 // ...and on the interface. See the note on amiPhiOld_ for why this is the one coupled
                 // place OF keeps the correction. deviceDdtCorrFlux's boundary sweep is elementwise, so
                 // it serves here with an all-ones mask and no internal part.
@@ -2030,7 +2069,15 @@ namespace brae {
             {
                 // Periodic/AMI: interface-coupled operator solved with Jacobi-PCG (no AMG; the internal-face Galerkin
                 // coarse operator cannot represent the interface edges).
-                const DeviceLduView pvc = hasCyclic_
+                // BOTH, when the mesh has both -- see deviceLduViewCyclicAmi. A ternary here dropped one
+                // interface's off-diagonal out of the matrix while its diagonal and flux stayed in.
+                const DeviceLduView pvc =
+                    (hasCyclic_ && hasAMI_)
+                    ? deviceLduViewCyclicAmi(dm,diagCp_,pU_,pL_,
+                                             cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data(),
+                                             ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(),
+                                             ami_.weight.data(), ami_.ifCoeff.data())
+                    : hasCyclic_
                     ? deviceLduViewCyclic(dm,diagCp_,pU_,pL_, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
                     : deviceLduViewAmi(dm,diagCp_,pU_,pL_, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
                 const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
@@ -2643,6 +2690,7 @@ namespace brae {
         // phi.oldTime(): the flux at the PREVIOUS time level, which fvc::ddtCorr reads. OF ages it at
         // runTime++ along with every other field, so it is fixed for the whole step -- all of the step's
         // pressure correctors see the same one, not each other's output.
+        if (phiOldInt_.size()) { deviceCopy(phiOld2Int_, phiOldInt_); deviceCopy(phiOld2Bnd_, phiOldBnd_); }
         deviceCopy(phiOldInt_, phiInt_);
         deviceCopy(phiOldBnd_, phiBnd_);
         // The interface's phi.oldTime(), and flux(U.oldTime()) across it. Both are fixed for the step, so
@@ -2682,6 +2730,7 @@ namespace brae {
             const DeviceMesh& dm = dm_;
             for (int k = 0; k < 3; ++k)   // age Uf, as runTime++ ages every registered field
             {
+                if (UfOldInt_[k].size()) { deviceCopy(UfOld2Int_[k], UfOldInt_[k]); deviceCopy(UfOld2Bnd_[k], UfOldBnd_[k]); }
                 deviceCopy(UfOldInt_[k], UfInt_[k]);
                 deviceCopy(UfOldBnd_[k], UfBnd_[k]);
                 if (hasAMI_)    deviceCopy(UfOldAmi_[k], UfAmi_[k]);
@@ -2691,6 +2740,13 @@ namespace brae {
                         UfOldInt_[0], UfOldInt_[1], UfOldInt_[2], phiOldInt_);
             deviceDotSf(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx, dm.Sfy, dm.Sfz,
                         UfOldBnd_[0], UfOldBnd_[1], UfOldBnd_[2], phiOldBnd_);
+            if (UfOld2Int_[0].size())   // backward's second level, on the CURRENT areas
+            {
+                deviceDotSf(dm.nInternalFaces, nullptr, dm.Sfx, dm.Sfy, dm.Sfz,
+                            UfOld2Int_[0], UfOld2Int_[1], UfOld2Int_[2], phiOld2Int_);
+                deviceDotSf(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx, dm.Sfy, dm.Sfz,
+                            UfOld2Bnd_[0], UfOld2Bnd_[1], UfOld2Bnd_[2], phiOld2Bnd_);
+            }
             if (hasAMI_)
                 deviceDotSf(ami_.n, nullptr, ami_.Sfx, ami_.Sfy, ami_.Sfz,
                             UfOldAmi_[0], UfOldAmi_[1], UfOldAmi_[2], amiPhiOld_);
@@ -3039,9 +3095,77 @@ namespace brae {
         return res;
     }
 
-    DeviceSimpleResidual DeviceSimpleSolver::pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors)
+    // OF pimpleControl::criteriaSatisfied. Every controlled field passes if its FINAL residual is below
+    // absTol, or if final/initial is below relTol -- either alone is enough, per field, and all fields
+    // must pass. The reference for the relative test is iteration 2's INITIAL residual (OF's
+    // storeInitialResiduals() is corr_ == 2), not iteration 1's: iteration 1 starts from the previous
+    // time step's field and its residual is not comparable with the outer-loop convergence being tested.
+    bool DeviceSimpleSolver::outerCriteriaSatisfied(const DeviceSimpleResidual& res, int oc)
+    {
+        // OF's maxResidual returns the pair (initial, final) of the LAST solve. The reference stored at
+        // corr_ == 2 is that pair's FIRST -- iteration 1's initial residual -- while the test from
+        // corr_ == 3 onward uses its LAST, the previous iteration's final residual. Two different halves
+        // of the pair; using the initial residual for both makes the relative test compare an iteration
+        // against itself and converge on step one.
+        auto initialOf = [&](const std::string& f) -> scalar
+        {
+            if (f == "U" || f == "Ux") return res.Ux;
+            if (f == "Uy") return res.Uy;
+            if (f == "Uz") return res.Uz;
+            if (f == "p")  return res.p;
+            return scalar(0);
+        };
+        auto residualOf = [&](const std::string& f) -> scalar
+        {
+            if (f == "U" || f == "Ux") return res.UxFinal;
+            if (f == "Uy") return res.UyFinal;
+            if (f == "Uz") return res.UzFinal;
+            if (f == "p")  return res.pFinal;
+            // A residualControl entry naming a field brae does not track here would otherwise decide
+            // convergence off a residual of zero -- i.e. converge instantly, on every step. Refuse
+            // instead: an unimplemented control must not silently change the algorithm.
+            throw std::runtime_error(
+                "brae: PIMPLE/residualControl names field '" + f + "', whose per-outer-iteration "
+                "residual brae does not track. Only U (Ux/Uy/Uz) and p are available. Running would "
+                "test convergence against a residual of zero and leave the outer loop immediately.");
+        };
+        if (oc == 0) return false;                       // OF: corr_ == 1 never satisfies
+        if (oc == 1)                                     // corr_ == 2: STORE, do not compare
+        {
+            for (const auto& rc : ctl_.outerResidualControl)
+                outerInitialResidual_[rc.field] = initialOf(rc.field);
+            return false;
+        }
+        bool achieved = true, checked = false;
+        for (const auto& rc : ctl_.outerResidualControl)
+        {
+            const scalar r = residualOf(rc.field);
+            const auto it = outerInitialResidual_.find(rc.field);
+            const scalar ini = (it == outerInitialResidual_.end() ? scalar(0) : it->second) + scalar(1e-300);
+            const bool abs_ = (rc.absTol > 0) && (r < rc.absTol);
+            const bool rel_ = (rc.relTol > 0) && (r / ini < rc.relTol);
+            achieved = achieved && (abs_ || rel_);
+            checked = true;
+        }
+        return checked && achieved;
+    }
+
+
+    DeviceSimpleResidual DeviceSimpleSolver::pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors,
+                                                       const std::function<void(int)>& moveMesh)
     {
         const DeviceMesh& dm = dm_;
+        // THE FIRST mesh update runs BEFORE advanceTime, not inside the loop with the others.
+        //
+        // OpenFOAM ages its fields (++runTime) and then updates the mesh, because phi.oldTime() is a
+        // stored field it reads LAZILY in pEqn, by which point the geometry is current. brae builds the
+        // old flux EAGERLY -- advanceTime turns Uf.oldTime() into phiOld against the current Sf -- so
+        // running it on pre-move geometry pairs an old face velocity with old areas, which is neither
+        // form OpenFOAM has. Measured: with the first update moved after advanceTime, movingCone went
+        // 3.6e-03 -> 8.0e-03, mixerVesselAMI2D 8.8e-03 -> 1.9e-02 and oscillatingInletACMI2D
+        // 1.3e-02 -> 2.0e-02. The additional moveMeshOuterCorrectors updates DO belong inside the loop:
+        // by then the fields are aged and only the geometry is being re-converged.
+        if (moveMesh) moveMesh(0);
         advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
         DeviceSimpleResidual res;
         const int nOuter = nOuterCorrectors > 0 ? nOuterCorrectors : 1;
@@ -3051,7 +3175,22 @@ namespace brae {
             // OF pimpleControl::loop -> mesh.data().setFinalIteration(true) on the LAST outer corrector.
             // That is the flag the bare solve() in UEqn.H and the turbulence models pick up, so U and
             // k/epsilon are on their Final entries for the whole of this iteration.
-            ctl_.finalIter = (oc == nOuter - 1);
+            // OF pimpleControl::finalIter() = converged_ || corr_ == nCorrPIMPLE_. residualControl can
+            // therefore make an EARLIER iteration the final one: when the criteria are met at the top of
+            // an iteration, OF flags that iteration final, runs it, and leaves the loop.
+            // OF calls criteriaSatisfied() at the TOP of loop(), reading the residuals the PREVIOUS
+            // iteration left in solverPerformanceDict -- so convergence detected here makes THIS
+            // iteration the final one, not the next. Checking after the body instead runs one iteration
+            // too many, which is what the contract test caught.
+            // OF pimpleFoam.C:140 -- mesh.controlledUpdate() runs on the first outer iteration, or on
+            // every one when moveMeshOuterCorrectors is set. Everything geometric that follows (AMI
+            // rebuild, moving-wall velocity, wall distance, correctPhi) is the callback's business.
+            if (moveMesh && oc > 0 && ctl_.moveMeshOuterCorrectors) moveMesh(oc);
+            if (!ctl_.outerResidualControl.empty() && !outerConverged_)
+                outerConverged_ = outerCriteriaSatisfied(res, oc);
+            ctl_.finalIter = (oc == nOuter - 1) || outerConverged_;
+            if (ctl_.solveFlow)
+            {
             solveMomentumPredictor(res);                     // momentum incl. implicit ddt
             for (int pc = 0; pc < nCorr; ++pc)               // PIMPLE pressure (inner) correctors
             {
@@ -3062,8 +3201,21 @@ namespace brae {
                 ctl_.finalInner = (pc == nCorr - 1) && (!ctl_.finalOnLastPimpleIterOnly || ctl_.finalIter);
                 correctPressureVelocity(res);
             }
-            correctTurbulence();
+            }   // solveFlow
+            // OF pimpleFoam.C: `if (pimple.turbCorr()) { laminarTransport.correct(); turbulence->correct(); }`
+            // with turbCorr() = !turbOnFinalIterOnly || finalIter(). The outer loop iterates the
+            // pressure-velocity coupling; the turbulence transport is advanced ONCE per time step unless
+            // the case asks otherwise. Correcting it every outer iteration integrates the model
+            // nOuterCorrectors times per physical step -- a different equation, not a tighter solve.
+            ++outerIterations_;
+            if (!ctl_.turbOnFinalIterOnly || ctl_.finalIter) { correctTurbulence(); ++turbCorrections_; }
+            // residualControl: evaluated from the SECOND outer iteration (OF storeInitialResiduals()
+            // returns corr_ == 2), where iteration 2's initial residuals become the reference the
+            // relative test divides by. Never on the first iteration, and never once already final.
+            if (ctl_.finalIter) break;   // OF leaves the loop after running the final iteration
         }
+        outerConverged_ = false;
+        outerInitialResidual_.clear();
         ctl_.finalIter = false;    // the steady path and anything outside the loop read the base entries
         ctl_.finalInner = false;
         // continuity errors on the corrected flux (identical to step()).

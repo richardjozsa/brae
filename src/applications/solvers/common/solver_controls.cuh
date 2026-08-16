@@ -9,6 +9,7 @@
 #include "smagorinsky_coeffs.cuh"
 #include "deshybrid_coeffs.cuh"
 #include <string>
+#include <vector>
 
 namespace brae {
 
@@ -109,6 +110,31 @@ struct DeviceSimpleControls
     // velocity (phi = Sf & Uf) and then PROJECTS it divergence-free by solving a pcorr Poisson, before
     // any momentum or pressure equation sees it. Skipping it leaves the step starting from a flux that
     // does not satisfy continuity on the mesh it is about to be used on.
+    // PIMPLE loop contract (OF pimpleControl). These are not tuning knobs -- each selects part of the
+    // pressure-velocity algorithm, so an unread one means solving a DIFFERENT algorithm.
+    //
+    // turbOnFinalIterOnly defaults to TRUE in OpenFOAM: turbulence->correct() runs ONCE per time step,
+    // on the final outer corrector, because the outer loop is iterating the pressure-velocity coupling,
+    // not the turbulence transport. brae corrected on every outer corrector, which on a case with
+    // nOuterCorrectors 5 advanced the turbulence model five times per physical step. A 30-case sweep
+    // missed it: most tutorials use nOuterCorrectors 1, where the two cadences coincide.
+    bool   turbOnFinalIterOnly = true;
+    bool   solveFlow = true;            // OF: skip the momentum/pressure solve entirely when false
+    bool   simpleRho = false;           // OF SIMPLErho: compressible rho update cadence; inert here
+    // PIMPLE residualControl: outer-loop convergence. When every controlled field meets its absolute or
+    // RELATIVE tolerance, OF runs ONE more iteration flagged as final and then leaves the loop early.
+    // That changes which iteration is `final`, and therefore which solver settings are used and when
+    // turbulence is corrected -- so it is not a cost-only control.
+    struct OuterResidualControl { std::string field; scalar absTol = 0; scalar relTol = 0; };
+    std::vector<OuterResidualControl> outerResidualControl;
+    // OF createDyMControls.H, default FALSE: the mesh moves once per time step, on the first outer
+    // iteration. When true it moves before EVERY outer corrector, so the outer loop converges the mesh
+    // position alongside the pressure-velocity coupling.
+    bool   moveMeshOuterCorrectors = false;
+    // dynamicFvMesh::controlledUpdate -- dynamicMeshDict updateControl/updateInterval (OF's timeControl
+    // with the "update" prefix). Default is every step.
+    std::string meshUpdateControl = "always";
+    int         meshUpdateInterval = 1;
     bool   correctPhi = false;
     // fvSolution solvers.pcorr -- OF's own tutorials give it a LOOSE tolerance (0.02) and relTol 0,
     // because the projection only has to remove the mapping error, not converge a pressure field.

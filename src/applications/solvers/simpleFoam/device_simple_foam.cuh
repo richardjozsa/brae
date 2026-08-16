@@ -48,6 +48,8 @@
 #include "device_fvoptions.cuh"
 #include "solver_controls.cuh"   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <vector>
 #include <cuda_runtime.h>
 
@@ -167,6 +169,20 @@ public:
     // Call after the mesh has moved and U's boundary has been refreshed, before the momentum predictor.
     // Returns the initial continuity residual of the pcorr solve (div(phi) before the projection).
     scalar correctPhi(const std::vector<FvPatch>& fvp, int nNonOrth);
+    // How many times the turbulence transport was advanced, and how many outer correctors ran, since
+    // the last reset. The PIMPLE contract is a statement about CADENCE -- turbulence once per time step
+    // by default, outer loop possibly cut short by residualControl -- and a cadence cannot be asserted
+    // from a converged field. Counting is the only way to test it.
+    long turbCorrections()  const { return turbCorrections_; }
+    long outerIterations()  const { return outerIterations_; }
+    void resetLoopCounters() { turbCorrections_ = 0; outerIterations_ = 0; }
+private:
+    long turbCorrections_ = 0, outerIterations_ = 0;
+    // PIMPLE residualControl state: outer-loop convergence flag and iteration-2 reference residuals.
+    bool outerConverged_ = false;
+    std::map<std::string, scalar> outerInitialResidual_;
+    bool outerCriteriaSatisfied(const DeviceSimpleResidual& res, int oc);
+public:
     // phi +/- mesh.phi() applied to one set of flux buffers (internal, boundary, cyclic, AMI).
     // sign -1 = fvc::makeRelative, +1 = fvc::makeAbsolute.
     void applyMeshPhi(const std::vector<FvPatch>& fvp, const std::vector<scalar>& mp, scalar sign,
@@ -214,7 +230,17 @@ public:
     void advanceTime(scalar deltaT);
     // One PIMPLE time step: advanceTime, then nOuterCorrectors x { momentum predictor (ddt folded in); nCorrectors x
     // pressure-velocity correction; turbulence }, then continuity errors. Returns the outer-loop residual signal.
-    DeviceSimpleResidual pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors);
+    // `moveMesh` is the mesh-update callback, invoked from INSIDE the outer loop at OpenFOAM's own
+    // condition: `pimple.firstIter() || moveMeshOuterCorrectors` (pimpleFoam.C:140). It receives the
+    // 0-based outer-iteration index. Passing nullptr leaves the loop static, which is every non-moving
+    // case and every other solver that shares this method.
+    //
+    // The mesh update HAS to live inside the loop to be faithful. With moveMeshOuterCorrectors true the
+    // mesh moves before every outer corrector, so the momentum and pressure equations of iteration 2
+    // are assembled on different geometry than iteration 1 -- an outer loop that also converges the
+    // mesh position. Hoisting it into the driver, as brae did, makes that flag unimplementable.
+    DeviceSimpleResidual pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors,
+                                    const std::function<void(int)>& moveMesh = nullptr);
 
     // Steady COMPRESSIBLE step (rhoSimpleFoam). Composes the same three phases as simpleStep/pimpleStep
     // with the energy equation and the thermo update inserted, in OF's rhoSimpleFoam.C order:
@@ -815,6 +841,11 @@ private:
     // the interface columns. Carrying the real field removes the approximation instead of announcing it.
     DeviceBuffer<scalar> UfInt_[3], UfBnd_[3], UfAmi_[3], UfCyc_[3];
     DeviceBuffer<scalar> UfOldInt_[3], UfOldBnd_[3], UfOldAmi_[3], UfOldCyc_[3];
+    // Second old level, for backward's fvcDdtUfCorr. OF forms it as (Sf & Uf.oldTime().oldTime()) --
+    // CURRENT areas against the two-steps-old face velocity -- so on a moving mesh it cannot be produced
+    // by ageing the phi VALUE, which would carry the older Sf along with it.
+    DeviceBuffer<scalar> UfOld2Int_[3], UfOld2Bnd_[3];
+    DeviceBuffer<scalar> phiOld2Int_, phiOld2Bnd_;
     bool   ufActive_ = false;            // set once the mesh-motion path has run: OF's mesh.dynamic()
     bool   meshPhiValid_ = false;
     DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
