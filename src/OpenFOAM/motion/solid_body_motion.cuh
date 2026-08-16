@@ -110,11 +110,15 @@ inline MeshMotion readMeshMotion(const std::string& caseDir)
     const FoamDict d = readDict(path);
 
     const std::string type = d.wordOr("dynamicFvMesh", "");
+    // staticFvMesh is OpenFOAM's explicit "this mesh does not move". A case may name it to be clear
+    // rather than to omit dynamicMeshDict, so it is ACCEPTED as no motion -- refusing it would reject a
+    // case brae handles perfectly, which is the opposite failure to the one the refusals exist for.
+    if (type == "staticFvMesh") return mm;
     if (type != "dynamicMotionSolverFvMesh")
         throw std::runtime_error(
-            "brae: constant/dynamicMeshDict dynamicFvMesh '" + type + "' is not implemented (brae "
-            "supports dynamicMotionSolverFvMesh with a solidBody motionSolver). Running it as a static "
-            "mesh would solve a different problem.");
+            "brae: constant/dynamicMeshDict dynamicFvMesh '" + type + "' is not implemented (brae has "
+            "dynamicMotionSolverFvMesh, and staticFvMesh as a no-op). Running it as a static mesh would "
+            "solve a different problem.");
 
     // OF motionSolver::New reads the name with getCompat<word>("motionSolver", {{"solver", -1666}}) --
     // `solver` is the older key and still what several v2412 tutorials write (RAS/
@@ -128,9 +132,10 @@ inline MeshMotion readMeshMotion(const std::string& caseDir)
     if (solver == "velocityComponentLaplacian") return mm;
     if (solver != "solidBody")
         throw std::runtime_error(
-            "brae: dynamicMeshDict motionSolver '" + solver + "' is not implemented. Only `solidBody` "
-            "(a prescribed rigid transform) is; the others solve a motion equation for the point field, "
-            "which brae does not do.");
+            "brae: dynamicMeshDict motionSolver '" + solver + "' is not implemented. brae has "
+            "`solidBody` (a prescribed rigid transform) and `velocityComponentLaplacian` (a Laplace "
+            "equation for one component of the point motion). The rest solve a different motion "
+            "equation, so the mesh would deform differently -- refused rather than substituted.");
 
     // OF motionSolver::coeffDict(): the `<type>Coeffs` sub-dictionary if present, else the dict itself.
     const FoamDict* co = d.subDict("solidBodyCoeffs");
