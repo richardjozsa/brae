@@ -46,7 +46,8 @@
 #include "device_amg.cuh"
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
-#include "solver_controls.cuh"   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
+#include "solver_controls.cuh"
+#include "time_controls.cuh"   // CourantNumbers   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -375,6 +376,14 @@ public:
     std::vector<scalar> nutWall() const { return dnutBndWall_.size() ? dnutBndWall_.host() : std::vector<scalar>(); }
     std::vector<scalar> cellY() const { return y_.size() ? y_.host() : std::vector<scalar>(); }   // cell wall distance (SST/SA)
     // diagnostics: the conservative face flux (internal then boundary) for continuity-error localisation.
+    // Courant number on the DEVICE, coupled interfaces included, returning two scalars.
+    //
+    // The driver used to pull phiInternal() and phiBoundary() to the host every step of an adaptive run
+    // and loop over faces and cells serially -- and it read only those two arrays, so cyclic and AMI
+    // flux never entered the sum at all. That is a correctness bug before it is a performance one: the
+    // Courant number was understated on exactly the cells a rotating interface makes fastest, and on an
+    // adjustTimeStep case the understated maxCo chooses the NEXT deltaT.
+    CourantNumbers courantNumbers(scalar deltaT) const;
     std::vector<scalar> phiInternal() const { return phiInt_.host(); }
     // The SOLVED boundary values, so the written boundaryField reports what the solve used rather than
     // echoing the input file. nut is the one that matters most: on a wall its value comes from the wall

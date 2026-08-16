@@ -2535,6 +2535,24 @@ namespace brae {
         return pr.initialResidual;
     }
 
+    CourantNumbers DeviceSimpleSolver::courantNumbers(scalar deltaT) const
+    {
+        CourantNumbers c;
+        const DeviceMesh& dm = dm_;
+        if (dm.nCells <= 0) return c;
+        DeviceBuffer<scalar> sumPhi;
+        deviceSurfaceSumMagPhi(dm, phiInt_, phiBnd_,
+                               hasCyclic_ ? &cyc_.ownCell : nullptr, hasCyclic_ ? &cyc_.phi : nullptr,
+                               hasAMI_    ? &ami_.ownCell : nullptr, hasAMI_    ? &ami_.phi : nullptr,
+                               sumPhi);
+        // OF CourantNo.H: CoNum = 0.5*max(sumPhi/V)*deltaT, meanCoNum = 0.5*(sum(sumPhi)/sum(V))*deltaT.
+        const scalar sumV = deviceSumMag(dm.V);
+        c.CoNum     = scalar(0.5)*deviceMaxRatio(sumPhi, dm.V)*deltaT;
+        c.meanCoNum = (sumV > 0) ? scalar(0.5)*(deviceSumMag(sumPhi)/sumV)*deltaT : scalar(0);
+        return c;
+    }
+
+
     void DeviceSimpleSolver::makeFluxRelative(const std::vector<FvPatch>& fvp, label nInternalFaces)
     {
         if (!meshPhiValid_ || meshPhi_.empty()) return;

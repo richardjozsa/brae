@@ -18,6 +18,7 @@
 //   backwardDdtScheme.C:96-98  coefft / coefft00 / coefft0
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
+#include "device_mesh.cuh"   // DeviceMesh: deviceSurfaceSumMagPhi needs the owner/neighbour addressing
 
 namespace brae {
 
@@ -201,6 +202,13 @@ void deviceCorrectUf(
 // STORED face velocity, which is what makes the Uf form exact on a mesh whose areas change (a rotating
 // mesh, or a cyclicACMI whose overlap mask rescales its coupled areas every step) where phi + mesh.phi()
 // is only an approximation of it.
+// fvc::surfaceSum(mag(phi)) per cell, coupled interfaces included. Pass nullptr for an absent interface.
+void deviceSurfaceSumMagPhi(const DeviceMesh& dm,
+                            const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
+                            const DeviceBuffer<label>* cycOwn, const DeviceBuffer<scalar>* cycPhi,
+                            const DeviceBuffer<label>* amiOwn, const DeviceBuffer<scalar>* amiPhi,
+                            DeviceBuffer<scalar>& out);
+
 void deviceDotSf(
     int n, const label* faceIdx,
     const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,

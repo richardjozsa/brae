@@ -767,11 +767,10 @@ try
         time.setSteps(static_cast<int>(timeControls.adjustTimeStep ? std::max(nSteps, 1L)*1000 : nSteps));
     }
     // OF setInitialDeltaT: start AT the requested Courant number rather than ramping to it.
-    auto courant = [&]() {
-        return courantNo(surfaceSumMagPhi(m.owner(), m.neighbour(), solver.phiInternal(),
-                                          solver.phiBoundary(), nC, m.nInternalFaces()),
-                         g.V(), deltaT);
-    };
+    // Device-side, and it INCLUDES the coupled-interface flux the host path silently omitted. Returns
+    // two scalars per call instead of copying the whole internal and boundary flux arrays back every
+    // step of an adaptive run. See DeviceSimpleSolver::courantNumbers.
+    auto courant = [&]() { return solver.courantNumbers(deltaT); };
     if (timeControls.adjustTimeStep)
     {
         const CourantNumbers c0 = courant();

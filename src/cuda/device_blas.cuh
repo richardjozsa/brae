@@ -12,6 +12,9 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y); 
 void   deviceCopy(DeviceBuffer<scalar>& dst, const DeviceBuffer<scalar>& src);        // dst = src (D2D)
 void   deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const scalar* diag);  // z = r/diag
 scalar deviceSumMag(const DeviceBuffer<scalar>& x);                                   // sum |x|  (reduction)
+// max over i of x[i]/y[i], skipping y[i] <= 0. The Courant number is a MAXIMUM, which cannot be built
+// from the sum/dot reductions above; this keeps it a single device pass returning one scalar.
+scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y);
 void   deviceHadamard(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b);  // out = a.*b
 void   deviceDivide(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b);     // out = a./b (0 where b==0)
 // fused multi-term BLAS-1 (fewer launches + less memory traffic, bit-identical to the separate-kernel sequences):

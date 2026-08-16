@@ -206,6 +206,70 @@ void deviceCorrectUf(
     cudaCheck(cudaGetLastError(), "correctUf");
 }
 
+namespace {
+// OF fvc::surfaceSum(mag(phi)) per cell: |phi| lands on the owner AND the neighbour of every internal
+// face, and on the owner of every boundary face.
+__global__
+void surfSumMagIntK(int nIf, const label* __restrict__ own, const label* __restrict__ nei,
+                    const scalar* __restrict__ phi, scalar* __restrict__ out)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const scalar a = fabs(phi[f]);
+    atomicAdd(&out[own[f]], a);
+    atomicAdd(&out[nei[f]], a);
+}
+__global__
+void surfSumMagOwnK(int n, const label* __restrict__ own, const scalar* __restrict__ phi,
+                    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(&out[own[i]], fabs(phi[i]));
+}
+} // namespace
+
+// surfaceSum(mag(phi)) on the device, INCLUDING the coupled interfaces.
+//
+// The host version this replaces read the internal and DeviceBoundary flux arrays only. cyclic and AMI
+// flux live in their own buffers and were simply absent, so every cell on a coupled interface had its
+// Courant number computed from a partial flux sum -- understated exactly where a rotating interface
+// makes it largest. On an adaptive-deltaT case that is not a diagnostic error: the understated maxCo
+// feeds setDeltaT and the next step is taken too large.
+void deviceSurfaceSumMagPhi(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& phiBnd,
+    const DeviceBuffer<label>*  cycOwn, const DeviceBuffer<scalar>* cycPhi,
+    const DeviceBuffer<label>*  amiOwn, const DeviceBuffer<scalar>* amiPhi,
+    DeviceBuffer<scalar>&       out)
+{
+    out.copyFrom(std::vector<scalar>(static_cast<std::size_t>(dm.nCells), scalar(0)));
+    if (dm.nInternalFaces > 0)
+    {
+        surfSumMagIntK<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(),
+                                                            dm.nei.data(), phiInt.data(), out.data());
+        cudaCheck(cudaGetLastError(), "surfSumMagInt");
+    }
+    if (dm.nBndFaces > 0 && (int)phiBnd.size() >= dm.nBndFaces)
+    {
+        surfSumMagOwnK<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), phiBnd.data(),
+                                                       out.data());
+        cudaCheck(cudaGetLastError(), "surfSumMagBnd");
+    }
+    auto addIface = [&](const DeviceBuffer<label>* own, const DeviceBuffer<scalar>* phi)
+    {
+        if (!own || !phi) return;
+        const int n = static_cast<int>(phi->size());
+        if (n == 0 || (int)own->size() < n) return;
+        surfSumMagOwnK<<<nBlocks(n), TPB>>>(n, own->data(), phi->data(), out.data());
+        cudaCheck(cudaGetLastError(), "surfSumMagIface");
+    };
+    addIface(cycOwn, cycPhi);
+    addIface(amiOwn, amiPhi);
+}
+
+
 void deviceDotSf(
     int n, const label* faceIdx,
     const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,

@@ -72,6 +72,39 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 }
 
 
+// max over cells of x/y, skipping y <= 0. This is the Courant reduction's only genuinely new shape:
+// sum and dot already exist, but the Courant NUMBER is a maximum, and a maximum cannot be assembled
+// from them. Kept as ratio-of-two-arrays rather than max(x) so the division happens in the same pass
+// and no per-cell ratio array is ever materialised.
+__global__
+void maxRatioKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scalar* result, int n)
+{
+    __shared__ scalar sdata[TPB];
+    const int tid = threadIdx.x;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = (i < n && y[i] > scalar(0)) ? (x[i]/y[i]) : scalar(0);
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] = fmax(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) atomicMax((unsigned long long*)result, __double_as_longlong(sdata[0]));
+}
+
+scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
+{
+    const int n = static_cast<int>(x.size());
+    if (n == 0 || (int)y.size() < n) return 0;
+    ensureRedScratch();
+    cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "maxratio zero");
+    maxRatioKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), g_redDev, n);
+    cudaCheck(cudaGetLastError(), "maxratio");
+    cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "maxratio result");
+    return *g_redPinned;
+}
+
+
 scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 {
     const int n = static_cast<int>(x.size());
