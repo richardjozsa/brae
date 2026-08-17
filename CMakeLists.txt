@@ -604,6 +604,19 @@ add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoS
 target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 
+# brae_rhoSimpleFoam_slice: the vertical-slice port (src/applications/solvers/rhoSimpleFoam/slice).
+#
+# SLICE 0 is a byte-faithful COPY of the shared driver, so this target exists to prove the seam -- that the
+# slice folder builds on its own, links the Tier-A infrastructure it shares rather than re-porting it, and
+# reproduces brae_rhoSimpleFoam's output exactly on a real tutorial. See slice/README.md for the tier
+# split and why the pimpleFoam port's defects motivate it.
+add_executable(brae_rhoSimpleFoam_slice
+               src/applications/solvers/rhoSimpleFoam/slice/solver/rho_simple_foam_slice.cu)
+target_include_directories(brae_rhoSimpleFoam_slice PRIVATE ${BRAE_HEADER_DIRS}
+                           src/applications/solvers/rhoSimpleFoam
+                           src/applications/solvers/rhoSimpleFoam/slice/solver)
+target_link_libraries(brae_rhoSimpleFoam_slice PRIVATE brae_core)
+
 # brae_rhoSimpleFoam_legacy: frozen snapshot of the GPU-first solver, kept runnable so the CPU-first
 # ground-truth rewrite always has a reference to diff against. See rhosimplefoam-ground-truth-port.md.
 # brae_rhoSimpleFoam keeps pointing at the current implementation until the new path passes every gate
