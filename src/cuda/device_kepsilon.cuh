@@ -364,6 +364,12 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
+// The same relation on BOUNDARY faces, which is what a `calculated` nut patch carries: OF's
+// SpalartAllmaras::correctNut does `nut_ = nuTilda_*fv1`, a GeometricField assignment, so the patch value
+// comes from nuTilda's patch value -- not from the file and not from the adjacent cell. nuFace supplies a
+// per-face nu (mu/rho) on a compressible mesh; nullptr uses the uniform nu.
+void deviceNutSABoundary(const DeviceBuffer<scalar>& nuTildaB, const DeviceBuffer<scalar>* nuFace,
+                         scalar nu, scalar Cv1, DeviceBuffer<scalar>& nutB);
 // ZDES2020 shielding fd from its eight input fields (unit-test/DES hook; the solver path builds the two
 // gradients itself inside deviceSpalartAllmarasCorrect).
 void deviceSAZdesFd(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& gradU,

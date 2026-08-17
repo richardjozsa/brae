@@ -155,6 +155,11 @@ struct DeviceSimpleControls
     bool   gsSigma = false;             // solvers/sigma smoothSolver + a GaussSeidel smoother
     bool   divULimitedV = false;
     scalar divUTwoBykV  = 2.0;   // OF limitedLinearLimiter twoByk_ = 2/max(k, SMALL); k = 1 -> 2
+    // OF LUST.H's two shares: weights() = 0.75*linear + 0.25*linearUpwind::weights(), and
+    // correction() = 0.25*linearUpwind::correction(). Named here so the matrix and the deferred
+    // correction cannot drift apart -- they have to sum to 1.
+    static constexpr scalar lustCentralFrac = 0.75;
+    static constexpr scalar lustUpwindFrac  = 0.25;
     bool   lust = false;         // div(phi,U) "LUST": deferred correction = 0.75*linear + 0.25*linearUpwind (OF LUST.H).
     bool   nonOrth = false;      // laplacian "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction. Set from fvSchemes.
     scalar nonOrthLimit = 1.0;   // snGrad "limited <psi>" coeff (OF fv::limitedSnGrad); 1.0 = "corrected" (unlimited). Set from fvSchemes.
@@ -164,6 +169,10 @@ struct DeviceSimpleControls
     bool   luK = false, luEps = false;             // div(phi,k|epsilon|nuTilda) "linearUpwind": deferred gradient correction. Set from fvSchemes.
     bool   gsK = false, gsEps = false;             // scalar linear solver = smoothSolver+symGaussSeidel (read from fvSolution solvers.{k|nuTilda} / {epsilon|omega}).
     bool   gsU = false;                            // momentum linear solver = smoothSolver+(sym)GaussSeidel (read from fvSolution solvers.U).
+    // fvSolution asked for `preconditioner DILU` on U (OF's default for the momentum equations, and the
+    // entry brae used to substitute Jacobi for). Only meaningful on the BiCGStab path -- a smoothSolver
+    // has no preconditioner in OF either.
+    bool   diluU = false;
     scalar twoBykK = 2.0, twoBykEps = 2.0;         // 2/max(k_,SMALL) from the limitedLinear coefficient (k_=1 -> 2).
     // div(phi,h|e) and div(phi,K|Ekp) -- the ENERGY equation's convection scheme (rhoSimpleFoam). Read from
     // fvSchemes like every other div scheme; brae used to hardcode upwind here and silently ignore what the

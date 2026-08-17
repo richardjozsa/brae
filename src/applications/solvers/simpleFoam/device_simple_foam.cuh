@@ -24,6 +24,7 @@
 #include "device_blas.cuh"
 #include "thermo_model.cuh"   // hConstHeToT: boundary he -> boundary T for the written field
 #include "device_pcg.cuh"
+#include "device_dilu.cuh"   // OF DILU preconditioner for the momentum BiCGStab
 #include "device_simple.cuh"
 #include "device_boundary.cuh"
 #include "thermo_types.cuh"
@@ -747,6 +748,7 @@ private:
     DeviceBuffer<scalar> nutBndFile_;   // nut's own boundaryField (OF reads nut_b from here, not cells)
     bool hasNutCalc_ = false;
     bool hasNutFixed_ = false;
+    DeviceBuffer<label> nutCalcSel_;   // complement of nutCalcMask_ (0 on calc faces), for deviceSelectFixedFlux
     DeviceBuffer<label> nutFixedMask_;   // 0 where nut's BC fixes a value on a non-wall patch
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces
     // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
@@ -864,6 +866,9 @@ private:
     bool   meshPhiValid_ = false;
     DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
     std::vector<std::pair<label, label>> cycRuns_, amiRuns_;
+    // DILU for the momentum solves (OF's `preconditioner DILU`). The level schedule depends only on the
+    // mesh addressing, so it is built once; rD is refactorised inside every solve.
+    DeviceDilu diluU_;
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)
     bool   amiNonConforming_ = false;                           // ...and a face with >1 partner -> BiCGStab (see below)
     DeviceAMI    ami_;                                          // cyclicAMI weighted-stencil coupling (translational path)

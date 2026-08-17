@@ -71,6 +71,9 @@ namespace brae {
             if (a.nbrCell.size() > a.ownCell.size()) { amiNonConforming_ = true; break; }
         if (std::getenv("BRAE_AMI_PCG")) amiNonConforming_ = false;   // attribution escape hatch
         if (hasCyclic_ || hasAMI_) ctl_.useGraph = false;   // V-cycle graph replay not interface-safe; minor perf only.
+        // The DILU level schedule: mesh addressing only, so once per solver. Skipped entirely when the
+        // case did not ask for DILU, so no case pays for it unasked.
+        if (ctl_.diluU) diluU_ = buildDeviceDilu(m.owner(), m.neighbour(), nC_);
         ctorMark("enter");
         dm_   = buildDeviceMesh(m, g, fvp);
         ctorMark("deviceMesh built");
@@ -112,7 +115,7 @@ namespace brae {
         }
         if (nut)
         {
-            std::vector<label> cm, fx;
+            std::vector<label> cm, cs, fx;
             // nut's OWN boundaryField, in DeviceBoundary face order. OF evaluates a non-wall patch's
             // nut from this, never from the adjacent cell -- extrapolating is 607x wrong at a
             // `calculated` inlet (rhosimplefoam-ground-truth-port.md section 3).
@@ -137,12 +140,14 @@ namespace brae {
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     cm.push_back(calc ? 1 : 0);
+                    // ...and its complement, because deviceSelectFixedFlux copies where the mask is ZERO.
+                    cs.push_back(calc ? 0 : 1);
                     // 0 marks "take nut's own read value here" -- the sense deviceSelectFixedFlux uses.
                     fx.push_back(nutFixed ? 0 : 1);
                     nb.push_back(pv[i]);
                 }
             }
-            if (hasNutCalc_) nutCalcMask_.copyFrom(cm);
+            if (hasNutCalc_) { nutCalcMask_.copyFrom(cm); nutCalcSel_.copyFrom(cs); }
             if (hasNutFixed_) nutFixedMask_.copyFrom(fx);
             nutBndFile_.copyFrom(nb);
         }
@@ -949,6 +954,25 @@ namespace brae {
             {
                 deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
                                           nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);
+                // SPALART-ALLMARAS: the `calculated` patches carry nuTilda_b*fv1(chi_b), which is what OF's
+                // correctNut leaves there -- `nut_ = nuTilda_*fv1` is a GeometricField assignment, so the
+                // patch value comes from nuTilda's PATCH value. brae had no SA branch here at all (the
+                // guard on the kEpsilon path reads `!ctl_.sa`), so those faces kept whatever 0/nut held.
+                //
+                // That is not a small error when 0/nut is a placeholder. On pimpleFoam/LES/vortexShed
+                // `internalField uniform 1.0e-05` with nu = 1e-05, while the physical value is
+                // nuTilda*fv1 = 1e-05*2.786e-03 = 2.79e-08 -- 360x smaller. brae's boundary nuEff came out
+                // 2.000e-05 against OpenFOAM's 1.0028e-05, so every non-wall patch's momentum
+                // internalCoeffs was 2x: predicted 1.9944, measured 1.9944 against the OF stage oracle.
+                // Same defect class as the 704x `fixedValue` inlet above, one turbulence model along.
+                if (hasNutCalc_ && ctl_.sa)
+                {
+                    DeviceBuffer<scalar> ntB, saNutB;
+                    deviceBCValue(dbK_, dk_, ntB);            // nuTilda's own patch values (dk_ is nuTilda for SA)
+                    deviceNutSABoundary(ntB, compressible_ ? &nuWallBnd_ : nullptr,
+                                        ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
+                    deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);   // calc faces only; wall faces keep Spalding
+                }
                 addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else if (ctl_.nutWall == NutWall::NutU)   // nutUWallFunction (log-law yPlus, stepwise blend)
@@ -1082,6 +1106,36 @@ namespace brae {
                 deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUlv, ctl_.gradULimitK,
                                      hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
             deviceDivLimitedVCoeffs(dm, phiInt_, Uk_, gradUlv, ctl_.divUTwoBykV, mDiag, mUp, mLo);
+        }
+        else if (ctl_.lust)
+        {
+            // LUST's blend belongs in the MATRIX, not in a deferred source. OF LUST.H:
+            //     weights()    = 0.75*linear.weights() + 0.25*linearUpwind::weights()
+            //     correction() = 0.25*linearUpwind::correction()
+            // so three quarters of the central weighting is implicit and only a quarter of the
+            // gradient term is explicit. brae assembled a PURE UPWIND matrix and carried the whole
+            // blend explicitly. The face value is the same either way, and the matrix is not: upwind
+            // puts more on the diagonal, so rAU came out too small -- and rAU is what sets the
+            // pressure-Laplacian coefficient and HbyA, so the entire pressure-velocity coupling was
+            // scaled wrong.
+            //
+            // Measured against the OF stage oracle on pimpleFoam/LES/vortexShed, ONE momentum assembly
+            // from identical inputs: brae's far-field diagonal was 1.1118x OpenFOAM's over the 112640
+            // cells that touch no boundary, and mDiag/V was 131.5 against 118.25 with 1/dt = 100 --
+            // i.e. the convection+diffusion part was ~1.7x. The same case run with `Gauss linear`,
+            // where brae's implicit weights already matched, gave a ratio of 1.0000. Downstream that
+            // 11% seeded an alternating-sign pressure mode in the second cell layer off the cylinder
+            // which grew 3-4x per step until |U| reached 1e+10 against OpenFOAM's 0.0435.
+            //
+            // fvm::div's coefficients are LINEAR in the face weight, so the blend is exact as a
+            // combination of the two schemes brae already builds -- no third kernel, and no chance of
+            // the blended form drifting from the central and upwind ones it is defined against.
+            DeviceBuffer<scalar> cD, cU, cL;
+            deviceDivCentralCoeffs(dm, phiInt_, cD, cU, cL);
+            deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
+            deviceScale(mDiag, DeviceSimpleControls::lustUpwindFrac);  deviceAxpy(DeviceSimpleControls::lustCentralFrac, cD, mDiag);
+            deviceScale(mUp,   DeviceSimpleControls::lustUpwindFrac);  deviceAxpy(DeviceSimpleControls::lustCentralFrac, cU, mUp);
+            deviceScale(mLo,   DeviceSimpleControls::lustUpwindFrac);  deviceAxpy(DeviceSimpleControls::lustCentralFrac, cL, mLo);
         }
         else                 deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
         deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
@@ -1357,13 +1411,10 @@ namespace brae {
                 else                    deviceLinearUpwindCorr(dm, phiInt_, LUx[kk], LUy[kk], LUz[kk], corr);
                 if (hasCyclic_) interfaceAddLinUpwindCorr(cyc_, kk, LUx, LUy, LUz, corr);   // + cyclic-face linearUpwind (rotated nbr)
                 if (hasAMI_)    interfaceAddLinUpwindCorr(ami_, kk, LUx, LUy, LUz, corr);      // + AMI-face linearUpwind (rotated nbr stencil)
-                if (ctl_.lust)   // OF LUST.H = 0.75*linear + 0.25*linearUpwind: scale the lU corr 0.25, add 0.75*linear corr
-                {
-                    deviceScale(corr, 0.25);
-                    DeviceBuffer<scalar> lc;
-                    deviceLinearCorr(dm, phiInt_, Uk_[kk], lc);
-                    deviceAxpy(0.75, lc, corr);   // (cyclic linear part omitted; LUST cases are non-cyclic)
-                }
+                // OF LUST.H correction() = 0.25*linearUpwind::correction(), and NOTHING else: the
+                // 0.75*linear part is carried by the implicit weights above, not here. Adding a linear
+                // deferred correction on top of the blended matrix would apply that share twice.
+                if (ctl_.lust) deviceScale(corr, DeviceSimpleControls::lustUpwindFrac);
                 deviceAxpy(-1.0, corr, relaxSrc[kk]);
             }
             if (ctl_.nonOrth)   // -fvm::laplacian source correction: -= lapCorr(nuEff, grad(U_kk))
@@ -1405,6 +1456,23 @@ namespace brae {
             if (hasAMI_ && ami_.rotational)    interfaceAddDeferredRot(ami_, Uint[0], Uint[1], Uint[2], kk, s);
             DeviceBuffer<scalar> diagC,b;
             deviceFold(dm, mDiagR, s, iC[kk], bCb[kk], diagC, b);
+            // The diagonal AFTER folding in the boundary internal coefficients -- the only form
+            // comparable to OpenFOAM's fvMatrix::D(), which is diag() + addCmptAvBoundaryDiag(). The
+            // pre-fold dump (stage_mDiagR) omits them, so near-wall cells could not be compared against
+            // the oracle at all: every boundary-adjacent cell showed a difference that was the missing
+            // term rather than a defect. Dumped per component because brae keeps the boundary diagonal
+            // per component (slip/symmetry give vf_k = |n_k|, so the three differ); OF's D() is their
+            // component average, which is what the comparison has to form.
+            const char* mdfTag = (kk == 0) ? "mDiagFold0" : (kk == 1) ? "mDiagFold1" : "mDiagFold2";
+            if (stageDumpActive() && stageDumpFirstOnly(mdfTag))
+                stageDump(std::string("stage_") + mdfTag, diagC);
+            // ...and the matching RHS. deviceFold produces both halves together (diagC gets the boundary
+            // internalCoeffs, b gets the boundaryCoeffs), so dumping only the diagonal leaves the other
+            // half of the boundary treatment unmeasurable. OF's counterpart is
+            // UEqn.source() + addBoundarySource(), which the oracle dumps as stage_mSrc + stage_mBndSrc.
+            const char* mbfTag = (kk == 0) ? "mRhsFold0" : (kk == 1) ? "mRhsFold1" : "mRhsFold2";
+            if (stageDumpActive() && stageDumpFirstOnly(mbfTag))
+                stageDump(std::string("stage_") + mbfTag, b);
             // rotational: the implicit off-diagonal for component kk is scaled by forwardT[kk][kk] (OF transformCoupleField).
             const scalar* mIfc = !hasCyclic_ ? nullptr : (cyc_.rotational ? cyc_.ifCoeffC[kk].data() : cyc_.ifCoeff.data());
             const DeviceLduView mv = hasCyclic_
@@ -1428,7 +1496,12 @@ namespace brae {
                 ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf);
             else
             {
-                uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), ctl_.uMaxIter(), ctl_.bicgCheckEvery, ctl_.uMinIter());
+                // DILU when the case asked for it. It matters most exactly where Jacobi is weakest: on a
+                // boundary-layer mesh the momentum matrix is dominated by the wall-normal coupling, and a
+                // diagonal preconditioner leaves the residual error in that direction for the PIMPLE
+                // outer loop to amplify (see device_dilu.cuh).
+                uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), ctl_.uMaxIter(), ctl_.bicgCheckEvery, ctl_.uMinIter(),
+                                             (ctl_.diluU && diluU_.valid) ? &diluU_ : nullptr);
                 ur = uperf.initialResidual;
             }
             // keep all 3 components + their final residual / nIter (OF prints Solving for Ux/Uy/Uz each iteration)

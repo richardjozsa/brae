@@ -47,7 +47,7 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
         // AN EARLIER VERSION OF THIS NOTE blamed the interface's VISCOUS coupling, "error proportional to
         // nuEff, the explicit half of UEqn.H()". That was withdrawn: the probe behind it selected its
         // reference with runTime.times().last() and read a stale 0.011 directory while comparing against
-        // 0.01. The free run at nu = 1e-3 agrees to 6.7e-08. See ACMI-HANDOFF.md.
+        // 0.01. The free run at nu = 1e-3 agrees to 6.7e-08. See ACMI-HANDOFF.md (kept in cudafoam/, outside the repo).
         //
         // THE OLD JUSTIFICATION HERE WAS WRONG, and is kept because it cost a long hunt. It read
         // "contLocal ~0.33 where OF reaches 1e-14, concentrated on the cells touching the interface".

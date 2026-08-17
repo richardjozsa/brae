@@ -2,7 +2,9 @@
 //
 // Found by dict_audit, which reported solvers/p/solver, solvers/p/smoother and
 // solvers/(U|h|e)/preconditioner as read off disk by nobody. brae runs AMG-PCG for pressure and
-// Jacobi-preconditioned BiCGStab elsewhere, whatever the dict says.
+// Jacobi-preconditioned BiCGStab elsewhere, whatever the dict says -- except U, whose DILU request is
+// now honoured (device_dilu.cuh), which is why this file asserts U's preconditioner notice is ABSENT
+// while the energy one is still present.
 //
 // This NOTICES rather than refuses, and the distinction is the whole design decision. A substituted
 // linear solver is not a wrong answer: it solves the same linear system to the same tolerance, so the
@@ -92,7 +94,12 @@ int main()
         check("p solver substitution is reported", has(out, "solvers/p solver") && has(out, "GAMG") && has(out, "AMG-PCG"), out);
         check("p smoother is reported ignored", has(out, "solvers/p smoother") && has(out, "DICGaussSeidel"), out);
         check("U solver substitution is reported", has(out, "solvers/U solver") && has(out, "PBiCGStab"), out);
-        check("U preconditioner is reported", has(out, "solvers/U preconditioner") && has(out, "DILU"), out);
+        // U's DILU is now IMPLEMENTED (device_dilu.cuh), so it must NOT be reported as a substitution --
+        // a notice that brae approximates something it actually runs is as misleading as a silent
+        // substitution, and it is what would hide the next real one. The energy check below is the
+        // other half: DILU is wired for the momentum path only, and `e` must still say so.
+        check("U preconditioner is NOT reported: DILU is implemented for the momentum solves",
+              !has(out, "solvers/U preconditioner"), out);
         check("energy preconditioner is reported", has(out, "solvers/e preconditioner") && has(out, "DILU"), out);
         // The wording must carry the reason, not just the fact -- a bare "ignored" would read as a bug.
         check("the notice explains the consequence", has(out, "iteration count and cost differ"), out);
