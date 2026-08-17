@@ -73,7 +73,7 @@ add_library(brae_core STATIC
     src/finiteVolume/fvMesh/fv_patch.cu
     src/OpenFOAM/decompose/scotch_decomposition.cu
     src/OpenFOAM/decompose/domain_decomposition.cu
-    src/TurbulenceModels/wallFunctions/nut_wall_function.cu
+    src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nut_wall_function.cu
     src/finiteVolume/finiteVolume/fvc.cu
     src/finiteVolume/finiteVolume/fvm.cu
     src/OpenFOAM/matrices/ldu_spmv.cu
@@ -526,6 +526,14 @@ target_include_directories(test_divdevreff PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_divdevreff PRIVATE brae_core)
 add_test(NAME divdevreff
          COMMAND test_divdevreff ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+
+# TURBULENT gate for the rebuilt loop: one k-epsilon SIMPLE iteration from OpenFOAM's CONVERGED solution
+# must leave it there, with a laminar control proving nut really reaches the momentum equation.
+add_executable(test_simple_turbulent_cpp tests/test_simple_turbulent_cpp.cu)
+target_include_directories(test_simple_turbulent_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_turbulent_cpp PRIVATE brae_core)
+add_test(NAME simple_turbulent_cpp
+         COMMAND test_simple_turbulent_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 
 add_executable(test_simple_turbulent tests/test_simple_turbulent.cu)
 target_include_directories(test_simple_turbulent PRIVATE ${BRAE_HEADER_DIRS})
@@ -1551,6 +1559,15 @@ target_link_libraries(test_gpu_momentum PRIVATE brae_core)
 add_test(NAME gpu_momentum COMMAND test_gpu_momentum ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
 # GPU offload G7: SIMPLE coupling glue on device (H/rAU/phiHbyA/matrixFlux/corrector)
+# CUDA vs the _cpp REFERENCE at stage granularity. Closes the chain OpenFOAM -> _cpp -> CUDA: every other
+# GPU test compares the device against CPU code written inline in that same test, which proves consistency
+# but not correctness.
+add_executable(test_gpu_vs_cpp tests/test_gpu_vs_cpp.cu)
+target_include_directories(test_gpu_vs_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_vs_cpp PRIVATE brae_core)
+add_test(NAME gpu_vs_cpp
+         COMMAND test_gpu_vs_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282)
+
 add_executable(test_gpu_simple tests/test_gpu_simple.cu)
 target_include_directories(test_gpu_simple PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_simple PRIVATE brae_core)
