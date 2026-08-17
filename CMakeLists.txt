@@ -86,6 +86,10 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
+    src/applications/solvers/simpleFoam/pEqn_cpp.cu
+    src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
+    src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
     src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
@@ -433,11 +437,27 @@ target_link_libraries(test_vector_solve PRIVATE brae_core)
 add_test(NAME vector_solve
          COMMAND test_vector_solve ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
 
+# The _cpp reference for pEqn.H, stage by stage: rAU/HbyA vs OpenFOAM's A()/H() (ops.dat), the pressure
+# Laplacian vs peqn.dat, then setReference / correctFlux / relax asserted analytically, plus the refusals.
+add_executable(test_peqn_cpp tests/test_peqn_cpp.cu)
+target_include_directories(test_peqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_peqn_cpp PRIVATE brae_core)
+add_test(NAME peqn_cpp
+         COMMAND test_peqn_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
+
 add_executable(test_peqn_matrix tests/test_peqn_matrix.cu)
 target_include_directories(test_peqn_matrix PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_peqn_matrix PRIVATE brae_core)
 add_test(NAME peqn_matrix
          COMMAND test_peqn_matrix ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
+
+# END-TO-END gate for the rebuilt simpleFoam: one SIMPLE iteration composed of the _cpp components,
+# against OpenFOAM's own dumpSimpleStep output. Proves the composition, not just the parts.
+add_executable(test_simple_step_cpp tests/test_simple_step_cpp.cu)
+target_include_directories(test_simple_step_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_step_cpp PRIVATE brae_core)
+add_test(NAME simple_step_cpp
+         COMMAND test_simple_step_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpSimple)
 
 add_executable(test_simple_step tests/test_simple_step.cu)
 target_include_directories(test_simple_step PRIVATE ${BRAE_HEADER_DIRS})
