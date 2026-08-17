@@ -356,13 +356,20 @@ COMPONENTS = {
              classification="GPU_REQUIRED", status="REVALIDATE_EXISTING",
              brae_existing="src/cuda/device_simple.cu, src/cuda/device_fvm.cu",
              brae_target="src/applications/solvers/simpleFoam/",
-             validation="tests/test_gpu_vs_cpp.cu -- CUDA against the _cpp reference at STAGE granularity "
-                        "on validation/matrixDumpAsym: rAU 1.2e-16, pEqn upper/lower 0, diag 2.7e-16, "
-                        "pEqn.flux() 0, setReference 0. Two controls fire.",
+             validation="tests/test_gpu_vs_cpp.cu -- CUDA against the _cpp reference at STAGE granularity, "
+                        "run on BOTH a laminar case (matrixDumpAsym/282) and a TURBULENT one "
+                        "(pitzDailyTurb/1576, nuEff varying per cell and per boundary face). "
+                        "PRESSURE: rAU 1.5e-16, laplacian upper/lower 0 diag 1.4e-16, pEqn.flux() 0, "
+                        "setReference 0. MOMENTUM: div(phi,U) upper/lower 0 diag 4.6e-18, divDevReff "
+                        "source 4.8e-15/5.6e-16/2.4e-16, H(U) 3.8e-16/2.3e-16/2.4e-16, phiHbyA 0, "
+                        "corrector 0. TURBULENCE: GbyNu 7.6e-17, nut 0. Three controls fire.",
              note="Closes the chain OpenFOAM -> _cpp -> CUDA. Every other GPU test compares the device "
                   "against CPU code written inline in that same test, which proves consistency but not "
-                  "correctness. The stages checked so far are the pressure side; the momentum assembly "
-                  "and the turbulence kernels are not yet compared this way."),
+                  "correctness. Running on a turbulent case as well is what makes it load-bearing: with "
+                  "constant nuEff a kernel that mishandles a per-face diffusivity, or reads the owner "
+                  "cell's value on a wall instead of the patch value, still agrees perfectly. NOT yet "
+                  "compared this way: the linear solves themselves, the wall functions (G0/eps0), and the "
+                  "k/epsilon transport assembly."),
 
         # ---- determinism ---------------------------------------------------------------------
         dict(name="deterministic_assembly", of_symbol="(brae-specific)",
