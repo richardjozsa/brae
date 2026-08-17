@@ -83,6 +83,7 @@ add_library(brae_core STATIC
     src/cuda/blas1.cu
     src/cuda/reductions.cu
     src/cuda/device_spmv.cu
+    src/cuda/device_dilu.cu
     src/cuda/device_pcg.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
@@ -1195,6 +1196,14 @@ target_include_directories(test_courant_device PRIVATE ${BRAE_HEADER_DIRS} ${CMA
 target_link_libraries(test_courant_device PRIVATE brae_core)
 add_test(NAME courant_device COMMAND test_courant_device)
 
+add_executable(test_lust_implicit tests/test_lust_implicit.cu)
+target_include_directories(test_lust_implicit PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_lust_implicit PRIVATE brae_core)
+add_test(NAME lust_implicit COMMAND test_lust_implicit)
+add_executable(test_dilu tests/test_dilu.cu)
+target_include_directories(test_dilu PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_dilu PRIVATE brae_core)
+add_test(NAME dilu COMMAND test_dilu)
 add_executable(test_relaxation_final tests/test_relaxation_final.cu)
 target_include_directories(test_relaxation_final PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_relaxation_final PRIVATE brae_core)

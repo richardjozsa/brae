@@ -17,7 +17,7 @@ finiteVolume (plus the turbulence wall functions), the finiteVolume schemes, the
 turbulence models, fvOptions, and the mesh-motion classes. OpenFOAM's thermophysical, regionModel,
 lagrangian and multiphase trees register many more types that this solver cannot select.
 
-Usage:  python3 tools/pimplefoam_coverage.py [--of <OpenFOAM src>] [--out docs/pimplefoam-coverage.md]
+Usage:  python3 tools/pimplefoam_coverage.py [--of <OpenFOAM src>] [--out ../pimplefoam-coverage.md]
 """
 
 import argparse
@@ -217,7 +217,8 @@ def build(ofsrc):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--of", default=os.environ.get("FOAM_SRC", "/usr/lib/openfoam/openfoam2412/src"))
-    ap.add_argument("--out", default=os.path.join(BRAE, "docs/pimplefoam-coverage.md"))
+    # kept outside the repo, alongside the other handoff notes in cudafoam/
+    ap.add_argument("--out", default=os.path.join(BRAE, "..", "pimplefoam-coverage.md"))
     a = ap.parse_args()
     if not os.path.isdir(a.of):
         sys.exit(f"OpenFOAM src not found: {a.of}")

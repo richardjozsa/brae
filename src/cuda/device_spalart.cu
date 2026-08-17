@@ -481,6 +481,29 @@ void deviceSpalartAllmarasCorrect(
 
 // Standalone SA correctNut (nut = nuTilda*fv1), used by the solver's startup validate() (OF
 // eddyViscosity::validate()->correctNut()), so the FIRST momentum predictor sees a consistent nut.
+// Boundary variant: nu VARIES per face on a compressible mesh (nu = mu/rho), so the scalar-nu form
+// would be wrong there. nuFace == nullptr falls back to the uniform nu.
+__global__
+void saNutFaceKernel(int n, const scalar* __restrict__ nt, const scalar* __restrict__ nuFace,
+                     scalar nu, scalar Cv1, scalar* __restrict__ nut)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const scalar nuL = nuFace ? nuFace[i] : nu;
+    const scalar chi = nt[i]/nuL, chi3 = chi*chi*chi, Cv13 = Cv1*Cv1*Cv1;
+    nut[i] = nt[i] * (chi3 / (chi3 + Cv13));
+}
+
+void deviceNutSABoundary(const DeviceBuffer<scalar>& nuTildaB, const DeviceBuffer<scalar>* nuFace,
+                         scalar nu, scalar Cv1, DeviceBuffer<scalar>& nutB)
+{
+    const int n = static_cast<int>(nuTildaB.size());
+    nutB.resize(n);
+    saNutFaceKernel<<<nBlocks(n), TPB>>>(n, nuTildaB.data(), nuFace ? nuFace->data() : nullptr,
+                                         nu, Cv1, nutB.data());
+    cudaCheck(cudaGetLastError(), "SA correctNut (boundary)");
+}
+
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut)
 {
     const int nC = static_cast<int>(nuTilda.size());

@@ -6,6 +6,7 @@
 // normalisation, passed from the host. Solves to the same converged solution as the CPU solver.
 #include "cf_types.cuh"
 #include "device_ldu.cuh"
+#include "device_dilu.cuh"   // optional DILU preconditioner (nullptr -> Jacobi, the historical behaviour)
 #include "device_buffer.cuh"
 #include <cuda_runtime.h>
 #include <vector>
@@ -40,13 +41,19 @@ DeviceSolverPerf deviceJacobiPCG(const DeviceLduView& A, const DeviceBuffer<scal
                                  scalar tol, scalar relTol, int maxIter, int minIter = 0);
 
 // Jacobi-preconditioned BiCGStab for the NON-symmetric momentum matrix (upwind convection -> upper!=lower).
-// Same recurrence as brae::pbicgstab, Jacobi in place of DILU; device-resident.
+// Same recurrence as brae::pbicgstab; device-resident.
+//
+// `precon` selects the preconditioner: nullptr keeps Jacobi (w = r/diag), a DeviceDilu runs OpenFOAM's
+// DILU. That is not a tuning knob -- both reach the requested relTol, but they leave the residual error
+// in different modes, and on a boundary-layer mesh Jacobi leaves it in the wall-normal direction where
+// the PIMPLE outer loop amplifies it (see device_dilu.cuh).
 // checkEvery: read the |s|/|r| convergence norms (the 2 of 4 D2H reads/iter that aren't breakdown guards) only every
 // K iters -> batched convergence, like deviceAMGPCG's checkEvery. Breakdown guards (rA0rA, omega) stay per-iter for
 // safety. K=1 = exact (bit-identical); K>1 overshoots convergence by < K iters. Default 1.
 DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                       DeviceBuffer<scalar>& psi, scalar normFactor,
-                                      scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0);
+                                      scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0,
+                                      const DeviceDilu* precon = nullptr);
 
 class DeviceHalo;   // forward (parallel/pstream/device_halo.cuh)
 

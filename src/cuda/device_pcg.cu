@@ -108,9 +108,18 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     scalar relTol,
     int maxIter,
     int checkEvery,
-    int minIter)
+    int minIter,
+    const DeviceDilu* precon)
 {
     const int nC = A.nCells;
+    // rD depends on the matrix, which changes every solve (the momentum diagonal moves every outer
+    // corrector), so the factorisation is rebuilt here rather than cached with the schedule.
+    if (precon && precon->valid) diluUpdate(A, *const_cast<DeviceDilu*>(precon));
+    auto applyPrecon = [&](DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& in)
+    {
+        if (precon && precon->valid) diluApply(A, *precon, in, out);
+        else                         deviceJacobi(out, in, A.diag);
+    };
     const int K = (checkEvery > 1) ? checkEvery : 1;             // convergence-read cadence (1 = exact per-iter)
     DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC), AyA(nC), sA(nC), zA(nC), tA(nC), Ax(nC);
 
@@ -146,7 +155,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
                 bicgBetaK<<<1,1>>>(s.rr.data(), s.rrOld.data(), s.alpha.data(), s.omega.data(), s.beta.data(), s.bd.data());
                 deviceFusedBicgP(rA, pA, AyA, s.beta.data(), s.negOmega.data());            // pA = rA + beta*(pA - omega*AyA)  [fused 3->1]
             }
-            deviceJacobi(yA, pA, A.diag);
+            applyPrecon(yA, pA);
             deviceAmul(A, yA, AyA);          // yA = M^-1 pA; AyA = A yA
             deviceDotInto(rA0, AyA, s.r0Ay.data());
             bicgAlphaK<<<1,1>>>(s.rr.data(), s.r0Ay.data(), s.alpha.data(), s.negAlpha.data(), s.bd.data());   // alpha = rA0rA/(rA0.AyA), guarded
@@ -163,7 +172,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
                     break;
                 }
             }
-            deviceJacobi(zA, sA, A.diag);
+            applyPrecon(zA, sA);
             deviceAmul(A, zA, tA);           // zA = M^-1 sA; tA = A zA
             deviceDotInto(tA, tA, s.tt.data());
             deviceDotInto(tA, sA, s.ts.data());

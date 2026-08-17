@@ -117,10 +117,9 @@ inline void readLinearSolverControls(
         if (!smoo.empty() && !gs)
             noticeIgnored("solvers/" + f + " smoother",
                           "'" + smoo + "' -- brae is not running a smoothSolver on this field");
-        // brae's Krylov solvers are Jacobi (diagonal) preconditioned throughout; there is no selection.
-        // Reported even on the smoothSolver path is wrong -- a smoothSolver has no preconditioner in OF
-        // either, so the entry would be inert there too.
-        if (!prec.empty() && !gs && prec != "diagonal" && prec != "none")
+        // DILU is now implemented (device_dilu.cuh), so only the preconditioners brae still substitutes
+        // are reported. A smoothSolver has no preconditioner in OF either, so the entry is inert there.
+        if (!prec.empty() && !gs && prec != "diagonal" && prec != "none" && prec != "DILU")
             noticeApproximated("solvers/" + f + " preconditioner",
                                "case asks '" + prec + "', brae preconditions with Jacobi (diagonal)");
     };
@@ -163,6 +162,13 @@ inline void readLinearSolverControls(
     ctl.gsU = useSymGS("U");
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;
+    // DILU on the momentum equations, when the case asks for it and brae is on the BiCGStab path.
+    {
+        const FoamDict* su = solvers ? solvers->subDict("U") : nullptr;
+        ctl.diluU = !ctl.gsU && su && su->wordOr("preconditioner", "") == "DILU";
+        if (const char* e = std::getenv("BRAE_DILU"))   // attribution escape hatch, both directions
+            ctl.diluU = (std::atoi(e) != 0) && !ctl.gsU;
+    }
     // p is never the case's choice: brae runs AMG-PCG (Jacobi-PCG on an interface-coupled mesh, where the
     // Galerkin coarse operator cannot represent the interface edges) whatever the dict says.
     noticeSolverChoice("p", "AMG-PCG", false);   // p never takes the smoothSolver path
