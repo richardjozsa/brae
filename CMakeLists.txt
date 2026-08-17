@@ -88,6 +88,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
     src/applications/solvers/simpleFoam/UEqn.cu
     src/applications/solvers/simpleFoam/pEqn.cu
+    src/applications/solvers/simpleFoam/simpleFoam.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
@@ -475,6 +476,15 @@ add_test(NAME peqn_matrix
 
 # END-TO-END gate for the rebuilt simpleFoam: one SIMPLE iteration composed of the _cpp components,
 # against OpenFOAM's own dumpSimpleStep output. Proves the composition, not just the parts.
+# END-TO-END: the CUDA driver against the _cpp driver, one iteration.
+add_executable(test_simple_step_cuda tests/test_simple_step_cuda.cu)
+target_include_directories(test_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_step_cuda PRIVATE brae_core)
+add_test(NAME simple_step_cuda
+         COMMAND test_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpSimple 282 laminar)
+add_test(NAME simple_step_cuda_turbulent
+         COMMAND test_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
 add_executable(test_simple_step_cpp tests/test_simple_step_cpp.cu)
 target_include_directories(test_simple_step_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_step_cpp PRIVATE brae_core)
