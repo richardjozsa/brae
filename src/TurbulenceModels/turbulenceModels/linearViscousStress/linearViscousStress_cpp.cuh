@@ -57,6 +57,20 @@
 namespace brae {
 namespace cpu {
 
+// nuEff interpolated to faces, the way OpenFOAM's fvm::laplacian(volScalarField, U) does it.
+//
+// Internal faces are the linear (weight-based) interpolation. BOUNDARY faces take the boundary field of
+// nuEff -- NOT the owner cell's value. On a wall with a nut wall function those differ by the whole of
+// nut_wall, and using the cell value silently under-predicts wall shear; brae has been bitten by exactly
+// this before (the boundary_mu_eff gate). Public because UEqn_cpp assembles the same implicit laplacian
+// and must use the same face viscosity -- two copies of this rule is two chances to get it wrong.
+SurfaceScalarField effectiveFaceViscosity(
+    const std::vector<scalar>& nuEff,
+    const std::vector<std::vector<scalar>>& nuEffBnd,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches);
+
 // The EXPLICIT half: -fvc::div(nuEff*dev2(T(grad(U)))), returned as a per-cell vector (already divided by
 // V by fvc::div, exactly as OpenFOAM's surfaceIntegrate does).
 //

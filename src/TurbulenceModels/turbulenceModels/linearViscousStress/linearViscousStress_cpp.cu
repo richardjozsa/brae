@@ -4,16 +4,9 @@
 namespace brae {
 namespace cpu {
 
-namespace {
-
-// nuEff interpolated to faces, the way OpenFOAM's fvm::laplacian(volScalarField, U) does it.
-//
-// Internal faces are the linear (weight-based) interpolation. BOUNDARY faces take the boundary field of
-// nuEff -- NOT the owner cell's value. On a wall with a nut wall function those differ by the whole of
-// nut_wall, and using the cell value silently under-predicts wall shear. brae has been bitten by exactly
-// this before (validation/bc_vs_openfoam.sh, the boundary_mu_eff gate), which is why the boundary array is
-// a required argument here rather than something this function is allowed to invent.
-SurfaceScalarField interpolateEff(
+// Declared in the header; see the note there. The boundary array is a required argument rather than
+// something this function is allowed to invent.
+SurfaceScalarField effectiveFaceViscosity(
     const std::vector<scalar>& nuEff,
     const std::vector<std::vector<scalar>>& nuEffBnd,
     const PrimitiveMesh& m,
@@ -30,8 +23,6 @@ SurfaceScalarField interpolateEff(
     }
     return gf;
 }
-
-} // namespace
 
 
 std::vector<vector> divDevReffExplicit(
@@ -89,7 +80,7 @@ void addDivDevReff(
 {
     // Implicit half: OpenFOAM writes `- fvm::laplacian(nuEff, U)` inside divDevReff, and UEqn.H adds
     // divDevReff to the equation -- so the laplacian enters with coefficient -1.
-    const SurfaceScalarField gammaf = interpolateEff(nuEff, nuEffBnd, m, g, patches);
+    const SurfaceScalarField gammaf = effectiveFaceViscosity(nuEff, nuEffBnd, m, g, patches);
     addEqual(UEqn, fvm::laplacian<vector>(gammaf, U, m, g, patches), -1.0);
 
     // Explicit half. OpenFOAM's equation reads  M(U) + divDevReff(U) == 0, i.e. the explicit term sits on
