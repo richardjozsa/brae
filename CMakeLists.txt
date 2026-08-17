@@ -86,6 +86,8 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
+    src/applications/solvers/simpleFoam/UEqn.cu
+    src/applications/solvers/simpleFoam/pEqn.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
@@ -413,6 +415,17 @@ add_test(NAME pbicgstab
 
 # The _cpp reference for UEqn.H, validated by decomposition against the same OpenFOAM momentum dump:
 # core vs OpenFOAM, then the dev2 term's effect isolated, then relaxation, then the MRF/fvOptions refusals.
+# The CUDA UEqn against the _cpp reference, field by field (decomposed: diag/upper/lower, the three
+# sources, and every boundary coefficient on every patch). Laminar and turbulent, because with constant
+# nuEff a per-face-diffusivity error cannot show up.
+add_executable(test_ueqn_cuda tests/test_ueqn_cuda.cu)
+target_include_directories(test_ueqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ueqn_cuda PRIVATE brae_core)
+add_test(NAME ueqn_cuda
+         COMMAND test_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME ueqn_cuda_turbulent
+         COMMAND test_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
 add_executable(test_ueqn_cpp tests/test_ueqn_cpp.cu)
 target_include_directories(test_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_ueqn_cpp PRIVATE brae_core)
@@ -439,6 +452,15 @@ add_test(NAME vector_solve
 
 # The _cpp reference for pEqn.H, stage by stage: rAU/HbyA vs OpenFOAM's A()/H() (ops.dat), the pressure
 # Laplacian vs peqn.dat, then setReference / correctFlux / relax asserted analytically, plus the refusals.
+# The CUDA pEqn against the _cpp reference, stage by stage. Laminar and turbulent.
+add_executable(test_peqn_cuda tests/test_peqn_cuda.cu)
+target_include_directories(test_peqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_peqn_cuda PRIVATE brae_core)
+add_test(NAME peqn_cuda
+         COMMAND test_peqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME peqn_cuda_turbulent
+         COMMAND test_peqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
 add_executable(test_peqn_cpp tests/test_peqn_cpp.cu)
 target_include_directories(test_peqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_peqn_cpp PRIVATE brae_core)
