@@ -77,8 +77,29 @@ run_case()
         bad=$((bad + 1))
         return
     fi
-    if [ "$b" = "$o" ]; then
-        echo "  $tag: OK  [$o]"
+    # THE CADENCE IS COMPARED EXACTLY; THE LAST ENTRY IS THE CONVERGENCE TIME AND IS ALLOWED ONE STEP.
+    #
+    # This case stops on residualControl (p/U/h at 1e-6), so the final directory's name is decided by the
+    # LINEAR SOLVER, not by any of the keys this test exists to check. Once brae honoured the case's
+    # `preconditioner DILU` it converged one iteration sooner than OpenFOAM -- brae 103, OF 104 -- and an
+    # exact set match turned that into three red cadences. Reverting to Jacobi restores 104 exactly
+    # (verified with BRAE_DILU=0), so the difference is a better preconditioner reaching the same
+    # tolerance a step earlier, not a cadence defect.
+    #
+    # So: every write BEFORE the final one must match exactly, and the final one within one deltaT. That
+    # still pins everything the keys control -- the 20/40/60/80/100 interval latch, purgeWrite's FIFO
+    # keeping only the last two, and runTime's fractional %g names -- and it still fails on the defect
+    # this file was written for (the compressible driver writing ONE directory, at the end), because that
+    # collapses the head to `0` and trips the exact comparison.
+    local bh oh bl ol
+    bh=$(echo "$b" | awk '{for(i=1;i<NF;i++) printf "%s ", $i}')
+    oh=$(echo "$o" | awk '{for(i=1;i<NF;i++) printf "%s ", $i}')
+    bl=$(echo "$b" | awk '{print $NF}')
+    ol=$(echo "$o" | awk '{print $NF}')
+    if [ "$bh" = "$oh" ] && awk -v a="$bl" -v c="$ol" -v d="$dt" \
+           'BEGIN { e=(a>c)?a-c:c-a; exit !(e <= d + 1e-9) }'; then
+        if [ "$b" = "$o" ]; then echo "  $tag: OK  [$o]"
+        else echo "  $tag: OK  [$o]  (brae final $bl, within one deltaT of OF $ol -- residualControl)"; fi
     else
         echo "  $tag: FAIL"
         echo "        brae: [$b]"

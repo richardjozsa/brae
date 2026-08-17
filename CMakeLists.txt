@@ -662,6 +662,12 @@ set_tests_properties(tracer_transport PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
 
 add_test(NAME boundary_mu_eff COMMAND test_boundary_mu_eff
          ${CMAKE_CURRENT_SOURCE_DIR}/validation/airfoil 0)
+# validation/ is .gitignore'd wholesale, so the airfoil case reaches a fresh checkout only if it was
+# force-added. Without this the test's 77 (its "fixture absent" code) is reported as a FAILURE, which
+# reads like a solver bug rather than a missing file. Skipping is the fallback, not the intent: airfoil is
+# the only checked-in case with faces where the patch nut and the cell nut differ, so a skip here means
+# this gate proves nothing -- the fixture belongs in the repo.
+set_tests_properties(boundary_mu_eff PROPERTIES SKIP_RETURN_CODE 77)
 
 # rhoSimpleFoam phase 3 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam on a heated duct.
 # Needs an OF install; skipped (77) if absent.
