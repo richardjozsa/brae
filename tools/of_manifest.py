@@ -58,11 +58,18 @@ COMPONENTS = {
              of_file="applications/solvers/incompressible/simpleFoam/simpleFoam.C",
              classification="HOST_ONLY", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/simpleFoam/simpleFoam_cpp.cu",
+             brae_cuda="src/applications/solvers/simpleFoam/simpleFoam.cu",
              brae_target="src/applications/solvers/simpleFoam/simpleFoam.cu",
              validation="tests/test_simple_step_cpp.cu -- END-TO-END, one SIMPLE iteration composed of the "
                         "_cpp components vs OpenFOAM dumpSimpleStep (validation/matrixDumpSimple/step.dat): "
                         "p 2.5e-11, U 1.6e-12, phi 1.2e-11, every boundary patch <= 3.5e-13. Gate set at "
-                        "1e-9, not the 1e-5 the older step test uses.",
+                        "1e-9, not the 1e-5 the older step test uses. "
+                        "CUDA DRIVER: tests/test_simple_step_cuda.cu runs the device driver and the _cpp "
+                        "driver for one iteration from the same fields, laminar and turbulent -- U/p/phi "
+                        "agree to 4.1e-09 or better, and the pre-solve p residual to 2.6e-12 ABSOLUTE. "
+                        "The gate is 1e-7 because the two paths run DIFFERENT Krylov methods (host "
+                        "GAMG/BiCGStab vs device AMG-PCG/BiCGStab); the 1e-16 arithmetic gates are "
+                        "test_ueqn_cuda and test_peqn_cuda.",
              note="The _cpp driver owns NO numerics -- 9 calls into shared components, each with its own "
                   "OpenFOAM provenance and test. Replaces a 3578-line file that pimpleFoam, rhoSimpleFoam "
                   "and five common/ headers all included. NOTE ON THE FIXTURE: matrixDumpSimple's "
