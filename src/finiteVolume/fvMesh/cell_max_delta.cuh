@@ -96,4 +96,44 @@ inline std::vector<scalar> cellWallNormalSpacing(
     return hwn;
 }
 
+// OF LESModels::maxDeltaxyz::calcDelta() -- the LES FILTER WIDTH a case selects with `delta maxDeltaxyz`:
+//
+//     hmax[c] = deltaCoeff * max over the cell's faces of |n_f . (Cf_f - C_c)|
+//
+// i.e. twice the largest distance from the cell centre to a face PLANE, with deltaCoeff defaulting to 2
+// (maxDeltaxyz.C:118). On a Cartesian hex that is exactly max(dx, dy, dz) and agrees with the vertex
+// bounding box above; on a curvilinear or skewed cell it does not, which is why this is a separate
+// function rather than a rename. cellMaxDeltaXYZ stays the IDDES hmax it has always been.
+inline std::vector<scalar> cellMaxDeltaFaceNormal(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    scalar deltaCoeff = 2.0)
+{
+    const label nCells = m.nCells();
+    const label nFaces = m.nFaces();
+    const label nIntF  = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<vector>& C  = g.C();
+    const std::vector<vector>& Cf = g.Cf();
+    const std::vector<vector>& Sf = g.Sf();
+    const std::vector<scalar>& mag = g.magSf();
+
+    std::vector<scalar> h(nCells, 0.0);
+    auto take = [&](label c, label f)
+    {
+        if (c < 0 || c >= nCells) return;
+        const scalar a = mag[f];
+        if (!(a > scalar(0))) return;                       // an uncovered ACMI face has no normal to speak of
+        const vector n{Sf[f].x/a, Sf[f].y/a, Sf[f].z/a};
+        const vector d{Cf[f].x - C[c].x, Cf[f].y - C[c].y, Cf[f].z - C[c].z};
+        const scalar t = std::fabs(n.x*d.x + n.y*d.y + n.z*d.z);
+        if (t > h[c]) h[c] = t;
+    };
+    for (label f = 0; f < nFaces; ++f) take(own[f], f);
+    for (label f = 0; f < nIntF;  ++f) take(nei[f], f);
+    for (label c = 0; c < nCells; ++c) h[c] *= deltaCoeff;
+    return h;
+}
+
 } // namespace brae

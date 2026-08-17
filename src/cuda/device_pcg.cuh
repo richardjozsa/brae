@@ -37,7 +37,7 @@ scalar deviceNormFactor(const DeviceLduView& A, const DeviceBuffer<scalar>& psi,
 
 DeviceSolverPerf deviceJacobiPCG(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                  DeviceBuffer<scalar>& psi, scalar normFactor,
-                                 scalar tol, scalar relTol, int maxIter);
+                                 scalar tol, scalar relTol, int maxIter, int minIter = 0);
 
 // Jacobi-preconditioned BiCGStab for the NON-symmetric momentum matrix (upwind convection -> upper!=lower).
 // Same recurrence as brae::pbicgstab, Jacobi in place of DILU; device-resident.
@@ -46,7 +46,7 @@ DeviceSolverPerf deviceJacobiPCG(const DeviceLduView& A, const DeviceBuffer<scal
 // safety. K=1 = exact (bit-identical); K>1 overshoots convergence by < K iters. Default 1.
 DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                       DeviceBuffer<scalar>& psi, scalar normFactor,
-                                      scalar tol, scalar relTol, int maxIter, int checkEvery = 1);
+                                      scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0);
 
 class DeviceHalo;   // forward (parallel/pstream/device_halo.cuh)
 

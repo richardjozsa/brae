@@ -52,7 +52,8 @@ void deviceGByNuFromGradU(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffe
 // turbulence strain S2 + production, which OF computes from fvc::grad(U) = the (cellLimited) grad(U) scheme.
 void deviceCellLimitGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                           const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                          DeviceBuffer<scalar>& gradU, scalar kc);
+                          DeviceBuffer<scalar>& gradU, scalar kc,
+                          const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr);
 
 // nut = Cmu k^2 / eps.
 void deviceNut(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut,
@@ -66,14 +67,26 @@ void deviceBoundField(const DeviceMesh& dm, DeviceBuffer<scalar>& x, scalar floo
 struct DeviceWallData
 {
     int nWF = 0;
+    // isWallCell: "this cell's epsilon/omega is FIXED by a wall function". Not the same question as
+    // "does this cell touch a wall patch", and the difference is a cyclicACMI. Its non-overlap patch is
+    // a wall of area (1-mask)*A, so a fully OPEN one is a wall face with no wall behind it, and OF does
+    // not constrain its cell -- cyclicACMIFvPatchField::manipulateMatrix redirects to the non-overlap
+    // patch with weights (1-mask), and epsilonWallFunction only constrains where weight > 1e-5.
+    // See buildDeviceWallData for what counting them anyway cost.
     DeviceBuffer<label>  wfCell, isWallCell;
+    // ...and the weight itself, for the partially blocked faces in between: OF blends rather than
+    // switches, G[c] = (1-w)*G[c] + w*G0[c] and the same for epsilon (epsilonWallFunction.C:592).
+    DeviceBuffer<scalar> wallW;
     DeviceBuffer<scalar> wfY, wfDc, wfUwx, wfUwy, wfUwz, invNw;
 };
+// The wall velocity comes in per patch rather than from a GeometricField, because on a MOVING mesh the
+// two can disagree: `movingWallVelocity` is assigned into the solver's device boundary after the move
+// (setPatchVelocity), and the host field is not what the solver imposes. See refreshWallData.
 inline DeviceWallData buildDeviceWallData(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp,
-    const GeometricField<vector>& U)
+    const std::vector<std::vector<vector>>& wallU)
 {
     const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
     std::vector<label> wfCell;
@@ -82,7 +95,7 @@ inline DeviceWallData buildDeviceWallData(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         if (fvp[pi].type == "wall")
         {
-            const std::vector<vector>& uv = U.boundary[pi]->value();
+            const std::vector<vector>& uv = wallU[pi];
             for (label i = 0; i < fvp[pi].size; ++i)
             {
                 const label c = fvp[pi].faceCells[i];
@@ -103,6 +116,37 @@ inline DeviceWallData buildDeviceWallData(
             invNw[c] = 1.0 / nw[c];
             isW[c] = 1;
         }
+    // THE ACMI NON-OVERLAP WALL IS ONLY A WALL WHERE IT IS CLOSED.
+    //
+    // A cyclicACMI carries a coincident wall (its nonOverlapPatch) whose area is (1-mask)*A, so on the
+    // covered part of the interface it is a `wall` patch with essentially zero area -- and brae counted
+    // every one of its faces as a wall face. That put the near-wall epsilon on cells that are not near a
+    // wall at all, and worse, deviceSolveScalarTransport zeroes the AMI off-diagonal for wall cells
+    // (their value is fixed), so epsilon lost its interface coupling entirely.
+    //
+    // OF gates it: cyclicACMIFvPatchField::manipulateMatrix hands the non-overlap patch field a weight
+    // of (1-mask) and epsilonWallFunction acts only where that exceeds tolerance_ = 1e-5, blending
+    // rather than switching in between. The weight is exactly the patch's areaFraction, which brae
+    // already has as scaled/raw |Sf| -- 1 on every ordinary wall, since rawMagSf falls back to magSf.
+    //
+    // Measured on pimpleFoam/RAS/oscillatingInletACMI2D, one step from OpenFOAM's own t=0.01: epsilon on
+    // the channel's interface column was 8.20x OF's and the duct's covered band 4.09x, with the fully
+    // blocked cells already correct to 3.9e-06 -- the giveaway that this was about which faces count as
+    // wall, not about the wall function itself.
+    constexpr scalar ACMI_WALL_TOL = 1e-5;   // OF epsilonWallFunctionFvPatchScalarField::tolerance_
+    std::vector<scalar> wallW(m.nCells(), 0.0);
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        if (fvp[pi].type == "wall")
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const label f = fvp[pi].start + i;
+                const scalar raw = g.rawMagSf(f);
+                const scalar frac = raw > scalar(0) ? g.magSf()[f]/raw : scalar(1);   // OF areaFraction()
+                const label c = fvp[pi].faceCells[i];
+                if (frac > wallW[c]) wallW[c] = frac;
+            }
+    for (label c = 0; c < m.nCells(); ++c)
+        if (wallW[c] <= ACMI_WALL_TOL) isW[c] = 0;   // a wall face with no wall behind it
     DeviceWallData w;
     w.nWF = static_cast<int>(wfCell.size());
     w.wfCell.copyFrom(wfCell);
@@ -113,7 +157,22 @@ inline DeviceWallData buildDeviceWallData(
     w.wfUwz.copyFrom(wuz);
     w.invNw.copyFrom(invNw);
     w.isWallCell.copyFrom(isW);
+    w.wallW.copyFrom(wallW);
     return w;
+}
+
+// Convenience overload: take the wall velocities off a U field's boundary. This is the construction-time
+// path, where the host field and the device boundary still agree.
+inline DeviceWallData buildDeviceWallData(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    const GeometricField<vector>& U)
+{
+    std::vector<std::vector<vector>> wallU(fvp.size());
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        if (fvp[pi].type == "wall") wallU[pi] = U.boundary[pi]->value();
+    return buildDeviceWallData(m, g, fvp, wallU);
 }
 
 // epsilonWallFunction near-wall values: eps0 = (1/nWall) Cmu^.75 k^1.5/(kappa y); G0 = (1/nWall)(nutw+nu)*
@@ -122,7 +181,8 @@ void deviceWallEpsG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, con
                      const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                      DeviceBuffer<scalar>& eps0, DeviceBuffer<scalar>& G0, const KEpsilonCoeffs& co = {}, int nutWall = 0,
                      scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
-                     const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+                     const DeviceBuffer<scalar>* nuFace = nullptr,
+    const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
 
 // add the eps / k reaction (Sp/Su) + SuSp(divU) terms to a matrix's diag/source (in place).
 void deviceEpsReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,
@@ -205,6 +265,10 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             // OF `grad(k)`/`grad(epsilon)` cellLimited coefficient (0 = unlimited); see the
                             // kOmegaSST declaration below for why this is distinct from gradULimitK.
                             scalar gradScalarLimitK = 0.0,
+                            // OF `grad(U)` cellLimited coefficient. kEpsilon::correct() builds its
+                            // production from fvc::grad(U), which resolves that entry; leaving it
+                            // unlimited makes the production term too large wherever the limiter bites.
+                            scalar gradULimitK = 0.0,
                             // fvOptions scalarFixedValueConstraint on k / epsilon (OF eqn.setValues).
                             // Applied BEFORE the eps wall function, per kEpsilon.C:266-267.
                             const DeviceBuffer<label>*  fvoKMask = nullptr,
@@ -252,7 +316,10 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<label>*  fvoKMask = nullptr,
                             const DeviceBuffer<scalar>* fvoKVal  = nullptr,
                             const DeviceBuffer<label>*  fvoEMask = nullptr,
-                            const DeviceBuffer<scalar>* fvoEVal  = nullptr);
+                            const DeviceBuffer<scalar>* fvoEVal  = nullptr,
+                            // The case's LES filter width (`delta maxDeltaxyz`); null keeps OF's
+                            // cubeRootVol. Must match what the convection scheme uses.
+                            const DeviceBuffer<scalar>* lesDelta = nullptr);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
@@ -286,10 +353,25 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   bool des = false,   // SpalartAllmarasDDES: DES length-scale limiter on the SA destruction
                                   bool iddes = false,   // SpalartAllmarasIDDES: use the improved (WMLES) length scale (needs hmax+hwn)
                                   const DeviceBuffer<scalar>* hmax = nullptr,   // per-cell maxDeltaxyz (IDDES delta); null -> DDES cubeRootVol
-                                  const DeviceBuffer<scalar>* hwn = nullptr);   // per-cell wall-normal spacing (IDDES delta 3rd term)
+                                  const DeviceBuffer<scalar>* hwn = nullptr,   // per-cell wall-normal spacing (IDDES delta 3rd term)
+                                  // The LES filter width the case selected (`delta maxDeltaxyz`); nullptr
+                                  // keeps OF's default cubeRootVol. Must match what the momentum scheme uses.
+                                  const DeviceBuffer<scalar>* lesDelta = nullptr,
+                                  // The OUTWARD unit normal of the nearest wall face, packed 3 x nC (OF
+                                  // wallDist::n()). Only ZDES2020 shielding reads it; nullptr (or the
+                                  // wrong size) leaves the standard DDES fd in place.
+                                  const DeviceBuffer<scalar>* wallN = nullptr);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
+// ZDES2020 shielding fd from its eight input fields (unit-test/DES hook; the solver path builds the two
+// gradients itself inside deviceSpalartAllmarasCorrect).
+void deviceSAZdesFd(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& gradU,
+                    const DeviceBuffer<scalar>& nuTilda, scalar nu,
+                    const DeviceBuffer<scalar>& wnx, const DeviceBuffer<scalar>& wny, const DeviceBuffer<scalar>& wnz,
+                    const DeviceBuffer<scalar>& gnx, const DeviceBuffer<scalar>& gny, const DeviceBuffer<scalar>& gnz,
+                    const DeviceBuffer<scalar>& gox, const DeviceBuffer<scalar>& goy, const DeviceBuffer<scalar>& goz,
+                    const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& fd);
 // SA-DDES length scale dTilda = y - fd*max(0, y - CDES*cubeRootVol(V)); fd = 1 - tanh((8 rd)^3). (Unit-test/DES hook.)
 void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& V,
     const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nuTilda, scalar nu,
@@ -320,14 +402,16 @@ void deviceBoundaryNutU(const DeviceVectorBoundary& dbU, const DeviceBuffer<labe
                         const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                         const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
                         DeviceBuffer<scalar>& nutBnd,
-                        const DeviceBuffer<scalar>* nuFace = nullptr);
+                        const DeviceBuffer<scalar>* nuFace = nullptr,
+    const DeviceBuffer<scalar>* nutFile = nullptr);
 
 void deviceBoundaryNutSpalding(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
                                const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
                                const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                const DeviceBuffer<scalar>& nutCell, scalar nu, const SpalartAllmarasCoeffs& co,
                                DeviceBuffer<scalar>& nutBnd,
-                               const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
+                               const DeviceBuffer<scalar>* nuFace = nullptr,
+    const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 // nutUBlendedWallFunction wall nut (velocity-based binomial n=4 blend); kappa/E explicit (any RAS model).
 void deviceBoundaryNutBlended(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
@@ -335,6 +419,7 @@ void deviceBoundaryNutBlended(const DeviceVectorBoundary& dbU, const DeviceBuffe
                               const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                               const DeviceBuffer<scalar>& nutCell, scalar nu, scalar kappa, scalar E,
                               DeviceBuffer<scalar>& nutBnd,
-                              const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: per-face nu = mu_b/rho_b
+                              const DeviceBuffer<scalar>* nuFace = nullptr,
+    const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: per-face nu = mu_b/rho_b
 
 } // namespace brae

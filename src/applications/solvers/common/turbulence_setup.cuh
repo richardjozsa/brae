@@ -62,10 +62,31 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                     std::printf("  laminar generalizedNewtonian/powerLaw: n=%.4g nuMin=%.4g nuMax=%.4g"
                                 "  (nu = clamp(nu0*strainRate^(n-1)))\n", ctl.gnN, ctl.gnNuMin, ctl.gnNuMax);
                 }
+                else if (lmodel == "Maxwell")
+                {
+                    // OF laminarModels::Maxwell. dimensionedScalar(name, dims, coeffDict_) THROWS when the
+                    // entry is absent, and coeffDict_ is dictionary::optionalSubDict("MaxwellCoeffs") --
+                    // so both spellings the tutorials use are valid: planarPoiseuille writes the
+                    // sub-dictionary, planarContraction writes the keys inline.
+                    const FoamDict* mc = lam->subDict("MaxwellCoeffs");
+                    const FoamDict& src = mc ? *mc : *lam;
+                    ctl.maxwell = true;
+                    ctl.maxwellNuM    = src.scalarOr("nuM", -1.0);
+                    ctl.maxwellLambda = src.scalarOr("lambda", -1.0);
+                    if (!(ctl.maxwellNuM >= 0.0) || !(ctl.maxwellLambda > 0.0))
+                        throw std::runtime_error(
+                            "brae: laminar model Maxwell needs `nuM` (>= 0) and `lambda` (> 0), in "
+                            "MaxwellCoeffs{} or directly in laminar{}. OpenFOAM also refuses without them "
+                            "-- there is no default relaxation time.");
+                    std::printf("  laminar Maxwell (viscoelastic): nuM=%.4g lambda=%.4g"
+                                "  (nu0 = nu + nuM; stress relaxes over lambda)\n",
+                                ctl.maxwellNuM, ctl.maxwellLambda);
+                }
                 else if (lmodel != "Stokes")
                     throw std::runtime_error(
                         "brae: unsupported laminar model '" + lmodel + "' in constant/turbulenceProperties. "
-                        "Only 'Stokes' (the OF default, molecular viscosity unchanged) is implemented. A "
+                        "brae has 'Stokes' (the OF default, molecular viscosity unchanged), "
+                        "'generalizedNewtonian' and 'Maxwell'. A "
                         "generalizedNewtonian model replaces nu with a strain-rate-dependent field, so "
                         "running without it is a different momentum equation, not an approximation.");
             }
@@ -82,19 +103,39 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES" || saIddes);
                 const bool sstDes = (model == "kOmegaSSTDDES" || model == "kOmegaSSTDES" || sstIddes);
                 const bool smag   = (model == "Smagorinsky");
-                if (!saDes && !sstDes && !smag)
+                const bool wale   = (model == "WALE");
+                if (!saDes && !sstDes && !smag && !wale)
                     throw std::runtime_error("brae: unsupported LESModel '" + model
-                        + "' (Smagorinsky, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES/IDDES)");
+                        + "' (Smagorinsky, WALE, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES/IDDES)");
                 const std::string delta = les->wordOr("delta", "cubeRootVol");
-                if (!saIddes && !sstIddes && delta != "cubeRootVol")   // IDDES computes its own (maxDeltaxyz-based) length scale internally
+                if (delta == "maxDeltaxyz")
+                {
+                    ctl.lesDeltaMax = true;
+                    if (const FoamDict* mc = les->subDict("maxDeltaxyzCoeffs"))
+                        ctl.lesDeltaCoeff = mc->scalarOr("deltaCoeff", ctl.lesDeltaCoeff);
+                }
+                else if (!saIddes && !sstIddes && delta != "cubeRootVol")   // IDDES computes its own (maxDeltaxyz-based) length scale internally
                     std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
                 const FoamDict* dc = les->subDict(model + "Coeffs");
+                if (wale)   // WALE: the other ALGEBRAIC sub-grid nut. Same slot as Smagorinsky -- no transport
+                {           // scalar, no DES limiter -- only the velocity scale differs (see WaleCoeffs).
+                    ctl.les = true;
+                    ctl.wale = true;
+                    if (dc) { ctl.waleCoeffs.Ck = dc->scalarOr("Ck", ctl.waleCoeffs.Ck);
+                              ctl.waleCoeffs.Ce = dc->scalarOr("Ce", ctl.waleCoeffs.Ce);
+                              ctl.waleCoeffs.Cw = dc->scalarOr("Cw", ctl.waleCoeffs.Cw); }
+                    std::printf("  WALE (LES, delta=%s): Ck=%.4g Cw=%.4g\n",
+                                ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol",
+                                ctl.waleCoeffs.Ck, ctl.waleCoeffs.Cw);
+                    return;
+                }
                 if (smag)   // pure LES Smagorinsky: ALGEBRAIC sub-grid nut (no transport scalar, no DES length-scale limiter)
                 {
                     ctl.les = true;
                     if (dc) { ctl.smagCoeffs.Ck = dc->scalarOr("Ck", ctl.smagCoeffs.Ck);
                               ctl.smagCoeffs.Ce = dc->scalarOr("Ce", ctl.smagCoeffs.Ce); }
-                    std::printf("  Smagorinsky (LES, delta=cubeRootVol): Ck=%.4g Ce=%.4g (equivalent Cs=%.4g)\n",
+                    std::printf("  Smagorinsky (LES, delta=%s): Ck=%.4g Ce=%.4g (equivalent Cs=%.4g)\n",
+                                ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol",
                                 ctl.smagCoeffs.Ck, ctl.smagCoeffs.Ce, ctl.smagCoeffs.Cs());
                     return;
                 }
@@ -104,6 +145,41 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                     ctl.sa = true;
                     ctl.iddes = saIddes;   // IDDES -> the improved (WMLES) length scale (maxDeltaxyz + blending); else plain DDES
                     if (dc) ctl.saCoeffs.CDES = dc->scalarOr("CDES", ctl.saCoeffs.CDES);
+                    // OF v2412 SpalartAllmarasDDES carries a `shielding` selector (standard | ZDES2020).
+                    // ZDES2020 (Deck & Renard 2020) multiplies the standard fd by a second shielding built
+                    // from grad(nuTilda).n and grad(|curl U|).n, which moves the RANS/LES switch -- it is a
+                    // different model, not a coefficient. brae runs the standard fd, so SAY so: an
+                    // unimplemented input read off disk and silently dropped is the failure mode this
+                    // project keeps its notices for. NACA4412 is the tutorial that asks for it.
+                    // OF v2412 SpalartAllmarasDDES carries a `shielding` selector (standard | ZDES2020).
+                    // ZDES2020 (Deck & Renard 2020) multiplies the standard fd by a second shielding built
+                    // from grad(nuTilda).n and grad(|curl U|).n -- a different model, not a coefficient.
+                    // IDDES has its own length scale and never calls fd, so the selector does not apply there.
+                    if (dc)
+                    {
+                        const std::string sh = dc->wordOr("shielding", "standard");
+                        ctl.saCoeffs.Cd1 = dc->scalarOr("Cd1", ctl.saCoeffs.Cd1);
+                        ctl.saCoeffs.Cd2 = dc->scalarOr("Cd2", ctl.saCoeffs.Cd2);
+                        if (sh == "ZDES2020")
+                        {
+                            if (saIddes)
+                                throw std::runtime_error(
+                                    "brae: `shielding ZDES2020` under SpalartAllmarasIDDES -- IDDES uses its own "
+                                    "length scale and never evaluates the DDES shielding function, so the entry "
+                                    "would have no effect. Remove it or select SpalartAllmarasDDES.");
+                            ctl.saCoeffs.zdes     = true;
+                            ctl.saCoeffs.Cd3      = dc->scalarOr("Cd3", ctl.saCoeffs.Cd3);
+                            ctl.saCoeffs.Cd4      = dc->scalarOr("Cd4", ctl.saCoeffs.Cd4);
+                            ctl.saCoeffs.betaZDES = dc->scalarOr("betaZDES", ctl.saCoeffs.betaZDES);
+                            const std::string fp2 = dc->wordOr("usefP2", "false");
+                            ctl.saCoeffs.usefP2   = (fp2 == "true" || fp2 == "yes" || fp2 == "on" || fp2 == "1");
+                        }
+                        else if (sh != "standard")
+                            throw std::runtime_error(
+                                "brae: SpalartAllmarasDDES `shielding " + sh + "` is not implemented "
+                                "(brae has `standard` and `ZDES2020`). The shielding function decides where "
+                                "the model leaves RANS for LES, so running another one is a different answer.");
+                    }
                     if (saIddes && dc)   // IDDES blending-constant overrides (defaults = Shur/Spalart/Strelets/Travin 2008)
                     {
                         ctl.saCoeffs.Cdt1 = dc->scalarOr("Cdt1", ctl.saCoeffs.Cdt1);
@@ -115,8 +191,9 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         std::printf("  %s (SA-IDDES, delta=IDDESDelta [maxDeltaxyz+hwn]): CDES=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g kappa=%.4g Cv1=%.3g\n",
                                     model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.Cdt1, ctl.saCoeffs.Cl, ctl.saCoeffs.Ct, ctl.saCoeffs.Cw, ctl.saCoeffs.kappa, ctl.saCoeffs.Cv1);
                     else
-                        std::printf("  %s (SA-DES, delta=cubeRootVol): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
-                                    model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.kappa, ctl.saCoeffs.Cb1, ctl.saCoeffs.Cw1(), ctl.saCoeffs.Cv1);
+                        std::printf("  %s (SA-DES, delta=%s, shielding=%s): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
+                                    model.c_str(), ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol",
+                                    ctl.saCoeffs.zdes ? "ZDES2020" : "standard", ctl.saCoeffs.CDES, ctl.saCoeffs.kappa, ctl.saCoeffs.Cb1, ctl.saCoeffs.Cw1(), ctl.saCoeffs.Cv1);
                 }
                 else         // kOmegaSST-DDES/IDDES: reuse the kOmegaSST transport + the DES factor on the k destruction
                 {
@@ -136,8 +213,8 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         std::printf("  %s (kOmegaSST-IDDES, delta=IDDESDelta [maxDeltaxyz+hwn]): CDES1=%.4g CDES2=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g betaStar=%.4g\n",
                                     model.c_str(), ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.Cdt1, ctl.ksstCoeffs.Cl, ctl.ksstCoeffs.Ct, ctl.ksstCoeffs.Cw, ctl.ksstCoeffs.betaStar);
                     else
-                        std::printf("  %s (kOmegaSST-DES, delta=cubeRootVol): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
-                                    model.c_str(), ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
+                        std::printf("  %s (kOmegaSST-DES, delta=%s): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
+                                    model.c_str(), ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol", ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
                 }
                 return;
             }
@@ -158,8 +235,9 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             ctl.sst = (model == "kOmegaSST") || ctl.lm;
             ctl.sa  = (model == "SpalartAllmaras");
             const bool rke = (model == "realizableKE");
-            if (model != "kEpsilon" && !rke && !ctl.sst && !ctl.sa)
-                throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
+            const bool rng = (model == "RNGkEpsilon");
+            if (model != "kEpsilon" && !rke && !rng && !ctl.sst && !ctl.sa)
+                throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, RNGkEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
             if (ctl.sa)
             {
                 // Spalart-Allmaras: OF defaults (coeffs read from RAS.SpalartAllmarasCoeffs would override; not needed here).
@@ -197,6 +275,35 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                     }
                     std::printf("  realizableKECoeffs: A0=%.4g C2=%.4g sigmak=%.4g sigmaEps=%.4g kappa=%.4g E=%.4g (variable Cmu)\n",
                                 c.A0, c.C2, c.sigmaK, c.sigmaEps, c.kappa, c.E);
+                }
+                else if (rng)
+                {
+                    // RNGkEpsilon: EVERY coefficient differs from the standard model, not just the extra R
+                    // term -- Cmu 0.0845 (not 0.09) feeds nut and the nut wall functions too, so reading
+                    // the RNG model with kEpsilon's defaults would be wrong even where R happens to vanish.
+                    c.rng = true;
+                    c.Cmu = 0.0845;
+                    c.C1 = 1.42;
+                    c.C2 = 1.68;
+                    c.C3 = -0.33;
+                    c.sigmaK = 0.71942;
+                    c.sigmaEps = 0.71942;
+                    if (const FoamDict* rgc = ras ? ras->subDict("RNGkEpsilonCoeffs") : nullptr)
+                    {
+                        c.Cmu = rgc->scalarOr("Cmu", c.Cmu);
+                        c.C1 = rgc->scalarOr("C1", c.C1);
+                        c.C2 = rgc->scalarOr("C2", c.C2);
+                        c.C3 = rgc->scalarOr("C3", c.C3);
+                        c.sigmaK = rgc->scalarOr("sigmak", c.sigmaK);
+                        c.sigmaEps = rgc->scalarOr("sigmaEps", c.sigmaEps);
+                        c.eta0 = rgc->scalarOr("eta0", c.eta0);
+                        c.beta = rgc->scalarOr("beta", c.beta);
+                        c.kappa = rgc->scalarOr("kappa", c.kappa);
+                        c.E = rgc->scalarOr("E", c.E);
+                    }
+                    std::printf("  RNGkEpsilonCoeffs: Cmu=%.4g C1=%.4g C2=%.4g C3=%.4g sigmak=%.5g sigmaEps=%.5g "
+                                "eta0=%.4g beta=%.4g kappa=%.4g E=%.4g\n",
+                                c.Cmu, c.C1, c.C2, c.C3, c.sigmaK, c.sigmaEps, c.eta0, c.beta, c.kappa, c.E);
                 }
                 else
                 {

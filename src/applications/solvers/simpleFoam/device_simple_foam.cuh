@@ -11,6 +11,8 @@
 // nuEff at boundary faces = the adjacent-cell value (this path's convention, consistent with its laplacian
 // boundary). The fully-faithful boundary-nut (nutkWallFunction) treatment lives in the host simple_foam.cuh.
 #include "cf_types.cuh"
+#include "function1.cuh"
+#include "foam_field_reader.cuh"   // FieldData/PatchFieldData: the parsed p0 Function1
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -44,8 +46,11 @@
 #include "device_amg.cuh"
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
-#include "solver_controls.cuh"   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
+#include "solver_controls.cuh"
+#include "time_controls.cuh"   // CourantNumbers   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <vector>
 #include <cuda_runtime.h>
 
@@ -130,10 +135,113 @@ public:
         }
     }
     // Advance one time level: store U.oldTime()[.oldTime()] + roll deltaT -> deltaT0 (OF runTime++ / GeometricField::oldTime).
+    // Move the mesh for one time step -- OF pimpleFoam.C:139-160, in OF's order:
+    //     mesh.controlledUpdate();          move points, recompute geometry
+    //     if (mesh.changing()) { ... fvc::makeRelative(phi, U); }
+    // The mesh moves BEFORE the equations, and phi is made relative immediately after, so the
+    // convective term never sees an absolute flux on a moving mesh.
+    //
+    // Every input is already verified independently: the transform (rigid invariants), the geometry
+    // refresh (bit-identical to a rebuild, addressing preserved), meshPhi (SCL to 1e-20) and
+    // makeRelative (relative flux vanishes, mutation-proven). This only composes them.
+    //
+    // Returns the per-face meshPhi so the caller can build movingWallVelocity from it.
+    std::vector<scalar> moveMesh(
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<FvPatch>& fvp,
+        const std::vector<vector>& oldPoints,
+        const std::vector<vector>& newPoints,
+        scalar deltaT);
+
+    // fvc::makeRelative(phi, U) -- subtract mesh.phi() from every stored flux, INCLUDING the coupled
+    // patches (cyc_/ami_.phi), which brae never reached. Called at the end of each pressure corrector,
+    // where OF's pEqn.H calls it; a no-op until moveMesh has supplied a meshPhi. See the definition.
+    void makeFluxRelative(const std::vector<FvPatch>& fvp, label nInternalFaces);
+    // fvc::correctUf(Uf, U, phi) -- rebuild the face velocity from the current U and the ABSOLUTE flux.
+    // Called at the end of each pressure corrector, before makeFluxRelative, exactly as pEqn.H does.
+    void correctUf();
+    // OF createUfIfPresent.H: the face velocity exists only on a dynamic mesh, and is constructed as
+    // fvc::interpolate(U) at case setup -- BEFORE any motion, which is why the driver calls this once
+    // before the time loop rather than letting the first mesh move trigger it. No mesh motion, no Uf,
+    // and fvc::ddtCorr falls back to its phi.oldTime() form exactly as OF's does.
+    void enableUf();
+    // OF CorrectPhi (finiteVolume/cfdTools/general/CorrectPhi) + the pimpleFoam.C lines that wrap it.
+    // Call after the mesh has moved and U's boundary has been refreshed, before the momentum predictor.
+    // Returns the initial continuity residual of the pcorr solve (div(phi) before the projection).
+    scalar correctPhi(const std::vector<FvPatch>& fvp, int nNonOrth);
+    // How many times the turbulence transport was advanced, and how many outer correctors ran, since
+    // the last reset. The PIMPLE contract is a statement about CADENCE -- turbulence once per time step
+    // by default, outer loop possibly cut short by residualControl -- and a cadence cannot be asserted
+    // from a converged field. Counting is the only way to test it.
+    long turbCorrections()  const { return turbCorrections_; }
+    long outerIterations()  const { return outerIterations_; }
+    void resetLoopCounters() { turbCorrections_ = 0; outerIterations_ = 0; }
+private:
+    long turbCorrections_ = 0, outerIterations_ = 0;
+    // PIMPLE residualControl state: outer-loop convergence flag and iteration-2 reference residuals.
+    bool outerConverged_ = false;
+    std::map<std::string, scalar> outerInitialResidual_;
+    bool outerCriteriaSatisfied(const DeviceSimpleResidual& res, int oc);
+public:
+    // phi +/- mesh.phi() applied to one set of flux buffers (internal, boundary, cyclic, AMI).
+    // sign -1 = fvc::makeRelative, +1 = fvc::makeAbsolute.
+    void applyMeshPhi(const std::vector<FvPatch>& fvp, const std::vector<scalar>& mp, scalar sign,
+                      DeviceBuffer<scalar>& fInt, DeviceBuffer<scalar>& fBnd,
+                      DeviceBuffer<scalar>& fCyc, DeviceBuffer<scalar>& fAmi);
+
+    // fvSolution PIMPLE/ddtCorr. OF defaults it to true and pimpleFoam's pEqn.H guards the whole
+    // fvc::ddtCorr term with it, so it is the switch that makes brae's answer comparable to a run with
+    // the correction deliberately turned off.
+    void setDdtCorr(bool on) { ddtCorr_ = on; }
+
+    // Maxwell: hand over the six components of the sigma field the driver read from 0/sigma (as six
+    // scalar fields, which is how they are solved). Must be called before the first step when
+    // `laminar { model Maxwell; }` is selected; the solver refuses to run the model without it.
+    void setMaxwellSigma(const std::vector<GeometricField<scalar>>& sigma, const std::vector<FvPatch>& fvp,
+                         const FvGeometry& g);
+    // ...and read it back for writing (six components, cell values).
+    std::vector<std::vector<scalar>> maxwellSigma() const
+    {
+        std::vector<std::vector<scalar>> out;
+        for (int k = 0; k < 6; ++k) out.push_back(sig_[k].host());
+        return out;
+    }
+    // The viscoelastic stress transport, OF Maxwell::correct(). Called from correctTurbulence().
+    void correctMaxwell();
+
+    // Overwrite one U patch's refValue -- the device half of movingWallVelocity's updateCoeffs.
+    // OF does `vectorField::operator=(Uwall())` on the patch field; this is the same assignment, on the
+    // buffers the momentum assembly reads.
+    void setPatchVelocity(label patchi, const std::vector<vector>& Uw);
+
+    // Rebuild the wall-function geometry from the CURRENT mesh. Everything in DeviceWallData is a
+    // function of the geometry -- the near-wall distance, the face deltaCoeffs, and (the reason this
+    // exists) the cyclicACMI area fractions that decide which non-overlap faces count as wall at all.
+    // A sliding ACMI re-splits those areas every step, so a set built once at construction is stale
+    // from the second step on. Call after the mesh has moved AND after any movingWallVelocity patch has
+    // been assigned, since the wall velocities are read back out of the device boundary.
+    void refreshWallData(const PrimitiveMesh& m, const FvGeometry& g, const std::vector<FvPatch>& fvp);
+    // Read-only view of that data, so a test can assert the refresh actually happened.
+    const DeviceWallData& wallData() const { return wall_; }
+    // Read-only view of the pressure boundary, so a test can check a per-step BC's contract (fixedMean's
+    // area-weighted mean) against the values the solver actually imposed.
+    const DeviceBoundary& pressureBoundary() const { return dbP_; }
+
     void advanceTime(scalar deltaT);
     // One PIMPLE time step: advanceTime, then nOuterCorrectors x { momentum predictor (ddt folded in); nCorrectors x
     // pressure-velocity correction; turbulence }, then continuity errors. Returns the outer-loop residual signal.
-    DeviceSimpleResidual pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors);
+    // `moveMesh` is the mesh-update callback, invoked from INSIDE the outer loop at OpenFOAM's own
+    // condition: `pimple.firstIter() || moveMeshOuterCorrectors` (pimpleFoam.C:140). It receives the
+    // 0-based outer-iteration index. Passing nullptr leaves the loop static, which is every non-moving
+    // case and every other solver that shares this method.
+    //
+    // The mesh update HAS to live inside the loop to be faithful. With moveMeshOuterCorrectors true the
+    // mesh moves before every outer corrector, so the momentum and pressure equations of iteration 2
+    // are assembled on different geometry than iteration 1 -- an outer loop that also converges the
+    // mesh position. Hoisting it into the driver, as brae did, makes that flag unimplementable.
+    DeviceSimpleResidual pimpleStep(scalar deltaT, int nOuterCorrectors, int nCorrectors,
+                                    const std::function<void(int)>& moveMesh = nullptr);
 
     // Steady COMPRESSIBLE step (rhoSimpleFoam). Composes the same three phases as simpleStep/pimpleStep
     // with the energy equation and the thermo update inserted, in OF's rhoSimpleFoam.C order:
@@ -154,6 +262,44 @@ public:
     // construction, exactly as it already owns U/p.
     // Per-boundary-face Prt from 0/alphat: alphatWallFunction patches carry their own (OF default 0.85),
     // every other face uses the turbulence model's (OF default 1.0). Optional -- absent, the model's is used.
+    // OF functionObjects::scalarTransport (scalarTransport.C). Solves ONE passive scalar on the
+    // device against the flux this solver already holds:
+    //
+    //     fvm::div(phi, s) - fvm::laplacian(D, s) == 0        (steady; ddt drops out)
+    //
+    // PASSIVE means passive: nothing here writes back into U, p, T, rho or the turbulence, so a case
+    // that carries a tracer solves identically with and without it. That is also why it is safe to run
+    // from a functionObject rather than from inside the SIMPLE loop proper.
+    //
+    // Reuses deviceSolveScalarTransport -- the same routine k, epsilon, omega and the energy already go
+    // through -- so the tracer gets the case's own div/laplacian schemes rather than a private
+    // discretisation. boundPositive is FALSE: OF's scalarTransport does not bound, and a tracer is not a
+    // positive-definite turbulence quantity.
+    void solvePassiveScalar(
+        DeviceBuffer<scalar>& field,
+        const DeviceBoundary& db,
+        const char* fieldName,
+        const DeviceBuffer<scalar>& D,   // built ONCE by the caller; a per-step H2D fill would be waste
+        scalar relax,
+        scalar tol,
+        // The FIELD'S OWN convection scheme, from the case's div(phi,<field>) entry
+        // (OF scalarTransport.C:249). Borrowing the momentum's flags instead ran a tracer through an
+        // unbounded central scheme and reached 5.59 against a bound of 1.0.
+        bool   schemeBounded,
+        bool   schemeLimited,
+        bool   schemeLinearUpwind,
+        scalar schemeTwoByk,
+        bool   schemeNonOrth,   // from laplacian(D<field>,<field>), not the solver's global setting
+        // TRANSIENT support. OF's scalarTransport carries fvm::ddt(s), which needs the field's own old
+        // time levels. Pass them and this builds the ddt from the SOLVER's own scheme and deltaT (there
+        // is exactly one time scheme in a case, and it is not the functionObject's to choose) and
+        // advances them here, mirroring advanceTime(). Omit them and the term drops out, which is
+        // correct for a steady solver and WRONG for a transient one -- so a transient caller must pass
+        // them or not register scalarTransport at all.
+        DeviceBuffer<scalar>* old  = nullptr,
+        DeviceBuffer<scalar>* old2 = nullptr,
+        DeviceBuffer<scalar>* ddt0 = nullptr);
+
     void setAlphatPrt(const std::vector<scalar>& prtFace);
     // Energy linear solver from fvSolution solvers.(h|e). Was hardcoded tol=1e-10, relTol=0, BiCGStab.
     void setEnergySolver(scalar tol, scalar relTol, bool useGS)
@@ -230,6 +376,14 @@ public:
     std::vector<scalar> nutWall() const { return dnutBndWall_.size() ? dnutBndWall_.host() : std::vector<scalar>(); }
     std::vector<scalar> cellY() const { return y_.size() ? y_.host() : std::vector<scalar>(); }   // cell wall distance (SST/SA)
     // diagnostics: the conservative face flux (internal then boundary) for continuity-error localisation.
+    // Courant number on the DEVICE, coupled interfaces included, returning two scalars.
+    //
+    // The driver used to pull phiInternal() and phiBoundary() to the host every step of an adaptive run
+    // and loop over faces and cells serially -- and it read only those two arrays, so cyclic and AMI
+    // flux never entered the sum at all. That is a correctness bug before it is a performance one: the
+    // Courant number was understated on exactly the cells a rotating interface makes fastest, and on an
+    // adjustTimeStep case the understated maxCo chooses the NEXT deltaT.
+    CourantNumbers courantNumbers(scalar deltaT) const;
     std::vector<scalar> phiInternal() const { return phiInt_.host(); }
     // The SOLVED boundary values, so the written boundaryField reports what the solve used rather than
     // echoing the input file. nut is the one that matters most: on a wall its value comes from the wall
@@ -333,6 +487,20 @@ public:
     std::vector<scalar> epsBoundary() const { return boundaryOf(dbEps_, de_); }
     std::vector<scalar> pBoundary()   const { return boundaryOf(dbP_,   dp_); }
     std::vector<scalar> phiBoundary() const { return phiBnd_.host(); }
+
+    // THE INTERFACE FLUX, per coupled patch, for the phi write. A cyclic/AMI patch's flux is NOT in
+    // phiBoundary -- it lives on the interface object (cyc_.phi / ami_.phi), because that is what the
+    // coupling reads. OpenFOAM keeps it in phi's boundaryField and WRITES it, so its restart resumes the
+    // exact flux; brae wrote the patch with a type and no value, so the flux could not survive a restart
+    // and was rebuilt from U instead. It is not the same number: on
+    // pimpleFoam/RAS/oscillatingInletACMI2D the rebuild differed from the stored flux by 1.3e-04 on the
+    // first face, and since the momentum interface coefficient is upwind (max(phi,0)) that landed
+    // directly on the diagonal -- 0.95% of rAU on every one of the 40 source-side interface cells, and
+    // nothing else in the mesh.
+    // Returns (fvPatch index, per-face flux in patch face order); empty when there is no interface.
+    std::vector<std::pair<label, std::vector<scalar>>> interfacePatchFlux() const;
+    // The inverse, for a restart: seed cyc_.phi / ami_.phi from the values just read out of phi's file.
+    void setInterfacePatchFlux(const std::vector<std::pair<label, std::vector<scalar>>>& byPatch);
     // rho on the boundary -- the EOS result the solve actually used, already maintained per face by the
     // pressure equation (phiHbyA is rho-weighted with it). Not derivable from the T/p descriptors here,
     // which is why it needs its own accessor rather than boundaryOf().
@@ -352,6 +520,82 @@ public:
     // target: 0=U (vector), 1=p, 2=k/nuTilda, 3=second (omega/epsilon). mixed=true -> codedMixed (also writes valueFraction).
     void addCodedBC(const std::string& name, const std::string& code, int offset, int count, int target = 0, bool mixed = false);
     void setTime(scalar t) { time_ = t; }
+
+    // uniformTotalPressure: p0 is a Function1 of time, so the device p0 must be refreshed each step
+    // before deviceUpdateTotalPressure recomputes p_b. OF does the same -- updateCoeffs() calls
+    // p0_->value(time) every step (uniformTotalPressureFvPatchScalarField.C:149). One entry per patch
+    // that declared a non-constant p0; a constant p0 needs none and keeps the value set at read time.
+    struct TimeVaryingP0 { label start = 0, count = 0; Function1 f; };
+    // fanPressure: p0 is shifted every step by the fan's pressure rise at the CURRENT patch flow rate.
+    //   volFlowRate = dir*sum(phi_patch),  dir = -1 for `direction in`, +1 for `out`
+    //   p0_eff      = p0 - dir*fanCurve(max(volFlowRate, 0))
+    // (fanPressureFvPatchScalarField::updateCoeffs, which then defers to totalPressure with that p0.)
+    // The curve is (flowRate, deltaP) pairs, linearly interpolated and CLAMPED outside its range, which is
+    // OF's `outOfBounds clamp` default for a table.
+    struct FanPressure
+    {
+        label  start = 0, count = 0;
+        scalar p0 = 0, dir = -1;
+        std::vector<std::pair<scalar, scalar>> curve;
+        scalar dp(scalar q) const
+        {
+            if (curve.empty()) return 0;
+            if (q <= curve.front().first) return curve.front().second;
+            if (q >= curve.back().first)  return curve.back().second;
+            for (std::size_t i = 1; i < curve.size(); ++i)
+                if (q <= curve[i].first)
+                {
+                    const scalar t = (q - curve[i-1].first) / (curve[i].first - curve[i-1].first);
+                    return curve[i-1].second + t*(curve[i].second - curve[i-1].second);
+                }
+            return curve.back().second;
+        }
+    };
+    void setFanPressure(std::vector<FanPressure> v) { fanP0_ = std::move(v); }
+    // fixedMean (OF fixedMeanFvPatchField): a fixedValue whose face values are the ADJACENT CELL values,
+    // shifted or scaled so their area-weighted mean equals a prescribed one:
+    //     psi   = patchInternalField()
+    //     mean  = sum(magSf*psi)/sum(magSf)
+    //     |target| > SMALL and |mean| > 0.5|target| : psi *= |target|/|mean|
+    //     otherwise                                : psi += (target - mean)
+    // It is built as a plain fixedValue and its refValue recomputed here every step, the same way
+    // codedFixedValue and fanPressure are.
+    struct FixedMean { label start = 0, count = 0; scalar meanValue = 0; };
+    void setFixedMean(std::vector<FixedMean> v) { fixedMean_ = std::move(v); }
+    void setTimeVaryingP0(std::vector<TimeVaryingP0> v) { tvP0_ = std::move(v); }
+
+    // Build the list from a pressure field's parsed boundary entries. Shared so all three drivers wire
+    // it identically -- three hand-rolled loops over patch offsets is how the copies in this codebase
+    // have historically drifted.
+    //
+    // The offsets must be the DeviceBoundary face order, which buildDeviceBoundary produces by walking
+    // `patches` in order and emitting patch.size faces each. Getting that wrong would ramp the wrong
+    // patch's p0, so it is derived from the same traversal rather than assumed.
+    static std::vector<TimeVaryingP0> collectTimeVaryingP0(
+        const FieldData<scalar>& pFd,
+        const std::vector<FvPatch>& patches)
+    {
+        std::vector<TimeVaryingP0> out;
+        label start = 0;
+        for (const FvPatch& fp : patches)
+        {
+            // dbP_.p0 is in DeviceBoundary face order, which SKIPS the coupled patches -- so the running
+            // offset has to skip them too, or every entry after a cyclic/AMI patch addresses the wrong faces.
+            if (isCoupledInterfaceType(fp.type)) continue;
+            for (const auto& b : pFd.boundary)
+            {
+                if (b.name != fp.name || !b.hasP0Function1) continue;
+                TimeVaryingP0 e;
+                e.start = start;
+                e.count = fp.size;
+                e.f     = b.p0Function1;
+                out.push_back(std::move(e));
+                break;
+            }
+            start += fp.size;
+        }
+        return out;
+    }
     std::vector<vector> Uddt0() const
     {
         const auto x = Uddt0_[0].host(), y = Uddt0_[1].host(), z = Uddt0_[2].host();
@@ -381,6 +625,8 @@ private:
     DeviceMesh dm_;
     DeviceVectorBoundary dbU_;
     DeviceBoundary dbP_, dbK_, dbEps_, dbExtrap_, dbReThetat_, dbGammaInt_;   // dbReThetat_/dbGammaInt_: kOmegaSSTLM
+    // pcorr (OF CorrectPhi): p's geometry, zeroGradient except fixedValue 0 where p fixes a value.
+    DeviceBoundary dbPcorr_;
     DeviceWallData wall_;
     DeviceMRF mrf_;                       // optional rotating zone (inactive by default)
     // fvOptions (empty by default -> no-op). Momentum source per component (relaxSrc) + implicit Sp (diagonal);
@@ -393,7 +639,10 @@ private:
     // meanVelocityForce: accumulated pressure gradient gradP_ driving the mean velocity to Ubar (channel flow).
     bool   mvfActive_ = false;
     vector mvfFlowDir_{0,0,0};
-    scalar mvfUbarMag_ = 0, mvfRelax_ = 1.0, mvfGradP_ = 0, mvfVtot_ = 0;
+    // meanVelocityForce keeps TWO gradients, exactly as OF does (meanVelocityForce.C:146-247), and the
+    // pair is not an implementation detail -- collapsing them into one accumulator makes the channel
+    // diverge. See the constrain step in the momentum assembly.
+    scalar mvfUbarMag_ = 0, mvfRelax_ = 1.0, mvfGradP0_ = 0, mvfDGradP_ = 0, mvfVtot_ = 0;
     DeviceBuffer<scalar> mvfMaskV_, mvfMask01_;   // V (and 1) in the zone, 0 else (= V / ones for selectionMode all)
     bool   limUActive_ = false;
     scalar limUMax_ = 0;
@@ -418,19 +667,43 @@ private:
     scalar vdcUMax_ = 0, vdcC_ = 1;
     DeviceBuffer<label> vdcCells_;   // velocityDampingConstraint
     // actuationDiskSource (Froude): thrust over a disk cellZone, computed each iter from the monitored upstream U.
-    bool   adActive_ = false;
-    vector adDiskDir_{1,0,0};
-    scalar adArea_ = 0, adA_ = 0, adVtot_ = 0, adNmon_ = 0;
-    DeviceBuffer<scalar> adMaskVDisk_, adMonMask01_;   // V in disk cells / 1 in monitor cells
+    // One entry per actuationDiskSource. Each turbine carries its OWN masks: sharing them across disks
+    // would apply every turbine's thrust to the union of their cells, which converges to a plausible
+    // but wrong wind field rather than failing.
+    struct ActuationDiskDev
+    {
+        vector diskDir{1,0,0};
+        scalar area = 0, a = 0, vtot = 0, nmon = 0;
+        DeviceBuffer<scalar> maskVDisk, monMask01;   // V in disk cells / 1 in monitor cells
+    };
+    bool adActive_ = false;
+    std::vector<ActuationDiskDev> adDisks_;
     DeviceRotorDisk rotor_;                            // rotorDiskSource (BEM); per-cell force recomputed each iter
     DeviceBuffer<scalar> rotorFx_, rotorFy_, rotorFz_;
     AMGData amg_;
     DeviceBuffer<scalar> Uk_[3], dp_, phiInt_, phiBnd_, dk_, de_, dnut_, y_;   // y_ = cell wall distance (SST/SA)
     DeviceBuffer<scalar> hmax_;   // per-cell maxDeltaxyz (IDDES filter width); built only when ctl_.iddes
+    // The LES filter width the case's `delta` entry selects, when it is not cubeRootVol. Empty otherwise,
+    // and every consumer then falls back to cbrt(V) in its own kernel -- so a case that says nothing is
+    // byte-for-byte unchanged. Shared by the sub-grid model, the DES length scale AND the convection
+    // scheme, which must all agree about the resolved scale.
+    DeviceBuffer<scalar> lesDelta_;
+    // Maxwell viscoelastic stress: the six components of sigma with their own boundaries, plus the
+    // per-outer-corrector production. Empty on every other case, and every Maxwell branch is gated on
+    // ctl_.maxwell, so a Newtonian run is untouched.
+    DeviceBuffer<scalar> sig_[6];
+    DeviceBoundary       dbSig_[6];
+    DeviceBuffer<scalar> sigOld_[6], sigOld2_[6], sigddt0_[6];   // fvm::ddt(sigma) old levels (backward/CN)
+    // OF wallDist::n() packed 3 x nC: the nearest wall face's OUTWARD unit normal. Built only for
+    // ZDES2020 shielding, which is the only consumer; empty otherwise.
+    DeviceBuffer<scalar> wallN_;
     DeviceBuffer<scalar> hwn_;    // per-cell wall-normal grid spacing (IDDES delta 3rd term); built only when ctl_.iddes
     // Transient (PIMPLE) state: ddt scheme + time steps + old-time velocity levels (U.oldTime()[.oldTime()]), rotated by
     // advanceTime(). steadyState + empty old-time buffers in the default steady SIMPLE path, where ddt is a no-op.
     DdtScheme ddtScheme_ = DdtScheme::steadyState;
+    std::vector<TimeVaryingP0> tvP0_;   // uniformTotalPressure p0(t), empty for constant p0
+    std::vector<FanPressure>   fanP0_;  // fanPressure: p0 shifted by the fan curve each step
+    std::vector<FixedMean>     fixedMean_;   // fixedMean: refValue re-derived from the adjacent cells each step
     scalar    deltaT_ = 0, deltaT0_ = 0;
     scalar    ocCoeff_ = 1;         // CrankNicolson off-centring (fvSchemes "CrankNicolson <oc>"); 0=Euler-like, 1=pure CN
     bool      cnWarm_  = false;     // CrankNicolson: the ddt0 recurrence has done its first (Euler-startup) update
@@ -467,7 +740,14 @@ private:
     // kEpsilon: 1 on boundary faces whose 0/nut BC is 'calculated'. OF fills those by field assignment
     // (Cmu*k_b^2/eps_b) rather than extrapolating the cell, and the two differ by >12x at a fixed-k inlet.
     DeviceBuffer<label>  nutCalcMask_;
+    // OF fvMesh::movePoints does storeOldVol(V()) BEFORE moving: the ddt source needs V^{n-1} while the
+    // diagonal uses V^n. Empty on a fixed mesh, where both are the same buffer and nothing changes.
+    DeviceBuffer<scalar> Vold_;
+    std::vector<label> patchStart_;   // DeviceBoundary face offset per patch
+    DeviceBuffer<scalar> nutBndFile_;   // nut's own boundaryField (OF reads nut_b from here, not cells)
     bool hasNutCalc_ = false;
+    bool hasNutFixed_ = false;
+    DeviceBuffer<label> nutFixedMask_;   // 0 where nut's BC fixes a value on a non-wall patch
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces
     // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
     // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed
@@ -528,13 +808,64 @@ private:
     DeviceBuffer<scalar> wfNu_;       // nu = mu_b/rho_b gathered onto wall faces, for omegaWallFunction/G0
     DeviceBuffer<scalar> nutBndAll_;  // nut at boundary faces (wall-function value on walls), for alphat_b
     DeviceBuffer<scalar> prtBnd_;     // per-face Prt: the alphatWallFunction's on its patches, the model's elsewhere
-    bool   hasMixed_ = false;                                  // any freestreamVelocity/Pressure (mixed) patch present
+    // any inletOutlet U patch present -> HbyA must keep its extrapolated boundary there (constrainHbyA
+    // skips assignable patches, and inletOutlet is one). Costs three zero-gradient evaluations per
+    // corrector, so it is gated on the case actually having such a patch.
+    bool   hasInletOutletU_ = false;
+    bool   hasMixed_ = false;
+    bool   hasWedge_ = false;   // any wedge (axisymmetric constraint) U patch -> per-step rotated value                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)
     bool   hasTotalP_ = false;                                 // any totalPressure p patch present (per-step refValue)
     bool   hasCyclic_ = false;                                 // any cyclic (periodic) interface -> Jacobi-PCG pressure (no AMG)
     DeviceCyclic cyc_;                                          // periodic interface coupling (OF updateInterfaceMatrix)
+    // (fvPatch index, face count) of each side stacked into cyc_.phi / ami_.phi, in the order
+    // buildDeviceCyclic / buildDeviceAMI concatenated them -- the map interfacePatchFlux() needs.
+    // The MOMENTUM interface off-diagonal, kept aside because cyc_/ami_.ifCoeff is shared with the
+    // pressure laplacian assembly and UEqn.H() needs the momentum one on every corrector, not just the
+    // first. See solveMomentumPredictor for what reading the wrong one costs.
+    // fvc::ddtCorr state. phi.oldTime() -- the flux at the previous TIME level, snapshotted in
+    // advanceTime and held constant across the step's correctors, exactly as OF's oldTime() is. The
+    // boundary mask is 0 wherever OF zeroes the coupling coefficient (U fixesValue, or a coupled patch)
+    // and 1 elsewhere; it is built once, since neither condition changes during a run.
+    DeviceBuffer<scalar> phiOldInt_, phiOldBnd_, ddtCorrBndMask_;
+    // ...and the same two things ON the interface, where OF's ddtCorr is the ONLY place it survives.
+    // ddtScheme::fvcDdtPhiCoeff zeroes the coefficient on `isA<cyclicAMIFvPatch>`, and cyclicACMIFvPatch
+    // derives from coupledFvPatch, NOT from cyclicAMIFvPatch -- so a plain cyclicAMI gets no correction
+    // and a cyclicACMI does. Everywhere else it vanishes on its own: a boundary face's phi IS U_b & Sf,
+    // so phiCorr is identically zero there. Measured on oscillatingInletACMI2D at t=0.01, OF's term is
+    // 0 on inlet/outlet/walls/blockage and max 1.07e-04 on the two coupled patches.
+    DeviceBuffer<scalar> amiPhiOld_, cycPhiOld_, amiFluxUold_, cycFluxUold_, ddtCorrIfOnes_;
+    bool   ddtCorr_ = true;         // fvSolution PIMPLE/ddtCorr (OF pimpleControl.C:55, default true)
+    bool   ddtCorrNoticed_ = false; // say once if the scheme is one brae has no ddtCorr form for
+
+    // mesh.phi() from the last move (per mesh face, internal then boundary). Held rather than applied at
+    // the move: fvc::makeRelative belongs at the end of the pressure corrector. See makeFluxRelative.
+    std::vector<scalar> meshPhi_;
+    // Uf -- the FACE VELOCITY a moving-mesh pimpleFoam carries beside phi (createUfIfPresent.H, made
+    // whenever mesh.dynamic()). Held in brae's four flux compartments: internal faces, non-coupled
+    // boundary faces, and the two interfaces. Updated by fvc::correctUf at the end of every pressure
+    // corrector, aged into *Old_ at the top of each step, and read by fvc::ddtCorr as
+    // phiUf0 = Sf_current & Uf.oldTime().
+    //
+    // WHY IT EXISTS RATHER THAN A SHORTCUT. phi + mesh.phi() reproduces phiUf0 exactly while Sf holds
+    // still, and that covered a translating mesh -- but a cyclicACMI rescales its coupled face areas
+    // every step from the overlap mask, and a rotating mesh turns Sf under the stored Uf. On the moving
+    // oscillatingInletACMI2D the shortcut was exact at step 1 and 5.1e-03 off by step 10, all of it on
+    // the interface columns. Carrying the real field removes the approximation instead of announcing it.
+    DeviceBuffer<scalar> UfInt_[3], UfBnd_[3], UfAmi_[3], UfCyc_[3];
+    DeviceBuffer<scalar> UfOldInt_[3], UfOldBnd_[3], UfOldAmi_[3], UfOldCyc_[3];
+    // Second old level, for backward's fvcDdtUfCorr. OF forms it as (Sf & Uf.oldTime().oldTime()) --
+    // CURRENT areas against the two-steps-old face velocity -- so on a moving mesh it cannot be produced
+    // by ageing the phi VALUE, which would carry the older Sf along with it.
+    DeviceBuffer<scalar> UfOld2Int_[3], UfOld2Bnd_[3];
+    DeviceBuffer<scalar> phiOld2Int_, phiOld2Bnd_;
+    bool   ufActive_ = false;            // set once the mesh-motion path has run: OF's mesh.dynamic()
+    bool   meshPhiValid_ = false;
+    DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
+    std::vector<std::pair<label, label>> cycRuns_, amiRuns_;
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)
+    bool   amiNonConforming_ = false;                           // ...and a face with >1 partner -> BiCGStab (see below)
     DeviceAMI    ami_;                                          // cyclicAMI weighted-stencil coupling (translational path)
 };
 

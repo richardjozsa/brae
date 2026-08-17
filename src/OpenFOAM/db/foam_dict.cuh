@@ -38,11 +38,24 @@ inline std::regex compileFoamRegex(const std::string& pat)
 inline bool isConstraintPatchType(const std::string& t)
 {
     return t == "empty" || t == "symmetryPlane" || t == "symmetry" || t == "wedge" || t == "cyclic"
-        || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicSlip" || t == "processor"
+        || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicPeriodicAMI" || t == "cyclicSlip" || t == "processor"
         || t == "processorCyclic" || t == "nonuniformTransformCyclic";
     // NOTE: "overset" is deliberately NOT here. It is a coupled patch whose fvPatchField cannot be
     // synthesised from the mesh type -- treating it as a constraint made an unsupported overset case run
     // silently. buildPatches refuses it outright (fv_patch.cu).
+}
+
+// Coupled INTERFACE patches: the pair whose face values come from the other side of the interface, not
+// from a boundary condition. brae handles these on the device (device_cyclic / device_ami), so the
+// ordinary boundary machinery -- DeviceBoundary entries, coded-BC scanning, surface-field reads, patch
+// field construction -- must skip them.
+//
+// cyclicACMI belongs here for the same reason it belongs on the device AMI path: it IS a cyclicAMI, plus
+// an area split with its coincident nonOverlapPatch wall. The wall half is an ordinary patch and is NOT
+// skipped -- it carries the uncovered fraction and needs its real boundary condition.
+inline bool isCoupledInterfaceType(const std::string& t)
+{
+    return t == "cyclic" || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicPeriodicAMI";
 }
 
 struct FoamDict
@@ -153,6 +166,29 @@ inline FoamDict parseDictBody(TokenStream& ts, bool top)
             if (!top) ts.next();
             break;
         }
+        // AN EMPTY ENTRY IS NOT A KEY. A stray ';' at key position must be skipped, not read as the name
+        // of the entry that follows -- otherwise that entry is consumed as this one's VALUE and disappears.
+        //
+        // It is brae's own $macro expansion that produces them. OF expands `$p;` as a dictionary MERGE:
+        // the keyword is `$p` and p's entries are added, so no punctuation is ever duplicated. brae
+        // expands it as TEXT, substituting p's captured body -- which ends in its own ';' -- for the `$p`,
+        // leaving the file's ';' behind it. So the canonical OpenFOAM override idiom
+        //
+        //     p      { solver GAMG; tolerance 1e-5;  relTol 0.01; }
+        //     pFinal { $p; tolerance 1e-10; relTol 0; }
+        //
+        // expanded to `... relTol 0.01 ; ; tolerance 1e-10 ; relTol 0 ;` and parsed the second ';' as a
+        // key holding "tolerance 1e-10". The override was not merely lost: it was swallowed, so
+        // find("tolerance") returned the 1e-5 the macro had pulled in and pFinal silently became p.
+        //
+        // Measured on pimpleFoam/RAS/oscillatingInletACMI2D, whose pFinal is exactly that idiom: the final
+        // pressure corrector stopped at 9.7e-06 instead of 1e-10 and the step's continuity error came out
+        // 2.2e-06 against OpenFOAM's 1.3e-14. Skipping the stray ';' here takes it to 2.2e-11.
+        //
+        // Fixed at the PARSER rather than in the expansion because this is the failure mode that matters:
+        // an unparseable empty entry is harmless, an empty entry that eats the next one is a silently
+        // ignored input. OF tolerates `;;` in hand-written dictionaries too.
+        if (ts.peek() == ";") { ts.next(); continue; }
         const std::string key = ts.next();
         if (ts.eof()) break;
         if (ts.peek() == "{")
@@ -303,7 +339,40 @@ inline std::string expandDictVariables(const std::string& rawIn)
         }
         std::string val;
         std::size_t j = i + 1;
-        for (; j < toks.size() && toks[j] != ";" && toks[j] != "{" && toks[j] != "}"; ++j) { if (!val.empty()) val += ' '; val += toks[j]; }
+        std::string prev;
+        for (; j < toks.size() && toks[j] != ";" && toks[j] != "}"; ++j)
+        {
+            if (toks[j] == "{")
+            {
+                // A '{' straight after a #directive is that directive's BODY, not a sub-dictionary:
+                //     internalField   uniform #eval{ 3.0/1520000.0 };
+                // Stopping here recorded the value as "uniform #eval", so every `$internalField` expanded
+                // to a #eval with no expression -- and the directive expander (which runs AFTER macros,
+                // because #eval bodies may themselves reference macros) then rejected it with a message
+                // pointing at the USE site, several patches away from the definition. That is how
+                // pimpleFoam/LES/NACA4412's 0/nut failed while its 0/k, written the same way, did not.
+                if (!prev.empty() && prev[0] == '#')
+                {
+                    int d = 1;
+                    if (!val.empty()) val += ' ';
+                    val += '{';
+                    for (++j; j < toks.size() && d > 0; ++j)
+                    {
+                        if      (toks[j] == "{") ++d;
+                        else if (toks[j] == "}") --d;
+                        val += ' ';
+                        val += toks[j];
+                    }
+                    --j;                 // the loop's own ++j steps past the closing '}'
+                    prev = "}";
+                    continue;
+                }
+                break;                   // a genuine sub-dictionary ends the value
+            }
+            if (!val.empty()) val += ' ';
+            val += toks[j];
+            prev = toks[j];
+        }
         // Skip a self-reference like `z0 $z0;` (an inner-scope entry that pulls from an outer variable of the SAME
         // name -- OF scoping). In brae's flat var map this would overwrite the real outer value with an unresolvable
         // self-ref, so keep the outer definition (e.g. `z0 uniform 0.1;` from an #include'd ABLConditions).
@@ -325,6 +394,16 @@ inline std::string expandDictVariables(const std::string& rawIn)
                 std::size_t j = i + 1;
                 bool brace = false;
                 if (j < text.size() && text[j] == '{') { brace = true; ++j; }
+                // OF's SCOPED reference: `${/name}` is "name at the FILE's root scope", and a case does
+                // reach for it -- LES/planeChannel writes
+                //     timeStart  #eval #{ 1.0/3.0 * ${/endTime} #};
+                // in a functionObject, referring up to controlDict's own endTime. brae's variable map is
+                // flat (every entry, whatever its depth, under its own name), so a root-scoped lookup is
+                // the same lookup with the leading '/' removed. Leading `:` is OF's older spelling of the
+                // same thing. NOT handled: `..` parent-relative and multi-level `a/b/c` paths, which
+                // would need a real scope tree -- they fall through unexpanded and are refused downstream
+                // rather than resolved to the wrong entry.
+                while (j < text.size() && (text[j] == '/' || text[j] == ':')) ++j;
                 const std::size_t s = j;
                 // WHICH CHARACTERS BELONG TO THE NAME. OF's word::valid (wordI.H:59) rejects only
                 // whitespace and " ' / ; { }, so a macro name may contain '-' and '.' -- and real cases

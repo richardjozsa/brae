@@ -1,5 +1,7 @@
 // cf GPU offload: explicit divDevReff stress source. Tensors packed component-major (i*3+j)*n + cell.
 #include "device_divdevreff.cuh"
+#include "device_kepsilon.cuh"   // deviceCellLimitGradU (the named grad(U) scheme)
+#include "stage_dump.cuh"   // sigma comparison against OF (ACMI trace)
 #include "device_blas.cuh"
 #include <cuda_runtime.h>
 
@@ -167,6 +169,46 @@ void tensorDivKernel(
 } // namespace
 
 
+// The two pieces of the stress path the MAXWELL model needs, exported so it does not have to
+// re-implement them: the gaussGrad-corrected BOUNDARY gradient, and the tensor divergence itself
+// (V*fvc::div(T), the source convention brae's momentum assembly uses). Both are the same kernels
+// divDevReff runs; sharing them is what keeps `div(nuM*grad(U))` consistent with
+// `div(nu*dev2(T(grad(U))))` down to the boundary treatment.
+void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
+                         const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB)
+{
+    const int nC = dm.nCells, nB = dm.nBndFaces;
+    DeviceBuffer<scalar> uxb, uyb, uzb;
+    deviceBCValue(dbU.comp[0], Ux, uxb);
+    deviceBCValue(dbU.comp[1], Uy, uyb);
+    deviceBCValue(dbU.comp[2], Uz, uzb);
+    gradB.resize(static_cast<std::size_t>(9) * nB);
+    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+                                      gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
+                                      dbU.comp[0].deltaCoeffs.data(), gradB.data());
+    cudaCheck(cudaGetLastError(), "boundaryGradU");
+}
+
+void deviceTensorDivSource(const DeviceMesh& dm,
+                           const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
+                           DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,
+                           const DeviceCyclic* cyc, const DeviceAMI* ami)
+{
+    const int nC = dm.nCells, nB = dm.nBndFaces;
+    srcX.resize(nC);
+    srcY.resize(nC);
+    srcZ.resize(nC);
+    tensorDivKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
+                                          dm.nei.data(), dm.w.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+                                          dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(),
+                                          Tcell.data(), Tbnd.data(), nB, dm.V.data(), srcX.data(), srcY.data(), srcZ.data());
+    cudaCheck(cudaGetLastError(), "tensorDivSource");
+    if (cyc) interfaceAddTensorDiv(*cyc, Tcell, nC, srcX, srcY, srcZ);
+    if (ami) interfaceAddTensorDiv(*ami, Tcell, nC, srcX, srcY, srcZ);
+}
+
+
 void deviceDivDevReff(
     const DeviceMesh& dm,
     const DeviceVectorBoundary& dbU,
@@ -180,7 +222,8 @@ void deviceDivDevReff(
     DeviceBuffer<scalar>& srcZ,
     const DeviceCyclic* cyc,
     const DeviceAMI* ami,
-    const DeviceProcStress* proc)
+    const DeviceProcStress* proc,
+    scalar gradULimitK)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
@@ -227,6 +270,10 @@ void deviceDivDevReff(
         *ub[i] = std::move(bval);
     }
 
+    // ...then LIMIT it, if the case named a limited grad(U). OF applies cellLimitedGrad to the base
+    // Gauss gradient AFTER the coupled-patch contributions are in, which is exactly here.
+    if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);
+
     // sigma cell
     DeviceBuffer<scalar> sigmaC(static_cast<std::size_t>(9) * nC);
     sigmaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuCell.data(), sigmaC.data());
@@ -270,6 +317,11 @@ void deviceDivDevReff(
         }
     }
 
+    if (stageDumpActive() && stageDumpFirstOnly("ddrSigma"))
+    {   // sigma = nuEff*dev2(T(grad(U))) per cell, the input to the tensor divergence. Packed 9*nC,
+        // [q*nC + c] with q = 3*row + col, so it can be compared against OF's volTensorField directly.
+        stageDump("stage_ddr_sigma", sigmaC);
+    }
     // tensor divergence (= V*fvc::div)
     srcX.resize(nC);
     srcY.resize(nC);

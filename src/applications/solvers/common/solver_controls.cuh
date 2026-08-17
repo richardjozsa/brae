@@ -7,7 +7,9 @@
 #include "komega_sst_coeffs.cuh"
 #include "spalart_coeffs.cuh"
 #include "smagorinsky_coeffs.cuh"
+#include "deshybrid_coeffs.cuh"
 #include <string>
+#include <vector>
 
 namespace brae {
 
@@ -20,16 +22,139 @@ enum class NutWall { Nutk, Spalding, Blended, NutU };   // NutU = nutUWallFuncti
 struct DeviceSimpleControls
 {
     scalar nu = 1e-5, relaxU = 0.7, relaxP = 0.3, relaxK = 0.7, relaxEps = 0.7;
+    // The same factors on the LAST outer corrector (OF's ".*Final" idiom). Default to the ordinary
+    // factor so a case without Final entries behaves exactly as before.
+    scalar relaxUFinal = 0.7, relaxPFinal = 0.3, relaxKFinal = 0.7, relaxEpsFinal = 0.7;
     vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
     scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
     scalar relTolU = 0.0, relTolP = 0.0, relTolKE = 0.0;   // solver relTol (fvSolution solvers.{U,p,k,epsilon}.relTol). 0 = abs tol.
+    // fvSolution's `Final` VARIANTS (solvers.pFinal / UFinal / kFinal ...). PIMPLE spends its early outer
+    // correctors getting close and its last one getting the answer, so OF gives the last one its own,
+    // tighter settings: pimpleControl::loop calls mesh.data().setFinalIteration(true) on the final outer
+    // corrector, and fvMatrix::solve() then resolves its dictionary through GeometricField::select(),
+    // which appends "Final" to the field name. Every solve inside that outer corrector uses them --
+    // including each inner PISO pressure corrector, since the flag is per outer iteration.
+    //
+    // brae read only the base entries, so a case's pFinal was inert: with the oscillatingInletACMI2D
+    // settings (p: 1e-5/relTol 0.01, pFinal: 1e-10/relTol 0) that left the FINAL flux converged to the
+    // loose figure and reported time-step continuity of 1.7e-04 where OF reaches 1e-14. It cost a long
+    // detour in the cyclicACMI hunt, because a continuity residual that size reads as a coupling defect.
+    // brae's dict audit had been printing `solvers/pFinal/ (whole sub-dictionary never read)` throughout.
+    //
+    // Absent entries fall back to the base ones (OF would FatalError instead; refusing a case that OF
+    // runs is worse than solving its last corrector exactly as tightly as the others).
+    // fvSolution solvers.<field>.{maxIter,minIter}. OF's lduMatrix::solver reads both (defaults 1000 and
+    // 0) and they are NOT cosmetic: LES/NACA4412 caps the pressure solve at `maxIter 10`, and on its
+    // impulsive first step GAMG leaves with a residual of 4.26 against an initial 1 -- an unconverged
+    // field by construction. A solver that instead runs to convergence produces a different (better, but
+    // different) answer, and the two cannot be compared on that step at all. minIter forces iterations
+    // even when the initial residual already passes, which is how a case pins down "always do one sweep".
+    int    maxIterU = 1000, maxIterP = 1000, maxIterKE = 1000;
+    int    minIterU = 0,    minIterP = 0,    minIterKE = 0;
+    int    maxIterUFinal = 1000, maxIterPFinal = 1000, maxIterKEFinal = 1000;
+    int    minIterUFinal = 0,    minIterPFinal = 0,    minIterKEFinal = 0;
+    scalar tolUFinal = 1e-8, tolPFinal = 1e-7, tolKEFinal = 1e-8;
+    scalar relTolUFinal = 0.0, relTolPFinal = 0.0, relTolKEFinal = 0.0;
+    // TWO flags, because OF selects the Final entry two different ways and the difference is visible in
+    // its log on any PISO-mode case (nOuterCorrectors 1, two pressure correctors):
+    //
+    //   GAMG: Solving for p, Initial residual = 0.0513, Final residual = 2.786e-04, No Iterations 4
+    //   GAMG: Solving for p, Initial residual = 0.0042, Final residual = 5.988e-11, No Iterations 16
+    //
+    // corrector 1 stopped on `p` (relTol 0.01), corrector 2 on `pFinal` (1e-10, relTol 0) -- so pFinal
+    // is NOT simply "the last outer iteration". pEqn.H asks for it explicitly:
+    //     pEqn.solve(p.select(pimple.finalInnerIter()))
+    // and finalInnerIter() = last PISO corrector AND last non-orthogonal pass (pimpleControlI.H:98),
+    // gated on the outer iteration only when `finalOnLastPimpleIterOnly` is set, which defaults false.
+    //
+    // UEqn.H and the turbulence models instead call the bare solve(), which resolves through
+    // fvMatrix::solverDict() -> psi_.select(mesh.data().isFinalIteration()) -- the flag pimpleControl
+    // sets for the whole of the final OUTER corrector. Same case, same log: Ux converges to 3.1e-07
+    // from an initial 3.3e-03, i.e. past the `U` relTol of 0.1, so it is on UFinal every step.
+    //
+    // Neither is ever set on the steady path: OF's simpleControl has no Final concept either.
+    bool   finalInner = false;   // p        -- last pressure corrector, last non-orth pass
+    bool   finalIter  = false;   // U, k/eps -- anywhere in the last outer corrector
+    int    pMaxIter() const { return finalInner ? maxIterPFinal : maxIterP; }
+    int    pMinIter() const { return finalInner ? minIterPFinal : minIterP; }
+    int    uMaxIter() const { return finalIter  ? maxIterUFinal : maxIterU; }
+    int    uMinIter() const { return finalIter  ? minIterUFinal : minIterU; }
+    scalar pTol()     const { return finalInner ? tolPFinal     : tolP; }
+    scalar pRelTol()  const { return finalInner ? relTolPFinal  : relTolP; }
+    scalar uRelax()   const { return finalIter  ? relaxUFinal   : relaxU; }
+    scalar pRelax()   const { return finalIter  ? relaxPFinal   : relaxP; }
+    scalar kRelax()   const { return finalIter  ? relaxKFinal   : relaxK; }
+    scalar epsRelax() const { return finalIter  ? relaxEpsFinal : relaxEps; }
+    scalar uTol()     const { return finalIter  ? tolUFinal     : tolU; }
+    scalar uRelTol()  const { return finalIter  ? relTolUFinal  : relTolU; }
+    scalar keTol()    const { return finalIter  ? tolKEFinal    : tolKE; }
+    scalar keRelTol() const { return finalIter  ? relTolKEFinal : relTolKE; }
+    // fvSolution PIMPLE/finalOnLastPimpleIterOnly (pimpleControl.C:53, default false).
+    bool   finalOnLastPimpleIterOnly = false;
     int    bicgCheckEvery = 1;      // batched convergence for ALL BiCGStab solves (momentum + k/eps); BRAE_BICG_CHECK_EVERY.
     bool   turbulent = false;
     bool   useGraph  = true;     // replay the pressure V-cycle from a cached CUDA graph (#7c-loop)
     bool   bounded   = false;    // "bounded Gauss upwind": add -Sp(div(phi),U). Set from fvSchemes; default off.
     bool   consistent = false;   // SIMPLEC (rAtU consistency correction, p=1). Set from fvSolution SIMPLE.consistent.
     bool   linearUpwind = false; // div(phi,U) "linearUpwind": add the deferred gradient correction. Set from fvSchemes.
+    // div(phi,U) bare "linear" = central differencing (OF linear.H:106 -> the geometric weights).
+    // Standard for LES, where upwind dissipation would damp the resolved turbulence the model exists to
+    // capture. Unbounded by construction, which is why cases pair it with `bounded`.
+    bool   divULinear = false;
     bool   linearUpwindV = false;// div(phi,U) "linearUpwindV": linearUpwind + OF's vector direction limiter (also sets linearUpwind).
+    // div(phi,U) "limitedLinearV k": OF's NVDVTVDV vector limiter -- ONE limiter per face built from the
+    // whole velocity vector, blending the central and upwind weights IMPLICITLY (no deferred correction).
+    // laminar { model Maxwell; } -- the viscoelastic stress transport. nuM is the polymer viscosity and
+    // lambda its relaxation time; both are material properties, not closure constants, and OF refuses
+    // the model without them.
+    // PIMPLE/momentumPredictor (OF pimpleControl, default TRUE). When off, pimpleFoam still ASSEMBLES
+    // and relaxes UEqn -- rAU and HbyA come from it -- but never solves it: U is updated only by the
+    // pressure corrector. laminar/planarPoiseuille turns it off, and solving anyway made its first step
+    // 56% fast (0.00535 against 0.00343 m/s) because the predictor moved U before the corrector did.
+    bool   momentumPredictor = true;
+    // PIMPLE/correctPhi (OF createDyMControls.H, default = mesh.dynamic()). After the mesh moves, the
+    // stored flux belongs to the OLD geometry: OF rebuilds the ABSOLUTE flux from the mapped surface
+    // velocity (phi = Sf & Uf) and then PROJECTS it divergence-free by solving a pcorr Poisson, before
+    // any momentum or pressure equation sees it. Skipping it leaves the step starting from a flux that
+    // does not satisfy continuity on the mesh it is about to be used on.
+    // PIMPLE loop contract (OF pimpleControl). These are not tuning knobs -- each selects part of the
+    // pressure-velocity algorithm, so an unread one means solving a DIFFERENT algorithm.
+    //
+    // turbOnFinalIterOnly defaults to TRUE in OpenFOAM: turbulence->correct() runs ONCE per time step,
+    // on the final outer corrector, because the outer loop is iterating the pressure-velocity coupling,
+    // not the turbulence transport. brae corrected on every outer corrector, which on a case with
+    // nOuterCorrectors 5 advanced the turbulence model five times per physical step. A 30-case sweep
+    // missed it: most tutorials use nOuterCorrectors 1, where the two cadences coincide.
+    bool   turbOnFinalIterOnly = true;
+    bool   solveFlow = true;            // OF: skip the momentum/pressure solve entirely when false
+    bool   simpleRho = false;           // OF SIMPLErho: compressible rho update cadence; inert here
+    // PIMPLE residualControl: outer-loop convergence. When every controlled field meets its absolute or
+    // RELATIVE tolerance, OF runs ONE more iteration flagged as final and then leaves the loop early.
+    // That changes which iteration is `final`, and therefore which solver settings are used and when
+    // turbulence is corrected -- so it is not a cost-only control.
+    struct OuterResidualControl { std::string field; scalar absTol = 0; scalar relTol = 0; };
+    std::vector<OuterResidualControl> outerResidualControl;
+    // OF createDyMControls.H, default FALSE: the mesh moves once per time step, on the first outer
+    // iteration. When true it moves before EVERY outer corrector, so the outer loop converges the mesh
+    // position alongside the pressure-velocity coupling.
+    bool   moveMeshOuterCorrectors = false;
+    // dynamicFvMesh::controlledUpdate -- dynamicMeshDict updateControl/updateInterval (OF's timeControl
+    // with the "update" prefix). Default is every step.
+    std::string meshUpdateControl = "always";
+    int         meshUpdateInterval = 1;
+    bool   correctPhi = false;
+    // fvSolution solvers.pcorr -- OF's own tutorials give it a LOOSE tolerance (0.02) and relTol 0,
+    // because the projection only has to remove the mapping error, not converge a pressure field.
+    scalar tolPcorr = 0.02, relTolPcorr = 0.0;
+    int    maxIterPcorr = 1000;
+    bool   maxwell = false;
+    scalar maxwellNuM = 0.0;
+    scalar maxwellLambda = 0.0;
+    bool   divSigmaVanAlbada = false;   // div(phi,sigma) Gauss vanAlbada (what both Maxwell tutorials name)
+    scalar relaxSigma = 1.0;            // relaxationFactors/equations/sigma (OF sigmaEqn.relax(); absent -> none)
+    bool   gsSigma = false;             // solvers/sigma smoothSolver + a GaussSeidel smoother
+    bool   divULimitedV = false;
+    scalar divUTwoBykV  = 2.0;   // OF limitedLinearLimiter twoByk_ = 2/max(k, SMALL); k = 1 -> 2
     bool   lust = false;         // div(phi,U) "LUST": deferred correction = 0.75*linear + 0.25*linearUpwind (OF LUST.H).
     bool   nonOrth = false;      // laplacian "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction. Set from fvSchemes.
     scalar nonOrthLimit = 1.0;   // snGrad "limited <psi>" coeff (OF fv::limitedSnGrad); 1.0 = "corrected" (unlimited). Set from fvSchemes.
@@ -118,6 +243,22 @@ struct DeviceSimpleControls
     bool   les = false;                            // pure LES Smagorinsky (simulationType LES): ALGEBRAIC sub-grid nut,
                                                    // NO transport scalar (no k/epsilon/omega/nuTilda). Mutually exclusive with sa/sst/des.
     SmagorinskyCoeffs smagCoeffs;                  // Smagorinsky coeffs (default = OF Ck=0.094, Ce=1.048); read from LES.SmagorinskyCoeffs.
+    // WALE: the same algebraic-LES slot, a different velocity scale. `les` stays the flag for
+    // "nut is algebraic, there is no transport scalar"; this only picks which formula fills it.
+    bool wale = false;
+    // fvSchemes wallDist `method exactDistance`: the true Euclidean distance to the wall surface, rather
+    // than OF's default connectivity-propagated meshWave. Different y => a different F1/F2/dTilda.
+    bool exactWallDist = false;
+    // div(phi,U) `Gauss DEShybrid <s1> <s2> <delta> ...`: a per-face blend of a low-dissipation scheme
+    // and an upwind-biased one, driven by a DES sensor. See deshybrid_coeffs.cuh.
+    // LES `delta maxDeltaxyz`: the filter width is OF's face-normal hmax rather than cubeRootVol.
+    // Every consumer of the filter width (Smagorinsky, WALE, the SA/SST DES length scale, DEShybrid)
+    // must use the SAME one, or the scheme and the model disagree about the resolved scale.
+    bool   lesDeltaMax = false;
+    scalar lesDeltaCoeff = 2.0;
+    bool desHybrid = false;
+    DesHybridCoeffs desCoeffs;
+    WaleCoeffs waleCoeffs;
     NutWall nutWall = NutWall::Nutk;               // nut wall function, read from the 0/nut wall BC TYPE (not the model),
                                                    // so nutUBlended/nutUSpalding are honoured on kEpsilon/kOmegaSST like OF.
     scalar atmZ0 = 0.0;                            // atmNutkWallFunction roughness length z0 (>0 -> rough-wall nut on the

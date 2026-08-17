@@ -88,16 +88,36 @@ void depsKernel(int nC, const scalar* __restrict__ nut, scalar sigma, scalar nu,
 
 
 static __global__
+// OF epsilonWallFunctionFvPatchScalarField::updateCoeffs(weights), epsilonWallFunction.C:586 --
+//     G[celli]       = (1 - w)*G[celli]       + w*G0[celli];
+//     epsilon[celli] = (1 - w)*epsilon[celli] + w*epsilon0[celli];
+// applied only where w > tolerance_. w is the non-overlap patch's weight, (1 - ACMI mask), and is 1 on
+// every ordinary wall -- so this reduces to the plain override everywhere except a partially covered
+// cyclicACMI face, which is the only place a wall is a fraction of a wall. `wallW` may be null for a
+// caller with no such patches, in which case isW alone decides, exactly as before.
 void overrideKernel(
     int nC,
     const label* __restrict__ isW,
     const scalar* __restrict__ G0,
-    const scalar* __restrict__ eps0,
+    scalar* __restrict__ eps0,
     scalar* __restrict__ G,
-    scalar* __restrict__ eps)
+    scalar* __restrict__ eps,
+    const scalar* __restrict__ wallW = nullptr)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c < nC && isW[c]) { G[c] = G0[c]; eps[c] = eps0[c]; }
+    if (c >= nC || !isW[c]) return;
+    const scalar w = wallW ? wallW[c] : scalar(1);
+    const scalar e = (scalar(1) - w)*eps[c] + w*eps0[c];
+    G[c]   = (scalar(1) - w)*G[c]   + w*G0[c];
+    eps[c] = e;
+    // ...AND THE MATRIX CONSTRAINT TAKES THE BLENDED VALUE, not the raw near-wall one.
+    // epsilonWallFunctionFvPatchScalarField::manipulateMatrix appends `epsilon[celli]` -- the field
+    // updateCoeffs(weights) has just blended -- and hands that to matrix.setValues. brae blended the
+    // field but then constrained the matrix to eps0, the UNBLENDED wall value. Identical on an ordinary
+    // wall, where w = 1 and the blend is the identity; different on exactly the cells a cyclicACMI
+    // partially covers. Measured on oscillatingInletACMI2D: epsilon on those cells was 0.72x OpenFOAM's
+    // while the median ACMI cell was already right to 1.7e-07.
+    eps0[c] = e;
 }
 } // anon (scaffold setValues kernels)
 
@@ -149,7 +169,15 @@ void deviceSolveScalarTransport(
     // boundaryManipulate (the epsilon wall function's own setValues) at 267 -- so on a cell claimed by both,
     // the WALL FUNCTION wins. Same three kernels; only the mask and the values differ.
     const DeviceBuffer<label>* fvoSetMask = nullptr,
-    const DeviceBuffer<scalar>* fvoSetVal = nullptr)
+    const DeviceBuffer<scalar>* fvoSetVal = nullptr,
+    // OF limitFuncs: a limited scheme on a NON-SCALAR field builds its limiter from one derived scalar
+    // (magSqr of the tensor), so every component shares a single per-face limiter -- it is not six
+    // independent limiters. Pass that scalar and its gradient here; null means "build it from `field`
+    // itself", which is what every scalar caller wants and leaves them byte-for-byte unchanged.
+    const DeviceBuffer<scalar>* limField = nullptr,
+    const DeviceBuffer<scalar>* limGradX = nullptr,
+    const DeviceBuffer<scalar>* limGradY = nullptr,
+    const DeviceBuffer<scalar>* limGradZ = nullptr)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -168,22 +196,76 @@ void deviceSolveScalarTransport(
         DeviceBuffer<scalar> bv;
         deviceBCValue(db, field, bv);
         deviceGaussGrad(dm, field, bv, gx, gy, gz);
+        // THE COUPLED FACES, which this gradient never had. deviceGaussGrad sums over the internal and
+        // non-coupled boundary faces; a cyclic/AMI/ACMI face is in neither list, so the gradient of k,
+        // epsilon, omega, nuTilda and he simply stopped at the interface -- while the MOMENTUM predictor
+        // has added them all along. All three consumers below read this buffer: limitedLinear's weight,
+        // linearUpwind's deferred correction and the non-orthogonal laplacian correction.
+        if (cyc && cyc->n > 0) interfaceAddGrad(*cyc, field, dm.V, gx, gy, gz);
+        if (ami && ami->n > 0) interfaceAddGrad(*ami, field, dm.V, gx, gy, gz);
         if (limitLU)
         {
             deviceCopy(lgx, gx); deviceCopy(lgy, gy); deviceCopy(lgz, gz);
-            deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK);
+            // ...and the limiter has to see them too: OF's cellLimitedGrad folds a coupled patch's
+            // patchNeighbourField into its range and clips the extrapolation to that face. A SCALAR is
+            // never rotated across the interface, so the neighbour value is the raw (AMI-interpolated)
+            // cell value. See CellLimitInterface and test_cell_limit_interface.
+            CellLimitInterface ifs[2];
+            int nIfs = 0;
+            DeviceBuffer<scalar> cycNbr, amiNbr, empty;
+            if (cyc && cyc->n > 0)
+            {
+                deviceCyclicNbrValue(*cyc, field, empty, empty, empty, 0, cycNbr);
+                ifs[nIfs++] = { cyc->n, cyc->ownCell.data(), cycNbr.data(),
+                                cyc->dOwnX.data(), cyc->dOwnY.data(), cyc->dOwnZ.data() };
+            }
+            if (ami && ami->n > 0)
+            {
+                deviceAmiInterpolate(*ami, field, amiNbr);
+                ifs[nIfs++] = { ami->n, ami->ownCell.data(), amiNbr.data(),
+                                ami->dOwnX.data(), ami->dOwnY.data(), ami->dOwnZ.data() };
+            }
+            deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK, ifs, nIfs);
         }
     }
-    if (limited) deviceDivLimitedCoeffs(dm, phiInt, field, gx, gy, gz, twoByk, aD, aU, aL);   // Gauss limitedLinear: implicit limited weight
+    if (limited)
+    {
+        const bool sharedLim = limField && limGradX && limGradY && limGradZ;
+        deviceDivLimitedCoeffs(dm, phiInt,
+                               sharedLim ? *limField  : field,
+                               sharedLim ? *limGradX  : gx,
+                               sharedLim ? *limGradY  : gy,
+                               sharedLim ? *limGradZ  : gz,
+                               twoByk, aD, aU, aL);   // Gauss limitedLinear/vanAlbada: implicit limited weight
+    }
     else
     {
         deviceDivUpwindCoeffs(dm, phiInt, aD, aU, aL);
-        if (linearUpwind) deviceLinearUpwindCorr(dm, phiInt, limitLU ? lgx : gx, limitLU ? lgy : gy, limitLU ? lgz : gz, luCorr);             // Gauss linearUpwind: upwind matrix + deferred corr
+        if (linearUpwind)
+        {
+            deviceLinearUpwindCorr(dm, phiInt, limitLU ? lgx : gx, limitLU ? lgy : gy, limitLU ? lgz : gz, luCorr);   // Gauss linearUpwind: upwind matrix + deferred corr
+            // ...and at the interface, which OF's linearUpwind::correction() reaches through its
+            // `if (pSfCorr.coupled())` boundary loop. The momentum predictor has done this since the
+            // interface work; the scalar path never did. rotate=false: a scalar is not transformed.
+            const DeviceBuffer<scalar>& lx = limitLU ? lgx : gx;
+            const DeviceBuffer<scalar>& ly = limitLU ? lgy : gy;
+            const DeviceBuffer<scalar>& lz = limitLU ? lgz : gz;
+            if (cyc && cyc->n > 0) interfaceAddLinUpwindCorr(*cyc, lx, ly, lz, luCorr);
+            if (ami && ami->n > 0) interfaceAddLinUpwindCorr(*ami, lx, ly, lz, luCorr);
+        }
     }
     // laplacian "corrected": nonOrthDeltaCoeffs implicit (in deviceLaplacianCoeffs) + corrVec.grad(field) explicit (deviceLaplacianCorr).
     deviceLaplacianCoeffs(dm, Df, lD, lU, lL, nonOrth);
     deviceAxpy(-1.0, lD, aD); deviceAxpy(-1.0, lU, aU); deviceAxpy(-1.0, lL, aL);
-    if (nonOrth) deviceLaplacianCorr(dm, Df, gx, gy, gz, lapCorr);
+    if (nonOrth)
+    {
+        deviceLaplacianCorr(dm, Df, gx, gy, gz, lapCorr);
+        // The interface's own non-orthogonal correction. An AMI face is non-conformal by construction, so
+        // its corrVec is NOT small even on a mesh that is orthogonal everywhere else -- the one place a
+        // "corrected" laplacian actually has work to do on this fixture.
+        if (cyc && cyc->n > 0) interfaceAddLapCorr(*cyc, D, gx, gy, gz, lapCorr);
+        if (ami && ami->n > 0) interfaceAddLapCorr(*ami, D, gx, gy, gz, lapCorr);
+    }
     if (bounded) { DeviceBuffer<scalar> bt; deviceHadamard(bt, divU, dm.V); deviceAxpy(-1.0, bt, aD); }   // -Sp(div(phi),f)
     DeviceBuffer<scalar> src(static_cast<std::size_t>(nC));
     cudaCheck(cudaMemsetAsync(src.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "src zero");

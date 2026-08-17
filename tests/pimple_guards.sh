@@ -20,6 +20,25 @@ mkcase()   # mkcase <dir> [extra controlDict lines]
     printf 'FoamFile { version 2.0; format ascii; class dictionary; object transportProperties; }\ntransportModel Newtonian;\nnu 1e-05;\n' > "$1/constant/transportProperties"
     printf 'FoamFile { version 2.0; format ascii; class dictionary; object turbulenceProperties; }\nsimulationType laminar;\n' > "$1/constant/turbulenceProperties"
 }
+# The mirror of `refuses`: the entry must no longer STOP the run at dictionary-read time.
+#
+# These fixtures carry no mesh -- they exist to check what the dictionary stage accepts or rejects, and
+# they always die later on the absent polyMesh. So the assertion is "got PAST the dict stage", evidenced
+# by reaching the mesh error, not "produced a Courant number" (which needs a mesh and a flux). Asserting
+# the latter here would be asserting something the fixture cannot show.
+accepts_past_dict() {
+    local name=$1 dir=$2
+    "$BIN" -case "$dir" > "$WORK/$name.log" 2>&1
+    if grep -qF "not supported yet" "$WORK/$name.log"; then
+        echo "FAIL: $name -- still refused at the dictionary stage, but the feature is implemented"; fail=1; return
+    fi
+    if ! grep -qF "constant/polyMesh/points" "$WORK/$name.log"; then
+        echo "FAIL: $name -- did not reach the mesh stage; it stopped on something else"
+        tail -2 "$WORK/$name.log"; fail=1; return
+    fi
+    echo "ok:   $name"
+}
+
 refuses()  # refuses <name> <case dir> <expected text>
 {
     local log="$WORK/$1.log"
@@ -37,25 +56,48 @@ refuses()  # refuses <name> <case dir> <expected text>
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-# 1. adjustTimeStep: running at the fixed deltaT instead is a DIFFERENT simulation, not an approximation of the
-#    requested one, so it cannot be quietly ignored.
+# 1. adjustTimeStep is now IMPLEMENTED (OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT, via the
+#    shared cfdTools module). It used to be refused, because running at the fixed deltaT instead is a
+#    DIFFERENT simulation rather than an approximation. It must now RUN and report the Courant number --
+#    a case that silently stopped reporting Co would mean the control loop is not executing.
 mkcase "$WORK/adjustdt" "adjustTimeStep yes;
 maxCo 0.9;"
-refuses adjust_time_step "$WORK/adjustdt" "adjustTimeStep yes is not supported yet"
+accepts_past_dict adjust_time_step "$WORK/adjustdt"
 
 # 2. An active MRF zone: dropping the rotation leaves a converged-looking field of the wrong flow.
 mkcase "$WORK/mrf"
 printf 'FoamFile { version 2.0; format ascii; class dictionary; object MRFProperties; }\nMRF1\n{\n    cellZone rotor;\n    active yes;\n    origin (0 0 0);\n    axis (0 0 1);\n    omega 104.72;\n}\n' > "$WORK/mrf/constant/MRFProperties"
 refuses active_mrf_zone "$WORK/mrf" "does not apply MRF yet"
 
-# 3. fvOptions in either of the two places OpenFOAM looks.
-mkcase "$WORK/fvopt_system"
-printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nmomentumSource { type meanVelocityForce; }\n' > "$WORK/fvopt_system/system/fvOptions"
-refuses fvoptions_in_system "$WORK/fvopt_system" "does not apply fvOptions yet"
+# 3. fvOptions. The blanket "transient does not apply fvOptions" refusal is GONE -- the momentum sources
+#    live in solveMomentumPredictor, which pimpleStep already calls, so the driver reads them and hands
+#    them over (planarPoiseuille agrees with OpenFOAM to 7.9e-08 on a flow that IS the source). What must
+#    still refuse is a source brae cannot apply, and a TIME WINDOW it cannot honour -- brae bakes every
+#    source into one set of buffers, so it cannot switch one on mid-run.
+mkcase "$WORK/fvopt_unsupported"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nheat { type semiImplicitSourceNotAThing; }\n' > "$WORK/fvopt_unsupported/system/fvOptions"
+refuses fvoptions_unsupported_source "$WORK/fvopt_unsupported" "SILENTLY dropped"
 
-mkcase "$WORK/fvopt_constant"
-printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nporosity { type explicitPorositySource; }\n' > "$WORK/fvopt_constant/constant/fvOptions"
-refuses fvoptions_in_constant "$WORK/fvopt_constant" "does not apply fvOptions yet"
+# A vectorSemiImplicitSource with NEITHER `sources` nor `injectionRateSuSp`: nothing to apply, so loud.
+mkcase "$WORK/fvopt_nokeys"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nmomentumSource { type vectorSemiImplicitSource; selectionMode all; }\n' > "$WORK/fvopt_nokeys/constant/fvOptions"
+refuses fvoptions_no_source_keys "$WORK/fvopt_nokeys" "neither a \`sources\`"
+
+# A window that does not cover the run must refuse rather than apply the source throughout.
+mkcase "$WORK/fvopt_window"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nmomentumSource { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; timeStart 5000; duration 1; sources { U ((5 0 0) 0); } }\n' > "$WORK/fvopt_window/constant/fvOptions"
+refuses fvoptions_time_window "$WORK/fvopt_window" "does not cover this run"
+
+# ...and a SUPPORTED, always-on source must NOT be refused -- the mirror-image bug of the old blanket stop.
+mkcase "$WORK/fvopt_ok"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\nmomentumSource { type vectorSemiImplicitSource; selectionMode all; volumeMode specific; sources { U ((5 0 0) 0); } }\n' > "$WORK/fvopt_ok/constant/fvOptions"
+"$BIN" -case "$WORK/fvopt_ok" > "$WORK/fvopt_ok.log" 2>&1
+if grep -qE -e "fvOptions|SILENTLY dropped" "$WORK/fvopt_ok.log"; then
+    echo "FAIL: fvoptions_supported_runs -- a supported always-on source was refused"
+    grep -m2 -E "fvOptions|SILENTLY" "$WORK/fvopt_ok.log"; fail=1
+else
+    echo "ok:   fvoptions_supported_runs"
+fi
 
 # 4. An INACTIVE MRF zone is not a refusal -- OpenFOAM cases routinely ship one switched off, and refusing those
 #    would be the mirror-image bug (stopping a case brae can solve perfectly well).
@@ -72,7 +114,7 @@ fi
 #    which is exactly how we know the guards let it through rather than the run being stopped early.
 mkcase "$WORK/clean"
 "$BIN" -case "$WORK/clean" > "$WORK/clean.log" 2>&1
-if grep -qE -e "does not apply (MRF|fvOptions) yet|adjustTimeStep yes is not supported" "$WORK/clean.log"; then
+if grep -qE -e "does not apply MRF yet|SILENTLY dropped|adjustTimeStep yes is not supported" "$WORK/clean.log"; then
     echo "FAIL: clean_case -- a guard fired on a case with none of the unsupported features"
     sed -n '1,8p' "$WORK/clean.log"; fail=1
 else

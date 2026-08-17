@@ -19,4 +19,19 @@ struct SmagorinskyCoeffs {
     scalar Cs() const { return std::sqrt(Ck * std::sqrt(Ck / Ce)); }
 };
 
+// WALE (Nicoud & Ducros) LES sub-grid model coefficients, OF LESModels::WALE defaults. Same family as
+// Smagorinsky -- an ALGEBRAIC nut with no transport equation -- but a different velocity scale, built from
+// the traceless symmetric part of the SQUARE of the velocity gradient rather than from the strain alone:
+//     Sd = devSymm(gradU & gradU)
+//     k  = (Cw^2*delta/Ck)^2 * |Sd|^6 / ( (|symm(gradU)|^5 + |Sd|^(5/2))^2 + SMALL )
+//     nut = Ck*delta*sqrt(k)
+// which collapses to the textbook form nut = (Cw*delta)^2 * (Sd:Sd)^(3/2) / ((S:S)^(5/2) + (Sd:Sd)^(5/4)).
+// Its point is the near-wall limit: Sd:Sd vanishes as y^6 in a laminar shear layer where S:S does not, so
+// nut ~ y^3 without any damping function -- which is why channel LES cases reach for it over Smagorinsky.
+struct WaleCoeffs {
+    scalar Ck = 0.094;   // OF WALE default
+    scalar Ce = 1.048;   // sub-grid dissipation coefficient (epsilon only; nut does not use it)
+    scalar Cw = 0.325;   // OF WALE default
+};
+
 } // namespace brae

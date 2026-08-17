@@ -3,8 +3,10 @@
 // boundaryField { patch { type; value; ... } }. Templated on the value type (scalar/vector).
 // ASCII for now; binary field values land with the binary field reader (later increment).
 #include "cf_types.cuh"
+#include "function1.cuh"   // OF Function1: constant / table
 #include "foam_token_reader.cuh"
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <filesystem>
 
@@ -19,12 +21,42 @@ template <> inline vector readFoamValue<vector>(TokenStream& ts)
     ts.expect(")");
     return v;
 }
+// OF SymmTensor's I/O order, which is also its component order: (xx xy xz yy yz zz).
+template <> inline symmTensor readFoamValue<symmTensor>(TokenStream& ts)
+{
+    ts.expect("(");
+    symmTensor t{ts.nextScalar(), ts.nextScalar(), ts.nextScalar(),
+                 ts.nextScalar(), ts.nextScalar(), ts.nextScalar()};
+    ts.expect(")");
+    return t;
+}
 
 // Skip an unhandled dict entry's tokens up to (not including) its terminating ';', paren-aware so nested "(...)" lists
 // / tables / Function1 entries are consumed whole. initialDepth accounts for a leading '(' the caller already read.
 // Leaves the ';' in place for the caller's ts.expect(";"). Single source for the reader's 3 table/skip fallbacks.
-inline void skipToSemicolon(TokenStream& ts, int initialDepth = 0)
+// Skip an entry's VALUE. Returns true if it consumed a sub-dictionary (which has no trailing ';', so the
+// caller must not expect one) and false for an ordinary value terminated by ';'.
+//
+// Brace tracking is not decoration. A patch entry can carry a sub-DICTIONARY value -- fanPressure's
+//     fanCurve { type table; file "<constant>/FluxVsdP.dat"; }
+// is one -- and a paren-only scan stops at the ';' INSIDE that block. The block's own '}' is then taken
+// for the patch's, and every later patch of the field is swallowed: the failure surfaced as "no
+// boundaryField entry for patch outlet1" on pimpleFoam/RAS/TJunctionFan, naming a patch that is plainly
+// there and pointing nowhere near the fanCurve two entries above it. The polyMesh boundary parser had the
+// identical bug for cyclicACMI's `scaleCoeffs` block.
+inline bool skipToSemicolon(TokenStream& ts, int initialDepth = 0)
 {
+    if (initialDepth == 0 && ts.peek() == "{")   // sub-dictionary value: skip it balanced, no ';' follows
+    {
+        ts.expect("{");
+        for (int d = 1; d > 0; )
+        {
+            const std::string t = ts.next();
+            if      (t == "{") ++d;
+            else if (t == "}") --d;
+        }
+        return true;
+    }
     int depth = initialDepth;
     while (!(depth == 0 && ts.peek() == ";"))
     {
@@ -32,6 +64,7 @@ inline void skipToSemicolon(TokenStream& ts, int initialDepth = 0)
         if (s == "(") ++depth;
         else if (s == ")") --depth;
     }
+    return false;
 }
 
 template <typename T>
@@ -45,6 +78,8 @@ struct PatchFieldData
     // stale `value` from an overridden fixedValue entry, so the field silently takes that constant
     // instead. Recorded here and refused at construction rather than guessed at.
     std::string    unsupportedFunction1;
+    Function1      p0Function1;              // uniformTotalPressure p0(t); empty unless hasP0Function1
+    bool           hasP0Function1 = false;
     // pressureInletOutletVelocity's optional `tangentialVelocity`. OF sets
     // refValue = tv - n*(n & tv) (pressureInletOutletVelocityFvPatchVectorField.C:135); brae leaves the
     // tangential refValue at zero, so honouring the key would need per-face storage it does not have.
@@ -159,6 +194,49 @@ inline bool isFoamNumber(const std::string& t)
     const char c = t[0];
     return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
 }
+// OF Function1 accepts a BARE value as shorthand for `constant <v>`: `uniformValue (0 0 0);` and
+// `uniformValue 5;` are constants, not tables. brae required the keyword, so a bare vector was
+// classified as an unsupported Function1 and the case refused -- simpleFoam/turbineSiting's terrain
+// patch is exactly `uniformFixedValue` with `uniformValue (0 0 0)`.
+template <typename T>
+inline T readBareFoamValue(TokenStream& ts, const std::string& first);
+
+template <>
+inline scalar readBareFoamValue<scalar>(TokenStream& ts, const std::string& first)
+{
+    (void)ts;
+    return static_cast<scalar>(std::strtod(first.c_str(), nullptr));
+}
+
+template <>
+inline vector readBareFoamValue<vector>(TokenStream& ts, const std::string& first)
+{
+    // `first` is already the '('; the three components and the ')' remain.
+    (void)first;
+    vector v{};
+    v.x = ts.nextScalar();
+    v.y = ts.nextScalar();
+    v.z = ts.nextScalar();
+    ts.expect(")");
+    return v;
+}
+
+template <>
+inline symmTensor readBareFoamValue<symmTensor>(TokenStream& ts, const std::string& first)
+{
+    // `first` is already the '('; the six components (xx xy xz yy yz zz) and the ')' remain.
+    (void)first;
+    symmTensor t{};
+    t.xx = ts.nextScalar();
+    t.xy = ts.nextScalar();
+    t.xz = ts.nextScalar();
+    t.yy = ts.nextScalar();
+    t.yz = ts.nextScalar();
+    t.zz = ts.nextScalar();
+    ts.expect(")");
+    return t;
+}
+
 
 template <typename T>
 inline void readValueOrInternal(
@@ -237,6 +315,54 @@ inline void readTimeVaryingMapped(
     p.mapPoints = readBoundaryDataList<vector>(bd + "/points");
     p.mapValues = readBoundaryDataList<T>(bd + "/" + best + "/" + field);
     p.hasMapData = (p.mapPoints.size() == p.mapValues.size() && !p.mapPoints.empty());
+}
+
+// One COMPONENT of a symmTensor field, as a scalar FieldData -- so a `sigma` read from 0/sigma can go
+// through the ordinary scalar machinery (buildField, DeviceBoundary, the scalar transport) six times.
+//
+// The Maxwell tutorials use exactly three boundary kinds on sigma: fixedValue with a value, zeroGradient,
+// and the constraint types (empty/symmetry/cyclic), which carry no value. Anything that DOES carry data
+// this does not split is refused rather than silently dropped -- a fixedGradient sigma boundary quietly
+// becoming zeroGradient is the class of bug that never shows up as an error.
+inline FieldData<scalar> symmTensorComponent(const FieldData<symmTensor>& fd, int k)
+{
+    auto comp = [](const symmTensor& t, int i) -> scalar
+    {
+        switch (i)
+        {
+            case 0: return t.xx;
+            case 1: return t.xy;
+            case 2: return t.xz;
+            case 3: return t.yy;
+            case 4: return t.yz;
+            default: return t.zz;
+        }
+    };
+    FieldData<scalar> out;
+    out.internalUniform      = fd.internalUniform;
+    out.internalUniformValue = comp(fd.internalUniformValue, k);
+    out.internalField.reserve(fd.internalField.size());
+    for (const symmTensor& t : fd.internalField) out.internalField.push_back(comp(t, k));
+
+    for (const PatchFieldData<symmTensor>& p : fd.boundary)
+    {
+        if (p.hasGradient || p.hasInletValue || p.hasRefValue || p.hasValueFraction || p.hasMapData
+         || p.hasNormalRef || p.hasFlowRate || !p.unsupportedFunction1.empty())
+            throw std::runtime_error(
+                "brae: sigma patch '" + p.name + "' is a '" + p.type + "', whose data brae does not know "
+                "how to split into components. The Maxwell stress supports fixedValue, zeroGradient and "
+                "the constraint types; anything else would be read and then dropped.");
+        PatchFieldData<scalar> q;
+        q.name         = p.name;
+        q.type         = p.type;
+        q.hasValue     = p.hasValue;
+        q.valueUniform = p.valueUniform;
+        q.uniformValue = comp(p.uniformValue, k);
+        q.values.reserve(p.values.size());
+        for (const symmTensor& t : p.values) q.values.push_back(comp(t, k));
+        out.boundary.push_back(std::move(q));
+    }
+    return out;
 }
 
 template <typename T>
@@ -357,24 +483,91 @@ inline FieldData<T> readField(const std::string& path)
                         }
                         ts.expect(";");
                     }
-                    else if (key == "inletValue")   // inletOutlet inflow value (may be $internalField)
-                    {
+                    else if (key == "inletValue"     // inletOutlet inflow value (may be $internalField)
+                          || key == "outletValue")   // outletInlet OUTflow value -- the same slot, the
+                    {                                // opposite flux branch (see OutletInletPatchField)
                         readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
                         p.hasInletValue = true;
                         ts.expect(";");
                     }
                     else if (key == "p0")   // totalPressure reference p0 (reuse the inletValue slot)
                     {
-                        readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
-                        p.hasInletValue = true;
+                        // p0 is a Function1 on uniformTotalPressure: it may be `table (...)`,
+                        // `polynomial`, `csvFile`, an expression -- not just a field value.
+                        // readValueOrInternal only knows uniform/nonuniform, so a table made the
+                        // TOKENISER fail mid-parse ("expected '(' got '0'", pimpleFoam/RAS/TJunction).
+                        // That is a raw parser error where this codebase's rule is that unsupported
+                        // input is NAMED. Record it and let the dispatch refuse by name instead.
+                        const std::string m = ts.peek();
+                        if (m == "uniform" || m == "nonuniform")
+                        {
+                            readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
+                            p.hasInletValue = true;
+                        }
+                        else if (m == "constant")
+                        {
+                            ts.next();
+                            p.inletUniformValue = readFoamValue<T>(ts);
+                            p.inletUniform = true;
+                            p.hasInletValue = true;
+                        }
+                        else if (isFoamNumber(m))
+                        {
+                            p.inletUniformValue = readBareFoamValue<T>(ts, ts.next());
+                            p.inletUniform = true;
+                            p.hasInletValue = true;
+                        }
+                        else if (m == "table")
+                        {
+                            // OF Function1 `table ((t v) (t v) ...)`: linear between entries, CLAMPed
+                            // outside (TableBase.C:76). pimpleFoam/RAS/TJunction ramps p0 this way.
+                            ts.next();                       // "table"
+                            ts.expect("(");
+                            std::vector<std::pair<scalar, scalar>> pts;
+                            while (!ts.eof() && ts.peek() != ")")
+                            {
+                                ts.expect("(");
+                                const scalar tt = ts.nextScalar();
+                                const scalar vv = ts.nextScalar();
+                                ts.expect(")");
+                                pts.emplace_back(tt, vv);
+                            }
+                            ts.expect(")");
+                            p.p0Function1 = Function1::table(std::move(pts));
+                            p.hasP0Function1 = true;
+
+                            // Seed the constant slot with t = 0 so a solver that never advances time
+                            // still has a defined p0 rather than zero.
+                            // p0 is a PRESSURE: scalar only. The reader is templated on T, so guard
+                            // rather than cast -- a vector field has no p0 and must not silently get one.
+                            if constexpr (std::is_same_v<T, scalar>)
+                            {
+                                p.inletUniformValue = p.p0Function1.value(0);
+                                p.inletUniform = true;
+                                p.hasInletValue = true;
+                            }
+                        }
+                        else
+                        {
+                            p.unsupportedFunction1 = m;
+                            ts.next();
+                            skipToSemicolon(ts, 0);
+                        }
                         ts.expect(";");
                     }
                     else if (key == "uniformValue")   // uniformFixedValue: steady PatchFunction1 "constant <v>"
                     {
-                        const std::string m = ts.next();     // "constant" | "uniform" (steady forms; tables unsupported)
+                        const std::string m = ts.next();     // "constant" | "uniform" | a BARE value
                         if (m == "constant" || m == "uniform")
                         {
                             p.uniformValue = readFoamValue<T>(ts);
+                            p.valueUniform = true;
+                            p.hasValue = true;
+                        }
+                        else if (m == "(" || isFoamNumber(m))
+                        {
+                            // Bare constant (see readBareFoamValue): OF's Function1 shorthand.
+                            p.uniformValue = readBareFoamValue<T>(ts, m);
                             p.valueUniform = true;
                             p.hasValue = true;
                         }
@@ -514,8 +707,9 @@ inline FieldData<T> readField(const std::string& path)
                     }
                     else
                     {
-                        skipToSemicolon(ts);                 // skip any other (unhandled) entry up to its ';' (paren-aware)
-                        ts.expect(";");
+                        // skip any other (unhandled) entry: a plain value up to its ';', or a whole
+                        // sub-dictionary (which carries no ';' of its own)
+                        if (!skipToSemicolon(ts)) ts.expect(";");
                     }
                 }
                 ts.expect("}");

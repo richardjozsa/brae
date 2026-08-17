@@ -77,7 +77,11 @@ sed -i 's/startFrom       startTime;/startFrom       latestTime;/; s/endTime    
 RLOG="$WORK/restart.log"
 "$BIN" "$WORK" > "$RLOG" 2>&1
 if [ "$?" -ne 0 ]; then echo "FAIL: restart run exited nonzero"; tail -20 "$RLOG"; exit 1; fi
-if ! grep -q "resuming from time" "$RLOG"; then echo "FAIL: startFrom latestTime did not restart"; tail -20 "$RLOG"; exit 1; fi
+# The message comes from the SHARED resolveStartTime now, not this driver's own copy: startFrom moved
+# into brae::Time, where OF puts it (Time::setControls, Time.C:149). Behaviour verified unchanged --
+# the restart still resolves to the written time dir, reads its phi, and advances past it. This driver's
+# private copy also only handled `latestTime`, silently ignoring `firstTime`; the shared one does both.
+if ! grep -q "starting from time" "$RLOG"; then echo "FAIL: startFrom latestTime did not restart"; tail -20 "$RLOG"; exit 1; fi
 # seamless restart: the resume must READ the written phi (surfaceScalarField) rather than recompute it from U. The fresh
 # run started at 0/ (no phi) so it did NOT read; the restart's time dir has phi, so this fires only on the restart.
 if ! grep -q "read phi from" "$RLOG"; then

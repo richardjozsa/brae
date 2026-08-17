@@ -85,4 +85,202 @@ void deviceFvmDdt(
     deviceFvmDdtSource(V, c, rho, psiOld, psiOld2, source, ddt0);
 }
 
+namespace {
+// One face. Written once and used for both the internal and the boundary sweep so the two cannot drift:
+// the only difference between them is where phi_old and rAU_face come from.
+// `phiCorrEff` is the quantity actually corrected; it equals phiCorr for Euler and carries backward's
+// two-level combination otherwise. It is a SEPARATE argument because OF computes the coupling coefficient
+// from the single old level -- fvcDdtPhiCoeff(U.oldTime(), Sf & Uf.oldTime()) -- and then applies that
+// coefficient to the scheme's own multi-level correction. Folding the combination into the coefficient
+// too would change the limiter, not just the term it limits.
+__device__ __forceinline__ scalar ddtCorrFace(scalar phiOld, scalar fluxUold, scalar phiCorrEff,
+                                              scalar rAUf, scalar rDeltaT)
+{
+    const scalar phiCorr = phiOld - fluxUold;
+    // ddtScheme<Type>::fvcDdtPhiCoeff, the ddtPhiCoeff_ < 0 branch (the default -- v2412 never reads
+    // ddtPhiCoeff from fvSchemes, so that branch is the only one a case can reach):
+    //     coeff = 1 - min(mag(phiCorr)/(mag(phi) + SMALL), 1)
+    // SMALL is Foam::SMALL = 1e-15 in double precision.
+    const scalar coeff = scalar(1) - fmin(fabs(phiCorr)/(fabs(phiOld) + scalar(1e-15)), scalar(1));
+    return rAUf*coeff*rDeltaT*phiCorrEff;
+}
+
+__global__ void ddtCorrIntK(int nIf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUf,
+                            const scalar* phiCorrEff, scalar rDeltaT, scalar* out)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const scalar eff = phiCorrEff ? phiCorrEff[f] : (phiOld[f] - fluxUold[f]);
+    out[f] += ddtCorrFace(phiOld[f], fluxUold[f], eff, rAUf[f], rDeltaT);
+}
+
+__global__ void ddtCorrBndK(int nBf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUb,
+                            const scalar* mask, const scalar* phiCorrEff, scalar rDeltaT, scalar* out)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nBf) return;
+    if (mask[b] == scalar(0)) return;   // fixesValue / cyclicAMI: OF sets the coupling coefficient to 0
+    const scalar eff = phiCorrEff ? phiCorrEff[b] : (phiOld[b] - fluxUold[b]);
+    out[b] += ddtCorrFace(phiOld[b], fluxUold[b], eff, rAUb[b], rDeltaT);
+}
+}   // namespace
+
+void deviceDdtCorrFlux(
+    int                         nInternalFaces,
+    const DeviceBuffer<scalar>& phiOldInt,
+    const DeviceBuffer<scalar>& phiOldBnd,
+    const DeviceBuffer<scalar>& fluxUoldInt,
+    const DeviceBuffer<scalar>& fluxUoldBnd,
+    const DeviceBuffer<scalar>& rAUf,
+    const DeviceBuffer<scalar>& rAUbnd,
+    const DeviceBuffer<scalar>& coeffMask,
+    scalar                      rDeltaT,
+    DeviceBuffer<scalar>&       outInt,
+    DeviceBuffer<scalar>&       outBnd,
+    const DeviceBuffer<scalar>* phiCorrEffInt,
+    const DeviceBuffer<scalar>* phiCorrEffBnd)
+{
+    const int nIf = nInternalFaces;
+    if (nIf > 0 && (int)phiOldInt.size() >= nIf && (int)fluxUoldInt.size() >= nIf
+        && (int)rAUf.size() >= nIf && (int)outInt.size() >= nIf)
+    {
+        ddtCorrIntK<<<nBlocks(nIf), TPB>>>(nIf, phiOldInt.data(), fluxUoldInt.data(), rAUf.data(),
+                                           (phiCorrEffInt && (int)phiCorrEffInt->size() >= nIf)
+                                               ? phiCorrEffInt->data() : nullptr,
+                                           rDeltaT, outInt.data());
+        cudaCheck(cudaGetLastError(), "ddtCorrInt");
+    }
+    const int nBf = (int)outBnd.size();
+    if (nBf > 0 && (int)phiOldBnd.size() >= nBf && (int)fluxUoldBnd.size() >= nBf
+        && (int)rAUbnd.size() >= nBf && (int)coeffMask.size() >= nBf)
+    {
+        ddtCorrBndK<<<nBlocks(nBf), TPB>>>(nBf, phiOldBnd.data(), fluxUoldBnd.data(), rAUbnd.data(),
+                                           coeffMask.data(),
+                                           (phiCorrEffBnd && (int)phiCorrEffBnd->size() >= nBf)
+                                               ? phiCorrEffBnd->data() : nullptr,
+                                           rDeltaT, outBnd.data());
+        cudaCheck(cudaGetLastError(), "ddtCorrBnd");
+    }
+}
+
+namespace {
+__global__ void correctUfK(int n, const label* __restrict__ idx,
+                           const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy,
+                           const scalar* __restrict__ Sfz, const scalar* __restrict__ magSf,
+                           const scalar* __restrict__ phi,
+                           scalar* __restrict__ ux, scalar* __restrict__ uy, scalar* __restrict__ uz)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int f = idx ? (int)idx[i] : i;
+    const scalar ms = magSf[f];
+    if (!(ms > scalar(0))) return;              // a zero-area face (an uncovered ACMI face) has no normal
+    const scalar nx = Sfx[f]/ms, ny = Sfy[f]/ms, nz = Sfz[f]/ms;
+    const scalar nu = nx*ux[i] + ny*uy[i] + nz*uz[i];
+    const scalar c  = phi[i]/ms - nu;
+    ux[i] += nx*c;  uy[i] += ny*c;  uz[i] += nz*c;
+}
+
+__global__ void dotSfK(int n, const label* __restrict__ idx,
+                       const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy,
+                       const scalar* __restrict__ Sfz, const scalar* __restrict__ ux,
+                       const scalar* __restrict__ uy, const scalar* __restrict__ uz,
+                       scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int f = idx ? (int)idx[i] : i;
+    out[i] = Sfx[f]*ux[i] + Sfy[f]*uy[i] + Sfz[f]*uz[i];
+}
+}   // namespace
+
+void deviceCorrectUf(
+    int n, const label* faceIdx,
+    const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,
+    const DeviceBuffer<scalar>& magSf, const DeviceBuffer<scalar>& phi,
+    DeviceBuffer<scalar>& ufx, DeviceBuffer<scalar>& ufy, DeviceBuffer<scalar>& ufz)
+{
+    if (n <= 0 || (int)phi.size() < n || (int)ufx.size() < n) return;
+    correctUfK<<<nBlocks(n), TPB>>>(n, faceIdx, Sfx.data(), Sfy.data(), Sfz.data(), magSf.data(),
+                                    phi.data(), ufx.data(), ufy.data(), ufz.data());
+    cudaCheck(cudaGetLastError(), "correctUf");
+}
+
+namespace {
+// OF fvc::surfaceSum(mag(phi)) per cell: |phi| lands on the owner AND the neighbour of every internal
+// face, and on the owner of every boundary face.
+__global__
+void surfSumMagIntK(int nIf, const label* __restrict__ own, const label* __restrict__ nei,
+                    const scalar* __restrict__ phi, scalar* __restrict__ out)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const scalar a = fabs(phi[f]);
+    atomicAdd(&out[own[f]], a);
+    atomicAdd(&out[nei[f]], a);
+}
+__global__
+void surfSumMagOwnK(int n, const label* __restrict__ own, const scalar* __restrict__ phi,
+                    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(&out[own[i]], fabs(phi[i]));
+}
+} // namespace
+
+// surfaceSum(mag(phi)) on the device, INCLUDING the coupled interfaces.
+//
+// The host version this replaces read the internal and DeviceBoundary flux arrays only. cyclic and AMI
+// flux live in their own buffers and were simply absent, so every cell on a coupled interface had its
+// Courant number computed from a partial flux sum -- understated exactly where a rotating interface
+// makes it largest. On an adaptive-deltaT case that is not a diagnostic error: the understated maxCo
+// feeds setDeltaT and the next step is taken too large.
+void deviceSurfaceSumMagPhi(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& phiBnd,
+    const DeviceBuffer<label>*  cycOwn, const DeviceBuffer<scalar>* cycPhi,
+    const DeviceBuffer<label>*  amiOwn, const DeviceBuffer<scalar>* amiPhi,
+    DeviceBuffer<scalar>&       out)
+{
+    out.copyFrom(std::vector<scalar>(static_cast<std::size_t>(dm.nCells), scalar(0)));
+    if (dm.nInternalFaces > 0)
+    {
+        surfSumMagIntK<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(),
+                                                            dm.nei.data(), phiInt.data(), out.data());
+        cudaCheck(cudaGetLastError(), "surfSumMagInt");
+    }
+    if (dm.nBndFaces > 0 && (int)phiBnd.size() >= dm.nBndFaces)
+    {
+        surfSumMagOwnK<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), phiBnd.data(),
+                                                       out.data());
+        cudaCheck(cudaGetLastError(), "surfSumMagBnd");
+    }
+    auto addIface = [&](const DeviceBuffer<label>* own, const DeviceBuffer<scalar>* phi)
+    {
+        if (!own || !phi) return;
+        const int n = static_cast<int>(phi->size());
+        if (n == 0 || (int)own->size() < n) return;
+        surfSumMagOwnK<<<nBlocks(n), TPB>>>(n, own->data(), phi->data(), out.data());
+        cudaCheck(cudaGetLastError(), "surfSumMagIface");
+    };
+    addIface(cycOwn, cycPhi);
+    addIface(amiOwn, amiPhi);
+}
+
+
+void deviceDotSf(
+    int n, const label* faceIdx,
+    const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,
+    const DeviceBuffer<scalar>& ufx, const DeviceBuffer<scalar>& ufy, const DeviceBuffer<scalar>& ufz,
+    DeviceBuffer<scalar>& out)
+{
+    out.resize(n);
+    if (n <= 0 || (int)ufx.size() < n) return;
+    dotSfK<<<nBlocks(n), TPB>>>(n, faceIdx, Sfx.data(), Sfy.data(), Sfz.data(),
+                                ufx.data(), ufy.data(), ufz.data(), out.data());
+    cudaCheck(cudaGetLastError(), "dotSf");
+}
+
 }  // namespace brae

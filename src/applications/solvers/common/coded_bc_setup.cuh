@@ -42,6 +42,18 @@ inline std::vector<CodedBCSpec> parseCodedBCs(const std::string& fieldPath)
         const std::size_t ns = p;
         while (p < t.size() && !isws(t[p]) && t[p] != '{') ++p;
         std::string pname = t.substr(ns, p - ns);
+        // A PREPROCESSOR DIRECTIVE is not a patch. OF tutorials routinely open boundaryField with
+        //     #includeEtc "caseDicts/setConstraintTypes"
+        // (pipeCyclic, and many others). Reading that as a patch name is not merely a wrong name: the
+        // scan then runs forward to the NEXT '{', which belongs to the first real patch, so that
+        // patch's body is consumed as the directive's and the patch itself disappears. pipeCyclic
+        // failed with "coded BC: patch '#includeEtc' not in the mesh boundary" -- the visible half of
+        // that. Directives are single-line, so skip to end of line.
+        if (!pname.empty() && pname.front() == '#')
+        {
+            while (p < t.size() && t[p] != '\n') ++p;
+            continue;
+        }
         if (!pname.empty() && pname.front() == '"' && pname.back() == '"') pname = pname.substr(1, pname.size() - 2);
         while (p < t.size() && t[p] != '{') ++p;
         if (p >= t.size()) break;
@@ -88,7 +100,7 @@ inline void setupCodedBCs(DeviceSimpleSolver& solver,
             int off = 0, cnt = -1;
             for (const FvPatch& q : fvp)
             {
-                if (q.type == "cyclic" || q.type == "cyclicAMI") continue;
+                if (isCoupledInterfaceType(q.type)) continue;
                 if (q.name == s.patch) { cnt = (int)q.size; break; }
                 off += (int)q.size;
             }

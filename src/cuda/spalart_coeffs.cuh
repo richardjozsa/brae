@@ -23,6 +23,18 @@ struct SpalartAllmarasCoeffs {
     scalar Ct       = 1.87;      // f_t  = tanh((Ct^2*rd_t)^3)
     scalar Cw       = 0.15;      // IDDES length scale delta = min(max(Cw*y, Cw*hmax), hmax)
     scalar fwStar   = 0.424;     // low-Re DES correction Psi: f_w in the log layer (Spalart et al. 2006)
+    // DDES shielding function fd = 1 - tanh((Cd1*r)^Cd2). OF exposes Cd1/Cd2 as dictionary entries
+    // (SpalartAllmarasDDES.C); the defaults are the values the standard formulation has always used.
+    scalar Cd1      = 8.0;
+    scalar Cd2      = 3.0;
+    // ZDES2020 (Deck & Renard 2020, OF `shielding ZDES2020`): a SECOND shielding built from the
+    // wall-normal derivatives of nuTilda and of |curl U|, which protects the boundary layer where the
+    // standard fd would already have released it. Off unless the case asks for it.
+    bool   zdes     = false;
+    scalar Cd3      = 25.0;      // GnuTilda = Cd3*max(grad(nuTilda).n, 0)/(|gradU| kappa y)
+    scalar Cd4      = 0.03;      // the GOmega thresholds of fR(GOmega)
+    scalar betaZDES = 2.5;       // only with usefP2
+    bool   usefP2   = false;     // OF Switch, default false: the more conservative fP2 form
     BRAE_HD scalar Cw1() const { return Cb1 / (kappa * kappa) + (scalar(1) + Cb2) / sigmaNut; }
 };
 

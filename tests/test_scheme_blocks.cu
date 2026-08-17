@@ -194,6 +194,71 @@ int main()
         checkFlag("C1 linear interpolation is accepted", threwLinear, false);
     }
 
+    // ---- D: div(phi,U) resolved through the divSchemes `default` -------------------------------
+    //
+    // OF looks the key up and falls back to `default`; `default none` means there is no fallback and OF
+    // itself throws. brae refused every case without an explicit div(phi,U), which stopped
+    // laminar/cylinder2D -- `default Gauss linear;` and nothing else -- over a scheme brae implements.
+    // The pair below is the whole rule: resolve when there is a default, refuse when it is `none`.
+    {
+        const DeviceSimpleControls ctl = parse(tmp + "/d1",
+            std::string("gradSchemes { default Gauss linear; }\n")
+            + "divSchemes { default Gauss linear; div((nuEff*dev(T(grad(U))))) Gauss linear; }\n"
+            + LAP_CORRECTED);
+        checkFlag("D1 `default Gauss linear` resolves div(phi,U) to central differencing", ctl.divULinear, true);
+    }
+    {
+        // ...and the resolved scheme is the DEFAULT's, not a guess: a limitedLinearV default must land on
+        // the limitedLinearV path, with its coefficient.
+        const DeviceSimpleControls ctl = parse(tmp + "/d2",
+            std::string("gradSchemes { default Gauss linear; }\n")
+            + "divSchemes { default Gauss limitedLinearV 1; }\n"
+            + LAP_CORRECTED);
+        checkFlag("D2 a limitedLinearV default resolves to limitedLinearV", ctl.divULimitedV, true);
+        checkNum("D2 twoByk from the default line", ctl.divUTwoBykV, 2.0);
+        checkFlag("D2 ...and not to plain linear", ctl.divULinear, false);
+    }
+    {
+        // An EXPLICIT div(phi,U) still wins over the default (dictionary lookup order).
+        const DeviceSimpleControls ctl = parse(tmp + "/d3",
+            std::string("gradSchemes { default Gauss linear; }\n")
+            + "divSchemes { default Gauss linear; div(phi,U) bounded Gauss upwind; }\n"
+            + LAP_CORRECTED);
+        checkFlag("D3 an explicit div(phi,U) overrides the default", ctl.divULinear, false);
+        checkFlag("D3 ...and its own `bounded` is read", ctl.bounded, true);
+    }
+    {
+        // Negative control 1: `default none` has nothing to resolve to -- still a refusal, as in OF.
+        // The MESSAGE is asserted, not just the throw: feeding the literal word `none` through as if it
+        // were a scheme also fails, but with "unknown scheme ''", which sends the reader looking for a
+        // typo in a line they never wrote.
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            parse(tmp + "/d4",
+                  std::string("gradSchemes { default Gauss linear; }\n")
+                  + "divSchemes { default none; div(phi,k) Gauss upwind; }\n"
+                  + LAP_CORRECTED);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        checkFlag("D4 `default none` with no div(phi,U) is refused", threw, true);
+        check("D4 the refusal names the `none` default", msg.find("`none`") != std::string::npos, msg, "mentions `none`");
+    }
+    {
+        // Negative control 2: no default at all is the same refusal.
+        bool threw = false;
+        try
+        {
+            parse(tmp + "/d5",
+                  std::string("gradSchemes { default Gauss linear; }\n")
+                  + "divSchemes { div(phi,k) Gauss upwind; }\n"
+                  + LAP_CORRECTED);
+        }
+        catch (const std::exception&) { threw = true; }
+        checkFlag("D5 no divSchemes default and no div(phi,U) is refused", threw, true);
+    }
+
     std::printf("scheme_blocks: %d failures\n", failures);
     return failures ? 1 : 0;
 }

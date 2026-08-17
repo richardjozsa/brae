@@ -220,6 +220,88 @@ int main()
         eqScalar("relaxP 0 -> 1.0", ctl.relaxP, 1.0);
     }
 
+    // ---- 8. THE `Final` VARIANTS, through OpenFOAM's own $macro idiom ----
+    //
+    // Two defects met here, and the test needs both halves because either one alone hides the other.
+    //
+    // (a) brae read only the base entries, so `pFinal` was inert: every PIMPLE corrector was solved to
+    //     the loose `p` tolerance. OF gives the LAST pressure corrector its own settings
+    //     (pEqn.solve(p.select(pimple.finalInnerIter()))), which is why its log shows one corrector
+    //     stopping at 2.8e-04 and the next at 6e-11 on the same step.
+    //
+    // (b) brae's $macro expansion is textual, and p's captured body ends in its own ';' -- so `$p;`
+    //     expanded to `... relTol 0.01 ; ;` and the parser read that second ';' as the KEY of the entry
+    //     that followed, swallowing the `tolerance 1e-10` meant to override it. pFinal silently became p.
+    //
+    // THE FIXTURE IS THE CANONICAL OPENFOAM IDIOM, verbatim, because that is the only form in which (b)
+    // bites -- writing pFinal out longhand passes even with the parser bug, which is exactly why this
+    // went unnoticed. Leg (ii) is that negative control: the same numbers, written without the macro.
+    {
+        const std::string d = base + "/pfinal";
+        std::filesystem::create_directories(d + "/system");
+        {
+            std::ofstream f(d + "/system/fvSolution");
+            f << "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\n"
+              << "solvers\n{\n"
+              << "    p      { solver GAMG; tolerance 1e-5; relTol 0.01; }\n"
+              << "    pFinal { $p; tolerance 1e-10; relTol 0; }\n"
+              << "    U      { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-6; relTol 0.1; }\n"
+              << "    UFinal { $U; relTol 0; }\n"
+              << "}\n"
+              << "PIMPLE { nOuterCorrectors 1; nCorrectors 2; }\n";
+        }
+        DeviceSimpleControls ctl;
+        readLinearSolverControls(readDict(d + "/system/fvSolution"), "epsilon", ctl, "PIMPLE");
+        eqScalar("base p tolerance untouched", ctl.tolP, 1e-5);
+        eqScalar("base p relTol untouched",    ctl.relTolP, 0.01);
+        eqScalar("pFinal tolerance overrides the $p macro", ctl.tolPFinal, 1e-10);
+        eqScalar("pFinal relTol overrides the $p macro",    ctl.relTolPFinal, 0.0);
+        eqScalar("UFinal inherits tolerance through $U",    ctl.tolUFinal, 1e-6);
+        eqScalar("UFinal relTol overrides",                 ctl.relTolUFinal, 0.0);
+        // VACUITY GUARD: if Final and base agreed, every assertion above would pass under both defects.
+        if (ctl.tolPFinal == ctl.tolP || ctl.relTolUFinal == ctl.relTolU)
+        {
+            std::printf("  FAIL vacuous: the Final entries do not differ from the base ones, so this leg\n"
+                        "       cannot tell a working override from an ignored one\n");
+            failures++;
+        }
+    }
+    {
+        // (ii) NEGATIVE CONTROL for the macro: the identical settings written longhand must give the
+        // identical controls. If these two legs ever disagree, the expansion is the thing that broke.
+        const std::string d = base + "/pfinal_nomacro";
+        std::filesystem::create_directories(d + "/system");
+        {
+            std::ofstream f(d + "/system/fvSolution");
+            f << "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\n"
+              << "solvers\n{\n"
+              << "    p      { solver GAMG; tolerance 1e-5; relTol 0.01; }\n"
+              << "    pFinal { solver GAMG; tolerance 1e-10; relTol 0; }\n"
+              << "}\n"
+              << "PIMPLE { nOuterCorrectors 1; nCorrectors 2; }\n";
+        }
+        DeviceSimpleControls ctl;
+        readLinearSolverControls(readDict(d + "/system/fvSolution"), "epsilon", ctl, "PIMPLE");
+        eqScalar("longhand pFinal tolerance", ctl.tolPFinal, 1e-10);
+        eqScalar("longhand pFinal relTol",    ctl.relTolPFinal, 0.0);
+    }
+    {
+        // (iii) NO Final entry -> fall back to the base one. OF would FatalError; refusing a case OF runs
+        // is worse than solving the last corrector exactly as tightly as the others.
+        const std::string d = base + "/nofinal";
+        std::filesystem::create_directories(d + "/system");
+        {
+            std::ofstream f(d + "/system/fvSolution");
+            f << "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\n"
+              << "solvers { p { solver GAMG; tolerance 3e-7; relTol 0.02; } }\n"
+              << "PIMPLE { nCorrectors 2; }\n";
+        }
+        DeviceSimpleControls ctl;
+        readLinearSolverControls(readDict(d + "/system/fvSolution"), "epsilon", ctl, "PIMPLE");
+        eqScalar("absent pFinal falls back to p tolerance", ctl.tolPFinal, 3e-7);
+        eqScalar("absent pFinal falls back to p relTol",    ctl.relTolPFinal, 0.02);
+    }
+
     std::printf("linear_solver_setup: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

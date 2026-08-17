@@ -39,6 +39,28 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       const DeviceBuffer<scalar>& nuCell, const DeviceBuffer<scalar>& nuBnd,
                       DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,
                       const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr,
-                      const DeviceProcStress* proc = nullptr);
+                      const DeviceProcStress* proc = nullptr,
+                      // grad(U) "cellLimited Gauss linear <k>" coefficient; 0 = unlimited.
+                      //
+                      // OF's linearViscousStress::divDevReff calls fvc::grad(U), which resolves the
+                      // NAMED gradSchemes entry -- so a case asking for `grad(U) cellLimited Gauss
+                      // linear 1` gets a limited gradient here too, not just in the linearUpwind
+                      // correction. brae built a plain Gauss gradient and ignored the entry.
+                      //
+                      // It is invisible until nuEff is large, because the whole term carries a factor of
+                      // it. Measured on pimpleFoam/RAS/oscillatingInletACMI2D as a FREE run (no restart,
+                      // no probe), laminar, 10 steps: at the tutorial's nu = 1e-6 the difference from
+                      // OpenFOAM is 6.5e-07 either way, but at nu = 1e-3 -- the size of a turbulent nut --
+                      // it is 4.7e-04 unlimited against 6.7e-08 limited. A factor of 7000.
+                      scalar gradULimitK = 0.0);
+
+// Exported for the Maxwell model -- see the definitions in device_divdevreff.cu.
+void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
+                         const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB);
+void deviceTensorDivSource(const DeviceMesh& dm,
+                           const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
+                           DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,
+                           const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr);
 
 } // namespace brae

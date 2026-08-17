@@ -18,6 +18,7 @@
 // Everything here is read-only on the dicts and writes only into ctl.
 
 #include "solver_controls.cuh"
+#include <regex>
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"   // noticeApproximated / noticeIgnored
 #include <algorithm>
@@ -60,6 +61,19 @@ inline void readLinearSolverControls(
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         return s ? s->scalarOr("relTol", 0.0) : 0.0;
     };
+    // OF lduMatrix::solver reads maxIter (default 1000) and minIter (default 0) from the same
+    // sub-dictionary. Both change WHERE the solve stops, so an unread `maxIter 10` is not a performance
+    // detail -- see the note in DeviceSimpleControls.
+    auto solverMaxIter = [&](const std::string& f, int def)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        return s ? static_cast<int>(s->scalarOr("maxIter", def)) : def;
+    };
+    auto solverMinIter = [&](const std::string& f, int def)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        return s ? static_cast<int>(s->scalarOr("minIter", def)) : def;
+    };
     // E2/E3 (dict_audit): SAY what brae runs when it is not what the case asked for.
     //
     // A substituted linear solver is not a wrong answer -- it solves the same linear system to the same
@@ -83,9 +97,22 @@ inline void readLinearSolverControls(
         const std::string smoo = s->wordOr("smoother", "");
         const std::string prec = s->wordOr("preconditioner", "");
         if (!want.empty() && !gs && want != braeRuns)
+        {
+            // The usual case: same system, same tolerance, so the CONVERGED answer is the same and only
+            // the iteration count differs. An iteration CAP breaks that premise -- both solvers then stop
+            // where the cap says, not where the tolerance says, and two different solvers stopped at the
+            // same iteration count hold two different residuals. LES/NACA4412 is the live example:
+            // `maxIter 10` on p, and at its impulsive first step OF's GAMG leaves at a residual of 4.26
+            // against an initial 1 while brae's leaves at 2.55. Neither is converged; they cannot agree.
+            const bool capped = s->found("maxIter") && s->scalarOr("maxIter", 1000.0) < 1000.0;
             noticeApproximated("solvers/" + f + " solver",
                                "case asks '" + want + "', brae runs " + braeRuns +
-                               " (same linear system and tolerance -- iteration count and cost differ)");
+                               (capped
+                                ? " AND this entry caps the solve at maxIter " + std::to_string((int)s->scalarOr("maxIter", 1000.0))
+                                  + " -- with a cap the two solvers stop at DIFFERENT residuals, so the fields differ"
+                                    " by however far the solve is from converged, not just in cost"
+                                : " (same linear system and tolerance -- iteration count and cost differ)"));
+        }
         // A smoother entry only means anything to brae when it actually took the smoothSolver path.
         if (!smoo.empty() && !gs)
             noticeIgnored("solvers/" + f + " smoother",
@@ -112,6 +139,27 @@ inline void readLinearSolverControls(
     ctl.tolU = solverTol("U", 1e-8);
     ctl.relTolP = solverRelTol("p");
     ctl.relTolU = solverRelTol("U");
+    // The `Final` variants, defaulting to the base entry when the case does not define one (see the
+    // note in DeviceSimpleControls). Read unconditionally: a steady case simply never sets finalIter,
+    // and reading them here is what stops the dict audit calling pFinal an unimplemented input.
+    ctl.tolPFinal = solverTol("pFinal", ctl.tolP);
+    ctl.tolUFinal = solverTol("UFinal", ctl.tolU);
+    ctl.relTolPFinal = solvers && solvers->subDict("pFinal") ? solverRelTol("pFinal") : ctl.relTolP;
+    ctl.relTolUFinal = solvers && solvers->subDict("UFinal") ? solverRelTol("UFinal") : ctl.relTolU;
+    ctl.maxIterP = solverMaxIter("p", 1000);
+    ctl.maxIterU = solverMaxIter("U", 1000);
+    ctl.minIterP = solverMinIter("p", 0);
+    // pcorr (CorrectPhi). The tutorials spell the key as the regex "pcorr.*"; FoamDict already does OF's
+    // regex-keyword lookup, so this finds it either way. Defaults are OF's lduMatrix ones, not p's --
+    // a case that asks for correctPhi without a pcorr entry gets a converged projection, not p's relTol.
+    ctl.tolPcorr = solverTol("pcorr", 1e-6);
+    ctl.relTolPcorr = solverRelTol("pcorr");
+    ctl.maxIterPcorr = solverMaxIter("pcorr", 1000);
+    ctl.minIterU = solverMinIter("U", 0);
+    ctl.maxIterPFinal = solverMaxIter("pFinal", ctl.maxIterP);
+    ctl.maxIterUFinal = solverMaxIter("UFinal", ctl.maxIterU);
+    ctl.minIterPFinal = solverMinIter("pFinal", ctl.minIterP);
+    ctl.minIterUFinal = solverMinIter("UFinal", ctl.minIterU);
     ctl.gsU = useSymGS("U");
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;
@@ -122,10 +170,15 @@ inline void readLinearSolverControls(
 
     if (ctl.turbulent)
     {
+        // brae solves the turbulence pair to ONE tolerance (the tighter of the two), so the Final pair
+        // collapses the same way. Falling back to the base value per field keeps a case that defines
+        // only one of them (kFinal but no epsilonFinal) from tightening the pair on the strength of it.
         if (ctl.sa)
         {
             ctl.tolKE = solverTol("nuTilda", 1e-8);
             ctl.relTolKE = solverRelTol("nuTilda");
+            ctl.tolKEFinal = solverTol("nuTildaFinal", ctl.tolKE);
+            ctl.relTolKEFinal = solvers && solvers->subDict("nuTildaFinal") ? solverRelTol("nuTildaFinal") : ctl.relTolKE;
             ctl.gsK = useSymGS("nuTilda");
             ctl.gsEps = false;
             noticeSolverChoice("nuTilda", "Jacobi-BiCGStab", ctl.gsK);
@@ -134,6 +187,11 @@ inline void readLinearSolverControls(
         {
             ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol(secondName, 1e-8));
             ctl.relTolKE = std::fmin(solverRelTol("k"), solverRelTol(secondName));
+            ctl.tolKEFinal = std::fmin(solverTol("kFinal", solverTol("k", 1e-8)),
+                                       solverTol(secondName + "Final", solverTol(secondName, 1e-8)));
+            ctl.relTolKEFinal = std::fmin(
+                solvers && solvers->subDict("kFinal") ? solverRelTol("kFinal") : solverRelTol("k"),
+                solvers && solvers->subDict(secondName + "Final") ? solverRelTol(secondName + "Final") : solverRelTol(secondName));
             ctl.gsK = useSymGS("k");
             ctl.gsEps = useSymGS(secondName);
             noticeSolverChoice("k", "Jacobi-BiCGStab", ctl.gsK);
@@ -147,6 +205,12 @@ inline void readLinearSolverControls(
         ctl.consistent = (cons == "yes" || cons == "true" || cons == "on" || cons == "1");   // SIMPLEC
     }
     ctl.nNonOrth = algo ? algo->intOr("nNonOrthogonalCorrectors", 0) : 0;
+    {
+        // pimpleControl.C:53. When set, pFinal is reserved for the last pressure corrector of the LAST
+        // outer iteration; by default every outer iteration's last corrector gets it.
+        const std::string fl = algo ? algo->wordOr("finalOnLastPimpleIterOnly", "no") : "no";
+        ctl.finalOnLastPimpleIterOnly = (fl == "yes" || fl == "true" || fl == "on" || fl == "1");
+    }
     {
         const std::vector<scalar> bf = algo ? algo->scalarListOr("bodyForce", {}) : std::vector<scalar>{};
         if (bf.size() >= 3) ctl.bodyForce = vector{bf[0], bf[1], bf[2]};   // constant momentum source
@@ -175,6 +239,41 @@ inline void readLinearSolverControls(
 // reused k's factor for epsilon/omega, so `omega 0.4` was ignored and omega ran at k's factor).
 //
 // Call AFTER the turbulence model is read: it branches on ctl.sa/ctl.sst to pick the field names.
+// OF looks a relaxation factor up with keyType::REGEX (solution.C:341,383), which is the ONLY reason the
+// near-universal PIMPLE idiom
+//     relaxationFactors { equations { U 0.8; ".*Final" 1; } }
+// does anything: on the last outer corrector OF appends "Final" to the name (GeometricField::relax and
+// fvMatrix::relax both go through psi.select(isFinalIteration())), so "UFinal" matches ".*Final" and the
+// final corrector runs UNRELAXED. Match the name literally first, then by regex, exactly as OF does.
+// pOnly reproduces the filter in OF's legacy branch (solution.C:82-100): when relaxationFactors is the
+// FLAT form, only keys beginning `p` or `rho` become FIELD relaxation, while the whole dict becomes
+// EQUATION relaxation. Without the filter a flat `{ ".*" 0.7; }` would field-relax pFinal, which OF
+// does not do -- its fieldRelaxDict_ never receives that key, so relax() is skipped entirely.
+inline bool relaxLookup(const FoamDict* d, const std::string& name, scalar& out, bool pOnly = false)
+{
+    if (!d) return false;
+    auto eligible = [pOnly](const std::string& k)
+    { return !pOnly || k.rfind("p", 0) == 0 || k.rfind("rho", 0) == 0; };
+    // A LITERAL probe, deliberately not d->found(): FoamDict's own lookup is regex-aware, so `found("p")`
+    // is satisfied by a `".*"` key and the eligibility filter below would never get a say.
+    bool literal = false;
+    for (const auto& lv : d->leaves) if (lv.first == name) { literal = true; break; }
+    if (literal && eligible(name)) { out = d->scalarOr(name, scalar(1)); return true; }
+    bool hit = false;
+    for (const auto& lv : d->leaves)
+    {
+        const std::string& key = lv.first;
+        if (key.find_first_of("()|*?[].^$") == std::string::npos) continue;   // plain word, already tried
+        if (!eligible(key)) continue;
+        try
+        {
+            if (std::regex_match(name, compileFoamRegex(key))) { out = d->scalarOr(key, scalar(1)); hit = true; }
+        }
+        catch (const std::regex_error&) { /* not a usable regex -> not a match, as OF treats it */ }
+    }
+    return hit;
+}
+
 inline void readRelaxationFactors(const FoamDict& fvSolution, DeviceSimpleControls& ctl)
 {
     const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
@@ -195,7 +294,30 @@ inline void readRelaxationFactors(const FoamDict& fvSolution, DeviceSimpleContro
     ctl.relaxU   = eqSrc  ? eqSrc->scalarOr("U", 1.0) : 1.0;
     ctl.relaxK   = eqSrc  ? eqSrc->scalarOr(kName, 1.0) : 1.0;
     ctl.relaxEps = eqSrc  ? eqSrc->scalarOr(sName, 1.0) : 1.0;
-    ctl.relaxP   = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
+    // p goes through the filtered lookup too, not scalarOr: FoamDict's lookup is regex-aware, so on the
+    // LEGACY flat form a catch-all `".*" 0.7;` would otherwise field-relax the pressure. OF's legacy
+    // branch never copies that key into fieldRelaxDict_, so it relaxes the equations only.
+    ctl.relaxP   = 1.0;
+    relaxLookup(fldSrc, "p", ctl.relaxP, /*pOnly*/!fld);
+    // ...and the FINAL-corrector factors, which brae had no notion of: it applied the ordinary factor on
+    // every outer corrector including the last. OF does not, and in PIMPLE that is not a matter of
+    // convergence rate -- the final corrector is what makes the step satisfy momentum and continuity
+    // together, so relaxing it leaves a residue that the next step inherits. Measured on LES/vortexShed
+    // (`relaxationFactors { nuTilda 0.8; U 0.8; p 0.8; ".*Final" 1.0; }`): the outer loop's initial
+    // pressure residual GREW corrector by corrector (0.208 -> 0.256 -> 0.311 -> 0.354) instead of
+    // falling, contLocal ran 1e-7 -> 40 over twenty steps, and |U| reached 1.29e+06 against OpenFOAM's
+    // 0.0435. Absent from the dict -> no Final entry -> fall back to the ordinary factor, which is also
+    // what OF does (the lookup simply misses and relax() is skipped for that name).
+    // NO MATCH MEANS NO RELAXATION, which is not the same as "reuse the ordinary factor". OF's relax()
+    // is guarded -- `if (relaxField(name)) relax(factor)` in GeometricField::relax, and the identical
+    // shape in fvMatrix::relax -- so on the final corrector, where the name carries the "Final" suffix,
+    // an unmatched name means relax() is never called and the factor is effectively 1. That is why a
+    // PIMPLE case with a bare `equations { U 0.7; }` still ends each step with an unrelaxed corrector.
+    // Steady SIMPLE is untouched: finalIter is only ever true inside the PIMPLE outer loop.
+    ctl.relaxUFinal = 1.0;   relaxLookup(eqSrc,  "UFinal",                     ctl.relaxUFinal);
+    ctl.relaxKFinal = 1.0;   relaxLookup(eqSrc,  kName + std::string("Final"), ctl.relaxKFinal);
+    ctl.relaxEpsFinal = 1.0; relaxLookup(eqSrc,  sName + "Final",              ctl.relaxEpsFinal);
+    ctl.relaxPFinal = 1.0;   relaxLookup(fldSrc, "pFinal", ctl.relaxPFinal, /*pOnly*/!fld);
 
     // A relaxation factor <= 0 divides by zero in the diagonal-relaxation kernel (Inf diag -> NaN). OF's
     // fvMatrix::relax skips relaxation for alpha <= 0; match that (treat as 1.0 = no under-relaxation) + warn.

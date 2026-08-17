@@ -15,6 +15,7 @@
 // adds them with deviceAxpy; no new device kernel is needed.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
+#include "cell_selection.cuh"   // OF cellSetOption: all|cellZone|cellSet resolved in ONE place
 #include "rotor_disk.cuh"
 #include <algorithm>
 #include <cstdlib>
@@ -85,12 +86,32 @@ struct FvOptionsData
     std::vector<label>  vdcCells;                   // empty => all cells
     // actuationDiskSource (Froude): wind-turbine/propeller momentum source over a disk cellZone, the thrust computed
     // each iter from the upstream-monitored velocity. T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), a = 1 - Cp/Ct.
-    bool                adActive = false;
-    vector              adDiskDir{1,0,0};
-    scalar              adArea = 0, adA = 0;        // diskArea, induction a = 1 - Cp/Ct
-    std::vector<label>  adDiskCells, adMonitorCells;
+    // actuationDiskSource: a LIST. A wind farm is several turbines (simpleFoam/turbineSiting ships two),
+    // and each is fully independent -- its own monitor cells, its own Uref, its own thrust, its own disk
+    // cells. Their momentum sinks simply superpose. brae kept only the first and refused the rest, so a
+    // two-turbine case could not run at all.
+    //
+    // The masks MUST be per disk. Sharing one mask would apply every turbine's thrust to the union of
+    // their cells -- a plausible-looking wrong wind field, which is the failure mode this codebase
+    // refuses on principle.
+    struct ActuationDisk
+    {
+        vector             diskDir{1,0,0};
+        scalar             area = 0, a = 0;       // diskArea, induction a = 1 - Cp/Ct
+        std::vector<label> diskCells, monitorCells;
+    };
+    bool                       adActive = false;
+    std::vector<ActuationDisk> adDisks;
     RotorDiskParams     rotor;                      // rotorDiskSource (BEM); geometry built later from the mesh
     int  count = 0;                      // number of options read (0 => no file / empty => all hooks no-op)
+    // OF fv::cellSetOption's TIME WINDOW: a source is active only while
+    //     timeStart <= t <= timeStart + duration
+    // and unconditionally when `timeStart` is absent (OF's default timeStart_ = -1, see
+    // cellSetOption::inTimeLimits). The STEADY solver has no time and ignores these; a TRANSIENT driver
+    // cannot, because applying a windowed source outside its window is wrong physics that still
+    // converges. Recorded per source so the driver can decide.
+    struct TimeWindow { std::string name; scalar start = -1; scalar duration = 0; };
+    std::vector<TimeWindow> windows;   // only sources that actually SET timeStart
     // Sources whose NAME brae recognizes but that it CANNOT apply here (unsupported selectionMode cellSet, a
     // parsed-but-unapplied scalarSemiImplicitSource, or an unknown type). Recorded instead of silently dropped;
     // the single-GPU driver throws on a non-empty list so a valid-looking case never runs with wrong physics. The
@@ -118,14 +139,76 @@ inline const FoamDict& coeffsOf(const FoamDict& opt, const std::string& type)
 } // namespace fvoptions_detail
 
 // Read fvOptions for a case. `zones` = cellZone name -> cells (readCellZones). `V` = cell volumes. Absent file -> empty.
+// Dict-only PRE-FLIGHT: the source types, their time windows, and whether a semi-implicit source has any
+// numbers to read -- all without a mesh. readFvOptions needs cell volumes and so can only run once the
+// polyMesh is in, which is far too late to refuse a case: the driver should stop before paying for the
+// mesh, and a guard fixture without one should still see the refusal it is testing for.
+struct FvOptionsPreflight
+{
+    bool present = false;
+    std::vector<std::string> unsupported;
+    std::vector<FvOptionsData::TimeWindow> windows;
+};
+
+inline FvOptionsPreflight preflightFvOptions(const std::string& caseDir)
+{
+    FvOptionsPreflight pf;
+    std::string path = caseDir + "/system/fvOptions";
+    {
+        std::ifstream f(path);
+        if (!f.good())
+        {
+            path = caseDir + "/constant/fvOptions";
+            std::ifstream g(path);
+            if (!g.good()) return pf;
+        }
+    }
+    pf.present = true;
+    const FoamDict d = readDict(path);
+    for (const auto& s : d.subs)
+    {
+        const FoamDict& opt = s.second;
+        const std::string type = opt.wordOr("type", "");
+        const std::string act  = opt.wordOr("active", "yes");
+        if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;
+        static const char* supported[] = {
+            "vectorSemiImplicitSource", "explicitPorositySource", "meanVelocityForce", "limitVelocity",
+            "actuationDiskSource", "rotorDisk", "rotorDiskSource", "velocityDampingConstraint",
+            "limitTemperature", "fixedTemperatureConstraint", "scalarFixedValueConstraint" };
+        bool ok = false;
+        for (const char* t : supported) if (type == t) { ok = true; break; }
+        if (!ok)
+        {
+            pf.unsupported.push_back("source '" + s.first + "' has unsupported type '" + type + "'");
+            continue;
+        }
+        const FoamDict& co = fvoptions_detail::coeffsOf(opt, type);
+        if (type == "vectorSemiImplicitSource"
+            && !co.subDict("injectionRateSuSp") && !opt.subDict("injectionRateSuSp")
+            && !co.subDict("sources")           && !opt.subDict("sources"))
+            pf.unsupported.push_back(
+                "source '" + s.first + "' (" + type + ") has neither a `sources` nor an "
+                "`injectionRateSuSp` sub-dictionary, so brae found nothing to apply");
+        const scalar ts = opt.scalarOr("timeStart", -1e300);
+        if (ts > -1e299 && ts >= scalar(0))
+            pf.windows.push_back({s.first, ts, opt.scalarOr("duration", 0.0)});
+    }
+    return pf;
+}
+
+
 inline FvOptionsData readFvOptions(
     const std::string& caseDir,
-    const std::map<std::string, std::vector<label>>& zones,
+    const std::map<std::string, std::vector<label>>& zonesIn,
     const std::vector<scalar>& V,
     label nCells,
     const std::vector<vector>& cellCentres = {})
 {
     FvOptionsData fo;
+    // Local copy: a cellSet resolved below is adopted into this map under its own name, so every
+    // source branch can look it up exactly as it looks up a cellZone -- one lookup path, both modes.
+    std::map<std::string, std::vector<label>> zones = zonesIn;
+    const std::string polyMeshDir = caseDir + "/constant/polyMesh";
     std::string path = caseDir + "/system/fvOptions";
     {
         std::ifstream f(path);
@@ -166,6 +249,11 @@ inline FvOptionsData readFvOptions(
         const bool isFixS = (type == "scalarFixedValueConstraint");
         const std::string act = opt.wordOr("active", "yes");
         if (!(act == "yes" || act == "true" || act == "on" || act == "1")) continue;   // inactive -> skip (OF)
+        {   // the time window, if this source sets one (-1e300 sentinel = the key is absent)
+            const scalar ts = opt.scalarOr("timeStart", -1e300);
+            if (ts > -1e299 && ts >= scalar(0))
+                fo.windows.push_back({s.first, ts, opt.scalarOr("duration", 0.0)});
+        }
         if (!isVec && !isSca && !isPor && !isMvf && !isLim && !isAd && !isRot && !isVdc && !isLimT && !isFixT && !isFixS)
         {
             fo.unsupported.push_back("source '" + s.first + "' has unsupported type '" + type + "'");
@@ -180,15 +268,24 @@ inline FvOptionsData readFvOptions(
             if (sm == "cellSet")  return c.wordOr("cellSet",  o.wordOr("cellSet",  ""));   // mapped to the same-named cellZone
             return "";
         };
+        // selectionMode cellSet: resolved through the SHARED resolver, as OF does in cellSetOption
+        // (cellSetOption.H:175) rather than per source. Previously this required a same-named cellZone
+        // to exist, so simpleFoam/turbineSiting -- whose actuationDiskSource[Froude] brae already
+        // implements -- was refused outright for want of a file reader. Reading the set makes it work
+        // for EVERY source type at once, which is why it belongs here and not in the disk branch.
         if (co.wordOr("selectionMode", opt.wordOr("selectionMode", "all")) == "cellSet")
         {
             const std::string cs = co.wordOr("cellSet", opt.wordOr("cellSet", ""));
-            if (zones.find(cs) == zones.end())   // brae reads cellZones; no same-named cellZone -> can't locate the cells
+            if (zones.find(cs) == zones.end())
             {
-                fo.unsupported.push_back("source '" + s.first + "' uses selectionMode cellSet '" + cs + "' with no matching"
-                    " cellZone -- brae selects cells by cellZone; convert the set (topoSet: cellZoneSet), or use selectionMode cellZone");
-                continue;
-            }   // else: the same-named cellZone exists -> the sources below resolve it via selZoneName
+                const CellSelection sel = resolveCellSelection(polyMeshDir, "cellSet", cs, zones);
+                if (!sel.ok)
+                {
+                    fo.unsupported.push_back("source '" + s.first + "' " + sel.reason);
+                    continue;
+                }
+                zones[cs] = sel.cells;   // adopt it under its own name; every branch below reads `zones`
+            }
         }
 
         if (isMvf)   // meanVelocityForce (channel-flow driver)
@@ -342,23 +439,23 @@ inline FvOptionsData readFvOptions(
         if (type == "actuationDiskSource")   // Froude actuator disk (turbine/propeller)
         {
             if (co.wordOr("variant", "Froude") != "Froude") continue;    // (variableScaling: future)
+            FvOptionsData::ActuationDisk disk;
             const std::vector<scalar> dd = co.scalarListOr("diskDir", {});
             if (dd.size() >= 3)
             {
                 vector d{dd[dd.size()-3], dd[dd.size()-2], dd[dd.size()-1]};
                 const scalar m = std::sqrt(d.x*d.x+d.y*d.y+d.z*d.z);
-                if (m > 0) fo.adDiskDir = vector{d.x/m, d.y/m, d.z/m};
+                if (m > 0) disk.diskDir = vector{d.x/m, d.y/m, d.z/m};
             }
-            fo.adArea = co.scalarOr("diskArea", 0.0);
+            disk.area = co.scalarOr("diskArea", 0.0);
             const scalar Cp = co.scalarOr("Cp", 0.0), Ct = co.scalarOr("Ct", 0.0);
-            if (fo.adArea <= 0 || Ct <= 0 || Cp <= 0) continue;
-            fo.adA = 1.0 - Cp/Ct;                                        // induction (sink cancels)
-            // disk cells: the selection cellZone (cellZone, or a cellSet mapped to the same-named cellZone).
+            if (disk.area <= 0 || Ct <= 0 || Cp <= 0) continue;
+            disk.a = 1.0 - Cp/Ct;                                        // induction (sink cancels)
             {
                 const auto it = zones.find(selZoneName(co, opt));
-                if (it != zones.end()) fo.adDiskCells = it->second;
+                if (it != zones.end()) disk.diskCells = it->second;
             }
-            if (fo.adDiskCells.empty()) continue;
+            if (disk.diskCells.empty()) continue;
             // monitor cells: POINTS -> findCell(upstreamPoint) (closest cell centre); cellSet/cellZone -> named zone.
             const std::string mm = co.wordOr("monitorMethod", "points");
             if (mm == "points")
@@ -380,16 +477,16 @@ inline FvOptionsData readFvOptions(
                         const scalar d2 = r.x*r.x+r.y*r.y+r.z*r.z;
                         if (d2 < bd) { bd = d2; best = c; }
                     }
-                    fo.adMonitorCells = { best };
+                    disk.monitorCells = { best };
                 }
             }
             else   // cellSet/cellZone monitor
             {
                 const auto it = zones.find(co.wordOr("cellSet", co.wordOr("cellZone", "")));
-                if (it != zones.end()) fo.adMonitorCells = it->second;
+                if (it != zones.end()) disk.monitorCells = it->second;
             }
-            if (fo.adMonitorCells.empty()) continue;
-            if (fo.adActive) fo.unsupported.push_back("source '" + s.first + "': a 2nd actuationDiskSource -- brae keeps only one");
+            if (disk.monitorCells.empty()) continue;
+            fo.adDisks.push_back(std::move(disk));   // every turbine, not just the first
             fo.adActive = true;
             ++fo.count;
             continue;
@@ -566,9 +663,23 @@ inline FvOptionsData readFvOptions(
             Vsel += V[c];
         const scalar VDash = absolute ? (Vsel > 0 ? Vsel : 1.0) : 1.0;
 
+        // OF SemiImplicitSource::readCoeffs: `injectionRateSuSp` is the 2112-and-earlier spelling, kept for
+        // compatibility, and `sources` is the current one -- findDict the old, else subDict the new. brae
+        // looked only for the old name, so a modern case (pimpleFoam/laminar/planarPoiseuille writes
+        // `sources { U ((5 0 0) 0); }`) fell through the `continue` below and the source vanished with the
+        // driver printing "No finite volume options present". A silently dropped body force is exactly what
+        // the transient refusal existed to prevent, so the miss must be LOUD, not a skip.
         const FoamDict* inj = co.subDict("injectionRateSuSp");
         if (!inj) inj = opt.subDict("injectionRateSuSp");
-        if (!inj) continue;
+        if (!inj) inj = co.subDict("sources");
+        if (!inj) inj = opt.subDict("sources");
+        if (!inj)
+        {
+            fo.unsupported.push_back(
+                "source '" + s.first + "' (" + type + ") has neither a `sources` nor an "
+                "`injectionRateSuSp` sub-dictionary, so brae found nothing to apply");
+            continue;
+        }
 
         ++fo.count;
         if (isVec)   // momentum: field "U"

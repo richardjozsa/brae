@@ -96,9 +96,11 @@ void deviceKReactionSST(const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar
     const DeviceBuffer<scalar>* rho = nullptr);   // kOmegaSST-DDES: k-dissipation *= FDES (nullptr=RANS)
 
 // kOmegaSST-DDES DES factor FDES = max((sqrt(k)/(betaStar*omega))/(CDES*cubeRootVol(V))*(1-F2), 1), CDES=F1-blended.
+// lesDelta: the case's LES filter width (`delta maxDeltaxyz`); nullptr keeps OF's cubeRootVol.
 void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
     const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& F2,
-    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES);
+    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES,
+                              const DeviceBuffer<scalar>* lesDelta = nullptr);
 // kOmegaSST-IDDES factor FDES = lRAS/lIDDES (Gritskevich et al. 2012): the improved (WMLES) length scale. (Unit-test/DES hook.)
 void deviceKOmegaSSTIDDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
     const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nut,

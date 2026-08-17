@@ -348,6 +348,32 @@ void deviceAmiZeroWallIfCoeff(DeviceAMI& ami, const DeviceBuffer<label>& isWallC
 }
 
 
+namespace {
+// face value of a CELL field on an interface face: fvc::interpolate on a coupled patch, i.e.
+//   w*patchInternalField + (1-w)*patchNeighbourField
+__global__
+void amiFaceValueKernel(int n, const label* __restrict__ own, const scalar* __restrict__ w,
+                        const scalar* __restrict__ cell, const scalar* __restrict__ nbrInterp,
+                        scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = w[i]*cell[own[i]] + (scalar(1) - w[i])*nbrInterp[i];
+}
+}   // namespace
+
+void deviceAmiFaceValue(const DeviceAMI& ami, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out)
+{
+    out.resize(ami.n);
+    if (ami.n == 0) return;
+    DeviceBuffer<scalar> nbr;
+    deviceAmiInterpolate(ami, cell, nbr);
+    amiFaceValueKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(),
+                                               cell.data(), nbr.data(), out.data());
+    cudaCheck(cudaGetLastError(), "amiFaceValue");
+}
+
+
 void deviceAmiAddGrad(
     const DeviceAMI& ami,
     const DeviceBuffer<scalar>& psi,
@@ -785,6 +811,25 @@ void deviceAmiAddLinUpwindCorr(
 }
 
 
+// SCALAR overloads. k/epsilon/omega/nuTilda/he have one gradient, not three, and are never transformed
+// across a rotational interface -- so the same kernels run with comp = 0, rotational off, and the single
+// gradient handed to all three component slots (the other two are read and discarded).
+void deviceAmiAddLinUpwindCorr(
+    const DeviceAMI& ami,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>& corr)
+{
+    if (ami.n==0) return;
+    amiLinUpwindKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
+        ami.weight.data(), ami.phi.data(), gx.data(),gy.data(),gz.data(), gx.data(),gy.data(),gz.data(),
+        gx.data(),gy.data(),gz.data(), ami.dOwnX.data(),ami.dOwnY.data(),ami.dOwnZ.data(),
+        ami.dNbrX.data(),ami.dNbrY.data(),ami.dNbrZ.data(), nullptr, 0, 0, corr.data());
+    cudaCheck(cudaGetLastError(),"amiLinUpwindScalar");
+}
+
+
 void deviceAmiAddLapCorr(
     const DeviceAMI& ami,
     int comp,
@@ -802,6 +847,25 @@ void deviceAmiAddLapCorr(
         gUx[0].data(),gUy[0].data(),gUz[0].data(), gUx[1].data(),gUy[1].data(),gUz[1].data(), gUx[2].data(),gUy[2].data(),gUz[2].data(),
         ami.rotational?ami.fT.data():nullptr, ami.rotational?1:0, comp, corr.data());
     cudaCheck(cudaGetLastError(),"amiLapCorr");
+}
+
+
+void deviceAmiAddLapCorr(
+    const DeviceAMI& ami,
+    const DeviceBuffer<scalar>& gammaCell,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>& corr)
+{
+    if (ami.n==0) return;
+    DeviceBuffer<scalar> nuN;
+    deviceAmiInterpolate(ami, gammaCell, nuN);
+    amiLapCorrKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
+        ami.weights.data(), gammaCell.data(), nuN.data(), ami.magSf.data(), ami.corrVecX.data(),ami.corrVecY.data(),ami.corrVecZ.data(),
+        gx.data(),gy.data(),gz.data(), gx.data(),gy.data(),gz.data(), gx.data(),gy.data(),gz.data(),
+        nullptr, 0, 0, corr.data());
+    cudaCheck(cudaGetLastError(),"amiLapCorrScalar");
 }
 
 

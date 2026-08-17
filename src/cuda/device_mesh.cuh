@@ -10,6 +10,7 @@
 #include "fv_patch.cuh"
 #include "device_buffer.cuh"
 #include "interface/cyclic_interface.cuh"
+#include "foam_dict.cuh"   // isCoupledInterfaceType
 #include <vector>
 
 namespace brae {
@@ -35,6 +36,29 @@ struct DeviceMesh
 // cyclicFvPatchField::updateInterfaceMatrix, it is NOT merged into this owner-sorted internal-face LDU (doing
 // so breaks the amulKernel's owner-contiguous scatter, which assumes faces sorted by owner). The `cyclics`
 // argument is kept for API symmetry but the LDU itself carries only the mesh internal faces.
+// Refresh ONLY the geometric buffers after a mesh move -- OF fvMesh::movePoints.
+//
+// OF invalidates exactly two groups and nothing else:
+//   primitiveMesh::clearGeom        cellCentres, cellVolumes, faceCentres, faceAreas
+//   surfaceInterpolation::clearOut  weights, deltaCoeffs, nonOrthDeltaCoeffs, nonOrthCorrectionVectors
+//
+// TOPOLOGY SURVIVES. owner/neighbour and the derived addressing (ownerStart, losort, losortStart, the
+// boundary gather) are functions of the FACES, not the points, and polyMesh::movePoints keeps the
+// topology fixed. Rebuilding them would be wasted work; worse, the LDU addressing is what every
+// assembled matrix and the AMG hierarchy are indexed by, so silently reordering it mid-run would
+// invalidate them. This function therefore moves only the geometry across and leaves addressing alone.
+//
+// Implemented by rebuilding through buildDeviceMesh and adopting the geometric buffers, rather than
+// duplicating the upload logic: a second copy of it would drift from the builder, and the two would
+// disagree on some later change to how a quantity is computed. The cost is that the addressing is
+// rebuilt and discarded -- correct first; if it shows up in a profile, split the builder in two.
+inline void refreshDeviceMeshGeometry(
+    DeviceMesh& dm,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    const std::vector<CyclicInterface>& cyclics = {});
+
 inline DeviceMesh buildDeviceMesh(
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -90,7 +114,7 @@ inline DeviceMesh buildDeviceMesh(
     std::vector<scalar> dBndX, dBndY, dBndZ;               // Cf - C(faceCell) per boundary face (cellLimited grad)
     for (const FvPatch& p : fvp)
     {
-        if (p.type == "cyclic" || p.type == "cyclicAMI") continue;
+        if (isCoupledInterfaceType(p.type)) continue;
         const label emp = (p.type == "empty") ? 1 : 0;
         for (label i = 0; i < p.size; ++i)
         {
@@ -173,6 +197,40 @@ inline DeviceMesh buildDeviceMesh(
     return dm;
 }
 
+inline void refreshDeviceMeshGeometry(
+    DeviceMesh& dm,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    const std::vector<CyclicInterface>& cyclics)
+{
+    DeviceMesh fresh = buildDeviceMesh(m, g, fvp, cyclics);
+    if (fresh.nCells != dm.nCells || fresh.nInternalFaces != dm.nInternalFaces
+     || fresh.nBndFaces != dm.nBndFaces)
+        throw std::runtime_error("brae: refreshDeviceMeshGeometry saw a different mesh size -- a move "
+                                 "must not change topology (OF polyMesh::movePoints keeps it fixed).");
+
+    // primitiveMesh::clearGeom equivalents
+    dm.V     = std::move(fresh.V);
+    dm.Sfx   = std::move(fresh.Sfx);
+    dm.Sfy   = std::move(fresh.Sfy);
+    dm.Sfz   = std::move(fresh.Sfz);
+    dm.magSf = std::move(fresh.magSf);
+    // surfaceInterpolation::clearOut equivalents
+    dm.w         = std::move(fresh.w);
+    dm.dc        = std::move(fresh.dc);
+    dm.nonOrthDc = std::move(fresh.nonOrthDc);
+    dm.corrVecX  = std::move(fresh.corrVecX);
+    dm.corrVecY  = std::move(fresh.corrVecY);
+    dm.corrVecZ  = std::move(fresh.corrVecZ);
+    // face-to-cell offsets: functions of faceCentres and cellCentres, both cleared by clearGeom
+    dm.dOwnX = std::move(fresh.dOwnX); dm.dOwnY = std::move(fresh.dOwnY); dm.dOwnZ = std::move(fresh.dOwnZ);
+    dm.dNeiX = std::move(fresh.dNeiX); dm.dNeiY = std::move(fresh.dNeiY); dm.dNeiZ = std::move(fresh.dNeiZ);
+    dm.dBndX = std::move(fresh.dBndX); dm.dBndY = std::move(fresh.dBndY); dm.dBndZ = std::move(fresh.dBndZ);
+    // owner/nei, ownerStart/losort/losortStart, bnd* deliberately NOT touched: topology, unchanged.
+}
+
+
 // Flatten a boundary field (per patch -> per face) into one device array in patch order (matches bndCell order).
 inline std::vector<scalar> flattenBoundary(const std::vector<std::vector<scalar>>& bnd)
 {
@@ -187,9 +245,31 @@ void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const D
 void deviceGaussGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
                      DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
 
+// The COUPLED-PATCH half of cellLimitedGrad, which brae's addressing cannot see on its own.
+//
+// A cyclic/cyclicAMI/cyclicACMI face is a boundary face to brae (DeviceBoundary skips it, so it is in
+// neither dm.bndCellStart nor Ubnd) but an INTERNAL one to OF's limiter: cellLimitedGrad::calcGrad folds
+// psf.patchNeighbourField() into maxVsf/minVsf for every coupled patch, and its second loop limits the
+// extrapolation to EVERY boundary face, coupled ones included. Without this an interface cell is limited
+// as though the interface were not there.
+//
+// nbrVal is this component's neighbour value per interface face, already interpolated (AMI) and rotated
+// (rotational cyclic) by the caller -- the rotation machinery lives there and is not duplicated here.
+struct CellLimitInterface
+{
+    int n = 0;
+    const label*  ownCell = nullptr;
+    const scalar* nbrVal  = nullptr;
+    const scalar* dOwnX   = nullptr;   // Cf - C[own], the extrapolation vector for this face
+    const scalar* dOwnY   = nullptr;
+    const scalar* dOwnZ   = nullptr;
+};
+
 // cellLimited Gauss linear <k> (OF cellLimitedGrad<minmod>) applied to one component's gradient (gx,gy,gz in/out).
+// With no interfaces this is the single-kernel path it has always been, bit for bit.
 void deviceCellLimitGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& U, const DeviceBuffer<scalar>& Ubnd,
-                         DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz, scalar k);
+                         DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz, scalar k,
+                         const CellLimitInterface* ifs = nullptr, int nIfs = 0);
 
 // G4: fvm matrix assembly on device, produces the raw lduMatrix coefficients (diag/upper/lower), the
 // boundary internalCoeffs/boundaryCoeffs are folded by the solver (G5). gammafInt / phiInt are nIf-sized.
@@ -220,6 +300,8 @@ void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phi
 // limitedLinear convection (OF "Gauss limitedLinear k_"): implicit limited face weight W_f = limiter*CDweight +
 // (1-limiter)*pos0(phi), limiter = clamp(twoByk*r, 0, 1), r = NVDTVD ratio from grad(field). twoByk = 2/max(k_,SMALL)
 // (k_=1 -> twoByk=2). gx/gy/gz = cell grad(field) (Gauss). Reduces to deviceDivUpwindCoeffs at limiter=0.
+void deviceDivCentralCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
+                            DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
 void deviceDivLimitedCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& field,
                             const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
                             scalar twoByk, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
@@ -228,6 +310,10 @@ void deviceDivLimitedCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& ph
 // are 3-element arrays (per component). Reduces to deviceDivUpwindCoeffs at limiter=0. Built implicitly like magSqr.
 void deviceDivLimitedVCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>* U,
                              const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz,
+                             scalar twoByk, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
+// ... taking deviceGradU's PACKED gradient (gradU[q*nC + c], q = 3i + j) rather than nine buffers.
+void deviceDivLimitedVCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>* U,
+                             const DeviceBuffer<scalar>& gradU,
                              scalar twoByk, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
 // G5: fold the boundary + pEqn source for the pressure solve -> diagC (= rawDiag + internalCoeffs),
 // b (= V*divPhi + boundaryCoeffs). iC/bC are flattened pEqn boundary coeffs (patch order = bndCell order).

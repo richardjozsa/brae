@@ -518,6 +518,62 @@ void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p)
 }
 
 
+namespace {
+// face value of a CELL field on a cyclic face: w*psi[own] + (1-w)*psi[nbr] -- fvc::interpolate on a
+// coupled patch, the 1:1 counterpart of deviceAmiFaceValue.
+__global__
+void cyclicFaceValueKernel(int n, const label* __restrict__ own, const label* __restrict__ nbr,
+                           const scalar* __restrict__ w, const scalar* __restrict__ cell,
+                           scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = w[i]*cell[own[i]] + (scalar(1) - w[i])*cell[nbr[i]];
+}
+}   // namespace
+
+namespace {
+// The RAW periodic-neighbour value per cyclic face -- OF's patchNeighbourField(), not a face
+// interpolation. cellLimitedGrad needs it to fold the coupled neighbour into a cell's min/max range.
+// Rotational: the neighbour vector is rotated by forwardT first, so component `comp` mixes all three.
+__global__
+void cyclicNbrValueKernel(int n, const label* __restrict__ nbr, const scalar* __restrict__ cell,
+                          const scalar* __restrict__ c0, const scalar* __restrict__ c1,
+                          const scalar* __restrict__ c2, const scalar* __restrict__ fT,
+                          int rotational, int comp, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int nb = nbr[i];
+    if (!rotational) { out[i] = cell[nb]; return; }
+    out[i] = fT[(3*comp+0)*n + i]*c0[nb] + fT[(3*comp+1)*n + i]*c1[nb] + fT[(3*comp+2)*n + i]*c2[nb];
+}
+}   // namespace
+
+void deviceCyclicNbrValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& cell,
+                          const DeviceBuffer<scalar>& c0, const DeviceBuffer<scalar>& c1,
+                          const DeviceBuffer<scalar>& c2, int comp, DeviceBuffer<scalar>& out)
+{
+    out.resize(cyc.n);
+    if (cyc.n == 0) return;
+    const bool rot = cyc.rotational && c0.size() && c1.size() && c2.size();
+    cyclicNbrValueKernel<<<nBlocks(cyc.n),TPB>>>(cyc.n, cyc.nbrCell.data(), cell.data(),
+        rot ? c0.data() : nullptr, rot ? c1.data() : nullptr, rot ? c2.data() : nullptr,
+        cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, out.data());
+    cudaCheck(cudaGetLastError(), "cyclicNbrValue");
+}
+
+
+void deviceCyclicFaceValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out)
+{
+    out.resize(cyc.n);
+    if (cyc.n == 0) return;
+    cyclicFaceValueKernel<<<nBlocks(cyc.n),TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(),
+                                                  cyc.weights.data(), cell.data(), out.data());
+    cudaCheck(cudaGetLastError(), "cyclicFaceValue");
+}
+
+
 void deviceCyclicAddGrad(
     const DeviceCyclic& cyc,
     const DeviceBuffer<scalar>& psi,
@@ -688,6 +744,22 @@ void deviceCyclicAddLinUpwindCorr(
     cudaCheck(cudaGetLastError(), "cyclicLinUpwind");
 }
 
+// SCALAR overload -- see the AMI one. comp = 0, rotation off, one gradient in all three slots.
+void deviceCyclicAddLinUpwindCorr(
+    const DeviceCyclic& cyc,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>& corr)
+{
+    if (cyc.n == 0) return;
+    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(),
+        gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(),
+        cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),
+        nullptr, 0, 0, corr.data());
+    cudaCheck(cudaGetLastError(), "cyclicLinUpwindScalar");
+}
+
 
 __global__
 void cycLapCorrKernel(
@@ -764,6 +836,22 @@ void deviceCyclicAddLapCorr(
         gUx[2].data(), gUy[2].data(), gUz[2].data(),
         cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, corr.data());
     cudaCheck(cudaGetLastError(), "cyclicLapCorr");
+}
+
+void deviceCyclicAddLapCorr(
+    const DeviceCyclic& cyc,
+    const DeviceBuffer<scalar>& gammaCell,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>& corr)
+{
+    if (cyc.n == 0) return;
+    cycLapCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), gammaCell.data(),
+        cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
+        gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(),
+        nullptr, 0, 0, corr.data());
+    cudaCheck(cudaGetLastError(), "cyclicLapCorrScalar");
 }
 
 

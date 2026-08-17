@@ -247,6 +247,9 @@ void epsReactionKernel(
     scalar C2,
     scalar C3,
     scalar Cmu,
+    int    rng,           // RNGkEpsilon: production coefficient (C1 - R) instead of C1
+    scalar eta0,
+    scalar beta,
     scalar* __restrict__ diag,
     scalar* __restrict__ source,
     const scalar* __restrict__ rho)   // compressible: OF weights EVERY RHS term by alpha*rho
@@ -259,8 +262,18 @@ void epsReactionKernel(
     //      - fvm::Sp(C2*alpha*rho*eps/k, eps)
     const scalar rw = rho ? rho[c] : scalar(1);
     const scalar sp = ((2.0/3.0) * C1 - C3) * divU[c];   // OF SuSp(((2/3)C1 - C3)*divU, eps)
+    // RNGkEpsilon.C: the G production alone carries (C1 - R). gByNu IS OF's S2 (= dev(twoSymm(gradU)) &&
+    // gradU, the same contraction G/nut is built from), so eta needs nothing the standard path does not
+    // already compute. The SuSp term above keeps the plain C1, exactly as OF writes it.
+    scalar C1p = C1;
+    if (rng)
+    {
+        const scalar eta = sqrt(fabs(gByNu[c])) * k[c] / eps[c];
+        const scalar R   = (eta * (scalar(1) - eta / eta0)) / (beta * eta * eta * eta + scalar(1));
+        C1p = C1 - R;
+    }
     diag[c]   += rw * V[c] * (C2 * eps[c] / k[c] + fmax(sp, 0.0));
-    source[c] += rw * (V[c] * (C1 * Cmu * k[c] * gByNu[c]) - V[c] * fmin(sp, 0.0) * eps[c]);
+    source[c] += rw * (V[c] * (C1p * Cmu * k[c] * gByNu[c]) - V[c] * fmin(sp, 0.0) * eps[c]);
 }
 
 
@@ -489,7 +502,8 @@ void deviceWallEpsG0(
     int nutWall,
     scalar atmZ0,
     bool   atmBoundNut,
-    const DeviceBuffer<scalar>* nuFace)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
+    const DeviceBuffer<scalar>* nuFace,
+    const DeviceBuffer<scalar>* nutFile)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
 {
     const int nC = static_cast<int>(k.size());
     eps0.resize(nC);
@@ -518,7 +532,9 @@ void deviceEpsReaction(
     const DeviceBuffer<scalar>* rho)
 {
     epsReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), eps.data(), k.data(), gByNu.data(), divU.data(),
-                                                   co.C1, co.C2, co.C3, co.Cmu, diag.data(), source.data(),
+                                                   co.C1, co.C2, co.C3, co.Cmu,
+                                                   co.rng ? 1 : 0, co.eta0, co.beta,
+                                                   diag.data(), source.data(),
                                                    rho ? rho->data() : nullptr);
     cudaCheck(cudaGetLastError(), "epsReaction");
 }
@@ -647,6 +663,7 @@ void deviceKEpsilonCorrect(
     const DeviceBuffer<scalar>* nutBnd,       // nut at boundary FACES -> DkEff/DepsEff(patchi), as OF's laplacian uses
     const DeviceBuffer<scalar>* muBnd,
     scalar gradScalarLimitK,
+    scalar gradULimitK,
                             const DeviceBuffer<label>*  fvoKMask,
                             const DeviceBuffer<scalar>* fvoKVal,
                             const DeviceBuffer<label>*  fvoEMask,
@@ -655,12 +672,19 @@ void deviceKEpsilonCorrect(
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
     DeviceBuffer<scalar> gByNu, rCmu, magS;
-    if (co.realizable)   // realizableKE: needs the full gradU tensor for rCmu/magS (deviceGbyNu only returns gByNu)
+    // THE NAMED grad(U) SCHEME. OF's kEpsilon::correct() opens with `tmp<volTensorField> tgradU =
+    // fvc::grad(U)`, which resolves gradSchemes `grad(U)` -- `cellLimited Gauss linear 1` on any case
+    // that says so. kOmegaSST's brae path has honoured that for a long time; kEpsilon's never did, and
+    // an UNLIMITED production gradient is larger exactly where the limiter would have bitten. Measured
+    // on pimpleFoam/RAS/oscillatingInletACMI2D, step 1: GbyNu peaked at 1.9e+04 against OpenFOAM's
+    // 3.6e+03 in the inlet channel, a factor of 5 on the production term itself.
+    if (co.realizable || gradULimitK > scalar(0))
     {
         DeviceBuffer<scalar> gradU;
         deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);
+        if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);
         deviceGByNuFromGradU(gradU, nC, gByNu);
-        deviceRealizableStrain(gradU, k, eps, co.A0, nC, rCmu, magS);
+        if (co.realizable) deviceRealizableStrain(gradU, k, eps, co.A0, nC, rCmu, magS);
     }
     else deviceGbyNu(dm, dbU, Ux, Uy, Uz, gByNu, ami, cyc);   // interface-aware grad(U) for production
     DeviceBuffer<scalar> G;
@@ -681,6 +705,7 @@ void deviceKEpsilonCorrect(
         // Only the components separate those two.
         DeviceBuffer<scalar> gradUd;
         deviceGradU(dm, dbU, Ux, Uy, Uz, gradUd, ami, cyc);
+        if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradUd, gradULimitK, cyc, ami);
         const std::vector<scalar> hT = gradUd.host();
         go << "# cell gByNu k eps nut g0..g8 (OF-convention gradU, column i = grad(U_i))\n";
         for (int c = 0; c < nC; ++c)
@@ -717,7 +742,26 @@ void deviceKEpsilonCorrect(
     else deviceCopy(divU, divPhi);
     DeviceBuffer<scalar> eps0, G0;
     deviceWallEpsG0(wall, k, Ux, Uy, Uz, nu, eps0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
-    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data());
+    // BRAE_DUMP_TERMS: the wall-function inputs, BEFORE the override rewrites eps/eps0. eps0 is the raw
+    // near-wall value invNw*Cmu^.75*k^1.5/(kappa*y), so a disagreement with OF here is one of invNw
+    // (the corner weighting, 1/nWallFaces), y, or k -- and the three are separable only side by side.
+    if (const char* wd = std::getenv("BRAE_DUMP_TERMS"))
+    {
+        static int wCall = 0;
+        const int wi = wCall++;
+        std::error_code wec; std::filesystem::create_directories(wd, wec);
+        char wfn[512]; std::snprintf(wfn, sizeof wfn, "%s/wall_%04d", wd, wi);
+        std::ofstream wo(wfn); wo.precision(10);
+        const std::vector<scalar> hE0 = eps0.host(), hG0 = G0.host(), hW = wall.wallW.size() ? wall.wallW.host() : std::vector<scalar>(nC, 1.0);
+        const std::vector<scalar> hInv = wall.invNw.host(), hE = eps.host(), hK = k.host();
+        const std::vector<label>  hIs = wall.isWallCell.host();
+        wo << "# cell isWall wallW invNw eps0 G0 epsIn k\n";
+        for (int c = 0; c < nC; ++c)
+            wo << c << ' ' << (int)hIs[c] << ' ' << hW[c] << ' ' << hInv[c] << ' '
+               << hE0[c] << ' ' << hG0[c] << ' ' << hE[c] << ' ' << hK[c] << '\n';
+    }
+    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data(),
+                                          wall.wallW.size() ? wall.wallW.data() : nullptr);
 
     // epsilon equation (loose solve) with the near-wall setValues constraint
     // DepsilonEff = nut/sigmaEps + nu. OF's laplacian is alpha*rho*DepsilonEff, so compressible wants
@@ -788,13 +832,16 @@ void spaldingNutKernel(
     scalar kappa,
     scalar E,
     scalar* __restrict__ nutBnd,
-    const scalar* __restrict__ nuFace)   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
+    const scalar* __restrict__ nuFace,   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
+    const scalar* __restrict__ nutFile)  // the patch's OWN nut boundaryField, null -> extrapolate
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     const int c = fc[i];
-    if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
+    // OF evaluates nut on a non-wall patch from that patch's OWN boundaryField; extrapolating the
+    // adjacent cell is 607x wrong at a `calculated` inlet (see rhosimplefoam-ground-truth-port.md).
+    if (!isWall[i]) { nutBnd[i] = nutFile ? nutFile[i] : nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
     const scalar magGradU = magUp * dc[i];
     const scalar nuw = nuFace ? nuFace[i] : nu;
@@ -822,13 +869,16 @@ void blendedNutKernel(
     scalar kappa,
     scalar E,
     scalar* __restrict__ nutBnd,
-    const scalar* __restrict__ nuFace)   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
+    const scalar* __restrict__ nuFace,   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
+    const scalar* __restrict__ nutFile)  // the patch's OWN nut boundaryField, null -> extrapolate
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     const int c = fc[i];
-    if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
+    // OF evaluates nut on a non-wall patch from that patch's OWN boundaryField; extrapolating the
+    // adjacent cell is 607x wrong at a `calculated` inlet (see rhosimplefoam-ground-truth-port.md).
+    if (!isWall[i]) { nutBnd[i] = nutFile ? nutFile[i] : nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
     const scalar magGradU = magUp * dc[i];
     const scalar nuw = nuFace ? nuFace[i] : nu;
@@ -848,7 +898,8 @@ void deviceBoundaryNutSpalding(
     scalar nu,
     const SpalartAllmarasCoeffs& co,
     DeviceBuffer<scalar>& nutBnd,
-    const DeviceBuffer<scalar>* nuFace)
+    const DeviceBuffer<scalar>* nuFace,
+    const DeviceBuffer<scalar>* nutFile)
 {
     // OF turbulenceModel::nu(patchi) = mu(patchi)/rho.boundaryField()[patchi] -- a per-FACE kinematic
     // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
@@ -863,7 +914,8 @@ void deviceBoundaryNutSpalding(
     spaldingNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                            dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                            nutCell.data(), nu, co.kappa, co.E, nutBnd.data(),
-                                           nuFace ? nuFace->data() : nullptr);
+                                           nuFace ? nuFace->data() : nullptr,
+                                           nutFile ? nutFile->data() : nullptr);
     cudaCheck(cudaGetLastError(), "spaldingNut");
 }
 
@@ -882,7 +934,8 @@ void deviceBoundaryNutBlended(
     scalar kappa,
     scalar E,
     DeviceBuffer<scalar>& nutBnd,
-    const DeviceBuffer<scalar>* nuFace)
+    const DeviceBuffer<scalar>* nuFace,
+    const DeviceBuffer<scalar>* nutFile)
 {
     // OF turbulenceModel::nu(patchi) = mu(patchi)/rho.boundaryField()[patchi] -- a per-FACE kinematic
     // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
@@ -897,7 +950,8 @@ void deviceBoundaryNutBlended(
     blendedNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                           dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                           nutCell.data(), nu, kappa, E, nutBnd.data(),
-                                          nuFace ? nuFace->data() : nullptr);
+                                          nuFace ? nuFace->data() : nullptr,
+                                          nutFile ? nutFile->data() : nullptr);
     cudaCheck(cudaGetLastError(), "blendedNut");
 }
 
@@ -914,12 +968,15 @@ void nutUWallKernel(
     const scalar* __restrict__ y, const scalar* __restrict__ dc,
     const scalar* __restrict__ Ux, const scalar* __restrict__ Uy, const scalar* __restrict__ Uz,
     const scalar* __restrict__ nutCell, scalar nu, scalar kappa, scalar E, scalar yPlusLam,
-    scalar* __restrict__ nutBnd, const scalar* __restrict__ nuFace)
+    scalar* __restrict__ nutBnd, const scalar* __restrict__ nuFace,
+    const scalar* __restrict__ nutFile)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int c = fc[i];
-    if (!isWall[i]) { nutBnd[i] = nutCell[c]; return; }
+    // OF evaluates nut on a non-wall patch from that patch's OWN boundaryField; extrapolating the
+    // adjacent cell is 607x wrong at a `calculated` inlet (see rhosimplefoam-ground-truth-port.md).
+    if (!isWall[i]) { nutBnd[i] = nutFile ? nutFile[i] : nutCell[c]; return; }
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);   // wall is stationary
     const scalar nuw = nuFace ? nuFace[i] : nu;
     nutBnd[i] = nutUWallValue(magUp, y[i], nuw, kappa, E, yPlusLam);
@@ -937,7 +994,8 @@ void deviceBoundaryNutU(
     const DeviceBuffer<scalar>& nutCell,
     scalar nu, scalar kappa, scalar E,
     DeviceBuffer<scalar>& nutBnd,
-    const DeviceBuffer<scalar>* nuFace)
+    const DeviceBuffer<scalar>* nuFace,
+    const DeviceBuffer<scalar>* nutFile)
 {
     const int n = dbU.comp[0].n;
     if (!n) return;
@@ -945,7 +1003,8 @@ void deviceBoundaryNutU(
     nutUWallKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                         dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                         nutCell.data(), nu, kappa, E, yPlusLamHost(kappa, E), nutBnd.data(),
-                                        nuFace ? nuFace->data() : nullptr);
+                                        nuFace ? nuFace->data() : nullptr,
+                                        nutFile ? nutFile->data() : nullptr);
     cudaCheck(cudaGetLastError(), "nutUWall");
 }
 

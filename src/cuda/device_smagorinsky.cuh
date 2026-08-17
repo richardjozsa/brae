@@ -10,7 +10,15 @@ namespace brae {
 
 // nut = Ck*delta*sqrt(k_sgs), delta = cbrt(V), k_sgs from the local production=dissipation balance (OF Smagorinsky).
 // gradU is the OF-convention 9-component tensor per cell (gradU[q*nC + c], q = i*3+j), as produced by deviceGradU.
+// `delta`, when given, is the LES filter width per cell (the case's `delta` entry, e.g. maxDeltaxyz);
+// nullptr keeps OF's default cubeRootVol = V^(1/3), computed in the kernel.
 void deviceSmagorinskyNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
-                          const SmagorinskyCoeffs& co, DeviceBuffer<scalar>& nut);
+                          const SmagorinskyCoeffs& co, DeviceBuffer<scalar>& nut,
+                          const DeviceBuffer<scalar>* delta = nullptr);
+
+// WALE (OF LESModels::WALE::correctNut): the other ALGEBRAIC sub-grid nut, same inputs as Smagorinsky.
+void deviceWaleNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
+                   const WaleCoeffs& co, DeviceBuffer<scalar>& nut,
+                   const DeviceBuffer<scalar>* delta = nullptr);
 
 } // namespace brae

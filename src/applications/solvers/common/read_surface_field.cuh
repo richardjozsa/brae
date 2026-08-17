@@ -44,7 +44,13 @@ SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<F
         for (const auto& b : fd.boundary)   // pass-1 exact-name match (written phi lists exact mesh-patch names)
         {
             if (b.name != patches[pi].name) continue;
-            if (b.hasValue && patches[pi].type != "cyclic" && patches[pi].type != "cyclicAMI")
+            // Coupled patches are READ too. They used to be skipped on the grounds that "the ctor
+            // recomputes cyclic/AMI flux from U", but that rebuild is not the stored flux: on
+            // pimpleFoam/RAS/oscillatingInletACMI2D it differed by 1.3e-04 per face, straight onto the
+            // momentum diagonal through the upwind max(phi,0). The caller hands these to
+            // setInterfacePatchFlux, and a file without them (brae's own older writes, or a solver with
+            // no interface) still leaves the zeros the rebuild then overwrites.
+            if (b.hasValue)
             {
                 if (b.valueUniform) std::fill(vals.begin(), vals.end(), b.uniformValue);
                 else if (b.values.size() == vals.size()) vals = b.values;   // else keep zeros (defensive)

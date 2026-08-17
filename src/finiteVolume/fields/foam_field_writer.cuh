@@ -1,4 +1,5 @@
 #pragma once
+#include <map>
 // brae::writeVolField, write a converged volume field in OpenFOAM's own structure. Unlike a raw text splice, this
 // emits a fully RESOLVED field like OpenFOAM does: the internalField is the solved nonuniform list, and the
 // boundaryField is written per mesh patch with an explicit `type` (+ value) entry, patch groups expanded, #include /
@@ -7,6 +8,7 @@
 #include "cf_types.cuh"
 #include "foam_field_reader.cuh"   // readField -> FieldData/PatchFieldData (resolves includes/macros/$internalField)
 #include "foam_dict.cuh"           // compileFoamRegex, isConstraintPatchType (same matching as buildField)
+#include "foam_token_reader.cuh"   // gzSlurp: the template field may be gzipped (OF writeCompression on)
 #include "fv_patch.cuh"            // FvPatch (name / type / inGroups)
 #include <fstream>
 #include <iomanip>
@@ -22,6 +24,12 @@ inline void formatFoamValue(std::ostream& os, scalar v) { os << v; }
 inline void formatFoamValue(std::ostream& os, const vector& v) { os << '(' << v.x << ' ' << v.y << ' ' << v.z << ')'; }
 inline const char* foamListType(scalar) { return "List<scalar>"; }
 inline const char* foamListType(const vector&) { return "List<vector>"; }
+inline void formatFoamValue(std::ostream& os, const symmTensor& t)
+{
+    os << '(' << t.xx << ' ' << t.xy << ' ' << t.xz << ' ' << t.yy << ' ' << t.yz << ' ' << t.zz << ')';
+}
+inline const char* foamListType(const symmTensor&) { return "List<symmTensor>"; }
+inline const char* foamClassName(const symmTensor&) { return "volSymmTensorField"; }
 inline const char* foamClassName(scalar) { return "volScalarField"; }
 inline const char* foamClassName(const vector&) { return "volVectorField"; }
 
@@ -137,9 +145,22 @@ inline void writeVolField(
     const std::vector<T>& computedBoundary = {},
     const DerivedFieldSpec* derived = nullptr)
 {
-    std::ifstream in(origPath);
-    if (!in) throw std::runtime_error("writeVolField: cannot read " + origPath);
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // The ORIGINAL field is re-read here as a template: its FoamFile header, dimensions and boundaryField
+    // shape are echoed into the new time directory. It may be gzipped -- OF writes `U.gz` whenever
+    // writeCompression is on, and pimpleFoam/LES/periodicPlaneChannel ships its 0/ that way -- so this has
+    // to go through gzSlurp like every other read, not a bare ifstream. The reader side already did;
+    // only the writer still opened the file directly, and the run died at its FIRST write having done all
+    // the solving.
+    std::string text;
+    try
+    {
+        const std::vector<char> b = gzSlurp(origPath);
+        text.assign(b.begin(), b.end());
+    }
+    catch (const std::exception&)
+    {
+        throw std::runtime_error("writeVolField: cannot read " + origPath + " (nor " + origPath + ".gz)");
+    }
 
     // FoamFile header block (verbatim, it holds no directives) + the dimensions line.
     const std::size_t ff = text.find("FoamFile");
@@ -159,6 +180,13 @@ inline void writeVolField(
         }
     }
     std::string header = (ff == std::string::npos) ? "" : text.substr(0, he);
+    // The template may be a BINARY file (OF writeFormat binary; pimpleFoam/LES/NACA4412 ships 0/U that
+    // way). brae writes ASCII, so the header it copies has to say so -- otherwise the written field is
+    // labelled binary and holds text, and nothing, OpenFOAM included, can read it back.
+    {
+        const std::regex fmtRe("format\\s+binary\\s*;");
+        header = std::regex_replace(header, fmtRe, std::string("format      ascii;"));
+    }
     if (derived && derived->object)
     {
         // Rewrite the template's `object <name>;` so the file identifies as what it IS. Some OF readers
@@ -237,7 +265,7 @@ inline void writeVolField(
                        : (derived ? "calculated" : "zeroGradient");
             d = &synth;
         }
-        const bool coupled = (p.type == "cyclic" || p.type == "cyclicAMI");
+        const bool coupled = (isCoupledInterfaceType(p.type));
         const bool haveComputed = !computedBoundary.empty() && !coupled && p.size > 0
                                && bndOff + static_cast<std::size_t>(p.size) <= computedBoundary.size()
                                && p.type != "empty";
@@ -266,7 +294,13 @@ inline void writeSurfaceField(
     // Defaulted to the volumetric form so the incompressible callers are unchanged. Getting this wrong
     // still loads, but every downstream tool that checks dimensions (postProcess, funkySetFields, a
     // restart into OF) then sees a field that claims to be something it is not.
-    const std::string& dimensions = "[0 3 -1 0 0 0 0]")
+    const std::string& dimensions = "[0 3 -1 0 0 0 0]",
+    // Per-COUPLED-patch flux, keyed by patch name. cyclic/cyclicAMI/cyclicACMI faces are not in
+    // phiBoundary at all (their flux lives on the interface object), so without this they were written
+    // as a bare `type <patchType>;` with no value -- and a restart had nothing to resume from. OF writes
+    // the values; see DeviceSimpleSolver::interfacePatchFlux for what the missing round-trip cost.
+    // Absent/empty keeps the old value-less form, which is still right for a solver with no interface.
+    const std::map<std::string, std::vector<scalar>>& coupledValues = {})
 {
     std::ofstream out(outPath);
     if (!out) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
@@ -282,9 +316,17 @@ inline void writeSurfaceField(
     for (const auto& p : patches)
     {
         out << "    " << p.name << "\n    {\n";
-        if (p.type == "cyclic" || p.type == "cyclicAMI")   // coupled: flux held on the interface, not in phiBoundary
+        if (isCoupledInterfaceType(p.type))   // coupled: flux held on the interface, not in phiBoundary
         {
-            out << "        type            " << p.type << ";\n    }\n";
+            out << "        type            " << p.type << ";\n";
+            const auto cv = coupledValues.find(p.name);
+            if (cv != coupledValues.end() && cv->second.size() == static_cast<std::size_t>(p.size))
+            {
+                out << "        value           nonuniform List<scalar> \n" << p.size << "\n(\n";
+                for (scalar v : cv->second) out << v << '\n';
+                out << ")\n;\n";
+            }
+            out << "    }\n";
             continue;                                       // do NOT advance off (phiBoundary skips these)
         }
         const std::size_t n = static_cast<std::size_t>(p.size);

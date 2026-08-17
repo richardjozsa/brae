@@ -16,7 +16,7 @@ namespace {
 __global__
 void smagorinskyNutKernel(
     int nC, const scalar* __restrict__ gradU, const scalar* __restrict__ V,
-    SmagorinskyCoeffs co, scalar* __restrict__ nut)
+    SmagorinskyCoeffs co, const scalar* __restrict__ dOpt, scalar* __restrict__ nut)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -24,7 +24,7 @@ void smagorinskyNutKernel(
     scalar t[9];
     for (int q = 0; q < 9; ++q)
         t[q] = gradU[q * nC + c];
-    const scalar delta = cbrt(V[c]);                              // LES filter width (cubeRootVol = V^(1/3))
+    const scalar delta = dOpt ? dOpt[c] : cbrt(V[c]);             // LES filter width: the case's `delta`
     const scalar trD = t[0] + t[4] + t[8];                        // tr(symm gradU) = div(U)
     scalar DD = 0;                                                // D:D = magSqr(symm(gradU))
     for (int i = 0; i < 3; ++i)
@@ -44,12 +44,77 @@ void smagorinskyNutKernel(
 
 } // namespace
 
-void deviceSmagorinskyNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
-                          const SmagorinskyCoeffs& co, DeviceBuffer<scalar>& nut)
+namespace {
+
+// OF LESModels::WALE::k(gradU), transcribed literally so the SMALL sits where OF puts it:
+//     Sd        = devSymm(gradU & gradU)                     [tensor product, then symm, then deviatoric]
+//     magSqrSd  = magSqr(Sd)
+//     k         = sqr(sqr(Cw)*delta/Ck) * pow3(magSqrSd)
+//                 / ( sqr( pow(magSqr(symm(gradU)), 5/2) + pow(magSqrSd, 5/4) ) + SMALL )
+//     nut       = Ck*delta*sqrt(k)
+// gradU is packed q = 3i + j = d(U_j)/d(x_i), which is OF's own tensor layout, so (A & B)[i][j] is
+// sum_k A[i][k]*B[k][j] on the same indices.
+__global__
+void waleNutKernel(
+    int nC, const scalar* __restrict__ gradU, const scalar* __restrict__ V,
+    WaleCoeffs co, const scalar* __restrict__ dOpt, scalar* __restrict__ nut)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    scalar t[9];
+    for (int q = 0; q < 9; ++q)
+        t[q] = gradU[q * nC + c];
+    const scalar delta = dOpt ? dOpt[c] : cbrt(V[c]);
+
+    scalar gg[9];                                                  // gradU & gradU
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+        {
+            scalar sum = 0;
+            for (int k = 0; k < 3; ++k) sum += t[i*3+k] * t[k*3+j];
+            gg[i*3+j] = sum;
+        }
+    const scalar trGG = gg[0] + gg[4] + gg[8];
+    scalar magSqrSd = 0, magSqrS = 0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+        {
+            // devSymm(gg) = symm(gg) - (1/3)tr(gg) I
+            scalar sd = scalar(0.5)*(gg[i*3+j] + gg[j*3+i]);
+            if (i == j) sd -= trGG/scalar(3);
+            magSqrSd += sd*sd;
+            const scalar s = scalar(0.5)*(t[i*3+j] + t[j*3+i]);    // symm(gradU)
+            magSqrS += s*s;
+        }
+    const scalar A   = co.Cw*co.Cw*delta/co.Ck;
+    const scalar den = pow(magSqrS, scalar(2.5)) + pow(magSqrSd, scalar(1.25));
+    const scalar k   = A*A * (magSqrSd*magSqrSd*magSqrSd) / (den*den + scalar(1e-15));
+    nut[c] = co.Ck * delta * sqrt(fmax(k, scalar(0)));
+}
+
+} // namespace
+
+
+void deviceWaleNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
+                   const WaleCoeffs& co, DeviceBuffer<scalar>& nut, const DeviceBuffer<scalar>* delta)
 {
     nut.resize(nC);
     if (nC == 0) return;
-    smagorinskyNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co, nut.data());
+    waleNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co,
+        (delta && delta->size()) ? delta->data() : nullptr, nut.data());
+    cudaCheck(cudaGetLastError(), "deviceWaleNut");
+}
+
+
+void deviceSmagorinskyNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& V,
+                          const SmagorinskyCoeffs& co, DeviceBuffer<scalar>& nut,
+                          const DeviceBuffer<scalar>* delta)
+{
+    nut.resize(nC);
+    if (nC == 0) return;
+    smagorinskyNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co,
+        (delta && delta->size()) ? delta->data() : nullptr, nut.data());
     cudaCheck(cudaGetLastError(), "deviceSmagorinskyNut");
 }
 

@@ -292,11 +292,11 @@ __global__
 void kOmegaSSTDESfactorKernel(
     int nC, const scalar* __restrict__ k, const scalar* __restrict__ om, const scalar* __restrict__ V,
     const scalar* __restrict__ F1, const scalar* __restrict__ F2, scalar betaStar, scalar CDES1, scalar CDES2,
-    scalar* __restrict__ FDES)
+    const scalar* __restrict__ dOpt, scalar* __restrict__ FDES)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    const scalar delta = cbrt(V[c]);
+    const scalar delta = dOpt ? dOpt[c] : cbrt(V[c]);
     const scalar Lt = sqrt(fmax(k[c], scalar(0))) / fmax(betaStar * om[c], 1e-300);
     const scalar CDES = F1[c]*CDES1 + (scalar(1) - F1[c])*CDES2;
     FDES[c] = fmax((Lt / fmax(CDES*delta, 1e-300)) * (scalar(1) - F2[c]), scalar(1));
@@ -745,11 +745,13 @@ void deviceKReactionSST(
 // Exported kOmegaSST-DDES DES-factor wrapper (single-GPU + unit-test hook): FDES from k/omega, cubeRootVol(V), F1, F2.
 void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
     const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& F2,
-    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES)
+    const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES, const DeviceBuffer<scalar>* lesDelta)
 {
     FDES.resize(nC);
     kOmegaSSTDESfactorKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), V.data(), F1.data(), F2.data(),
-                                                   co.betaStar, co.CDES1, co.CDES2, FDES.data());
+                                                   co.betaStar, co.CDES1, co.CDES2,
+                                                   (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr,
+                                                   FDES.data());
     cudaCheck(cudaGetLastError(), "kOmegaSSTDESfactor");
 }
 
@@ -780,10 +782,19 @@ void deviceCellLimitGradU(
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
     DeviceBuffer<scalar>& gradU,
-    scalar kc)
+    scalar kc,
+    const DeviceCyclic* cyc,
+    const DeviceAMI* ami)
 {
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+    // The AMI-interpolated (and rotated) neighbour velocity, once for all three components.
+    DeviceBuffer<scalar> amiNbr[3];
+    if (ami && ami->n > 0)
+    {
+        if (ami->rotational) deviceAmiInterpolateVec(*ami, Ux, Uy, Uz, amiNbr[0], amiNbr[1], amiNbr[2]);
+        else for (int j = 0; j < 3; ++j) deviceAmiInterpolate(*ami, *U[j], amiNbr[j]);
+    }
     for (int j = 0; j < 3; ++j)
     {
         DeviceBuffer<scalar> gx(nC), gy(nC), gz(nC);
@@ -792,7 +803,22 @@ void deviceCellLimitGradU(
         cudaMemcpyAsync(gz.data(), gradU.data()+(std::size_t)(6+j)*nC, nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         DeviceBuffer<scalar> ubv;
         deviceBCValue(dbU.comp[j], *U[j], ubv);
-        deviceCellLimitGrad(dm, *U[j], ubv, gx, gy, gz, kc);
+        // The coupled patches join the limiter's range, exactly as in the momentum predictor -- an
+        // interface cell limited as if the interface were not there is the defect this whole path
+        // turned on. See CellLimitInterface.
+        CellLimitInterface ifs[2];
+        int nIfs = 0;
+        DeviceBuffer<scalar> cycNbr;
+        if (cyc && cyc->n > 0)
+        {
+            deviceCyclicNbrValue(*cyc, *U[j], Ux, Uy, Uz, j, cycNbr);
+            ifs[nIfs++] = { cyc->n, cyc->ownCell.data(), cycNbr.data(),
+                            cyc->dOwnX.data(), cyc->dOwnY.data(), cyc->dOwnZ.data() };
+        }
+        if (ami && ami->n > 0)
+            ifs[nIfs++] = { ami->n, ami->ownCell.data(), amiNbr[j].data(),
+                            ami->dOwnX.data(), ami->dOwnY.data(), ami->dOwnZ.data() };
+        deviceCellLimitGrad(dm, *U[j], ubv, gx, gy, gz, kc, ifs, nIfs);
         cudaMemcpyAsync(gradU.data()+(std::size_t)j*nC,     gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         cudaMemcpyAsync(gradU.data()+(std::size_t)(3+j)*nC, gy.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         cudaMemcpyAsync(gradU.data()+(std::size_t)(6+j)*nC, gz.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
@@ -892,13 +918,14 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<label>*  fvoKMask,
     const DeviceBuffer<scalar>* fvoKVal,
     const DeviceBuffer<label>*  fvoEMask,
-    const DeviceBuffer<scalar>* fvoEVal)     // compressible: mu at boundary faces (the +mu of rho*D+mu)
+    const DeviceBuffer<scalar>* fvoEVal,     // compressible: mu at boundary faces (the +mu of rho*D+mu)
+    const DeviceBuffer<scalar>* lesDelta)    // case `delta` (maxDeltaxyz); null = OF's cubeRootVol
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);   // interface-aware grad(U)
-    if (gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK);   // grad(U) cellLimited (OF)
+    if (gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);   // grad(U) cellLimited (OF)
     DeviceBuffer<scalar> GbyNu0;
     deviceGByNuFromGradU(gradU, nC, GbyNu0);
     DeviceBuffer<scalar> G;
@@ -949,7 +976,8 @@ void deviceKOmegaSSTCorrect(
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
     deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
-    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data());
+    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data(),
+                                          wall.wallW.size() ? wall.wallW.data() : nullptr);
 
     // CDkOmega from grad(k), grad(omega); F1, F2.
     DeviceBuffer<scalar> kbv;
@@ -986,7 +1014,7 @@ void deviceKOmegaSSTCorrect(
         if (iddes && hmax && hwn)   // kOmegaSST-IDDES: the improved (WMLES) length scale (needs the SST nut + hmax + hwn + gradU + y)
             deviceKOmegaSSTIDDESfactor(nC, k, omega, F1, gradU, nut, y, *hmax, *hwn, nu, co, FDES);
         else                 // kOmegaSST-DDES: the F2-shielded cubeRootVol DES factor
-            deviceKOmegaSSTDESfactor(nC, k, omega, dm.V, F1, F2, co, FDES);
+            deviceKOmegaSSTDESfactor(nC, k, omega, dm.V, F1, F2, co, FDES, lesDelta);
     }
 
     // blends, limited production-by-nu, DomegaEff.

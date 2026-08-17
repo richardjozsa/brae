@@ -64,13 +64,15 @@ void pcgSetCondK(
     const scalar* init,
     scalar relTol,
     int* iter,
-    int maxIter)
+    int maxIter,
+    int minIter)   // OF lduMatrix: keep iterating while nIter < minIter, whatever the residual says
 {
     if (threadIdx.x || blockIdx.x) return;
     const int it = ++(*iter);
     const scalar fr = *res;          // res already normalized by normFactor
     const bool conv = (fr < tol) || (relTol > 0.0 && fr < relTol * (*init));
-    cudaGraphSetConditional(h, (conv || it >= maxIter) ? 0u : 1u);
+    const bool stop = (conv || it >= maxIter) && it >= minIter;
+    cudaGraphSetConditional(h, stop ? 0u : 1u);
 }
 static DeviceSolverPerf deviceAMGPCGGraph(
     const DeviceLduView& A,
@@ -80,7 +82,8 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter)
+    int maxIter,
+    int minIter)
 {
     const int nC = A.nCells;
     amg.corrScaling = false;
@@ -130,7 +133,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     perf.initialResidual = initRes;
     perf.finalResidual = initRes;
     auto convergedHost = [&](scalar fr){ return (fr < tol) || (relTol > 0.0 && fr < relTol*initRes); };
-    if (convergedHost(initRes))
+    if (convergedHost(initRes) && minIter <= 0)
     {
         perf.nIterations = 0;
         return perf;
@@ -149,7 +152,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     scalar res1;
     cudaCheck(cudaMemcpyAsync(&res1, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg it0 D2H");
     cudaStreamSynchronize(cudaStreamPerThread);
-    if (convergedHost(res1) || maxIter <= 1)
+    if ((convergedHost(res1) || maxIter <= 1) && minIter <= 1)
     {
         perf.finalResidual = res1;
         perf.nIterations = 1;
@@ -157,7 +160,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     }
     cudaMemsetAsync(c.sIter.data(), 0, sizeof(int), cudaStreamPerThread);   // WHILE-body counter (0 = iter-1)
     // WHILE body = steady-state iteration 1+ (captured once, replayed on-device)
-    if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter)
+    if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter || c.keyMinIter != minIter)
     {
         if (c.exec)
         {
@@ -192,7 +195,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         deviceAxpyDev(dNegAlpha, wA, rA);
         deviceSumMagInto(rA, c.sRes.data());
         gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sRes.data(), c.sNormF.data());   // normalized residual
-        pcgSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1);   // maxIter-1: iteration 0 ran outside the loop
+        pcgSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1, minIter-1);   // -1: iteration 0 ran outside the loop
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "pcg capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pcg graph instantiate");
@@ -200,6 +203,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         c.keyTol = tol;
         c.keyRelTol = relTol;
         c.keyMaxIter = maxIter;
+        c.keyMinIter = minIter;
     }
     cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "pcg graph launch");
     scalar finalRes;
@@ -327,7 +331,9 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
         deviceAxpyDev(dNegAlpha, wA, rA);
         gsum(rA, c.sRes.data());
         gsScaleInvK<<<1,1,0,strm>>>(c.sRes.data(), c.sNormF.data());
-        pcgSetCondK<<<1,1,0,strm>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1);
+        // minIter 0: the DISTRIBUTED path does not carry the fvSolution minIter yet (the single-GPU
+        // solvers do). Passing 0 keeps it exactly as it was rather than half-wiring it.
+        pcgSetCondK<<<1,1,0,strm>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1, 0);
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(strm, &tmp), "pgraph capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pgraph instantiate");
@@ -372,12 +378,13 @@ DeviceSolverPerf deviceAMGPCG(
     int maxIter,
     bool captureVcycle,
     int checkEvery,
-    bool corrScaling)
+    bool corrScaling,
+    int minIter)
 {
 #ifdef BRAE_HAS_GS_DEVICE
     {
         static const bool pcgDev = envFlag("BRAE_PCG_DEVICE", true);                 // device-resident pressure solve (default ON; opt out BRAE_PCG_DEVICE=0)
-        if (pcgDev && !corrScaling) return deviceAMGPCGGraph(A, amg, b, psi, normFactor, tol, relTol, maxIter);
+        if (pcgDev && !corrScaling) return deviceAMGPCGGraph(A, amg, b, psi, normFactor, tol, relTol, maxIter, minIter);
     }
 #endif
     const int nC = A.nCells;
@@ -491,7 +498,7 @@ DeviceSolverPerf deviceAMGPCG(
     scalar* dResNorm = amg.sResNorm.data();
     const int K = (checkEvery > 1) ? checkEvery : 1;            // residual read cadence (1 = exact per-iter)
     int nIter = 0;
-    if (!converged(perf.finalResidual))
+    if (minIter > 0 || !converged(perf.finalResidual))
     {
         do
         {
@@ -522,7 +529,7 @@ DeviceSolverPerf deviceAMGPCG(
                 deviceSumMagInto(rA, dResNorm);
                 perf.finalResidual = deviceReadScalar(dResNorm)/normFactor;   // the only host sync
             }
-        } while (nIter < maxIter && !converged(perf.finalResidual));
+        } while ((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter);
     }
     perf.nIterations = nIter;
     static const bool dbgCyc = std::getenv("BRAE_AMG_CYCLES") != nullptr;   // benchmark: AMG V-cycles per pressure solve

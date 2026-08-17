@@ -231,6 +231,140 @@ void cellLimitGradKernel(
     gy[c] = gcy*lim;
     gz[c] = gcz*lim;
 }
+
+// ---- the coupled-patch path (see CellLimitInterface) -------------------------------------------------
+// max/min and the limiter are all order-independent reductions, so scattering them from the faces with
+// atomics gives the same answer every run whatever order the faces land in.
+__device__ __forceinline__ void atomicFmax(scalar* a, scalar v)
+{
+    unsigned long long* p = reinterpret_cast<unsigned long long*>(a);
+    unsigned long long old = *p, assumed;
+    while (v > __longlong_as_double(old))
+    {
+        assumed = old;
+        old = atomicCAS(p, assumed, __double_as_longlong(v));
+        if (old == assumed) break;
+    }
+}
+__device__ __forceinline__ void atomicFmin(scalar* a, scalar v)
+{
+    unsigned long long* p = reinterpret_cast<unsigned long long*>(a);
+    unsigned long long old = *p, assumed;
+    while (v < __longlong_as_double(old))
+    {
+        assumed = old;
+        old = atomicCAS(p, assumed, __double_as_longlong(v));
+        if (old == assumed) break;
+    }
+}
+
+// Phase 1 on cells: maxD/minD from the internal + non-coupled boundary faces only. Split out of
+// cellLimitGradKernel so the interface faces can be folded in between the two halves.
+__global__
+void cellLimitMinMaxKernel(
+    int nC,
+    const scalar* __restrict__ U,
+    const scalar* __restrict__ Ubnd,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ nei,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ owner,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    scalar* __restrict__ maxD,
+    scalar* __restrict__ minD)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar uc = U[c];
+    scalar mx = 0.0, mn = 0.0;   // incl. the cell itself (U[c]-U[c]=0)
+    for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f)
+    { const scalar d = U[nei[f]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
+    for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
+    { const scalar d = U[owner[losort[j]]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
+    for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
+    { const scalar d = Ubnd[bndPerm[j]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
+    maxD[c] = mx;
+    minD[c] = mn;
+}
+
+// Phase 2 on interface faces: the coupled neighbour joins the cell's range.
+__global__
+void ifMinMaxKernel(int n, const label* __restrict__ own, const scalar* __restrict__ nbrVal,
+                    const scalar* __restrict__ U, scalar* __restrict__ maxD, scalar* __restrict__ minD)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int c = own[i];
+    const scalar d = nbrVal[i] - U[c];
+    atomicFmax(&maxD[c], d);
+    atomicFmin(&minD[c], d);
+}
+
+// Phase 3: OF's k<1 widening, applied once the range is complete (interfaces included).
+__global__
+void widenKernel(int nC, scalar k, scalar* __restrict__ maxD, scalar* __restrict__ minD)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar wdn = (1.0/k - 1.0)*(maxD[c] - minD[c]);
+    maxD[c] += wdn;
+    minD[c] -= wdn;
+}
+
+// Phase 4 on cells: the limiter from the internal + non-coupled boundary face extrapolations.
+__global__
+void cellLimitFactorKernel(
+    int nC,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
+    const scalar* __restrict__ maxD, const scalar* __restrict__ minD,
+    const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
+    scalar* __restrict__ lim)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar gcx = gx[c], gcy = gy[c], gcz = gz[c], mx = maxD[c], mn = minD[c];
+    scalar l = 1.0;
+    for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f)
+        l = fmin(l, limFace(mx, mn, dOwnX[f]*gcx + dOwnY[f]*gcy + dOwnZ[f]*gcz));
+    for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
+    { const int f = losort[j]; l = fmin(l, limFace(mx, mn, dNeiX[f]*gcx + dNeiY[f]*gcy + dNeiZ[f]*gcz)); }
+    for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
+    { const int bk = bndPerm[j]; l = fmin(l, limFace(mx, mn, dBndX[bk]*gcx + dBndY[bk]*gcy + dBndZ[bk]*gcz)); }
+    lim[c] = l;
+}
+
+// Phase 5 on interface faces: OF's second loop is over EVERY boundary face, not just the uncoupled ones.
+__global__
+void ifLimitKernel(int n, const label* __restrict__ own,
+                   const scalar* __restrict__ dx, const scalar* __restrict__ dy, const scalar* __restrict__ dz,
+                   const scalar* __restrict__ maxD, const scalar* __restrict__ minD,
+                   const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
+                   scalar* __restrict__ lim)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int c = own[i];
+    atomicFmin(&lim[c], limFace(maxD[c], minD[c], dx[i]*gx[c] + dy[i]*gy[c] + dz[i]*gz[c]));
+}
+
+__global__
+void applyLimitKernel(int nC, const scalar* __restrict__ lim,
+                      scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar l = lim[c];
+    gx[c] *= l; gy[c] *= l; gz[c] *= l;
+}
 } // namespace
 
 
@@ -244,8 +378,42 @@ void deviceCellLimitGrad(
     DeviceBuffer<scalar>& gx,
     DeviceBuffer<scalar>& gy,
     DeviceBuffer<scalar>& gz,
-    scalar k)
+    scalar k,
+    const CellLimitInterface* ifs,
+    int nIfs)
 {
+    int nIfFaces = 0;
+    for (int i = 0; i < nIfs; ++i) if (ifs[i].n > 0 && ifs[i].nbrVal) nIfFaces += ifs[i].n;
+    if (nIfFaces > 0)
+    {
+        // The five-phase form: the interface faces have to enter the range BEFORE the widening and the
+        // limiter, and the extrapolation limit AFTER the range is complete. Same arithmetic as the
+        // single-kernel path below, just split where a scatter can be inserted.
+        const int nC = dm.nCells;
+        DeviceBuffer<scalar> maxD(nC), minD(nC), lim(nC);
+        cellLimitMinMaxKernel<<<nBlocks(nC), TPB>>>(nC, U.data(), Ubnd.data(),
+            dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
+            dm.bndCellStart.data(), dm.bndPerm.data(), maxD.data(), minD.data());
+        for (int i = 0; i < nIfs; ++i)
+            if (ifs[i].n > 0 && ifs[i].nbrVal)
+                ifMinMaxKernel<<<nBlocks(ifs[i].n), TPB>>>(ifs[i].n, ifs[i].ownCell, ifs[i].nbrVal,
+                                                           U.data(), maxD.data(), minD.data());
+        if (k < 1.0) widenKernel<<<nBlocks(nC), TPB>>>(nC, k, maxD.data(), minD.data());
+        cellLimitFactorKernel<<<nBlocks(nC), TPB>>>(nC,
+            dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+            dm.bndCellStart.data(), dm.bndPerm.data(),
+            dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+            dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), maxD.data(), minD.data(),
+            gx.data(), gy.data(), gz.data(), lim.data());
+        for (int i = 0; i < nIfs; ++i)
+            if (ifs[i].n > 0 && ifs[i].nbrVal)
+                ifLimitKernel<<<nBlocks(ifs[i].n), TPB>>>(ifs[i].n, ifs[i].ownCell,
+                    ifs[i].dOwnX, ifs[i].dOwnY, ifs[i].dOwnZ, maxD.data(), minD.data(),
+                    gx.data(), gy.data(), gz.data(), lim.data());
+        applyLimitKernel<<<nBlocks(nC), TPB>>>(nC, lim.data(), gx.data(), gy.data(), gz.data());
+        cudaCheck(cudaGetLastError(), "cellLimitGradInterface");
+        return;
+    }
     cellLimitGradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, k, U.data(), Ubnd.data(),
         dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(),

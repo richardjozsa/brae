@@ -150,6 +150,9 @@ void deviceAmiOffDiagSum(const DeviceAMI& ami, DeviceBuffer<scalar>& sumOff);
 void deviceAmiAddH(const DeviceAMI& ami, const DeviceBuffer<scalar>& UkNbr, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& H);
 // interface flux: phi[i] = (w*H[own] + (1-w)*interp(forwardT.H[nbr])) . Sf.
 void deviceAmiFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& Hx, const DeviceBuffer<scalar>& Hy, const DeviceBuffer<scalar>& Hz);
+// fvc::interpolate of a CELL field onto the interface faces: w*psi[own] + (1-w)*interp(psi[nbr]).
+// Needed wherever a face diffusivity is wanted on the interface -- fvc::ddtCorr's interpolate(rAU).
+void deviceAmiFaceValue(const DeviceAMI& ami, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out);
 // continuity: div[own] += phi[i]/V.
 void deviceAmiAddDiv(const DeviceAMI& ami, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div);
 // epsilon setValues: zero the interface off-diagonal for wall-cell owners (their eps is fixed = eps0).
@@ -186,6 +189,13 @@ void deviceAmiAddLinUpwindCorr(const DeviceAMI& ami, int comp, const DeviceBuffe
                                const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz, DeviceBuffer<scalar>& corr);
 // non-orth laplacian correction (momentum, component comp): src[own] -= gammaFace*magSf*(corrVec.grad(U_comp)_face);
 // neighbour grad rotated as a TENSOR R.gradU.R^T then AMI-interpolated. gammaCell = nuEff per cell.
+// SCALAR overloads (k/epsilon/omega/nuTilda/he): one gradient, never rotated across the interface.
+void deviceAmiAddLinUpwindCorr(const DeviceAMI& ami, const DeviceBuffer<scalar>& gx,
+                               const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
+                               DeviceBuffer<scalar>& corr);
+void deviceAmiAddLapCorr(const DeviceAMI& ami, const DeviceBuffer<scalar>& gammaCell,
+                         const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+                         const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& corr);
 void deviceAmiAddLapCorr(const DeviceAMI& ami, int comp, const DeviceBuffer<scalar>& gammaCell,
                          const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz,
                          DeviceBuffer<scalar>& corr);

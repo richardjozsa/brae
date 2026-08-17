@@ -91,11 +91,13 @@ add_library(brae_core STATIC
     src/cuda/device_boundary_assembly.cu
     src/cuda/device_boundary_flow.cu
     src/cuda/device_divdevreff.cu
+    src/cuda/device_maxwell.cu
     src/cuda/device_ddt.cu
     src/cuda/device_kepsilon.cu
     src/cuda/device_spalart.cu
     src/cuda/device_komega_sst.cu
     src/cuda/device_smagorinsky.cu
+    src/cuda/device_deshybrid.cu
     src/cuda/device_generalized_newtonian.cu
     src/cuda/device_coded_bc.cu
     src/cuda/device_energy.cu
@@ -601,11 +603,64 @@ add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoS
 target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 
+# brae_rhoSimpleFoam_legacy: frozen snapshot of the GPU-first solver, kept runnable so the CPU-first
+# ground-truth rewrite always has a reference to diff against. See rhosimplefoam-ground-truth-port.md.
+# brae_rhoSimpleFoam keeps pointing at the current implementation until the new path passes every gate
+# below that this one passes; only then does the name move.
+add_executable(brae_rhoSimpleFoam_legacy
+               src/applications/solvers/rhoSimpleFoam/legacy/gpuRhoSimpleFoamLegacy.cu)
+target_include_directories(brae_rhoSimpleFoam_legacy PRIVATE ${BRAE_HEADER_DIRS}
+                           src/applications/solvers/rhoSimpleFoam)
+target_link_libraries(brae_rhoSimpleFoam_legacy PRIVATE brae_core)
+
 # rhoSimpleFoam phase 4.3: alphat wall conditions load, Jayatilleke refused by name
 add_executable(test_alphat_bc tests/test_alphat_bc.cu)
 target_include_directories(test_alphat_bc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_alphat_bc PRIVATE brae_core)
 add_test(NAME alphat_bc COMMAND test_alphat_bc ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox)
+
+# Host boundary muEff: OF takes nut_b from the patch's own boundaryField, the legacy device path
+# extrapolates the adjacent cell. Verified against nut as OpenFOAM itself wrote it -- no instrumentation.
+# The test self-reports as vacuous on a case where the two candidates coincide, so the case matters.
+add_executable(test_boundary_mu_eff tests/test_boundary_mu_eff.cu)
+target_include_directories(test_boundary_mu_eff PRIVATE ${BRAE_HEADER_DIRS}
+                           src/applications/solvers/rhoSimpleFoam/cpu)
+target_link_libraries(test_boundary_mu_eff PRIVATE brae_core)
+#
+# THE CASE IS PART OF THE TEST. Measured over the checked-in cases, discriminating faces (where the
+# patch nut and the adjacent cell nut actually differ, i.e. where the two implementations can be told
+# apart) are: backwardFacingStep2D 0/41746, channel 0/20500, duct3d_cf 0/11400, airfoil 78/21812.
+# rhoBox has no nut at all. So airfoil is the ONLY checked-in case that can go red here, and even it
+# is weak at 0.36%. That measurement IS the explanation for how the 607x boundary-muEff defect
+# survived every gate: on a blockMesh duct the extrapolated cell nut and the patch nut coincide.
+# A stronger gate needs a case with a `calculated` inlet nut against a turbulent interior.
+# scalarTransport gate. Until this existed NOTHING in the suite carried a tracer, and three separate
+# defects lived behind that: the field solved but was never written; the convection scheme was hardcoded
+# instead of read from div(phi,<field>); and a transient tracer bounded by 1.0 reached 6.32 because the
+# functionObject ran before the solver knew deltaT. All three were green on the full suite throughout.
+# Carries its own negative control (scheme removed under `default none` must be REFUSED), so the gate
+# is proven able to fail rather than merely passing.
+# Restart fidelity. A restart must reproduce a continuous run: OF pairs createPhi.H:45 READ_IF_PRESENT
+# with AUTO_WRITE so phi RESUMES rather than being rebuilt from fvc::flux(U). Before the fix this case
+# measured U 7.85e-06 / p 2.08e-05 against a 9.5e-12 reproducibility floor -- six orders above noise,
+# shipping, and covered by nothing. Mutation-checked: reverting the phi read makes this test fail with
+# exactly those numbers.
+add_test(NAME restart_continuity
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/validation/restart_continuity.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/channel
+                 ${CMAKE_CURRENT_BINARY_DIR}/restart_continuity_work)
+set_tests_properties(restart_continuity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME tracer_transport
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/validation/tracer_transport.sh
+                 $<TARGET_FILE:brae_rhoSimpleFoam>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/tracerBox
+                 ${CMAKE_CURRENT_BINARY_DIR}/tracer_transport_work)
+set_tests_properties(tracer_transport PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+add_test(NAME boundary_mu_eff COMMAND test_boundary_mu_eff
+         ${CMAKE_CURRENT_SOURCE_DIR}/validation/airfoil 0)
 
 # rhoSimpleFoam phase 3 gate: brae_rhoSimpleFoam vs OpenFOAM rhoSimpleFoam on a heated duct.
 # Needs an OF install; skipped (77) if absent.
@@ -1073,6 +1128,234 @@ target_link_libraries(test_cyclic_poisson PRIVATE brae_core)
 add_test(NAME cyclic_poisson COMMAND test_cyclic_poisson ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
 
 # Cyclic increment C3c: cyclic in the full SIMPLE loop (periodic channel)
+# phi's coupled-patch flux must survive write -> read, or an AMI/cyclic restart silently rebuilds the
+# interface flux from U and lands the difference on the momentum diagonal (see the test's header).
+# meshPhi / fvc::makeRelative: a fluid moving WITH the mesh must have zero relative flux, on the
+# cyclicACMI interface faces as much as anywhere else (see the test's header).
+# fvc::ddtCorr: the ddt flux correction pimpleFoam adds to phiHbyA (see the test's header).
+# fvc::correctUf: Sf & Uf == phi, and why phi + mesh.phi() cannot stand in for it (see the header).
+# A cyclicACMI non-overlap patch is a wall only where it is closed (see the test's header).
+add_executable(test_acmi_wall_gate tests/test_acmi_wall_gate.cu)
+target_include_directories(test_acmi_wall_gate PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_acmi_wall_gate PRIVATE brae_core)
+add_test(NAME acmi_wall_gate COMMAND test_acmi_wall_gate)
+set_tests_properties(acmi_wall_gate PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_wall_data_refresh tests/test_wall_data_refresh.cu)
+target_include_directories(test_wall_data_refresh PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_wall_data_refresh PRIVATE brae_core)
+add_test(NAME wall_data_refresh COMMAND test_wall_data_refresh)
+set_tests_properties(wall_data_refresh PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_cell_limit_interface tests/test_cell_limit_interface.cu)
+target_include_directories(test_cell_limit_interface PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_cell_limit_interface PRIVATE brae_core)
+add_test(NAME cell_limit_interface COMMAND test_cell_limit_interface)
+set_tests_properties(cell_limit_interface PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_scalar_interface_corr tests/test_scalar_interface_corr.cu)
+target_include_directories(test_scalar_interface_corr PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_scalar_interface_corr PRIVATE brae_core)
+add_test(NAME scalar_interface_corr COMMAND test_scalar_interface_corr)
+set_tests_properties(scalar_interface_corr PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_kepsilon_production_and_blend tests/test_kepsilon_production_and_blend.cu)
+target_include_directories(test_kepsilon_production_and_blend PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_kepsilon_production_and_blend PRIVATE brae_core)
+add_test(NAME kepsilon_production_and_blend COMMAND test_kepsilon_production_and_blend)
+
+add_executable(test_near_wall_dist_combined tests/test_near_wall_dist_combined.cu)
+target_include_directories(test_near_wall_dist_combined PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_near_wall_dist_combined PRIVATE brae_core)
+add_test(NAME near_wall_dist_combined COMMAND test_near_wall_dist_combined)
+
+add_executable(test_boundary_subdict_skip tests/test_boundary_subdict_skip.cu)
+target_include_directories(test_boundary_subdict_skip PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_boundary_subdict_skip PRIVATE brae_core)
+add_test(NAME boundary_subdict_skip COMMAND test_boundary_subdict_skip)
+
+add_executable(test_fvoptions_sources_key tests/test_fvoptions_sources_key.cu)
+target_include_directories(test_fvoptions_sources_key PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_fvoptions_sources_key PRIVATE brae_core)
+add_test(NAME fvoptions_sources_key COMMAND test_fvoptions_sources_key)
+
+
+add_executable(test_wedge_patch tests/test_wedge_patch.cu)
+target_include_directories(test_wedge_patch PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_wedge_patch PRIVATE brae_core)
+add_test(NAME wedge_patch COMMAND test_wedge_patch)
+
+add_executable(test_ami_broad_phase tests/test_ami_broad_phase.cu)
+target_include_directories(test_ami_broad_phase PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_ami_broad_phase PRIVATE brae_core)
+add_test(NAME ami_broad_phase COMMAND test_ami_broad_phase)
+
+add_executable(test_courant_device tests/test_courant_device.cu)
+target_include_directories(test_courant_device PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_courant_device PRIVATE brae_core)
+add_test(NAME courant_device COMMAND test_courant_device)
+
+add_executable(test_relaxation_final tests/test_relaxation_final.cu)
+target_include_directories(test_relaxation_final PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_relaxation_final PRIVATE brae_core)
+add_test(NAME relaxation_final COMMAND test_relaxation_final)
+add_executable(test_mean_velocity_force tests/test_mean_velocity_force.cu)
+target_include_directories(test_mean_velocity_force PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mean_velocity_force PRIVATE brae_core)
+add_test(NAME mean_velocity_force COMMAND test_mean_velocity_force)
+add_executable(test_interface_invariants_real tests/test_interface_invariants_real.cu)
+target_include_directories(test_interface_invariants_real PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_interface_invariants_real PRIVATE brae_core)
+add_test(NAME interface_invariants_real COMMAND test_interface_invariants_real)
+
+add_executable(test_interface_invariants tests/test_interface_invariants.cu)
+target_include_directories(test_interface_invariants PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_interface_invariants PRIVATE brae_core)
+add_test(NAME interface_invariants COMMAND test_interface_invariants)
+
+add_executable(test_motion_contract tests/test_motion_contract.cu)
+target_include_directories(test_motion_contract PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_motion_contract PRIVATE brae_core)
+add_test(NAME motion_contract COMMAND test_motion_contract)
+
+add_executable(test_ddt_corr_backward tests/test_ddt_corr_backward.cu)
+target_include_directories(test_ddt_corr_backward PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_ddt_corr_backward PRIVATE brae_core)
+add_test(NAME ddt_corr_backward COMMAND test_ddt_corr_backward)
+
+add_executable(test_pimple_loop_contract tests/test_pimple_loop_contract.cu)
+target_include_directories(test_pimple_loop_contract PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_pimple_loop_contract PRIVATE brae_core)
+add_test(NAME pimple_loop_contract COMMAND test_pimple_loop_contract)
+
+add_executable(test_periodic_ami tests/test_periodic_ami.cu)
+target_include_directories(test_periodic_ami PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_periodic_ami PRIVATE brae_core)
+add_test(NAME periodic_ami COMMAND test_periodic_ami)
+
+add_executable(test_coupled_patch_refusal tests/test_coupled_patch_refusal.cu)
+target_include_directories(test_coupled_patch_refusal PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_coupled_patch_refusal PRIVATE brae_core)
+add_test(NAME coupled_patch_refusal COMMAND test_coupled_patch_refusal)
+
+add_executable(test_correct_phi tests/test_correct_phi.cu)
+target_include_directories(test_correct_phi PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_correct_phi PRIVATE brae_core)
+add_test(NAME correct_phi COMMAND test_correct_phi)
+
+add_executable(test_rng_kepsilon tests/test_rng_kepsilon.cu)
+target_include_directories(test_rng_kepsilon PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rng_kepsilon PRIVATE brae_core)
+add_test(NAME rng_kepsilon COMMAND test_rng_kepsilon)
+
+add_executable(test_wedge_device_coeffs tests/test_wedge_device_coeffs.cu)
+target_include_directories(test_wedge_device_coeffs PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_wedge_device_coeffs PRIVATE brae_core)
+add_test(NAME wedge_device_coeffs COMMAND test_wedge_device_coeffs)
+
+add_executable(test_vol_point_interp tests/test_vol_point_interp.cu)
+target_include_directories(test_vol_point_interp PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_vol_point_interp PRIVATE brae_core)
+add_test(NAME vol_point_interp COMMAND test_vol_point_interp)
+
+add_executable(test_eval_scoped tests/test_eval_scoped.cu)
+target_include_directories(test_eval_scoped PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_eval_scoped PRIVATE brae_core)
+add_test(NAME eval_scoped COMMAND test_eval_scoped)
+
+add_executable(test_maxwell_terms tests/test_maxwell_terms.cu)
+target_include_directories(test_maxwell_terms PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_maxwell_terms PRIVATE brae_core)
+add_test(NAME maxwell_terms COMMAND test_maxwell_terms)
+
+add_executable(test_acmi_scale tests/test_acmi_scale.cu)
+target_include_directories(test_acmi_scale PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_acmi_scale PRIVATE brae_core)
+add_test(NAME acmi_scale COMMAND test_acmi_scale)
+set_tests_properties(acmi_scale PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_zdes_shielding tests/test_zdes_shielding.cu)
+target_include_directories(test_zdes_shielding PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_zdes_shielding PRIVATE brae_core)
+add_test(NAME zdes_shielding COMMAND test_zdes_shielding)
+
+add_executable(test_hbya_inletoutlet tests/test_hbya_inletoutlet.cu)
+target_include_directories(test_hbya_inletoutlet PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_hbya_inletoutlet PRIVATE brae_core)
+add_test(NAME hbya_inletoutlet COMMAND test_hbya_inletoutlet)
+
+add_executable(test_limited_linear_v tests/test_limited_linear_v.cu)
+target_include_directories(test_limited_linear_v PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_limited_linear_v PRIVATE brae_core)
+add_test(NAME limited_linear_v COMMAND test_limited_linear_v)
+
+add_executable(test_max_delta_xyz tests/test_max_delta_xyz.cu)
+target_include_directories(test_max_delta_xyz PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_max_delta_xyz PRIVATE brae_core)
+add_test(NAME max_delta_xyz COMMAND test_max_delta_xyz)
+
+add_executable(test_wale_nut tests/test_wale_nut.cu)
+target_include_directories(test_wale_nut PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_wale_nut PRIVATE brae_core)
+add_test(NAME wale_nut COMMAND test_wale_nut)
+
+add_executable(test_gz_field_write tests/test_gz_field_write.cu)
+target_include_directories(test_gz_field_write PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_gz_field_write PRIVATE brae_core)
+add_test(NAME gz_field_write COMMAND test_gz_field_write)
+
+add_executable(test_exact_wall_dist tests/test_exact_wall_dist.cu)
+target_include_directories(test_exact_wall_dist PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_exact_wall_dist PRIVATE brae_core)
+add_test(NAME exact_wall_dist COMMAND test_exact_wall_dist)
+
+add_executable(test_fan_pressure tests/test_fan_pressure.cu)
+target_include_directories(test_fan_pressure PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_fan_pressure PRIVATE brae_core)
+add_test(NAME fan_pressure COMMAND test_fan_pressure)
+
+add_executable(test_deshybrid tests/test_deshybrid.cu)
+target_include_directories(test_deshybrid PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_deshybrid PRIVATE brae_core)
+add_test(NAME deshybrid COMMAND test_deshybrid)
+
+add_executable(test_binary_field_read tests/test_binary_field_read.cu)
+target_include_directories(test_binary_field_read PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_binary_field_read PRIVATE brae_core)
+add_test(NAME binary_field_read COMMAND test_binary_field_read)
+
+add_executable(test_fixed_mean tests/test_fixed_mean.cu)
+target_include_directories(test_fixed_mean PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_fixed_mean PRIVATE brae_core)
+add_test(NAME fixed_mean COMMAND test_fixed_mean)
+
+# divDevReff must use the case's NAMED grad(U) scheme, not a bare Gauss one (see the test's header).
+add_executable(test_divdevreff_gradscheme tests/test_divdevreff_gradscheme.cu)
+target_include_directories(test_divdevreff_gradscheme PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_divdevreff_gradscheme PRIVATE brae_core)
+add_test(NAME divdevreff_gradscheme COMMAND test_divdevreff_gradscheme)
+
+add_executable(test_correct_uf tests/test_correct_uf.cu)
+target_include_directories(test_correct_uf PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_correct_uf PRIVATE brae_core)
+add_test(NAME correct_uf COMMAND test_correct_uf)
+
+add_executable(test_ddt_corr tests/test_ddt_corr.cu)
+target_include_directories(test_ddt_corr PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ddt_corr PRIVATE brae_core)
+add_test(NAME ddt_corr COMMAND test_ddt_corr)
+
+add_executable(test_mesh_flux_relative tests/test_mesh_flux_relative.cu)
+target_include_directories(test_mesh_flux_relative PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mesh_flux_relative PRIVATE brae_core)
+add_test(NAME mesh_flux_relative COMMAND test_mesh_flux_relative)
+set_tests_properties(mesh_flux_relative PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_coupled_phi_roundtrip tests/test_coupled_phi_roundtrip.cu)
+target_include_directories(test_coupled_phi_roundtrip PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_coupled_phi_roundtrip PRIVATE brae_core)
+add_test(NAME coupled_phi_roundtrip COMMAND test_coupled_phi_roundtrip ${CMAKE_CURRENT_BINARY_DIR}/coupled_phi_roundtrip_work)
+
 add_executable(test_cyclic_channel tests/test_cyclic_channel.cu)
 target_include_directories(test_cyclic_channel PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_channel PRIVATE brae_core)
@@ -1095,6 +1378,28 @@ add_executable(test_cyclic_device_rot tests/test_cyclic_device_rot.cu)
 target_include_directories(test_cyclic_device_rot PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_device_rot PRIVATE brae_core)
 add_test(NAME cyclic_device_rot COMMAND test_cyclic_device_rot ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicWedge)
+
+add_executable(test_acmi_area_scaling tests/test_acmi_area_scaling.cu)
+target_include_directories(test_acmi_area_scaling PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_acmi_area_scaling PRIVATE brae_core)
+add_test(NAME acmi_area_scaling COMMAND test_acmi_area_scaling)
+set_tests_properties(acmi_area_scaling PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_acmi_mask tests/test_acmi_mask.cu)
+target_include_directories(test_acmi_mask PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_acmi_mask PRIVATE brae_core)
+add_test(NAME acmi_mask COMMAND test_acmi_mask)
+set_tests_properties(acmi_mask PROPERTIES ENVIRONMENT "BRAE_ALLOW_ACMI=1")
+
+add_executable(test_acmi_patch_read tests/test_acmi_patch_read.cu)
+target_include_directories(test_acmi_patch_read PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_acmi_patch_read PRIVATE brae_core)
+add_test(NAME acmi_patch_read COMMAND test_acmi_patch_read)
+
+add_executable(test_ami_curved tests/test_ami_curved.cu)
+target_include_directories(test_ami_curved PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ami_curved PRIVATE brae_core)
+add_test(NAME ami_curved COMMAND test_ami_curved)
 
 add_executable(test_ami_weights tests/test_ami_weights.cu)
 target_include_directories(test_ami_weights PRIVATE ${BRAE_HEADER_DIRS})
@@ -1265,6 +1570,15 @@ add_test(NAME pimple_run
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
                  ${CMAKE_CURRENT_BINARY_DIR}/pimple_run_work)
 set_tests_properties(pimple_run PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
+
+# PIMPLE/momentumPredictor: the same case with the switch on and off must give DIFFERENT fields (and the
+# default must equal `on`). See the header of the script for why the log line is not enough.
+add_test(NAME momentum_predictor
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/momentum_predictor.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/momentum_predictor_work)
+set_tests_properties(momentum_predictor PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 
 # The same transient case run through `brae` itself: the case says `application pimpleFoam`, so the solver
 # registry (solvers/common/solver_dispatch.cuh) must hand it to brae_pimpleFoam and produce the identical

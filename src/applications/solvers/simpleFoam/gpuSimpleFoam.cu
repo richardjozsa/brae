@@ -7,6 +7,7 @@
 //
 //   brae -case <caseDir>
 #include "primitive_mesh.cuh"
+#include "acmi_area_scaling.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -17,15 +18,19 @@
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
 #include "foam_dict.cuh"
+#include "dict_audit.cuh"
 #include "scheme_parse.cuh"
 #include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
 #include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
+#include "../common/read_surface_field.cuh"   // OF READ_IF_PRESENT for phi on restart
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
+#include "brae_time.cuh"
+#include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 
 #include <algorithm>
 #include <cctype>
@@ -168,33 +173,30 @@ int main(int argc, char** argv)
         const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
         const FoamDict turbProps   = readDict(caseDir + "/constant/turbulenceProperties");
 
-        std::string startStr = controlDict.wordOr("startTime", "0");
-        // OF startFrom: 'latestTime' restarts from the newest numeric time directory, 'firstTime' from the earliest
-        // (default 'startTime' uses startTime). brae previously IGNORED startFrom, so a 'latestTime' restart silently
-        // re-ran from startTime (scratch). Resolve it by scanning the case's numeric time dirs that hold a U field.
-        {
-            const std::string startFrom = controlDict.wordOr("startFrom", "startTime");
-            if (startFrom == "latestTime" || startFrom == "firstTime")
-            {
-                namespace fs = std::filesystem;
-                std::error_code ec;
-                double best = 0.0; std::string bestName;
-                for (const auto& e : fs::directory_iterator(caseDir, ec))
-                {
-                    if (!e.is_directory()) continue;
-                    const std::string nm = e.path().filename().string();
-                    char* end = nullptr; const double t = std::strtod(nm.c_str(), &end);
-                    if (end == nm.c_str() || *end != '\0') continue;   // not a pure number -> skip constant/system/*.orig
-                    if (!(fs::exists(e.path() / "U") || fs::exists(e.path() / "U.gz"))) continue;   // must be a field dir
-                    if (bestName.empty() || (startFrom == "latestTime" ? t > best : t < best)) { best = t; bestName = nm; }
-                }
-                if (!bestName.empty() && bestName != startStr)
-                {
-                    std::fprintf(stderr, "brae: startFrom %s -> starting from time '%s'\n", startFrom.c_str(), bestName.c_str());
-                    startStr = bestName;
-                }
-            }
-        }
+        // Report every dictionary entry read off disk and then ignored, on EVERY exit including a
+        // refusal. Declared AFTER the dicts so it is destroyed FIRST -- it holds pointers to them.
+        // Until now this ran only in gpuRhoSimpleFoam, so the incompressible solvers had no unread-entry
+        // reporting at all: an input this driver parsed and never applied was invisible.
+        DictAuditScope audit;
+        audit.add(controlDict, "system/controlDict");
+        audit.add(fvSolution,  "system/fvSolution");
+        audit.add(transport,   "constant/transportProperties");
+        audit.add(turbProps,   "constant/turbulenceProperties");
+        audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
+
+        // Account for controlDict.functions at STARTUP, not after the run: a case that refuses on an
+        // unsupported model, or that never reaches the post-run forces block, must still be told which
+        // of its functionObjects brae will not honour. forceCoeffs is declared APPROXIMATED because this
+        // driver prints it once at the end, whereas OF's runs every time step and writes a history
+        // (forceCoeffs.H:547,550) -- gpuPimpleFoam declares the same type APPLIED, because it does
+        // sample on the write cadence.
+
+
+        // startFrom is resolved by Time, as OF does in Time::setControls() (Time.C:149-188). This
+        // driver carried its own copy of that scan; measured identical to the shared one on an
+        // adversarial directory (numeric dir without U, non-integer time, 0.orig) before removing it.
+        Time time(caseDir, controlDict);   // startFrom resolves here; functionObjects are read below
+        std::string startStr = time.startName();
         // OF `restore0Dir` convention (NOT a solver fallback): tutorials needing a mesh-prep step (snappyHexMesh /
         // setFields / changeDictionary, e.g. motorBike) ship the flow fields in <startTime>.orig, because
         // snappyHexMesh writes mesh-level fields (cellLevel/pointLevel/...) INTO <startTime>. OpenFOAM's Allrun copies
@@ -216,6 +218,50 @@ int main(int argc, char** argv)
             }
         }
         const std::string fieldDir = caseDir + "/" + startStr;   // solver reads <startTime> exactly as in OpenFOAM
+
+        // Time owns the functionObject lifecycle, as OF's Foam::Time does: the loop below never mentions
+        // functionObjects, which is what stops a solver from being able to forget them. Placed here --
+        // after the start directory resolves, but still BEFORE mesh, geometry and solver -- so the report
+        // reaches a case that refuses later, while the objects resolve those dependencies from the
+        // registry on first execute(). forceCoeffs is APPROXIMATED in this driver (a single post-run
+        // print); gpuPimpleFoam declares the same type APPLIED, because it samples on the write cadence.
+        ObjectRegistry timeRegistry;
+        std::vector<ScalarTransportFO*> scalarTransports;
+        std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
+        foTypes.emplace_back(
+            "scalarTransport",
+            [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+            {
+                // Only OF's constant-D branch is implemented; nut-based and alphaD/alphaDt are refused
+                // by name rather than quietly replaced by a constant (scalarTransport.C D()).
+                if (!fd.found("D"))
+                {
+                    noticeIgnored("functions/" + foName,
+                                  "scalarTransport without a constant `D` (nut-based or alphaD/alphaDt "
+                                  "diffusivity) is not implemented, so this tracer is NOT solved.");
+                    return nullptr;
+                }
+                const std::string fld = fd.wordOr("field", foName);
+                // OF: schemesField defaults to the field name, and the scheme is looked up as
+                // div(phi,<schemesField>). Absent under `default none` is fatal in OF, so it is here
+                // too -- reported and declined rather than run with a substituted discretisation.
+                const std::string schemesField = fd.wordOr("schemesField", fld);
+                FieldDivScheme scheme;
+                try { scheme = parseFieldDivScheme(caseDir, schemesField); }
+                catch (const std::exception& e)
+                {
+                    noticeIgnored("functions/" + foName, std::string(e.what()) +
+                                  " -- this tracer is NOT solved.");
+                    return nullptr;
+                }
+                auto fo = std::make_unique<ScalarTransportFO>(
+                    foName, fld, fieldDir + "/" + fld, timeRegistry,
+                    fd.scalarOr("D", 0.0), fd.scalarOr("relaxCoeff", 1.0), fd.scalarOr("tol", 1e-6),
+                    scheme);
+                scalarTransports.push_back(fo.get());
+                return fo;
+            });
+        time.readFunctionObjects(controlDict, foTypes, {"forceCoeffs"});
         const int   endTime   = controlDict.intOr("endTime", 1000);
         // Steady simpleFoam's endTime is an INTEGER iteration count. A fractional endTime (e.g. 0.3, copy-pasted from
         // a transient case) truncates to 0 -> the loop runs 0 iterations and would write the initial field as "the
@@ -325,14 +371,21 @@ int main(int argc, char** argv)
         m.read(caseDir + "/constant/polyMesh");
         _tsLap("mesh read");
         FvGeometry g;
-        g.build(m);
+        // cyclicACMI splits the coincident interface faces' areas before cell volumes are computed;
+        // on a mesh without one this is exactly g.build + buildPatches.
+        std::vector<FvPatch> fvpBuilt;
+        { std::vector<AMIInterface> amisInit; buildGeometryPatchesAndAMI(m, g, fvpBuilt, amisInit); }
         _tsLap("geometry build");
-        const std::vector<FvPatch> fvp = buildPatches(m, g);
+        const std::vector<FvPatch> fvp = std::move(fvpBuilt);
+        timeRegistry.store("mesh", &m);
+        timeRegistry.store("geometry", &g);
+        timeRegistry.store("patches", &fvp);
         const label nC = m.nCells();
 
         GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC);
         U.evaluateBoundary();
-        GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, nC);
+        const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
+        GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC);
         p.evaluateBoundary();
         // pressure needs a reference iff NO p patch fixes the value (singular all-Neumann system, e.g. closed
         // lid-driven cavity / fixedFluxPressure-walled domains). Then adjustPhi + pEqn.setReference (OF needReference).
@@ -351,7 +404,17 @@ int main(int argc, char** argv)
             std::printf("  pressure needs reference (no fixedValue-p): pRefCell=%d pRefValue=%.4g\n",
                         (int)ctl.pRefCell, ctl.pRefValue);
         }
-        SurfaceScalarField phi = fvc::flux(U, m, g, fvp);
+        // OF createPhi.H:45 builds phi with IOobject::READ_IF_PRESENT, so a restart RESUMES the stored
+        // flux instead of rebuilding it. A converged SIMPLE phi is NOT fvc::flux(U): it carries the
+        // Rhie-Chow pressure correction, so rebuilding discards that and restarts from a different
+        // state than OF would. Measured on validation/channel, restart-at-30 vs continuous-to-60:
+        // U 7.85e-06 / p 2.08e-05 relative, against a restart-to-restart reproducibility floor of
+        // 9.5e-12 -- six orders above noise, so not round-off.
+        //
+        // Identical to the defect already fixed for the compressible driver; this driver simply never
+        // received it, which is what carrying three copies of the same behaviour costs.
+        SurfaceScalarField phi = readPhiIfPresent(fieldDir, fvp, m.nInternalFaces(),
+                                                  fvc::flux(U, m, g, fvp));
 
         const std::string secondName = ctl.sst ? "omega" : "epsilon";   // the 2nd turbulence scalar
         TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
@@ -401,6 +464,15 @@ int main(int argc, char** argv)
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                                   ctl.turbulent ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa) ? &tf.eps : nullptr, ctl.turbulent ? &tf.nut : nullptr,
                                   ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+        // uniformTotalPressure p0(t). OF samples p0_->value(t) at construction with the CURRENT
+        // time and again in every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:73,149),
+        // so the tables are handed over before the first step and re-evaluated per step inside the
+        // solver. Without this the parsed table sat unused and p0 stayed frozen at its seed --
+        // measured on pimpleFoam/RAS/TJunction as inlet p FALLING 9.32 -> 8.62 where the table asks
+        // for 13.09 -> 15.11, i.e. a case that runs and silently ignores the prescribed ramp.
+        solver.setTimeVaryingP0(DeviceSimpleSolver::collectTimeVaryingP0(pFd, fvp));
+        solver.setTime(static_cast<scalar>(std::strtod(startStr.c_str(), nullptr)));   // seed p0 at the START time, as OF's constructor does
+        timeRegistry.store("solver", &solver);   // from here the functionObjects can resolve
         _tsLap("solver ctor (incl AMG)");
         if (partition)   // caches written by the mesh read + the AMG build above; done, like decomposePar finishing.
         {
@@ -466,36 +538,23 @@ int main(int argc, char** argv)
         // and every time value below is measured from the start. Taking the dict's value made a run
         // restarted from 10 name its output 1, 2, 3... -- overwriting the case's own early history.
         const scalar startTimeVal  = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
-        long writeTimeIndex = 0;
-        auto timeName = [](scalar t) -> std::string   // integer name for whole times (deltaT=1), else %g
-        {
-            if (t == std::floor(t) && std::fabs((double)t) < 1e15) return std::to_string((long long)std::llround((double)t));
-            char b[64];
-            std::snprintf(b, sizeof b, "%g", (double)t);
-            return std::string(b);
-        };
-        auto isWriteTime = [&](int it, scalar tval) -> bool   // Foam::Time::operator++ write switch
-        {
-            if (writeControl == "timeStep")
-                return writeInterval >= 1 && (it % (long)writeInterval) == 0;       // Time.C: !(timeIndex % writeInterval)
-            if (writeControl == "runTime" || writeControl == "adjustable" || writeControl == "adjustableRunTime")
-            {
-                const long wi = (long)(((tval - startTimeVal) + 0.5 * deltaT) / writeInterval);
-                if (wi > writeTimeIndex)
-                {
-                    writeTimeIndex = wi;
-                    return true;
-                }
-                return false;
-            }
-            return false;   // none / clockTime / cpuTime: only the final state (written after the loop)
-        };
-        std::deque<std::string> writtenTimes;                                       // purgeWrite FIFO (keep the last N)
+        // Write cadence comes from Time, which owns the WriteControl -- as OF does in
+        // Time::operator++ / TimeIO.C:277. This driver carried its own isWriteTime lambda; it was
+        // measured identical to the shared one over 8 controlDict cases x 40 steps (including
+        // runTime float accumulation and a non-zero-startTime restart) before being removed.
         const std::string wsrc = fieldDir + "/";
         auto writeTimeDir = [&](const std::string& tname)   // reconstruct + write one time directory
         {
             const std::string outDir = caseDir + "/" + tname;
             std::filesystem::create_directories(outDir);
+            // scalarTransport tracers. OF builds its transported field with AUTO_WRITE
+            // (scalarTransport.C transportedField()), so it appears in every written time directory
+            // alongside the solved fields. Pulled from the device only HERE -- on the write cadence,
+            // not every iteration -- which is why OF splits write() from execute().
+            for (ScalarTransportFO* st : scalarTransports)
+                if (st->ready())
+                    writeVolField(fieldDir + "/" + st->fieldName(), outDir + "/" + st->fieldName(),
+                                  st->hostField(), fvp, 12);
             // The written fields keep the source field's `#include "include/..."` directives (resolved relative to the
             // time dir). Copy the startTime include/ dir alongside so OpenFOAM readers (paraFoam, postProcess, foamToVTK)
             // resolve them, otherwise the field points at a nonexistent <time>/include/ and fails to load.
@@ -505,6 +564,13 @@ int main(int argc, char** argv)
                     std::filesystem::copy(fieldDir + "/include", outDir + "/include",
                         std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, ec2);
             }
+            // phi, so a brae->brae restart RESUMES the corrected flux. OF's createPhi.H pairs
+            // READ_IF_PRESENT with AUTO_WRITE; reading it without writing it leaves every restart
+            // falling back to fvc::flux(U), which is the very field the read exists to avoid.
+            // INCOMPRESSIBLE dimensions: volumetric flux [0 3 -1 0 0 0 0], not the compressible
+            // driver's mass flux [1 0 -1 0 0 0 0].
+            writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp,
+                              17, "[0 3 -1 0 0 0 0]");
             writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, precision, solver.UBoundary());
             writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, precision, solver.pBoundary());
             if (ctl.sa)   // one-equation: the k slot holds nuTilda
@@ -525,16 +591,11 @@ int main(int argc, char** argv)
             }
             std::printf("written %s/{U,p%s}\n", outDir.c_str(),
                         ctl.turbulent ? (ctl.sa ? ",nuTilda,nut" : ctl.sst ? ",k,omega,nut" : ",k,epsilon,nut") : "");
-            if (purgeWrite > 0)   // Foam::Time TimeIO: keep only the last purgeWrite dirs
-            {
-                if (writtenTimes.empty() || writtenTimes.back() != tname) writtenTimes.push_back(tname);
-                while ((int)writtenTimes.size() > purgeWrite)
-                {
-                    std::error_code pec;
-                    std::filesystem::remove_all(caseDir + "/" + writtenTimes.front(), pec);
-                    writtenTimes.pop_front();
-                }
-            }
+            // purgeWrite, from Time's WriteControl. This driver's copy was measured identical over 6
+            // FIFO cases (disabled / keep-1 / keep-2 / never-exceeds / repeated tname / non-integer
+            // names), and all three copies purged at the SAME point -- immediately after the write --
+            // so consolidating changes no filesystem side effect.
+            time.writeControl().recordWritten(caseDir, tname);
         };
 
         // endTime is ABSOLUTE, not a run length. OF's Time::run() tests `value() < endTime - 0.5*deltaT`,
@@ -553,8 +614,10 @@ int main(int argc, char** argv)
         bool converged = false;
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
-        for (iter = 1; iter <= nSteps && !converged; ++iter)
+        time.setSteps(static_cast<int>(nSteps));
+        while (!converged && time.loop())
         {
+            iter = time.timeIndex();
             const DeviceSimpleResidual r = solver.step();
             {
                 // OpenFOAM-style per-iteration report: Time, per-field solver residuals, continuity, turbulence, ExecutionTime.
@@ -623,9 +686,15 @@ int main(int argc, char** argv)
             // a plausible-looking field set (simpleControl.C:51-57).
             converged = converged && rcChecked > 0;
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
-            if (!converged && iter != nSteps && isWriteTime(iter, tval)) writeTimeDir(timeName(tval));  // intermediate writes
+            if (!converged && iter != nSteps && time.writeControl().isWriteTime(iter, tval))
+            {
+                writeTimeDir(WriteControl::timeName(tval));
+                time.write();   // OF splits write() from execute(); this driver owns its own cadence
+            }
         }
-        const int nIter = converged ? iter - 1 : static_cast<int>(nSteps);
+        time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
+        // timeIndex() is the iteration that ran, so no -1: the for-loop this replaced incremented past it.
+        const int nIter = converged ? time.timeIndex() : static_cast<int>(nSteps);
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
 
@@ -711,7 +780,7 @@ int main(int argc, char** argv)
         }
 
         // always write the final (converged / endTime) state; matches OF's writeAndEnd, and feeds purgeWrite
-        writeTimeDir(timeName(startTimeVal + (scalar)nIter * deltaT));
+        writeTimeDir(WriteControl::timeName(startTimeVal + (scalar)nIter * deltaT));
         const std::vector<vector> Ug = solver.U();   // converged fields, reused by the force calculation below
         const std::vector<scalar> pg = solver.p();
 
@@ -740,7 +809,12 @@ int main(int argc, char** argv)
                 std::printf("forces (walls, rhoInf=1):  pressure=(%.5e %.5e %.5e)  viscous=(%.5e %.5e %.5e)  total=(%.5e %.5e %.5e)\n",
                             F.pressure.x, F.pressure.y, F.pressure.z, F.viscous.x, F.viscous.y, F.viscous.z, F.total().x, F.total().y, F.total().z);
 
-                // forceCoeffs (Cd/Cl/Cm) if the case defines a forceCoeffs functionObject (controlDict.functions).
+                // controlDict.functions. Every entry is now ACCOUNTED FOR through the shared
+                // FunctionObjectList: forceCoeffs is computed just below (reported as approximated,
+                // because brae prints it once here while OF's forceCoeffs runs every time step and
+                // writes a history -- forceCoeffs.H:547,550), and anything else is reported as ignored
+                // rather than silently skipped. Before this, a case could carry any number of
+                // functionObjects and the only one even looked at was forceCoeffs.
                 const FoamDict* funcs = controlDict.subDict("functions");
                 const FoamDict* fcd = nullptr;
                 if (funcs)

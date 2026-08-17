@@ -25,7 +25,8 @@ DeviceSolverPerf deviceJacobiPCG(
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter)
+    int maxIter,
+    int minIter)
 {
     const int nC = A.nCells;
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
@@ -41,7 +42,9 @@ DeviceSolverPerf deviceJacobiPCG(
 
     scalar wArA = 1e300, wArAold;
     int nIter = 0;
-    if (!converged(perf.finalResidual))
+    // OF lduMatrix PCG: the loop is entered when minIter demands it even if the initial residual already
+    // passes, and it keeps going until BOTH the convergence test and minIter are satisfied.
+    if (minIter > 0 || !converged(perf.finalResidual))
     {
         do
         {
@@ -62,7 +65,7 @@ DeviceSolverPerf deviceJacobiPCG(
             deviceAxpy(-alpha, wA, rA);                     // rA  -= alpha*wA
             perf.finalResidual = deviceSumMag(rA) / normFactor;
             ++nIter;
-        } while (nIter < maxIter && !converged(perf.finalResidual));
+        } while ((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter);
     }
     perf.nIterations = nIter;
     return perf;
@@ -104,7 +107,8 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     scalar tol,
     scalar relTol,
     int maxIter,
-    int checkEvery)
+    int checkEvery,
+    int minIter)
 {
     const int nC = A.nCells;
     const int K = (checkEvery > 1) ? checkEvery : 1;             // convergence-read cadence (1 = exact per-iter)
@@ -129,7 +133,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     BiCGScalars& s = bicgScalars();
     cudaCheck(cudaMemsetAsync(s.bd.data(), 0, sizeof(scalar), cudaStreamPerThread), "bicg bd zero");
     int nIter = 0;
-    if (!converged(perf.finalResidual))
+    if (minIter > 0 || !converged(perf.finalResidual))
     {
         do
         {
@@ -177,7 +181,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
                 }
             }
             ++nIter;
-        } while (nIter < maxIter && !converged(perf.finalResidual));
+        } while ((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter);
     }
     perf.nIterations = nIter;
     return perf;

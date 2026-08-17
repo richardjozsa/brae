@@ -5,8 +5,10 @@
 // etc.) come with Phase 3 (assembly). Unsupported types throw, no silent fallback.
 #include "cf_types.cuh"
 #include "fv_patch.cuh"
+#include "wedge_patch.cuh"   // the axisymmetric constraint patch's rotation tensors
 #include "foam_field_reader.cuh"
 #include "cf_pstream.cuh"
+#include "foam_dict.cuh"   // isCoupledInterfaceType
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -37,6 +39,11 @@ public:
     // internal cell, valueIC=1, gradIC=0); 1 = fixedValue (fixedValue/noSlip: value=ref, valueIC=0,
     // gradIC=-deltaCoeffs); 2 = calculated (value=ref but extrapolated coeffs).
     virtual int bcCategory() const { return 0; }
+    // wedge (axisymmetric constraint): the HALF-angle and FULL-angle rotation tensors, or null on every
+    // other patch type. The device builder reads them to set the per-component valueFraction and to
+    // recompute the rotated value each step.
+    virtual const tensor* wedgeFaceT() const { return nullptr; }
+    virtual const tensor* wedgeCellT() const { return nullptr; }
     // flowRateInletVelocity: the dict flow rate, so the solver can recompute avgU against the live rho.
     virtual scalar flowRateValue() const { return 0.0; }
 
@@ -400,6 +407,55 @@ template <> inline void SymmetryPlanePatchField<vector>::evaluate(const std::vec
     }
 }
 
+// wedge (OF wedgeFvPatchField) -- the AXISYMMETRIC constraint patch. The mesh is one cell thick in the
+// azimuthal direction and the two bounding planes are related by a rotation about the symmetry axis, so
+// the patch value is the CELL value ROTATED onto the patch plane:
+//
+//     value                  = transform(faceT, patchInternalField)
+//     snGrad                 = (transform(cellT, pif) - pif)*0.5*deltaCoeffs
+//     snGradTransformDiag_k  = 0.5*(1 - cellT_kk)                       [per component]
+//     valueInternalCoeffs_k  = 1 - snGradTransformDiag_k
+//     gradientInternalCoeffs_k = -deltaCoeffs*snGradTransformDiag_k
+//
+// FOR A SCALAR IT IS EXACTLY zeroGradient, and that is not an approximation: OF specialises
+// wedgeFvPatchField<scalar> to return snGrad 0, value = pif and snGradTransformDiag 0 (a scalar has no
+// direction to rotate). Only the VECTOR case carries the rotation -- which is why the coefficients above
+// are per-component SCALARS with the cross-component coupling living entirely in the value.
+template <typename T>
+class WedgePatchField : public fvPatchField<T>
+{
+public:
+    WedgePatchField(const FvPatch& p, const tensor& faceT, const tensor& cellT)
+        : fvPatchField<T>(p), faceT_(faceT), cellT_(cellT) {}
+    void evaluate(const std::vector<T>& internal) override
+    {
+        this->value_ = this->patchInternalField(internal);   // scalar: zeroGradient, exactly as OF
+    }
+    bool fixesValue() const override { return false; }
+    int  bcCategory() const override { return 0; }           // scalar: the device's zeroGradient
+    const tensor* wedgeFaceT() const override { return &faceT_; }
+    const tensor* wedgeCellT() const override { return &cellT_; }
+
+protected:
+    tensor faceT_, cellT_;
+};
+
+// vector: the rotation is real. value = faceT & U_cell.
+template <> inline void WedgePatchField<vector>::evaluate(const std::vector<vector>& internal)
+{
+    for (label i = 0; i < this->patch_.size; ++i)
+    {
+        const vector& v = internal[this->patch_.faceCells[i]];
+        this->value_[i] = vector{faceT_.xx*v.x + faceT_.xy*v.y + faceT_.xz*v.z,
+                                 faceT_.yx*v.x + faceT_.yy*v.y + faceT_.yz*v.z,
+                                 faceT_.zx*v.x + faceT_.zy*v.y + faceT_.zz*v.z};
+    }
+}
+// ...and a vector wedge is a MIXED (Robin) boundary per component, with valueFraction
+// d_k = 0.5*(1 - cellT_kk) -- which reproduces OF's valueInternalCoeffs/gradientInternalCoeffs exactly
+// (mixed gives 1 - vf and -deltaCoeffs*vf). Category 5 is the device's mixed slot.
+template <> inline int WedgePatchField<vector>::bcCategory() const { return 5; }
+
 // Shared storage + read-and-hold value() for the OF calculated / inletOutlet / outletInlet /
 // pressureInletOutletVelocity / mixed family, they differ ONLY in which device category (bcCategory) claims the
 // face; value_[i] is the same uniform-or-per-face read value (= refValue). Each OF-named subclass below stays a
@@ -698,6 +754,20 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "which brae does not apply -- it would silently run with zero tangential velocity. Remove the "
             "entry (if the tangential component really is zero) or use a BC that fixes the full vector.");
     }
+    // `table` is implemented (Function1::table + the solver's per-step p0 refresh), so it is not in
+    // unsupportedFunction1 at all. Anything still recorded there -- polynomial, csvFile, expression --
+    // is genuinely unevaluated and must stay named rather than silently frozen at its t=0 value.
+    if ((d.type == "uniformTotalPressure" || d.type == "totalPressure") && !d.unsupportedFunction1.empty())
+    {
+        // Same rule as uniformFixedValue below: a time-varying p0 that brae cannot evaluate must be
+        // named, not silently replaced by whatever `value` happens to hold -- that would run a
+        // constant-pressure outlet where the case asked for a ramp.
+        throw std::runtime_error(
+            "brae: patch " + p.name + " is " + d.type + " with a non-constant p0 ('"
+            + d.unsupportedFunction1 + "'). brae evaluates only `constant`/`uniform` Function1 entries, "
+            "so the prescribed time variation would be lost. Replace p0 with a constant, or drive the "
+            "case at fixed total pressure.");
+    }
     if (d.type == "uniformFixedValue" && !d.unsupportedFunction1.empty())
     {
         // A non-constant uniformValue. Refusing rather than falling back to whatever `value` happens to
@@ -708,6 +778,11 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "Running would silently substitute the patch's `value` entry, so it is refused. Replace it "
             "with a constant, or use codedFixedValue.");
     }
+    // fixedMean: a fixedValue whose face values are the adjacent cell values, shifted or scaled so their
+    // area-weighted mean equals `meanValue` (OF fixedMeanFvPatchField). Seeded from `value`; the solver
+    // recomputes refValue every step, exactly as it does for codedFixedValue and fanPressure.
+    if (d.type == "fixedMean")
+        return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue")
         // uniformFixedValue: steady constant = fixedValue. codedFixedValue: seed with `value`; the NVRTC device kernel
         // (device_coded_bc) OVERWRITES this patch's refValue each step from the compiled `code` snippet (the driver
@@ -722,7 +797,15 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // That is its only standard usage (no-flux walls), so we map it to zeroGradient (exact there). See
     // PORTING_PRESSURE_REFERENCE.md; a fixedFluxPressure on a non-fixed-velocity patch would need the gradient path.
     if (d.type == "fixedFluxPressure") return std::make_unique<ZeroGradientPatchField<T>>(p);
-    if (d.type == "totalPressure")   // p0 read into the inletValue slot (foam_field_reader); fall back to value
+    // uniformTotalPressure is totalPressure with a TIME-VARYING p0 -- OF's own class differs only in
+    // that p0 comes from a Function1 (uniformTotalPressureFvPatchScalarField.C:149 samples it every
+    // updateCoeffs). The face treatment is identical: p_b = p0 - 0.5*neg(phi)*magSqr(U). So it builds
+    // the same patch field, and the solver refreshes p0 per step from the table.
+    // fanPressure is totalPressure with p0 shifted by a fan curve: OF's updateCoeffs computes the patch
+    // volumetric flow rate, looks up the pressure rise, and calls totalPressure::updateCoeffs(p0 - dir*pdFan)
+    // (fanPressureFvPatchScalarField.C). The FACE treatment is identical, so it builds the same patch field
+    // seeded with p0, and the solver shifts p0 per step. Same split as uniformTotalPressure above.
+    if (d.type == "totalPressure" || d.type == "uniformTotalPressure" || d.type == "fanPressure")   // p0 read into the inletValue slot
     {
         // OF has three branches. brae implements the two that share one expression (kinematic, and the
         // compressible low-speed form with rho). The isentropic branch a named psi selects is different
@@ -772,6 +855,14 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     {
         const auto v = inletOrValue(d);
         return std::make_unique<InletOutletPatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+    }
+    // outletInlet: the same mixed BC with the flux test inverted -- outflow (phi >= 0) takes the
+    // prescribed outletValue, inflow extrapolates. The class and its device category existed already;
+    // nothing constructed it, so a case naming it was refused. (pimpleFoam/LES/NACA4412 uses it.)
+    if (d.type == "outletInlet")
+    {
+        const auto v = inletOrValue(d);   // outletValue is read into the same slot
+        return std::make_unique<OutletInletPatchField<T>>(p, v.uniform, v.uniformValue, v.values);
     }
     // turbulent-inlet BCs (inletOutlet-derived): inflow value computed from U/k by the solver (applyTurbulentInlets);
     // here we build an inletOutlet placeholder from the written `value` so buildField succeeds.
@@ -853,10 +944,20 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // cyclic: the device-resident solver couples it via appended internal faces (DeviceMesh), so the host patch
     // field is a no-op placeholder here (its value is unused; the FvPatch type "cyclic" drives the device skip).
-    if (d.type == "cyclic" || d.type == "cyclicAMI")          return std::make_unique<ZeroGradientPatchField<T>>(p);
+    if (isCoupledInterfaceType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")
         return std::make_unique<SymmetryPlanePatchField<T>>(p);  // slip = OF basicSymmetry
+    if (d.type == "wedge")   // axisymmetric constraint: the geometry IS the boundary condition
+    {
+        const WedgeGeometry w = wedgeGeometry(p);
+        return std::make_unique<WedgePatchField<T>>(p, w.faceT, w.cellT);
+    }
+    // cellMotion (OF cellMotionFvPatchField): the CELL-motion counterpart of a prescribed point motion.
+    // It holds the value the motion solver put there, so as a boundary condition it is a fixedValue --
+    // which is what OF's cellMotionBoundaryTypes maps a fixed point motion to. Appears in a written
+    // cellMotionU<Cmpt> field, which a restart reads back.
+    if (d.type == "cellMotion")      return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "calculated")      return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // atmBoundaryLayerInlet{Velocity,K,Epsilon,Omega} (OpenFOAM atmBoundaryLayer.C, v2412): Richards-Hoxey log-law
     // profile evaluated per boundary face from the face-centre height z = Cf.zDir - d, a steady fixedValue. Params come
@@ -929,6 +1030,19 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "iteration, so a frozen value would impose a flux the case never asked for. If kappa is "
             "effectively constant for your case, compute g = q/kappa yourself and use "
             "`type fixedGradient; gradient uniform <g>;` -- brae discretises that exactly (see B5).");
+    }
+    // movingWallVelocity -- OF movingWallVelocityFvPatchVectorField. It IS a fixedValue: updateCoeffs()
+    // does `vectorField::operator=(Uwall())` and then defers to fixedValueFvPatchVectorField, and on a
+    // STATIC mesh (`if (mesh.moving())` is false) it never assigns at all and is exactly the `value`
+    // entry. So the patch field is a plain fixedValue here; the solver overwrites its refValue each
+    // step from movingWallVelocity() when the mesh moves, which is the same split OF uses.
+    //
+    // A case that declares it WITHOUT a moving mesh therefore behaves correctly by construction: no
+    // move, no overwrite, the value entry stands -- which is what OF does.
+    if (d.type == "movingWallVelocity")
+    {
+        const auto v = inletOrValue(d);
+        return std::make_unique<FixedValuePatchField<T>>(p, v.uniform, v.uniformValue, v.values);
     }
     throw std::runtime_error("brae: unsupported BC type '" + d.type + "' on patch " + p.name);
 }

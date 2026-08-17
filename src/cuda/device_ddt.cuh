@@ -18,6 +18,7 @@
 //   backwardDdtScheme.C:96-98  coefft / coefft00 / coefft0
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
+#include "device_mesh.cuh"   // DeviceMesh: deviceSurfaceSumMagPhi needs the owner/neighbour addressing
 
 namespace brae {
 
@@ -76,8 +77,22 @@ inline DdtCoeffs ddtCoeffs(DdtScheme scheme, scalar deltaT, scalar deltaT0, scal
 // Add the implicit ddt of ONE scalar component (a velocity component, or a transported scalar) to (diag, source).
 // diag/source are the assembled fvMatrix arrays (size == nCells); this ACCUMULATES, matching ddt being one UEqn term.
 // psiOld2 may be empty (Euler / bootstrap). rho is the constant density (1 for incompressible pimpleFoam). No-op when
-// c.active is false. V is the cell-volume field (mesh V; brae is always a fixed mesh so Vsc == V). Use this when diag +
-// source belong to the SAME matrix (a scalar transport, e.g. k/epsilon in PIMPLE).
+// c.active is false. V is the cell-volume field.
+//
+// MOVING MESH. OF's EulerDdtScheme::fvmDdt (EulerDdtScheme.C:383-388) is
+//     fvm.diag()   = rDeltaT*mesh().Vsc();                          // CURRENT volume
+//     fvm.source() = rDeltaT*vf.oldTime()*(moving ? Vsc0() : Vsc()); // OLD volume when moving
+// so the discrete term is (V^n*psi^n - V^{n-1}*psi^{n-1})/dt, NOT V*(psi^n - psi^{n-1})/dt. That
+// difference IS the discrete space conservation law: with phi made relative, the two together keep
+// continuity exact on a moving mesh. Using one volume for both leaves a continuity error that grows
+// every step -- measured on pimpleFoam/RAS/rotatingFanInRoom as contLocal 8.1e-03 -> 8.0e-02 while the
+// Courant number sat at 0.46, i.e. a divergence that is not a CFL problem.
+//
+// The split needs no new kernel: deviceFvmDdtDiag and deviceFvmDdtSource already take V separately, so
+// a moving-mesh caller passes the CURRENT volume to Diag and the OLD volume to Source. On a fixed mesh
+// the two buffers are the same and every existing call is unchanged.
+//
+// Use deviceFvmDdt when diag + source belong to the SAME matrix (a scalar transport, e.g. k/epsilon).
 void deviceFvmDdt(
     const DeviceBuffer<scalar>& V,
     const DdtCoeffs&            c,
@@ -128,5 +143,76 @@ void deviceFvmDdtUpdateDdt0(
     const DeviceBuffer<scalar>& psiOld,
     const DeviceBuffer<scalar>& psiOld2,
     DeviceBuffer<scalar>&       ddt0);
+
+// fvc::ddtCorr(U, phi) -- the Rhie-Chow-style ddt flux correction pimpleFoam adds to phiHbyA:
+//
+//     phiHbyA += fvc::interpolate(rAU)*fvc::ddtCorr(U, phi, Uf)          (pEqn.H)
+//
+// EulerDdtScheme::fvcDdtPhiCorr, verified term for term against OpenFOAM v2412 on
+// pimpleFoam/RAS/oscillatingInletACMI2D (21464 internal faces, agreement 1.2e-10 L2):
+//
+//     phiCorr = phi_old - (interpolate(U_old) & Sf)
+//     coeff   = 1 - min(|phiCorr| / (|phi_old| + SMALL), 1)        <- ddtScheme::fvcDdtPhiCoeff
+//     ddtCorr = coeff * (1/deltaT) * phiCorr
+//
+// The coefficient is what makes it a CORRECTION rather than a second convection term: it is 1 where the
+// stored flux already agrees with the interpolated velocity and falls to 0 where they disagree by as
+// much as the flux itself, so a face whose flux is pure Rhie-Chow contributes nothing. On that case it
+// ran between 0.875 and 1.0.
+//
+// `coeffMask` is per BOUNDARY face: OF zeroes the coefficient wherever U fixesValue() or the patch is a
+// cyclicAMI (ddtScheme.C, fvcDdtPhiCoeff), so pass 0 there and 1 elsewhere. Coupled-interface faces are
+// not in this array at all and get no correction, which is the same thing OF's cyclicAMI branch does.
+//
+// out{Int,Bnd} are ACCUMULATED into (+=), so this adds straight onto phiHbyA.
+void deviceDdtCorrFlux(
+    int                         nInternalFaces,
+    const DeviceBuffer<scalar>& phiOldInt,   // phi.oldTime(), internal faces
+    const DeviceBuffer<scalar>& phiOldBnd,   // phi.oldTime(), boundary faces (DeviceBoundary order)
+    const DeviceBuffer<scalar>& fluxUoldInt, // (interpolate(U.oldTime()) & Sf), internal
+    const DeviceBuffer<scalar>& fluxUoldBnd, // ... boundary
+    const DeviceBuffer<scalar>& rAUf,        // fvc::interpolate(rAU), internal faces
+    const DeviceBuffer<scalar>& rAUbnd,      // rAU on the boundary faces (adjacent-cell value)
+    const DeviceBuffer<scalar>& coeffMask,   // per boundary face: 0 at fixesValue/coupled, else 1
+    scalar                      rDeltaT,
+    DeviceBuffer<scalar>&       outInt,      // += the correction
+    DeviceBuffer<scalar>&       outBnd,
+    const DeviceBuffer<scalar>* phiCorrEffInt = nullptr,   // backward: the two-level correction
+    const DeviceBuffer<scalar>* phiCorrEffBnd = nullptr);
+
+// fvc::correctUf (fvcMeshPhi.C) -- the face velocity a moving-mesh pimpleFoam carries alongside phi:
+//
+//     Uf  = fvc::interpolate(U);
+//     n   = Sf/magSf;
+//     Uf += n*(phi/magSf - (n & Uf));
+//
+// i.e. the interpolated cell velocity with its NORMAL component replaced by the one the conservative flux
+// implies. `phi` must be the ABSOLUTE flux -- OF calls this at the end of pEqn.H, before makeRelative.
+//
+// `faceIdx` maps entry i to its index in Sf/magSf: pass the boundary gather (dm.bndGFace) for boundary
+// faces, and nullptr when the arrays are already in the caller's own order (internal faces, or an
+// interface whose Sf is stored per interface face).
+void deviceCorrectUf(
+    int n, const label* faceIdx,
+    const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,
+    const DeviceBuffer<scalar>& magSf, const DeviceBuffer<scalar>& phi,
+    DeviceBuffer<scalar>& ufx, DeviceBuffer<scalar>& ufy, DeviceBuffer<scalar>& ufz);   // in: interp(U), out: Uf
+
+// Sf & Uf, per face. This is EulerDdtScheme::fvcDdtUfCorr's phiUf0 -- the CURRENT Sf dotted into the
+// STORED face velocity, which is what makes the Uf form exact on a mesh whose areas change (a rotating
+// mesh, or a cyclicACMI whose overlap mask rescales its coupled areas every step) where phi + mesh.phi()
+// is only an approximation of it.
+// fvc::surfaceSum(mag(phi)) per cell, coupled interfaces included. Pass nullptr for an absent interface.
+void deviceSurfaceSumMagPhi(const DeviceMesh& dm,
+                            const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
+                            const DeviceBuffer<label>* cycOwn, const DeviceBuffer<scalar>* cycPhi,
+                            const DeviceBuffer<label>* amiOwn, const DeviceBuffer<scalar>* amiPhi,
+                            DeviceBuffer<scalar>& out);
+
+void deviceDotSf(
+    int n, const label* faceIdx,
+    const DeviceBuffer<scalar>& Sfx, const DeviceBuffer<scalar>& Sfy, const DeviceBuffer<scalar>& Sfz,
+    const DeviceBuffer<scalar>& ufx, const DeviceBuffer<scalar>& ufy, const DeviceBuffer<scalar>& ufz,
+    DeviceBuffer<scalar>& out);
 
 }  // namespace brae

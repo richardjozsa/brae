@@ -1,4 +1,5 @@
 #pragma once
+#include "brae_notice.cuh"
 // Which brae solver owns a case -- the one place that maps an OpenFOAM case to a brae executable.
 //
 // `brae` is the single command a user types; the case itself names the solver it wants, in controlDict's
@@ -165,12 +166,27 @@ inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
                 "\n  brae stops rather than run a case with the wrong solver.");
         // The case names a solver but its ddtSchemes says the other thing -- one of the two is wrong, and
         // guessing which would silently produce the wrong answer.
-        if (!ddt.empty() && chosen->transient != transientCase)
+        // A STEADY solver with a transient ddtSchemes entry is NOT an error in OpenFOAM. simpleFoam's
+        // UEqn has no ddt term at all --
+        //     fvm::div(phi, U) + MRF.DDt(U) + turbulence->divDevSigma(U) == fvOptions(U)
+        // -- so the entry is never looked up and is simply inert. OF's OWN squareBend tutorial ships
+        // `application simpleFoam` with `ddtSchemes { default Euler; }` and runs fine; brae refused it.
+        // Report that the entry is ignored (the steady path forces steadyState regardless) rather than
+        // reject a valid, shipped case.
+        if (!ddt.empty() && chosen->transient != transientCase && !chosen->transient)
+        {
+            noticeIgnored("fvSchemes/ddtSchemes.default",
+                          "'" + ddt + "' on the steady solver '" + application + "'. OpenFOAM's steady "
+                          "solvers construct no ddt term, so this entry is inert there and is ignored "
+                          "here too -- the run is steady.");
+        }
+        // The reverse IS an error: a transient solver with steadyState would silently drop the time
+        // derivative, which is a different equation rather than an unused entry.
+        else if (!ddt.empty() && chosen->transient != transientCase)
             throw std::runtime_error(
-                "controlDict application '" + application + "' is " +
-                (chosen->transient ? "transient" : "steady") + ", but fvSchemes ddtSchemes.default is '" + ddt +
-                "'. Fix one of the two: steady solvers need steadyState, transient solvers need "
-                "Euler|backward|CrankNicolson.");
+                "controlDict application '" + application + "' is transient, but fvSchemes "
+                "ddtSchemes.default is '" + ddt + "'. A transient solver needs "
+                "Euler|backward|CrankNicolson; steadyState would drop the time derivative entirely.");
         why = "controlDict application " + application;
     }
     else

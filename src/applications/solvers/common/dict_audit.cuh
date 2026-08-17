@@ -18,9 +18,11 @@
 //
 // On by default so it is visible during development. BRAE_DICT_AUDIT=0 silences it.
 #include "foam_dict.cuh"
+#include "scheme_parse.cuh"   // divSchemesConsumed(): recorded on the consumption path
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +76,58 @@ inline void auditWalk(
 
 }   // namespace detail
 
+// PREFLIGHT: an unread key in the ALGORITHM-CONTROL block is FATAL, not a notice.
+//
+// auditDict above reports and does not throw, for a good reason -- an unread key elsewhere may belong to
+// another tool. That reasoning does not extend to fvSolution's PIMPLE/SIMPLE sub-dictionary. Every entry
+// there selects part of the pressure-velocity algorithm, none of them belong to anyone else, and reading
+// one and ignoring it means brae is running a DIFFERENT ALGORITHM than the case asked for -- silently,
+// and with a converged-looking field at the end.
+//
+// This is not hypothetical. `turbOnFinalIterOnly` defaults to TRUE in OpenFOAM's pimpleControl, so
+// turbulence is corrected once per time step on the final outer corrector. brae corrected it on EVERY
+// outer corrector and never read the key. A 30-case tutorial sweep did not catch it, because most
+// tutorials use nOuterCorrectors 1, where the two cadences are the same; the cases that would have shown
+// it (vortexShed 5, propeller 2, axialTurbine 10) were failing for what looked like other reasons.
+// `residualControl`, `solveFlow`, `SIMPLErho` and `moveMeshOuterCorrectors` are the same shape.
+//
+// So the rule for this one block is inverted: brae must consume every key or refuse. A gap becomes a
+// startup error naming the key, never a discovery made halfway through a simulation.
+inline void preflightAlgorithmControls(const FoamDict& fvSolution, const std::string& dictName)
+{
+    const FoamDict* alg = fvSolution.subDict(dictName);
+    if (!alg) return;
+    // Controls brae consumes CONDITIONALLY, so an unread one is not a gap. Each needs a reason, and the
+    // reason has to be that OpenFOAM ignores it under the same condition -- otherwise this list is just a
+    // way to silence the check. Keep it short: anything added here stops being enforced.
+    auto conditional = [](const std::string& k)
+    {
+        //  pRefCell/pRefValue : read only when the pressure needs a reference (no fixedValue-p patch).
+        //                       OpenFOAM's setRefCell does nothing on a case with a fixed-pressure
+        //                       boundary either, so an unread pair there is inert in both codes.
+        //  transonic          : consumed by the COMPRESSIBLE pEqn. Incompressible pimpleFoam never reads
+        //                       it in OpenFOAM either -- a case that sets it is setting a no-op.
+        return k == "pRefCell" || k == "pRefValue" || k == "transonic";
+    };
+    std::vector<std::string> unread;
+    for (const auto& l : alg->leaves)
+        if (!alg->queried.count(l.first) && !conditional(l.first)) unread.push_back(l.first);
+    for (const auto& sb : alg->subs)
+        if (!alg->queried.count(sb.first)) unread.push_back(sb.first + " (sub-dictionary)");
+    if (unread.empty()) return;
+
+    std::string msg = "brae: system/fvSolution " + dictName + " contains "
+                    + std::to_string(unread.size()) + " entr"
+                    + (unread.size() == 1 ? "y" : "ies") + " brae never read:";
+    for (const std::string& k : unread) msg += "\n    " + dictName + "/" + k;
+    msg += "\n  Every entry in this block selects part of the pressure-velocity algorithm, so running "
+           "with one ignored means solving a different algorithm than the case specifies -- which "
+           "converges to a plausible wrong answer instead of failing. Refused at startup rather than "
+           "discovered mid-run. Implement the control, or delete it from the case if it is not wanted.";
+    throw std::runtime_error(msg);
+}
+
+
 // Name every entry in `d` that brae never looked up. `label` is the file, e.g. "system/fvSolution".
 // `partial` marks a report taken from a run that STOPPED EARLY -- see DictAuditScope.
 inline void auditDict(const FoamDict& d, const std::string& label, bool partial = false)
@@ -100,6 +154,83 @@ inline void auditDict(const FoamDict& d, const std::string& label, bool partial 
                      "brae NOTICE [unread]   (an entry here is EVIDENCE of an unimplemented input, not proof --\n"
                      "brae NOTICE [unread]    some belong to other tools. Set BRAE_DICT_AUDIT=0 to silence.)\n");
 }
+// fvSchemes, audited at BLOCK granularity.
+//
+// WHY NOT LEAF GRANULARITY. Every other dict brae reads goes through FoamDict, which records each key on
+// the lookup path itself -- so the unread set cannot drift from what the code consumes. fvSchemes does
+// not: parseFvSchemesControls reads it as raw TEXT (readFileExpanded), because keys like
+// `div(phi,U)` and `$turbulence` expansion are awkward through the dict reader. Auditing its leaves
+// would therefore mean maintaining a hand-written list of "keys the text parser touches", and that list
+// would drift -- a stale entry marks an ignored input as read, which is precisely the failure this file
+// exists to catch, now with a green light on it. A false NEGATIVE here is worse than no audit.
+//
+// So this reports whole blocks brae never looks at. That is what caught `fluxRequired`: not a wrong
+// answer (it is an assertion OF sets in code, createFields.H:43) but an entry nothing in brae mentions.
+// Leaf-level fvSchemes coverage stays an open gap, and the notice says so rather than implying it.
+inline void auditFvSchemes(const std::string& caseDir)
+{
+    if (const char* e = std::getenv("BRAE_DICT_AUDIT"))
+        if (std::atoi(e) == 0) return;
+
+    FoamDict fvSchemes;
+    try { fvSchemes = readDict(caseDir + "/system/fvSchemes"); }
+    catch (const std::exception&) { return; }   // absent/unparseable is the parser's problem, not ours
+
+    // The blocks brae resolves. ddtSchemes goes through setDdtScheme rather than parseFvSchemesControls;
+    // wallDist is checked by checkWallDistMethod.
+    static const char* read[] = {
+        "ddtSchemes", "gradSchemes", "divSchemes", "laplacianSchemes",
+        "interpolationSchemes", "snGradSchemes", "wallDist"
+    };
+
+    std::vector<std::string> unread;
+    for (const auto& sub : fvSchemes.subs)
+    {
+        bool known = false;
+        for (const char* r : read) if (sub.first == r) { known = true; break; }
+        if (!known) unread.push_back(sub.first + "/ (whole block)");
+    }
+    for (const auto& leaf : fvSchemes.leaves)
+    {
+        bool known = false;
+        for (const char* r : read) if (leaf.first == r) { known = true; break; }
+        if (!known) unread.push_back(leaf.first + " (entry)");
+    }
+    // divSchemes at LEAF granularity. Possible here and nowhere else in fvSchemes because div
+    // consumption has a single choke point (checkDiv), so the consumed set is recorded on the
+    // consumption path and cannot drift. A div entry the case declares and brae never reads means the
+    // field is being discretised by something other than what was asked for -- the exact defect that
+    // put a passive tracer at 6.32 against a bound of 1.0.
+    // Read the RAW block, not FoamDict's leaves: the tokeniser splits on parentheses, so `div(phi,U)`
+    // arrives as the key `div` with `( phi , U )` among its values. Comparing against leaf keys silently
+    // matched nothing and reported nothing -- a false negative, the failure mode this audit exists to
+    // prevent. Parsing the same text parseFvSchemesControls reads keeps the two in step by construction.
+    try
+    {
+        const std::string blk =
+            fvSchemesBlock(readFileExpanded(caseDir + "/system/fvSchemes"), "divSchemes");
+        for (std::size_t i = blk.find("div("); i != std::string::npos; i = blk.find("div(", i + 1))
+        {
+            const std::string key = divKeyOf(blk.substr(i));
+            if (key.empty() || divSchemesConsumed().count(key)) continue;
+            unread.push_back("divSchemes/" + key);
+        }
+    }
+    catch (const std::exception&) {}
+
+    if (unread.empty()) return;
+
+    std::fprintf(stderr,
+                 "brae NOTICE [unread] system/fvSchemes -- %zu entr%s brae never looked at:\n",
+                 unread.size(), unread.size() == 1 ? "y" : "ies");
+    for (const std::string& k : unread)
+        std::fprintf(stderr, "brae NOTICE [unread]   %s\n", k.c_str());
+    std::fprintf(stderr,
+                 "brae NOTICE [unread]   (divSchemes is audited per ENTRY -- its consumption has a single choke\n"
+                 "brae NOTICE [unread]    point. Other blocks are audited whole: fvSchemes is text-parsed, so their\n"
+                 "brae NOTICE [unread]    individual entries are not tracked.)\n");
+}
+
 
 // E5: audit on EVERY exit, including a refusal.
 //
@@ -120,16 +251,25 @@ class DictAuditScope
 public:
     void add(const FoamDict& d, std::string label) { entries_.push_back({&d, std::move(label)}); }
 
+    // fvSchemes is audited at SCOPE EXIT, not where it is parsed. Entries are consumed at different
+    // points in the run -- the tracer's div(phi,<field>) is read by the functionObject factory, long
+    // after parseFvSchemesControls -- so auditing at the parse point reported a consumed entry as
+    // unread. Same reason every other dict here reports from the destructor.
+    void addFvSchemes(std::string caseDir) { caseDir_ = std::move(caseDir); }
+
     ~DictAuditScope()
     {
         // Non-zero only when we are unwinding, i.e. brae threw. C++17's uncaught_exceptions() is the
         // supported way to tell a destructor which path it is on.
         const bool partial = std::uncaught_exceptions() > 0;
         for (const auto& e : entries_) auditDict(*e.first, e.second, partial);
+        if (!caseDir_.empty()) auditFvSchemes(caseDir_);
     }
 
 private:
     std::vector<std::pair<const FoamDict*, std::string>> entries_;
+    std::string caseDir_;
 };
+
 
 }   // namespace brae

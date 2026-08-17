@@ -2,7 +2,7 @@
 // brae::nearWallDist, OpenFOAM turbulence.y(): the near-wall distance used by wall functions.
 // Mirrors src/finiteVolume/fvMesh/wallDist/nearWallDist. For each wall-patch face with adjacent
 // cell C, y = the smallest distance from C to the nearest point on any wall face that is a
-// point-neighbour of the face within the SAME patch (the own face included). This differs from
+// point-neighbour of the face, across ALL wall patches (the own face included). This differs from
 // the per-face normal distance 1/deltaCoeffs at corners (e.g. the pitzDaily step), where a
 // point-neighbour wall face is geometrically closer than the cell's own wall face.
 //
@@ -17,6 +17,7 @@
 #include "fv_patch.cuh"
 #include <vector>
 #include <unordered_map>
+#include <utility>
 
 namespace brae {
 
@@ -90,6 +91,25 @@ inline scalar pointToFaceDist(
 }
 
 // Per-patch near-wall distance y (size patches.size(); non-wall patches left empty).
+//
+// THE SEARCH CROSSES PATCH BOUNDARIES. OF v2412's nearWallDist has two branches, chosen by
+// cellDistFuncs::useCombinedWallPatch, which DEFAULTS TO TRUE: it gathers the faces of every wall patch
+// into one uindirectPrimitivePatch and takes point-neighbours in that combined set. brae implemented the
+// legacy per-patch branch, so a face whose closest wall neighbour lives on a DIFFERENT wall patch got its
+// own (larger) distance instead.
+//
+// Where that bites is a corner cell shared by two wall patches, and a cyclicACMI makes one routinely: its
+// non-overlap blockage is a wall patch coincident with the interface, so the cell at the END of the
+// interface touches both the blockage and the ordinary side wall. Measured on
+// pimpleFoam/RAS/oscillatingInletACMI2D, cell 3200 (first face of ACMI2_couple):
+//
+//     OF: y(ACMI2_blockage) = 5.20833e-03   <- the WALLS distance, not its own face's 1.25e-02
+//     OF: y(walls)          = 5.20833e-03
+//     brae (per-patch)      = 1.25e-02 and 5.20833e-03 respectively
+//
+// and cell 3280, one row in and touching only the blockage, agrees at 1.25e-02 in both. Through
+// epsilon0 = invNw*Cmu^.75*k^1.5/(kappa*y) that made epsilon at those cells 0.71x and 0.90x OpenFOAM's
+// while the median interface cell was already right to 1.7e-07.
 inline std::vector<std::vector<scalar>> nearWallDist(
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -100,40 +120,52 @@ inline std::vector<std::vector<scalar>> nearWallDist(
     const std::vector<label>&  fo  = m.faceOffsets();
     const std::vector<vector>& C   = g.C();
 
-    std::vector<std::vector<scalar>> y(patches.size());
+    // One combined wall patch: the global face index of every wall face, plus where it came from.
+    std::vector<label> wallFace;                     // global face index
+    std::vector<std::pair<std::size_t, label>> from; // (patch, local index)
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& wp = patches[pi];
-        if (wp.type != "wall" || wp.size == 0) continue;
-
-        // point -> local wall faces within this patch (global face index = wp.start + i).
-        std::unordered_map<label, std::vector<label>> pointFaces;
+        if (wp.type != "wall") continue;
         for (label i = 0; i < wp.size; ++i)
         {
-            const label f = wp.start + i;
-            for (label j = fo[f]; j < fo[f + 1]; ++j)
-                pointFaces[fv[j]].push_back(i);
+            wallFace.push_back(wp.start + i);
+            from.push_back({pi, i});
         }
+    }
 
-        y[pi].assign(wp.size, nwdGreat);
-        for (label i = 0; i < wp.size; ++i)
-        {
-            const vector& Cc = C[wp.faceCells[i]];
-            const label f = wp.start + i;
-            // candidate faces: this face + every wall face in the patch sharing a vertex.
-            std::vector<label> cand{i};
-            for (label j = fo[f]; j < fo[f + 1]; ++j)
-                for (label nf : pointFaces[fv[j]])
-                    cand.push_back(nf);
-            scalar best = nwdGreat;
-            for (label nf : cand)
+    std::vector<std::vector<scalar>> y(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        if (patches[pi].type == "wall" && patches[pi].size > 0)
+            y[pi].assign(patches[pi].size, nwdGreat);
+    if (wallFace.empty()) return y;
+
+    // point -> combined-wall-face indices
+    std::unordered_map<label, std::vector<label>> pointFaces;
+    for (std::size_t w = 0; w < wallFace.size(); ++w)
+    {
+        const label f = wallFace[w];
+        for (label j = fo[f]; j < fo[f + 1]; ++j)
+            pointFaces[fv[j]].push_back(static_cast<label>(w));
+    }
+
+    for (std::size_t w = 0; w < wallFace.size(); ++w)
+    {
+        const std::size_t pi = from[w].first;
+        const label i = from[w].second;
+        const vector& Cc = C[patches[pi].faceCells[i]];
+        const label f = wallFace[w];
+        // candidates: this face + every wall face sharing a vertex, on ANY wall patch
+        scalar best = pointToFaceDist(Cc, pts, fv, fo[f], fo[f + 1]);
+        for (label j = fo[f]; j < fo[f + 1]; ++j)
+            for (label nw : pointFaces[fv[j]])
             {
-                const label gf = wp.start + nf;
+                if (static_cast<std::size_t>(nw) == w) continue;
+                const label gf = wallFace[nw];
                 const scalar d = pointToFaceDist(Cc, pts, fv, fo[gf], fo[gf + 1]);
                 if (d < best) best = d;
             }
-            y[pi][i] = best;
-        }
+        y[pi][i] = best;
     }
     return y;
 }
