@@ -370,6 +370,25 @@ COMPONENTS = {
                   "PCG. That is a different algorithm with a different iteration count -- the solver must "
                   "say so, not silently substitute."),
 
+        dict(name="dispatch", of_symbol="controlDict application",
+             of_file="applications/solvers/incompressible/simpleFoam/simpleFoam.C",
+             classification="DISPATCH", status="REIMPLEMENT",
+             brae_cuda="src/applications/solvers/simpleFoam/simpleFoamV2.cu",
+             brae_target="src/applications/solvers/simpleFoam/simpleFoamV2.cu",
+             validation="tests/simplefoam_v2_dispatch.sh (ctest: simplefoam_v2_dispatch) -- drives the real "
+                        "binary on real cases: OFF changes nothing and stays silent; ON+supported runs to "
+                        "endTime and writes; ON+unsupported REFUSES with the reason and exits 1 for each of "
+                        "MRF, fvOptions, SIMPLEC, a non-upwind div(phi,U), a transient ddtScheme and RAS; "
+                        "the GAMG->AMG-PCG substitution is announced. Negative control: the guard admits "
+                        "the supported case, so it is not refusing unconditionally.",
+             note="OPT-IN via BRAE_SIMPLEFOAM_V2=1 while the envelope is small, and there is deliberately "
+                  "NO try/catch around it: selected-but-unsupported must stop, never fall through to the "
+                  "old solver. A user who asked for the new path and silently got the old one cannot tell "
+                  "from the output which algorithm produced the answer. ENVELOPE TODAY: steady, laminar, "
+                  "upwind div(phi,U), no MRF/fvOptions/SIMPLEC, no coupled patches. RAS/kEpsilon passes the "
+                  "envelope check but the turbulence hook is not yet wired to the device model, so the "
+                  "runner refuses it explicitly rather than solving the case laminar."),
+
         dict(name="cuda_vs_reference", of_symbol="(brae-specific)",
              of_file="-",
              classification="GPU_REQUIRED", status="REVALIDATE_EXISTING",
