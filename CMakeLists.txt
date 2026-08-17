@@ -80,11 +80,12 @@ add_library(brae_core STATIC
     src/OpenFOAM/matrices/pcg.cu
     src/OpenFOAM/matrices/gamg.cu
     src/OpenFOAM/matrices/pbicgstab.cu
-    src/cuda/blas1.cu
-    src/cuda/reductions.cu
-    src/cuda/device_spmv.cu
-    src/cuda/device_dilu.cu
-    src/cuda/device_pcg.cu
+    src/matrices/lduMatrix/lduMatrix/blas1.cu
+    src/matrices/lduMatrix/lduMatrix/reductions.cu
+    src/matrices/lduMatrix/lduMatrix/device_spmv.cu
+    src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
+    src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
+    src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
     src/cuda/device_simple.cu
@@ -106,13 +107,13 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
-    src/cuda/device_amg.cu
-    src/cuda/device_amg_cache.cu
-    src/cuda/device_amg_coarse.cu
-    src/cuda/device_amg_smoothers.cu
-    src/cuda/device_amg_gauss_seidel.cu
-    src/cuda/device_amg_vcycle.cu
-    src/cuda/device_amg_pcg.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_cache.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_coarse.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_smoothers.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_gauss_seidel.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
+    src/matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
     src/cuda/device_cluster.cu
     src/cuda/device_cyclic.cu
     src/cuda/device_ami.cu
@@ -468,6 +469,14 @@ target_include_directories(test_kepsilon_correct PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_kepsilon_correct PRIVATE brae_core)
 add_test(NAME kepsilon_correct
          COMMAND test_kepsilon_correct ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+
+# The _cpp reference for divDevReff, proven against the SAME OpenFOAM dump as the inline test above,
+# with a wrong-sign check and a wall-nuEff negative control so the test is known to be able to fail.
+add_executable(test_divdevreff_cpp tests/test_divdevreff_cpp.cu)
+target_include_directories(test_divdevreff_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_divdevreff_cpp PRIVATE brae_core)
+add_test(NAME divdevreff_cpp
+         COMMAND test_divdevreff_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 
 add_executable(test_divdevreff tests/test_divdevreff.cu)
 target_include_directories(test_divdevreff PRIVATE ${BRAE_HEADER_DIRS})

@@ -1,9 +1,27 @@
-// cf GPU offload -- BLAS-1 REDUCTIONS: block-reduction dot / sum(|x|) (shared memory + atomicAdd to a device
-// accumulator), the device-resident "Into" variants, and the device->host scalar read-back. The reduction order
-// differs from the CPU sequential sum, so results match to machine precision (FP non-associativity), not
-// bit-for-bit -- the validation criterion for reductions. Split from device_blas.cu (elementwise ops in blas1.cu).
+// cf GPU offload -- BLAS-1 REDUCTIONS: dot / sum(|x|) / max-ratio, the device-resident "Into" variants, and the
+// device->host scalar read-back. Split from device_blas.cu (elementwise ops in blas1.cu).
+//
+// THE SUMS ARE TWO-STAGE AND DETERMINISTIC, not atomicAdd. They used to accumulate each block's partial into one
+// device scalar with atomicAdd, which makes the summation order depend on the order blocks happen to finish -- so
+// the SAME binary on the SAME input returned a different last bit every run.
+//
+// That is not a cosmetic reproducibility complaint. Every Krylov solver takes its stopping decision from one of
+// these reductions, so a last-bit difference decides which iteration crosses the tolerance. Measured on
+// compressible/rhoSimpleFoam/squareBend (transonic -> the asymmetric pressure matrix on Jacobi-BiCGStab, relTol
+// 0.1): the pressure solve stopped at 484 iterations with a final residual of 5.70e-02 on one run and 480 with
+// 9.75e-02 on the next. At that residual the iterate is nowhere near converged, so the two runs' velocity fields
+// differed by 2.6% on all 112000 cells -- from the same binary and the same case.
+//
+// Stage 1 writes block partials to a fixed slot (partials[blockIdx.x]); stage 2 reduces that array in ONE block,
+// in index order. Both stages have a fixed traversal, so the result is bit-identical run to run. max is exempt:
+// it is associative and exact in floating point, so atomicMax was already deterministic.
+//
+// This does NOT make brae bit-reproducible on its own. There are ~68 other atomicAdd sites, most of them
+// scatter-accumulates into per-cell arrays (out[own[f]] += ...), which are order-dependent for the same reason.
+// What this fixes is the reduction that the convergence test reads.
 #include "device_blas.cuh"
 #include <cuda_runtime.h>
+#include <cstddef>
 
 namespace brae {
 
@@ -18,6 +36,18 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 scalar* g_redDev = nullptr;       // device accumulator (1 scalar)
 scalar* g_redPinned = nullptr;    // pinned host mirror (1 scalar)
 scalar* g_readPinned = nullptr;   // pinned host mirror for deviceReadScalar (separate so it never clobbers g_redPinned)
+scalar* g_partials = nullptr;     // stage-1 block partials; grown on demand, never shrunk
+int     g_partialsCap = 0;
+inline scalar* ensurePartials(int nb)
+{
+    if (nb > g_partialsCap)
+    {
+        if (g_partials) cudaCheck(cudaFree(g_partials), "partials free");
+        cudaCheck(cudaMalloc(reinterpret_cast<void**>(&g_partials), (std::size_t)nb*sizeof(scalar)), "partials alloc");
+        g_partialsCap = nb;
+    }
+    return g_partials;
+}
 inline void ensureRedScratch()
 {
     if (!g_redDev)    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&g_redDev), sizeof(scalar)), "red dev alloc");
@@ -38,7 +68,7 @@ void dotKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scala
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
-    if (tid == 0) atomicAdd(result, sdata[0]);
+    if (tid == 0) result[blockIdx.x] = sdata[0];   // fixed slot, not atomicAdd -- see the note at the top
 }
 
 
@@ -55,7 +85,40 @@ void sumMagKernel(const scalar* __restrict__ x, scalar* result, int n)
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
-    if (tid == 0) atomicAdd(result, sdata[0]);
+    if (tid == 0) result[blockIdx.x] = sdata[0];   // fixed slot, not atomicAdd
+}
+
+
+// Stage 2: sum `partials[0..nb)` in ONE block, in index order. A single block with a fixed grid-stride walk and a
+// fixed shared-memory tree visits the values in the same order on every launch, which is what makes the whole
+// reduction bit-reproducible.
+__global__
+void finalSumKernel(const scalar* __restrict__ partials, scalar* out, int nb)
+{
+    __shared__ scalar sdata[TPB];
+    const int tid = threadIdx.x;
+    scalar acc = 0;
+    for (int i = tid; i < nb; i += TPB) acc += partials[i];
+    sdata[tid] = acc;
+    __syncthreads();
+    for (int s = TPB / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) *out = sdata[0];
+}
+
+// One deterministic sum reduction: stage 1 into partials, stage 2 into `dResult`. No memset needed -- stage 2
+// assigns rather than accumulates.
+template <class K>
+inline void reduceInto(K launchStage1, int n, scalar* dResult)
+{
+    if (n <= 0) { cudaCheck(cudaMemsetAsync(dResult, 0, sizeof(scalar), cudaStreamPerThread), "reduce zero"); return; }
+    const int nb = nBlocks(n);
+    scalar* part = ensurePartials(nb);
+    launchStage1(nb, part);
+    finalSumKernel<<<1, TPB>>>(part, dResult, nb);
 }
 } // namespace
 
@@ -64,8 +127,7 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
     ensureRedScratch();
-    cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "dot zero");
-    dotKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), g_redDev, n);
+    reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, g_redDev);
     cudaCheck(cudaGetLastError(), "dot");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "dot result");
     return *g_redPinned;
@@ -109,8 +171,7 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 {
     const int n = static_cast<int>(x.size());
     ensureRedScratch();
-    cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "summag zero");
-    sumMagKernel<<<nBlocks(n), TPB>>>(x.data(), g_redDev, n);
+    reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, g_redDev);
     cudaCheck(cudaGetLastError(), "summag");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "summag result");
     return *g_redPinned;
@@ -121,8 +182,7 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 void deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar* dResult)
 {
     const int n = static_cast<int>(x.size());
-    cudaCheck(cudaMemsetAsync(dResult, 0, sizeof(scalar), cudaStreamPerThread), "dotInto zero");
-    dotKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), dResult, n);
+    reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, dResult);
     cudaCheck(cudaGetLastError(), "dotInto");
 }
 
@@ -130,8 +190,7 @@ void deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y,
 void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
 {
     const int n = static_cast<int>(x.size());
-    cudaCheck(cudaMemsetAsync(dResult, 0, sizeof(scalar), cudaStreamPerThread), "summagInto zero");
-    sumMagKernel<<<nBlocks(n), TPB>>>(x.data(), dResult, n);
+    reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, dResult);
     cudaCheck(cudaGetLastError(), "summagInto");
 }
 
