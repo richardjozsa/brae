@@ -70,7 +70,14 @@ COMPONENTS = {
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/simpleFoam/UEqn_cpp.cu",
              brae_target="src/applications/solvers/simpleFoam/UEqn.cu",
-             note="24 lines in OpenFOAM. Everything it calls must already exist as a shared primitive."),
+             validation="tests/test_ueqn_cpp.cu -- validated by DECOMPOSITION against "
+                        "validation/matrixDumpAsym/momentum.dat: the div/laplacian core matches OpenFOAM to "
+                        "1e-11 on diag/upper/lower/source; adding divDevReff provably changes only `source`, "
+                        "and by exactly the explicit dev2 term; relaxation raises |diag| and leaves the "
+                        "off-diagonals alone; MRF and fvOptions both throw.",
+             note="24 lines in OpenFOAM. The _cpp reference REFUSES MRF and fvOptions rather than ignoring "
+                  "them -- brae has shipped a solver that silently ignored MRFProperties and produced a "
+                  "converged wrong answer. The CUDA side is not written yet."),
         dict(name="pEqn", of_symbol="pEqn.H",
              of_file="applications/solvers/incompressible/simpleFoam/pEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
@@ -303,12 +310,20 @@ COMPONENTS = {
         # ---- determinism ---------------------------------------------------------------------
         dict(name="deterministic_assembly", of_symbol="(brae-specific)",
              of_file="-",
-             classification="GPU_REQUIRED", status="REIMPLEMENT",
-             brae_existing="src/cuda/reductions.cu",
+             classification="GPU_REQUIRED", status="REUSE_EXISTING",
+             brae_existing="src/matrices/lduMatrix/lduMatrix/reductions.cu",
              brae_target="src/matrices/lduMatrix/lduMatrix/",
-             note="reductions.cu is now two-stage deterministic. 68 scatter atomicAdd sites remain, giving "
-                  "~1e-3 run-to-run variation. The _cpp-vs-CUDA comparison cannot resolve a defect below "
-                  "its own noise floor, so this is a PREREQUISITE for the validation plan, not a follow-up."),
+             validation="tests/determinism_gate.sh -- pitzDaily (kEpsilon) and pitzDailyKOmega bit-identical "
+                        "over two runs; verified to 200 iterations, plus airfoil and backwardFacingStep2D. "
+                        "Carries a 1-ULP negative control.",
+             note="DONE for the incompressible simpleFoam path. Was 3.6e-02 after 20 iterations, now 0. "
+                  "Three scatter sites, all converted to fixed-order gathers: AMG restriction "
+                  "(rc[map[c]] += r[c], hit every level of every V-cycle of every PCG iteration), the "
+                  "turbulence wall functions (cells with >1 wall face), and the eps setValues constraint "
+                  "(cells with >1 constrained face). The last two are RARE -- bit-identical at 1/5/8/10/15 "
+                  "iterations and different at 12 -- so intermittency, not just a systematic offset, is "
+                  "what the gate has to catch. STILL OPEN: the opt-in BRAE_AMG_SA path still scatters, and "
+                  "the cyclic/AMI (42 sites) and distributed (device_halo) paths are untouched."),
     ],
 }
 

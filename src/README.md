@@ -93,14 +93,39 @@ OpenFOAM, at **7.4e-16** over 12,225 cells, and carries two controls that must f
 - a **wall-nuEff negative control** (rel 1.03) — re-runs with the boundary viscosity replaced by the owner
   cell value, the exact defect brae has shipped before. A test that cannot detect it is blind.
 
-## Determinism is a prerequisite, not a follow-up
+## Determinism — done for the incompressible simpleFoam path
 
-`reductions.cu` uses a two-stage fixed-order reduction and is deterministic. **68 scatter `atomicAdd` sites
-remain**, giving roughly 1e-3 run-to-run variation on the compressible path.
+Two runs of the same binary on the same case now produce **bit-identical** fields. Before:
 
-That number is the *noise floor* of every `_cpp`-vs-CUDA comparison. A defect smaller than the floor cannot
-be seen — which is how the LUST implicit-weight bug hid behind a plausible residual. Deterministic assembly
-therefore has to land before the validation plan is trustworthy, not after.
+| iterations | 1 | 5 | 20 | 200 |
+|---|---|---|---|---|
+| worst rel, before | 1.9e-08 | 1.4e-03 | 3.6e-02 | — |
+| worst rel, now | **0** | **0** | **0** | **0** |
+
+That number was the *noise floor* of every `_cpp`-vs-CUDA comparison, and a defect smaller than the floor
+cannot be seen — which is how the LUST implicit-weight bug hid behind a plausible residual.
+
+Three scatter sites caused it. All three were converted from `atomicAdd` scatter to a **fixed-order
+gather**, which is possible because the addressing they need (`ownerStart`/`losort`/`losortStart`, and the
+inverse of the AMG agglomeration) is static and already built:
+
+| site | why it summed in a varying order |
+|---|---|
+| AMG restriction, `rc[map[c]] += r[c]` | many fine cells per coarse cell; runs every level, every V-cycle, every PCG iteration |
+| turbulence wall functions, `G0/eps0/omega0[c]` | cells with more than one wall face (`invNw` exists precisely for those) |
+| eps `setValues`, `source[nei] -= lower[f]*eps0[own]` | cells with more than one constrained face |
+
+The last two are **rare**, which made them harder rather than easier: the case came out bit-identical at
+1, 5, 8, 10 and 15 iterations and differed at 12. An intermittent seed is still fatal here because the
+SIMPLE loop amplifies it — one ULP at iteration 1 became 1.3e-3 by iteration 20.
+
+`tests/determinism_gate.sh` (ctest: `determinism_kepsilon`, `determinism_komega`) runs the same case twice
+and requires bit equality, and carries a 1-ULP negative control so a broken comparator cannot report
+success. Also verified on `airfoil` and `backwardFacingStep2D`.
+
+**Still open**: the opt-in `BRAE_AMG_SA` path still scatters, and the cyclic/AMI (42 sites) and distributed
+(`device_halo`) paths are untouched. Those are outside the incompressible single-GPU simpleFoam path and
+are recorded in the manifest rather than silently fixed.
 
 ## Provenance and drift
 
