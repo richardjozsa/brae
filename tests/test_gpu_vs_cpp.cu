@@ -25,8 +25,14 @@
 #include "device_simple.cuh"
 #include "UEqn_cpp.cuh"
 #include "pEqn_cpp.cuh"
+#include "linearViscousStress_cpp.cuh"
+#include "device_boundary.cuh"
+#include "device_divdevreff.cuh"
+#include "device_kepsilon.cuh"
+#include "k_epsilon.cuh"
 
 #include <cmath>
+#include <filesystem>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -89,9 +95,31 @@ int main(int argc, char** argv)
     std::printf("test_gpu_vs_cpp:\n");
 
     // ---- the _cpp reference UEqn and its pressure stages ------------------------------------
+    //
+    // nuEff VARIES when the case has a nut field. That matters: on a laminar case nuEff is constant, and a
+    // kernel that mishandles a per-face diffusivity -- or takes the owner cell's value on a boundary face
+    // instead of the patch value -- still agrees perfectly. Running this on a turbulent case as well is
+    // what makes the divDevReff and Laplacian comparisons load-bearing.
     std::vector<scalar> nuEffC(nC, nu);
     std::vector<std::vector<scalar>> nuEffB(fvp.size());
     for (std::size_t pi = 0; pi < fvp.size(); ++pi) nuEffB[pi].assign(fvp[pi].size, nu);
+
+    const bool turbulent = std::filesystem::exists(caseDir + "/" + t + "/nut")
+                        || std::filesystem::exists(caseDir + "/" + t + "/nut.gz");
+    GeometricField<scalar> nutF;
+    if (turbulent)
+    {
+        nutF = buildField<scalar>(readField<scalar>(caseDir + "/" + t + "/nut"), fvp, nC);
+        nutF.evaluateBoundary();
+        for (label c = 0; c < nC; ++c) nuEffC[c] = nu + nutF.internal[c];
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::vector<scalar>& nb = nutF.boundary[pi]->value();
+            for (label i = 0; i < fvp[pi].size; ++i) nuEffB[pi][i] = nu + nb[i];
+        }
+    }
+    std::printf("  (%s case: nuEff %s)\n", turbulent ? "TURBULENT" : "laminar",
+                turbulent ? "varies per cell and per boundary face" : "is constant");
 
     cpu::MomentumInput mi;
     mi.phi = &phiF.internalField; mi.phiBnd = &phiBnd;
@@ -168,6 +196,139 @@ int main(int argc, char** argv)
         cmp(dSrc.host(),  rSrc,  "setReference source", 1e-15);
         // Control: the reference cell must actually have changed, or both sides agree trivially.
         check(rDiag[refCell] != pEqn.diag[refCell], "the reference cell really changed (control)");
+    }
+
+    // =========================== MOMENTUM STAGES ============================================
+    const DeviceVectorBoundary dbU = buildDeviceVectorBoundary(U, fvp, g);
+    std::vector<scalar> ux(nC), uy(nC), uz(nC);
+    for (label c = 0; c < nC; ++c) { ux[c] = U.internal[c].x; uy[c] = U.internal[c].y; uz[c] = U.internal[c].z; }
+    DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz);
+
+    std::printf("  -- momentum stages\n");
+
+    // fvm::div(phi, U): the UPWIND implicit coefficients. This is the operator whose implicit weights hid
+    // brae's LUST defect, so it is compared coefficient by coefficient rather than through a residual.
+    {
+        DeviceBuffer<scalar> dphi(phiF.internalField);
+        DeviceBuffer<scalar> dDiag, dUp, dLo;
+        deviceDivUpwindCoeffs(dm, dphi, dDiag, dUp, dLo);
+        const FvVectorMatrix divRef = fvm::div(phiF.internalField, phiBnd, U, m, fvp);
+        cmp(dUp.host(),   divRef.upper, "div(phi,U) upper", 1e-13);
+        cmp(dLo.host(),   divRef.lower, "div(phi,U) lower", 1e-13);
+        cmp(dDiag.host(), divRef.diag,  "div(phi,U) diag",  1e-13);
+    }
+
+    // turbulence->divDevReff(U), explicit half. The device returns the EXTENSIVE source V*div(sigma);
+    // the reference returns -div(sigma) per volume, so the identity is  dev = -V * ref.
+    {
+        // Flatten the boundary nuEff in the device's boundary-face order (patch by patch), so the wall
+        // value really is the wall value -- not the owner cell's.
+        std::vector<scalar> nuBndFlat;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i) nuBndFlat.push_back(nuEffB[pi][i]);
+        nuBndFlat.resize(dm.nBndFaces, nu);
+        DeviceBuffer<scalar> nuCell(nuEffC);
+        DeviceBuffer<scalar> nuBnd(nuBndFlat);
+        DeviceBuffer<scalar> sx, sy, sz;
+        deviceDivDevReff(dm, dbU, dUx, dUy, dUz, nuCell, nuBnd, sx, sy, sz);
+
+        const std::vector<vector> ref = cpu::divDevReffExplicit(U, nuEffC, nuEffB, m, g, fvp);
+        const std::vector<scalar>& V = g.V();
+        std::vector<scalar> rx(nC), ry(nC), rz(nC);
+        for (label c = 0; c < nC; ++c)
+        { rx[c] = -V[c]*ref[c].x; ry[c] = -V[c]*ref[c].y; rz[c] = -V[c]*ref[c].z; }
+        cmp(sx.host(), rx, "divDevReff source x", 1e-11);
+        cmp(sy.host(), ry, "divDevReff source y", 1e-11);
+        cmp(sz.host(), rz, "divDevReff source z", 1e-11);
+    }
+
+    // fvMatrix::H(), per component -- the numerator of HbyA.
+    {
+        std::vector<scalar> D = UEqn.diag;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+                D[fvp[pi].faceCells[i]] += cmptAv(UEqn.internalCoeffs[pi][i]);
+        DeviceBuffer<scalar> dDiag(D), dUp(UEqn.upper), dLo(UEqn.lower);
+        DeviceLduView A{};
+        A.nCells = nC; A.nInternalFaces = m.nInternalFaces();
+        A.diag = dDiag.data(); A.upper = dUp.data(); A.lower = dLo.data();
+        A.owner = dm.owner.data(); A.nei = dm.nei.data();
+        A.ownerStart = dm.ownerStart.data();
+        A.losort = dm.losort.data(); A.losortStart = dm.losortStart.data();
+
+        const std::vector<vector> Href = matrixH(UEqn, U, m, g, fvp);
+        const char* nm[3] = {"H(U) x", "H(U) y", "H(U) z"};
+        for (int k = 0; k < 3; ++k)
+        {
+            std::vector<scalar> psiK(nC), srcK(nC), bdDiagK, bdSrcK, ref(nC);
+            for (label c = 0; c < nC; ++c)
+            {
+                psiK[c] = component(U.internal[c], k);
+                srcK[c] = component(UEqn.source[c], k);
+                ref[c]  = component(Href[c], k);
+            }
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    const vector ic = UEqn.internalCoeffs[pi][i];
+                    bdDiagK.push_back(cmptAv(ic) - component(ic, k));
+                    bdSrcK.push_back(component(UEqn.boundaryCoeffs[pi][i], k));
+                }
+            DeviceBuffer<scalar> dPsi(psiK), dSrc(srcK), dBd(bdDiagK), dBs(bdSrcK), dH;
+            deviceMatrixH(A, dm, dPsi, dSrc, dBd, dBs, dH);
+            cmp(dH.host(), ref, nm[k], 1e-11);
+        }
+    }
+
+    // fvc::flux(HbyA) internal -- phiHbyA.
+    {
+        std::vector<scalar> hx(nC), hy(nC), hz(nC);
+        for (label c = 0; c < nC; ++c)
+        { hx[c] = st.HbyA[c].x; hy[c] = st.HbyA[c].y; hz[c] = st.HbyA[c].z; }
+        DeviceBuffer<scalar> dHx(hx), dHy(hy), dHz(hz), dPhi;
+        deviceVectorFlux(dm, dHx, dHy, dHz, dPhi);
+        cmp(dPhi.host(), st.phiHbyA.internal, "phiHbyA (deviceVectorFlux)", 1e-12);
+    }
+
+    // U = HbyA - rAU*grad(p), the momentum corrector.
+    {
+        const std::vector<vector> gradP = fvc::gaussGrad(p, m, g, fvp);
+        const std::vector<vector> ref = cpu::correctVelocity(st, p, m, g, fvp);
+        std::vector<scalar> hx(nC), gx(nC), rx(nC);
+        for (label c = 0; c < nC; ++c) { hx[c] = st.HbyA[c].x; gx[c] = gradP[c].x; rx[c] = ref[c].x; }
+        DeviceBuffer<scalar> dH(hx), dRAU(st.rAU), dG(gx), dU;
+        deviceCorrector(dH, dRAU, dG, dU);
+        cmp(dU.host(), rx, "U corrector x (deviceCorrector)", 1e-13);
+    }
+
+    // =========================== TURBULENCE STAGES ==========================================
+    std::printf("  -- turbulence stages\n");
+    {
+        // GbyNu = gradU && devTwoSymm(gradU) -- the production term.
+        DeviceBuffer<scalar> dG;
+        deviceGbyNu(dm, dbU, dUx, dUy, dUz, dG);
+        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, fvp);
+        cmp(dG.host(), kepsilon::GbyNu(gradU), "GbyNu (deviceGbyNu)", 1e-11);
+    }
+    {
+        // nut = Cmu k^2/epsilon. Uses this case's own k/epsilon if present, else a synthetic pair -- the
+        // kernel is the same either way and a synthetic field still exercises every cell.
+        std::vector<scalar> kk(nC), ee(nC);
+        if (turbulent && std::filesystem::exists(caseDir + "/" + t + "/k"))
+        {
+            const GeometricField<scalar> kf =
+                buildField<scalar>(readField<scalar>(caseDir + "/" + t + "/k"), fvp, nC);
+            const GeometricField<scalar> ef =
+                buildField<scalar>(readField<scalar>(caseDir + "/" + t + "/epsilon"), fvp, nC);
+            kk = kf.internal; ee = ef.internal;
+        }
+        else
+        {
+            for (label c = 0; c < nC; ++c) { kk[c] = 0.1 + 0.01*(c % 17); ee[c] = 1.0 + 0.05*(c % 23); }
+        }
+        DeviceBuffer<scalar> dk(kk), de(ee), dnut;
+        deviceNut(dk, de, dnut);
+        cmp(dnut.host(), kepsilon::nut(kk, ee), "nut = Cmu k^2/eps (deviceNut)", 1e-14);
     }
 
     // ---- control: the comparison can detect a difference ------------------------------------

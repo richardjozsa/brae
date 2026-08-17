@@ -1567,6 +1567,11 @@ target_include_directories(test_gpu_vs_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_vs_cpp PRIVATE brae_core)
 add_test(NAME gpu_vs_cpp
          COMMAND test_gpu_vs_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282)
+# ...and again on a TURBULENT case, where nuEff varies per cell and per boundary face. On the laminar case
+# above nuEff is constant, so a kernel that mishandles a per-face diffusivity -- or reads the owner cell's
+# value on a wall instead of the patch value -- would still agree perfectly.
+add_test(NAME gpu_vs_cpp_turbulent
+         COMMAND test_gpu_vs_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 
 add_executable(test_gpu_simple tests/test_gpu_simple.cu)
 target_include_directories(test_gpu_simple PRIVATE ${BRAE_HEADER_DIRS})
