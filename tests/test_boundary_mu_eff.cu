@@ -23,6 +23,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "foam_field_reader.cuh"
+#include <sys/stat.h>
 #include "boundary_mu_eff.cuh"
 #include <cstdio>
 #include <cmath>
@@ -42,6 +43,24 @@ int main(int argc, char** argv)
 {
     const std::string caseDir = argc > 1 ? argv[1] : "validation/rhoBox";
     const std::string timeDir = argc > 2 ? argv[2] : "0";
+
+    // SKIP (77, the code CMake is already told to treat as skipped) rather than abort when the case is
+    // absent. validation/ is `.gitignore`d wholesale, so a fixture reaches CI only if it was force-added;
+    // this test threw std::runtime_error from PrimitiveMesh::read instead, which ctest reports as a
+    // failure and which reads like a solver bug rather than a missing file.
+    //
+    // Skipping is the fallback, NOT the intent: airfoil is the only checked-in case with faces where the
+    // patch nut and the adjacent cell nut differ (78 of 21812), so a skip here means this test proves
+    // nothing. The fixture belongs in the repo.
+    {
+        struct stat st;
+        const std::string pts = caseDir + "/constant/polyMesh/points";
+        if (stat(pts.c_str(), &st) != 0 && stat((pts + ".gz").c_str(), &st) != 0)
+        {
+            std::printf("SKIP: case fixture '%s' not present\n", caseDir.c_str());
+            return 77;
+        }
+    }
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
