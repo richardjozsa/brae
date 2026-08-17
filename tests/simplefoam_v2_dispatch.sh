@@ -44,7 +44,7 @@ supported() {
 import re, sys, os
 d = sys.argv[1]
 s = open(d + '/system/fvSchemes').read()
-s = re.sub(r'div\(phi,U\)[^;]*;', 'div(phi,U)      bounded Gauss upwind;', s)
+s = re.sub(r'div\(phi,U\)[^;]*;', 'div(phi,U)      Gauss upwind;', s)
 open(d + '/system/fvSchemes', 'w').write(s)
 s = open(d + '/system/fvSolution').read()
 s = re.sub(r'consistent\s+\S+;', 'consistent      no;', s)
@@ -107,6 +107,13 @@ try_refusal simplec \
   "s=open(d+'/system/fvSolution').read(); s=re.sub(r'consistent\s+\S+;','consistent      yes;',s); open(d+'/system/fvSolution','w').write(s)" \
   "SIMPLEC"
 
+# `bounded Gauss upwind` still names `upwind` as its scheme, so a guard that only read the scheme word
+# accepted it and ran without the -fvm::Sp(fvc::div(phi),U) term. That term is zero at convergence, so a
+# converged comparison cannot see the omission -- the guard is the only thing that can.
+try_refusal bounded \
+  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss upwind;',s); open(d+'/system/fvSchemes','w').write(s)" \
+  "bounded"
+
 try_refusal divscheme \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss linearUpwind grad(U);',s); open(d+'/system/fvSchemes','w').write(s)" \
   "implicit weights only"
@@ -115,9 +122,31 @@ try_refusal transient \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'default\s+steadyState;','default         Euler;',s); open(d+'/system/fvSchemes','w').write(s)" \
   "steadyState"
 
-try_refusal turbulence \
-  "s=open(d+'/constant/turbulenceProperties').read(); s=re.sub(r'simulationType\s+\S+;','simulationType  RAS;',s); open(d+'/constant/turbulenceProperties','w').write(s)" \
-  "RAS"
+# RAS/kEpsilon is SUPPORTED: the driver's turbulence hook is wired to the device k-epsilon. This used to
+# be a refusal, and flipping it is the point of that work -- so assert it RUNS and writes the turbulence
+# fields, not merely that it is accepted. A case that ran without writing k/epsilon/nut would mean the
+# hook was never called.
+echo "== 4b. RAS/kEpsilon is supported: the turbulence hook runs =="
+supported "$W/ras"
+python3 - "$W/ras" <<'PYEOF'
+import re, sys
+d = sys.argv[1]
+s = open(d + '/constant/turbulenceProperties').read()
+s = re.sub(r'simulationType\s+\S+;', 'simulationType  RAS;', s)
+open(d + '/constant/turbulenceProperties', 'w').write(s)
+PYEOF
+( cd "$W/ras" && BRAE_SIMPLEFOAM_V2=1 "$BRAE" > log 2>&1 )
+rasrc=$?
+if [ $rasrc -eq 0 ]; then ok "RAS/kEpsilon: exit 0"; else bad "RAS/kEpsilon: exit $rasrc"; sed -n '1,4p' "$W/ras/log"; fi
+for fld in k epsilon nut; do
+    if [ -f "$W/ras/3/$fld" ]; then ok "RAS/kEpsilon: wrote $fld (the hook ran)"
+    else bad "RAS/kEpsilon: no $fld written"; fi
+done
+# The turbulence must have CHANGED nut -- a hook that ran but did nothing would still write the file.
+if [ -f "$W/ras/3/nut" ] && [ -f "$W/ras/0/nut" ]; then
+    if cmp -s "$W/ras/3/nut" "$W/ras/0/nut"; then bad "RAS/kEpsilon: nut is unchanged (control)"
+    else ok "RAS/kEpsilon: nut changed (control)"; fi
+fi
 
 echo "== 5. NEGATIVE CONTROL: the guard is not refusing everything =="
 # The supported case above ran. If it had not, every "refused" line would be meaningless -- a guard that

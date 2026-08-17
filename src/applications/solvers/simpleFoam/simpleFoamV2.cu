@@ -14,6 +14,8 @@
 #include "fvc.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
+#include "device_kepsilon.cuh"
+#include "near_wall_dist.cuh"
 #include "solver_dispatch.cuh"   // readDdtSchemeWord: the same steady/transient test the dispatcher uses
 
 #include <cstdlib>
@@ -34,6 +36,14 @@ bool fileExists(const std::string& p)
 
 // The div SCHEME the case asks for on div(phi,U). Returned as the selectable keyword, i.e. the last word
 // that is not `Gauss`, `bounded` or a numeric coefficient -- the same rule ofscan's case layer applies.
+// Does div(phi,U) carry the `bounded` prefix? OpenFOAM's `bounded Gauss <scheme>` adds
+//     - fvm::Sp(fvc::div(phi), U)
+// to the momentum equation (boundedConvectionScheme). It vanishes at convergence, where div(phi) -> 0,
+// which is exactly why dropping it is invisible in a converged comparison and very visible in the
+// approach to it: it is what keeps the equation diagonally dominant while the flux is not yet
+// conservative. The rebuilt UEqn does not implement it.
+bool divUBounded(const std::string& caseDir);
+
 std::string divUScheme(const std::string& caseDir)
 {
     std::string text;
@@ -65,6 +75,28 @@ std::string divUScheme(const std::string& caseDir)
         break;      // the FIRST such word is the scheme; anything after is its coefficient
     }
     return last;
+}
+
+bool divUBounded(const std::string& caseDir)
+{
+    std::string text;
+    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return false; }
+    const std::size_t blk = text.find("divSchemes");
+    if (blk == std::string::npos) return false;
+    const std::size_t open = text.find('{', blk);
+    if (open == std::string::npos) return false;
+    const std::size_t close = text.find('}', open);
+    const std::string b = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
+    static const std::regex re(R"(div\(phi,U\)\s*([^;]*);)");
+    std::smatch mm;
+    std::string entry;
+    if (std::regex_search(b, mm, re)) entry = mm[1].str();
+    else
+    {
+        static const std::regex rd(R"(default\s+([^;]*);)");
+        if (std::regex_search(b, mm, rd)) entry = mm[1].str();
+    }
+    return entry.find("bounded") != std::string::npos;
 }
 
 bool switchOn(const FoamDict& d, const std::string& key, bool def)
@@ -117,6 +149,16 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
     // limitedLinear/linearUpwind/LUST on those weights would silently solve a different discretisation --
     // which is exactly how brae's LUST implicit-weight defect stayed hidden.
     {
+        // `bounded` FIRST: the scheme word after it is still `upwind`, so a guard that only looked at
+        // the scheme word accepted `bounded Gauss upwind` and ran it without the Sp term. Measured on
+        // pitzDaily: the existing solver's Ux residual fell 1 -> 0.022 over 20 iterations while the
+        // rebuilt path plateaued at ~0.5. The term vanishes at convergence, so a converged comparison
+        // cannot see it -- which is precisely why the guard has to.
+        if (divUBounded(caseDir))
+            r.blockers.push_back("div(phi,U) is `bounded`, which adds -fvm::Sp(fvc::div(phi), U) to the "
+                                 "momentum equation. The rebuilt UEqn does not implement it; the term is "
+                                 "zero only at convergence, so omitting it changes the path there.");
+
         const std::string sc = divUScheme(caseDir);
         if (!sc.empty() && sc != "upwind")
             r.blockers.push_back("div(phi,U) asks for `" + sc + "`; the rebuilt UEqn implements `upwind` "
@@ -244,18 +286,8 @@ int runSimpleFoamV2(const std::string& caseDir)
         gf.phiBnd.copyFrom(pb);
     }
 
-    // Laminar for now: the turbulence hook is left unset, so nuEff is constant. A RAS/kEpsilon case is
-    // accepted by the envelope but its model is not yet wired here -- so refuse that combination
-    // explicitly rather than run it laminar, which is the same silent substitution the guard exists to
-    // prevent.
-    {
-        const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
-        if (turbProps.wordOr("simulationType", "laminar") == "RAS")
-            throw std::runtime_error(
-                "BRAE_SIMPLEFOAM_V2=1: this case is RAS/kEpsilon. The rebuilt driver takes turbulence "
-                "through a hook (simpleFoam.cuh StepInput::correct) and that hook is not yet wired to the "
-                "device kEpsilon, so running it here would solve the case LAMINAR. Refusing.");
-    }
+    const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
+    const bool ras = (turbProps.wordOr("simulationType", "laminar") == "RAS");
 
     std::vector<scalar> nuEffC(nC, nu);
     std::vector<std::vector<scalar>> nuEffB(fvp.size());
@@ -279,7 +311,119 @@ int runSimpleFoamV2(const std::string& caseDir)
     adjustable.resize(dm.nBndFaces, 0);
     DeviceBuffer<label> dTakeU(takeU), dAdjust(adjustable);
 
+    // ---- turbulence: k-epsilon on the device, behind the driver's hook ------------------------
+    //
+    // The hook exists so the driver never names a model (that is what made the old solver a god object).
+    // Everything the model needs is set up here and captured; the driver only knows that SOMETHING runs
+    // at the end of the iteration, which is where simpleFoam.C:94 calls turbulence->correct().
+    //
+    // The hook also owns the nuEff REFRESH. The driver reads nuEff through pointers, so updating those
+    // buffers here is what makes the coupling lagged in the right direction: iteration n+1's momentum
+    // equation sees the nut this correct() just produced, and nothing else in the loop has to know.
+    GeometricField<scalar> kF, epsF, nutF;
+    DeviceBuffer<scalar> dK, dEps, dNut;
+    DeviceWallData wall;
+    DeviceBoundary dbK, dbEps, dbNut;
+    DeviceBuffer<label> bndIsWall;
+    DeviceBuffer<scalar> bndY;
+    scalar relaxK = 0.7, relaxEps = 0.7;
+
     StepInput in;
+    if (ras)
+    {
+        kF   = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/k"), fvp, nC);
+        epsF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/epsilon"), fvp, nC);
+        nutF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/nut"), fvp, nC);
+        kF.evaluateBoundary(); epsF.evaluateBoundary(); nutF.evaluateBoundary();
+
+        dK.copyFrom(kF.internal); dEps.copyFrom(epsF.internal); dNut.copyFrom(nutF.internal);
+        dbK   = buildDeviceBoundary(kF,   fvp, g);
+        dbEps = buildDeviceBoundary(epsF, fvp, g);
+        dbNut = buildDeviceBoundary(nutF, fvp, g);
+
+        // Wall geometry for the wall functions. wallU is the patch velocity; a static mesh with no
+        // movingWallVelocity means the field's own boundary value is what the solver imposes.
+        std::vector<std::vector<vector>> wallU(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi) wallU[pi] = f.U.boundary[pi]->value();
+        wall = buildDeviceWallData(m, g, fvp, wallU);
+
+        {
+            const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
+            std::vector<label> isW; std::vector<scalar> yv;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const bool isWall = (fvp[pi].type == "wall");
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    isW.push_back(isWall ? 1 : 0);
+                    yv.push_back(isWall ? yW[pi][i] : 0.0);
+                }
+            }
+            bndIsWall.copyFrom(isW);
+            bndY.copyFrom(yv);
+        }
+
+        if (const FoamDict* rf = fvSolution.subDict("relaxationFactors"))
+            if (const FoamDict* eq = rf->subDict("equations"))
+            {
+                relaxK   = eq->scalarOr("k", relaxK);
+                relaxEps = eq->scalarOr("epsilon", relaxEps);
+            }
+
+        // Seed nuEff from the nut just read, so iteration 1 already uses it.
+        {
+            DeviceBuffer<scalar> nb;
+            deviceBoundaryNut(dbNut, bndIsWall, bndY, dK, dNut, nu, nb);
+            const std::vector<scalar> nutC = dNut.host(), nutB = nb.host();
+            for (label c = 0; c < nC; ++c) nuEffC[c] = nu + nutC[c];
+            std::size_t j = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                for (label i = 0; i < fvp[pi].size; ++i, ++j)
+                    if (j < nutB.size()) nuEffB[pi][i] = nu + nutB[j];
+            }
+            const SurfaceScalarField nf2 = cpu::effectiveFaceViscosity(nuEffC, nuEffB, m, g, fvp);
+            dNuCell.copyFrom(nuEffC);
+            dNuFace.copyFrom(nf2.internal);
+            std::vector<scalar> flat;
+            for (const auto& v : nuEffB) for (scalar x : v) flat.push_back(x);
+            flat.resize(dm.nBndFaces, nu);
+            dNuBnd.copyFrom(flat);
+        }
+
+        in.correct = [&]()
+        {
+            deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
+                                  dK, dEps, dNut, gf.phiInt, gf.phiBnd,
+                                  nu, relaxEps, relaxK, 1e-10);
+
+            // nuEff for the NEXT iteration: nu + nut, with the boundary value from the wall function --
+            // NOT the owner cell's. That distinction is the defect that once made boundary viscosity
+            // 2000x too small; deviceBoundaryNut is what applies the wall function per face.
+            DeviceBuffer<scalar> nb;
+            deviceBoundaryNut(dbNut, bndIsWall, bndY, dK, dNut, nu, nb);
+
+            const std::vector<scalar> nutC = dNut.host(), nutB = nb.host();
+            for (label c = 0; c < nC; ++c) nuEffC[c] = nu + nutC[c];
+            std::size_t j = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                for (label i = 0; i < fvp[pi].size; ++i, ++j)
+                    if (j < nutB.size()) nuEffB[pi][i] = nu + nutB[j];
+            }
+            const SurfaceScalarField nf2 = cpu::effectiveFaceViscosity(nuEffC, nuEffB, m, g, fvp);
+            dNuCell.copyFrom(nuEffC);
+            dNuFace.copyFrom(nf2.internal);
+            std::vector<scalar> flat;
+            for (const auto& v : nuEffB) for (scalar x : v) flat.push_back(x);
+            flat.resize(dm.nBndFaces, nu);
+            dNuBnd.copyFrom(flat);
+        };
+    }
+
     in.nuEffCell = &dNuCell; in.nuEffFace = &dNuFace; in.nuEffBndFace = &dNuBnd;
     in.relaxU = relaxU; in.relaxP = relaxP;
     in.momentumPredictor = cd.momentumPredictor;
@@ -317,7 +461,13 @@ int runSimpleFoamV2(const std::string& caseDir)
 
         writeVolField<scalar>(src + "/p", outDir + "/p", pOut, fvp);
         writeVolField<vector>(src + "/U", outDir + "/U", UOut, fvp);
-        std::printf("written %s/{U,p}\n", outDir.c_str());
+        if (ras)
+        {
+            writeVolField<scalar>(src + "/k",       outDir + "/k",       dK.host(),   fvp);
+            writeVolField<scalar>(src + "/epsilon", outDir + "/epsilon", dEps.host(), fvp);
+            writeVolField<scalar>(src + "/nut",     outDir + "/nut",     dNut.host(), fvp);
+        }
+        std::printf("written %s/{U,p%s}\n", outDir.c_str(), ras ? ",k,epsilon,nut" : "");
     }
     return static_cast<int>(iter);
 }
