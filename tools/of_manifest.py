@@ -57,14 +57,30 @@ COMPONENTS = {
         dict(name="simpleFoam_main", of_symbol="main",
              of_file="applications/solvers/incompressible/simpleFoam/simpleFoam.C",
              classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/simpleFoam/simpleFoam_cpp.cu",
              brae_target="src/applications/solvers/simpleFoam/simpleFoam.cu",
-             note="Thin driver. Must own no numerics; the old god-object is what this replaces."),
+             validation="tests/test_simple_step_cpp.cu -- END-TO-END, one SIMPLE iteration composed of the "
+                        "_cpp components vs OpenFOAM dumpSimpleStep (validation/matrixDumpSimple/step.dat): "
+                        "p 2.5e-11, U 1.6e-12, phi 1.2e-11, every boundary patch <= 3.5e-13. Gate set at "
+                        "1e-9, not the 1e-5 the older step test uses.",
+             note="The _cpp driver owns NO numerics -- 9 calls into shared components, each with its own "
+                  "OpenFOAM provenance and test. Replaces a 3578-line file that pimpleFoam, rhoSimpleFoam "
+                  "and five common/ headers all included. NOTE ON THE FIXTURE: matrixDumpSimple's "
+                  "fvSolution sets `consistent yes`, but step.dat was dumped with plain SIMPLE; the test "
+                  "asserts the SIMPLEC refusal fires on that case and then compares with SIMPLEC off. A "
+                  "SIMPLEC oracle is needed before SIMPLEC can be ported."),
         dict(name="createFields", of_symbol="createFields.H",
              of_file="applications/solvers/incompressible/simpleFoam/createFields.H",
              classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/simpleFoam/createFields_cpp.cu",
              brae_target="src/applications/solvers/simpleFoam/createFields.cu",
+             validation="tests/test_simple_step_cpp.cu -- phi READ from disk (not recomputed), "
+                        "needReference() false on a case whose outlet fixes p, so no reference cell is "
+                        "set and adjustPhi does not run.",
              note="p and U are MUST_READ; phi comes from createPhi.H (READ_IF_PRESENT, else "
-                  "linearInterpolate(U) & Sf) -- the read-if-present half was a past defect."),
+                  "fvc::flux(U)) -- the read-if-present half was a past defect. setRefCell REFUSES when a "
+                  "reference is needed and neither pRefCell nor pRefPoint is given, rather than quietly "
+                  "pinning cell 0; pRefPoint is refused outright (needs mesh.findCell)."),
         dict(name="UEqn", of_symbol="UEqn.H",
              of_file="applications/solvers/incompressible/simpleFoam/UEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
@@ -83,14 +99,29 @@ COMPONENTS = {
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/simpleFoam/pEqn_cpp.cu",
              brae_target="src/applications/solvers/simpleFoam/pEqn.cu",
-             note="50 lines. Includes the SIMPLEC (`consistent`) branch via UEqn.H1()."),
+             validation="tests/test_peqn_cpp.cu -- stage by stage on validation/matrixDumpAsym: rAU and "
+                        "HbyA vs OpenFOAM A()/H() (ops.dat) to 1e-11; the pressure Laplacian incl. all "
+                        "patch coefficients vs peqn.dat to 1e-11; source == laplacian source + "
+                        "div(phiHbyA)*V; setReference asserted to be exactly fvMatrix.C:1011-1023 (it "
+                        "DOUBLES the diagonal, it does not overwrite it); correctFlux analytic at p=0; "
+                        "relaxField analytic; MRF/fvOptions/consistent all refused.",
+             note="50 lines. Every intermediate is RETURNED rather than kept local, so the first divergent "
+                  "stage can be isolated -- a past investigation ended at `phi = phiHbyA - pEqn.flux()`, "
+                  "which is stage 7 here. SIMPLEC (`consistent`) is refused: it needs UEqn.H1() and "
+                  "fvc::snGrad, neither ported. The CUDA side is not written yet."),
 
         # ---- control -------------------------------------------------------------------------
         dict(name="simpleControl", of_symbol="Foam::simpleControl",
              of_file="src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl.C",
              classification="CONFIGURATION", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/cfdTools/general/solutionControl/simpleControl/"
+                            "simpleControl_cpp.cu",
              brae_target="src/finiteVolume/cfdTools/general/solutionControl/simpleControl/",
              schema_for="solutionControl",
+             validation="tests/test_simple_step_cpp.cu -- parses the real matrixDumpSimple SIMPLE block: "
+                        "`consistent yes`, nNonOrthogonalCorrectors 0, three residualControl entries "
+                        "including the regex key \"(k|epsilon|omega|f|v2)\" which matches 'epsilon' and "
+                        "not 'T'; correctNonOrthogonal runs nNonOrth+1 times and resets.",
              note="loop() = setFirstIterFlag; read(); if(initialised && criteriaSatisfied) writeAndEnd(); "
                   "else storePrevIterFields(); return runTime.loop(). Reads its keys from "
                   "solutionDict().subOrEmptyDict('SIMPLE')."),
