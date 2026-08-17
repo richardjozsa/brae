@@ -89,6 +89,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/UEqn.cu
     src/applications/solvers/simpleFoam/pEqn.cu
     src/applications/solvers/simpleFoam/simpleFoam.cu
+    src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
@@ -536,6 +537,13 @@ add_test(NAME kepsilon_correct
 # cannot be detected, and the floor here used to be 3.6e-02 after 20 iterations. Two cases, because the
 # turbulence wall functions were one of the three scatter sites and kEpsilon/kOmegaSST take different ones.
 # SKIP_RETURN_CODE 77 lets it skip cleanly when no GPU binary is present.
+# DISPATCH GATE for the rebuilt simpleFoam: off changes nothing, on+supported runs, on+unsupported
+# REFUSES with the reason. A path that quietly degrades is indistinguishable from a correct one.
+add_test(NAME simplefoam_v2_dispatch
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simplefoam_v2_dispatch.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(simplefoam_v2_dispatch PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
 add_test(NAME determinism_kepsilon
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/determinism_gate.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily 20)

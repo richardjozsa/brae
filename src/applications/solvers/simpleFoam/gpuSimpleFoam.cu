@@ -22,6 +22,7 @@
 #include "scheme_parse.cuh"
 #include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
+#include "simpleFoamV2.cuh"      // the rebuilt path + its envelope guard (BRAE_SIMPLEFOAM_V2)
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
 #include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
@@ -162,6 +163,18 @@ int main(int argc, char** argv)
         // read or CUDA init. -partition is solver-agnostic prep (mesh + AMG cache) and always runs here.
         // Registry + rules: solvers/common/solver_dispatch.cuh.
         if (!partition) dispatchSolver(caseDir, argc, argv);
+
+        // The REBUILT simpleFoam (UEqn.cu + pEqn.cu + simpleFoam.cu), selected with BRAE_SIMPLEFOAM_V2=1.
+        // It covers a strict subset of what the code below runs, so it is opt-in -- but once selected it
+        // either runs the case or REFUSES with the reason. It must never quietly fall through to the old
+        // solver: a user who asked for the new path and silently got the old one cannot tell from the
+        // output which algorithm produced their answer, and that is the failure mode this rebuild exists
+        // to remove. Hence no try/catch here.
+        if (!partition && gpu::simpleFoamV2Selected())
+        {
+            gpu::runSimpleFoamV2(caseDir);
+            return 0;
+        }
 
         // -partition is cf's analogue of OF decomposePar: do the one-time prep (parse mesh + build AMG hierarchy) and
         // persist it to constant/polyMesh/.brae_mesh|amgcache, so the actual run reloads it warm. Forces the cache write.
