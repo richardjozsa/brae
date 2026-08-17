@@ -19,6 +19,7 @@
 //     relaxField            pEqn_cpp            (p.relax())
 //     correctVelocity       pEqn_cpp            (U = HbyA - rAU*grad(p))
 //     correctNonOrthogonal  simpleControl_cpp   (the corrector loop)
+//     kepsilon::correct     TurbulenceModels    (turbulence->correct(), after the pressure corrector)
 //
 // Compare with what it replaces: src/applications/solvers/simpleFoam/device_simple_foam.cu, 3578 lines,
 // included by pimpleFoam, rhoSimpleFoam and five headers in solvers/common.
@@ -34,6 +35,8 @@
 #include "fv_patch.cuh"
 #include "createFields_cpp.cuh"
 #include "simpleControl_cpp.cuh"
+#include "kepsilon_coeffs.cuh"
+#include "geometric_field.cuh"
 #include <map>
 #include <string>
 #include <vector>
@@ -41,9 +44,33 @@
 namespace brae {
 namespace cpu {
 
+// Turbulence coupling. simpleFoam.C:93-94 calls laminarTransport.correct() then turbulence->correct()
+// AFTER the pressure corrector, so the momentum equation of iteration n uses nut from iteration n-1 --
+// a LAGGED coupling. Running correct() before UEqn instead is a different algorithm that still converges
+// to something plausible, which is exactly why the order is written down here rather than assumed.
+//
+// nuEff is DERIVED rather than supplied: nuEff = nu + nut, with boundary values from nut's own boundary
+// field (nut_wall on a wall function), never the owner cell. That boundary rule has bitten brae before;
+// see effectiveFaceViscosity.
+struct TurbulenceState
+{
+    GeometricField<scalar>* k = nullptr;
+    GeometricField<scalar>* epsilon = nullptr;
+    GeometricField<scalar>* nut = nullptr;
+    KEpsilonCoeffs coeffs{};
+    scalar relaxK = 0.7, relaxEpsilon = 0.7;
+    scalar tol = 1e-10, relTol = 0.0;
+    int    maxIter = 2000;
+};
+
 struct StepInput
 {
-    std::vector<scalar>              nuEff;      // cells
+    // Laminar viscosity. With `turb` set, nuEff is built from nu + nut each iteration and the two arrays
+    // below are ignored; without it they are used as given (the laminar path).
+    scalar nu = 1e-5;
+    TurbulenceState* turb = nullptr;
+
+    std::vector<scalar>              nuEff;      // cells    (laminar path only)
     std::vector<std::vector<scalar>> nuEffBnd;   // [patch][face]
     scalar relaxU = 0.7;                         // relaxationFactors/equations U
     scalar relaxP = 0.3;                         // relaxationFactors/fields p
