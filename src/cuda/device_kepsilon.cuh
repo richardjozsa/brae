@@ -74,6 +74,10 @@ struct DeviceWallData
     // patch with weights (1-mask), and epsilonWallFunction only constrains where weight > 1e-5.
     // See buildDeviceWallData for what counting them anyway cost.
     DeviceBuffer<label>  wfCell, isWallCell;
+    // Wall-face gather grouped by cell -- see the note in buildWallData. nWC wall cells; wcCell[i] is the
+    // mesh cell, and wcFace[wcStart[i] .. wcStart[i+1]) are its wall faces in ascending face index.
+    int                  nWC = 0;
+    DeviceBuffer<label>  wcCell, wcStart, wcFace;
     // ...and the weight itself, for the partially blocked faces in between: OF blends rather than
     // switches, G[c] = (1-w)*G[c] + w*G0[c] and the same for epsilon (epsilonWallFunction.C:592).
     DeviceBuffer<scalar> wallW;
@@ -116,6 +120,33 @@ inline DeviceWallData buildDeviceWallData(
             invNw[c] = 1.0 / nw[c];
             isW[c] = 1;
         }
+
+    // WALL-CELL GATHER ADDRESSING (determinism).
+    //
+    // The wall kernels used to run one thread per wall FACE and atomicAdd the near-wall production into
+    // G0[cell] and eps0/omega0[cell]. `invNw` is 1/(wall faces on this cell), so cells with more than one
+    // wall face demonstrably exist -- and for those the summation order was whatever order the faces
+    // happened to be scheduled in. It is a rare race (most wall cells have exactly one wall face), which
+    // made it worse rather than better: two identical 1-iteration pitzDaily runs came out bit-identical
+    // twice and 1 ULP apart on the third, on epsilon and nut only. The SIMPLE loop then amplified that
+    // single ULP to 1.3e-3 by iteration 20.
+    //
+    // Grouping the wall faces by cell lets one thread own a cell and sum its faces in ascending face
+    // index -- a fixed order -- then write once.
+    std::vector<label> wcCell;
+    for (label c = 0; c < m.nCells(); ++c) if (nw[c] > 0) wcCell.push_back(c);
+    std::vector<label> cellSlot(m.nCells(), -1);
+    for (std::size_t i = 0; i < wcCell.size(); ++i) cellSlot[wcCell[i]] = static_cast<label>(i);
+
+    std::vector<label> wcStart(wcCell.size() + 1, 0);
+    for (std::size_t f = 0; f < wfCell.size(); ++f) ++wcStart[cellSlot[wfCell[f]] + 1];
+    for (std::size_t i = 0; i < wcCell.size(); ++i) wcStart[i+1] += wcStart[i];
+    std::vector<label> wcFace(wfCell.size());
+    {
+        std::vector<label> at(wcStart.begin(), wcStart.end() - 1);
+        for (std::size_t f = 0; f < wfCell.size(); ++f)
+            wcFace[at[cellSlot[wfCell[f]]]++] = static_cast<label>(f);
+    }
     // THE ACMI NON-OVERLAP WALL IS ONLY A WALL WHERE IT IS CLOSED.
     //
     // A cyclicACMI carries a coincident wall (its nonOverlapPatch) whose area is (1-mask)*A, so on the
@@ -149,6 +180,10 @@ inline DeviceWallData buildDeviceWallData(
         if (wallW[c] <= ACMI_WALL_TOL) isW[c] = 0;   // a wall face with no wall behind it
     DeviceWallData w;
     w.nWF = static_cast<int>(wfCell.size());
+    w.nWC = static_cast<int>(wcCell.size());
+    w.wcCell.copyFrom(wcCell);
+    w.wcStart.copyFrom(wcStart);
+    w.wcFace.copyFrom(wcFace);
     w.wfCell.copyFrom(wfCell);
     w.wfY.copyFrom(wfY);
     w.wfDc.copyFrom(wfDc);

@@ -70,45 +70,73 @@ void rapScatterK(
     else if (dk==1) atomicAdd(&cUp[di], v);
     else atomicAdd(&cLo[di], v);
 }
-// Injection Galerkin scatter (default path): coarse LDU from fine diag/upper/lower via faceRestrict/faceFlip.
+// Injection Galerkin (default path): coarse LDU from fine diag/upper/lower via faceRestrict/faceFlip.
+//
+// DETERMINISM. These used to SCATTER with atomicAdd -- cDiag[map[c]] += fineDiag[c] and
+// cUp[fr[f]] += up[f] -- and the contention is heavy by construction: agglomeration exists precisely to
+// map many fine entities onto one coarse entity. The summation order was therefore whatever order the
+// blocks happened to finish in, so the COARSE OPERATOR itself differed bit-for-bit between two runs of
+// the same binary on the same case. That changes the preconditioner, which changes the Krylov path,
+// which stops the pressure solve at a different iterate. Measured on pitzDaily/kEpsilon: two identical
+// 1-iteration runs already disagreed by 1.9e-8, growing to 1.6e-6 by iteration 2, 1.4e-3 by 5 and
+// 3.6e-2 by 20 -- the SIMPLE loop amplifies the seed.
+//
+// The cure is to GATHER instead. The agglomeration is static for the life of the mesh (that is why the
+// AMG hierarchy can be cached at all), so the inverse maps -- which fine cells feed a coarse cell, which
+// fine faces feed a coarse face -- are built once on the host as CSR lists and reused by every solve.
+// One thread per COARSE entity then sums its own contributions in ascending fine index, a fixed order,
+// and WRITES the result rather than accumulating into it. That also removes the need to pre-zero the
+// coarse arrays on this path.
+//
+// Cost: three label arrays per level, built once. No per-solve work is added.
 __global__
-void galDiagK(
-    int nF,
-    const label* __restrict__ map,
+void galDiagGatherK(
+    int nCoarse,
+    const label* __restrict__ cellStart,   // [nCoarse+1] into cellList
+    const label* __restrict__ cellList,    // fine cells feeding this coarse cell, ascending
+    const label* __restrict__ dfaceStart,  // [nCoarse+1] into dfaceList
+    const label* __restrict__ dfaceList,   // fine faces INTERNAL to this agglomerate (faceRestrict < 0)
     const scalar* __restrict__ fineDiag,
-    scalar* __restrict__ cDiag)
-{
-    const int c = blockIdx.x*blockDim.x + threadIdx.x;
-    if (c < nF) atomicAdd(&cDiag[map[c]], fineDiag[c]);
-}
-__global__
-void galFaceK(
-    int nFaces,
-    const label* __restrict__ fr,
-    const label* __restrict__ flip,
     const scalar* __restrict__ up,
     const scalar* __restrict__ lo,
-    scalar* __restrict__ cDiag,
+    scalar* __restrict__ cDiag)
+{
+    const int ci = blockIdx.x*blockDim.x + threadIdx.x;
+    if (ci >= nCoarse) return;
+    scalar s = 0.0;
+    for (label k = cellStart[ci]; k < cellStart[ci+1]; ++k) s += fineDiag[cellList[k]];
+    // A face interior to an agglomerate contributes both its off-diagonals to the coarse DIAGONAL.
+    for (label k = dfaceStart[ci]; k < dfaceStart[ci+1]; ++k)
+    {
+        const label f = dfaceList[k];
+        s += up[f] + lo[f];
+    }
+    cDiag[ci] = s;
+}
+__global__
+void galFaceGatherK(
+    int nCoarseFaces,
+    const label* __restrict__ faceStart,   // [nCoarseFaces+1] into faceList/faceFlipList
+    const label* __restrict__ faceList,    // fine faces feeding this coarse face, ascending
+    const label* __restrict__ faceFlipList,
+    const scalar* __restrict__ up,
+    const scalar* __restrict__ lo,
     scalar* __restrict__ cUp,
     scalar* __restrict__ cLo)
 {
-    const int f = blockIdx.x*blockDim.x + threadIdx.x;
-    if (f >= nFaces) return;
-    const int cf = fr[f];
-    if (cf >= 0)
+    const int cf = blockIdx.x*blockDim.x + threadIdx.x;
+    if (cf >= nCoarseFaces) return;
+    scalar u = 0.0, l = 0.0;
+    for (label k = faceStart[cf]; k < faceStart[cf+1]; ++k)
     {
-        if (!flip[f])
-        {
-            atomicAdd(&cUp[cf], up[f]);
-            atomicAdd(&cLo[cf], lo[f]);
-        }
-        else
-        {
-            atomicAdd(&cUp[cf], lo[f]);
-            atomicAdd(&cLo[cf], up[f]);
-        }
+        const label f = faceList[k];
+        // flip means the fine face's owner/neighbour orientation is reversed relative to the coarse
+        // face's, so upper and lower swap -- exactly as the scatter version did.
+        if (!faceFlipList[k]) { u += up[f]; l += lo[f]; }
+        else                  { u += lo[f]; l += up[f]; }
     }
-    else atomicAdd(&cDiag[-1-cf], up[f]+lo[f]);
+    cUp[cf] = u;
+    cLo[cf] = l;
 }
 
 
@@ -117,6 +145,61 @@ void galFaceK(
 
 
 namespace {
+
+// Invert map/faceRestrict into the CSR gather lists the deterministic Galerkin kernels read.
+//
+// Counting sort, so each coarse entity's list comes out in ASCENDING fine index -- a fixed traversal
+// order, which is the whole point. Runs once per level at hierarchy build; the AMG cache stores the
+// agglomeration this is derived from, so a cached hierarchy rebuilds these for free.
+template <class AgglomT>
+void buildGalerkinGather(AMGLevel& L, const AgglomT& a, int nFine)
+{
+    const int nC = a.nCoarse, nCF = a.nCoarseFaces;
+    const int nFaces = static_cast<int>(a.faceRestrict.size());
+
+    // coarse cell <- fine cells
+    std::vector<label> cs(nC + 1, 0), cl(nFine);
+    for (int c = 0; c < nFine; ++c) ++cs[a.map[c] + 1];
+    for (int i = 0; i < nC; ++i) cs[i+1] += cs[i];
+    {
+        std::vector<label> at(cs.begin(), cs.end() - 1);
+        for (int c = 0; c < nFine; ++c) cl[at[a.map[c]]++] = c;
+    }
+
+    // coarse cell <- fine faces interior to the agglomerate (faceRestrict < 0), and
+    // coarse face  <- fine faces (faceRestrict >= 0), with the flip carried alongside.
+    std::vector<label> ds(nC + 1, 0), fs(nCF + 1, 0);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label cf = a.faceRestrict[f];
+        if (cf >= 0) ++fs[cf + 1];
+        else         ++ds[(-1 - cf) + 1];
+    }
+    for (int i = 0; i < nC;  ++i) ds[i+1] += ds[i];
+    for (int i = 0; i < nCF; ++i) fs[i+1] += fs[i];
+
+    std::vector<label> dl(ds[nC]), fl(fs[nCF]), ff(fs[nCF]);
+    {
+        std::vector<label> dat(ds.begin(), ds.end() - 1), fat(fs.begin(), fs.end() - 1);
+        for (int f = 0; f < nFaces; ++f)
+        {
+            const label cf = a.faceRestrict[f];
+            if (cf >= 0)
+            {
+                const label k = fat[cf]++;
+                fl[k] = f;
+                ff[k] = a.faceFlip[f];
+            }
+            else dl[dat[-1 - cf]++] = f;
+        }
+    }
+
+    L.galCellStart.copyFrom(cs);   L.galCellList.copyFrom(cl);
+    L.galDFaceStart.copyFrom(ds);  L.galDFaceList.copyFrom(dl);
+    L.galFaceStart.copyFrom(fs);   L.galFaceList.copyFrom(fl);
+    L.galFaceFlipList.copyFrom(ff);
+}
+
 // One pairwise agglomeration step (host): merge cells of a grid (owner/nei/faceWeights, nC cells) into a coarse
 // grid. Returns the cell->coarse map, the coarse addressing (cOwn/cNei + gather starts), the face restriction,
 // and the carried coarse face weights (sum of the agglomerated fine face weights) for the NEXT level.
@@ -807,6 +890,7 @@ AMGData buildAMG(
             L.cLosortStart.copyFrom(a.cLS);
             L.faceRestrict.copyFrom(a.faceRestrict);
             L.faceFlip.copyFrom(a.faceFlip);
+            buildGalerkinGather(L, a, n);
             L.cDiag.resize(a.nCoarse);
             L.cUpper.resize(a.nCoarseFaces);
             L.cLower.resize(a.nCoarseFaces);
@@ -917,17 +1001,25 @@ void amgGalerkin(
             fl = A.level[k-1].cLower.data();
             nFaces = A.level[k-1].nCoarseFaces;
         }
-        zeroT<scalar><<<nBlocks(L.nCoarse),TPB>>>(L.nCoarse, L.cDiag.data());
-        zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cUpper.data());
-        zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cLower.data());
         if (A.saSmooth)                                          // general Galerkin A_c = P^T A P (precomputed RAP recipe)
+        {
+            // The SA path still SCATTERS, so it is still order-dependent. It is opt-in (BRAE_AMG_SA) and
+            // off by default; leaving it as it was keeps this change to one behaviour at a time. The
+            // determinism gate asserts the DEFAULT path, and the SA path is listed as a known gap.
+            zeroT<scalar><<<nBlocks(L.nCoarse),TPB>>>(L.nCoarse, L.cDiag.data());
+            zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cUpper.data());
+            zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cLower.data());
             rapScatterK<<<nBlocks(L.nTriples),TPB>>>(L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(),
                 L.rapDstKind.data(), L.rapDstIdx.data(), fd, fu, fl, L.cDiag.data(), L.cUpper.data(), L.cLower.data());
-        else                                                  // injection Galerkin (default): face-restrict scatter
+        }
+        else       // injection Galerkin (default): fixed-order GATHER per coarse entity, no pre-zero needed
         {
-            galDiagK<<<nBlocks(L.nFine),TPB>>>(L.nFine, L.map.data(), fd, L.cDiag.data());
-            galFaceK<<<nBlocks(nFaces),TPB>>>(nFaces, L.faceRestrict.data(), L.faceFlip.data(), fu, fl,
-                                              L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            galDiagGatherK<<<nBlocks(L.nCoarse),TPB>>>(
+                L.nCoarse, L.galCellStart.data(), L.galCellList.data(),
+                L.galDFaceStart.data(), L.galDFaceList.data(), fd, fu, fl, L.cDiag.data());
+            galFaceGatherK<<<nBlocks(L.nCoarseFaces),TPB>>>(
+                L.nCoarseFaces, L.galFaceStart.data(), L.galFaceList.data(), L.galFaceFlipList.data(),
+                fu, fl, L.cUpper.data(), L.cLower.data());
         }
     }
     cudaCheck(cudaGetLastError(), "galerkin");

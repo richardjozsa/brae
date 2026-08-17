@@ -147,8 +147,10 @@ void rkeEpsReactionKernel(
 
 __global__
 void wallFnKernel(
-    int nWF,
-    const label* __restrict__ wfCell,
+    int nWC,
+    const label* __restrict__ wcCell,
+    const label* __restrict__ wcStart,
+    const label* __restrict__ wcFace,
     const scalar* __restrict__ wfY,
     const scalar* __restrict__ wfDc,
     const scalar* __restrict__ wux,
@@ -172,16 +174,28 @@ void wallFnKernel(
     scalar* __restrict__ G0,
     const scalar* __restrict__ nuFace)   // compressible: per-wall-face nu, null -> the scalar nu
 {
-    const int wf = blockIdx.x * blockDim.x + threadIdx.x;
-    if (wf >= nWF) return;
+    // One thread per wall CELL, summing that cell's wall faces in ascending face index and writing once.
+    // The per-face form needed atomicAdd here, and a cell with more than one wall face then depended on
+    // scheduling order -- rare, intermittent, and amplified by the SIMPLE loop. See buildDeviceWallData.
+    const int wc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (wc >= nWC) return;
 
-    const int c = wfCell[wf];
-    const scalar y = wfY[wf], dc = wfDc[wf], kc = k[c];
-    // OF epsilonWallFunction reads turbulenceModel::nu(patchi) = mu_b/rho_b, a per-FACE field. The scalar
-    // fallback is only right for constant-property incompressible flow.
-    const scalar nuw = nuFace ? nuFace[wf] : nu;
-    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nuw, yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall, G0);
-    atomicAdd(&eps0[c], invNw[c] * Cmu75 * pow(kc, 1.5) / (kappa * y));   // kEpsilon: distinct eps wall value
+    const int c = wcCell[wc];
+    const scalar kc = k[c], iN = invNw[c];
+    scalar g0 = 0.0, e0 = 0.0;
+    for (label j = wcStart[wc]; j < wcStart[wc+1]; ++j)
+    {
+        const label wf = wcFace[j];
+        const scalar y = wfY[wf], dc = wfDc[wf];
+        // OF epsilonWallFunction reads turbulenceModel::nu(patchi) = mu_b/rho_b, a per-FACE field. The
+        // scalar fallback is only right for constant-property incompressible flow.
+        const scalar nuw = nuFace ? nuFace[wf] : nu;
+        g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
+                               yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
+        e0 += iN * Cmu75 * pow(kc, 1.5) / (kappa * y);   // kEpsilon: distinct eps wall value
+    }
+    G0[c]   = g0;
+    eps0[c] = e0;
 }
 
 
@@ -511,8 +525,9 @@ void deviceWallEpsG0(
     cudaCheck(cudaMemsetAsync(eps0.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "eps0 zero");
     cudaCheck(cudaMemsetAsync(G0.data(),   0, nC*sizeof(scalar), cudaStreamPerThread), "G0 zero");
     const scalar Cmu25 = std::pow(co.Cmu, 0.25), Cmu75 = std::pow(co.Cmu, 0.75), yplLam = yPlusLamHost(co.kappa, co.E);
-    if (w.nWF > 0)
-        wallFnKernel<<<nBlocks(w.nWF), TPB>>>(w.nWF, w.wfCell.data(), w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
+    if (w.nWC > 0)
+        wallFnKernel<<<nBlocks(w.nWC), TPB>>>(w.nWC, w.wcCell.data(), w.wcStart.data(), w.wcFace.data(),
+                                              w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
                                               w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(), Uy.data(),
                                               Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, eps0.data(), G0.data(),
                                               (nuFace && nuFace->size()) ? nuFace->data() : nullptr);

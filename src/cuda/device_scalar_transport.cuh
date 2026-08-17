@@ -32,25 +32,67 @@ inline std::vector<ScalarSolveEntry>& turbStore() { static std::vector<ScalarSol
 
 namespace {
 // setValues (eps wall constraint): zero wall-cell off-diagonals + move the known eps0 to the neighbour RHS.
+//
+// DETERMINISM. This was one kernel, one thread per internal FACE, moving the contribution with
+//     if (ow) atomicAdd(&source[n], -lower[f]*eps0[o]);
+//     if (nw) atomicAdd(&source[o], -upper[f]*eps0[n]);
+// A cell receives one such contribution per constrained face it touches, so the summation order followed
+// face scheduling. It is rare -- it only bites a cell in the near-wall band with more than one constrained
+// face -- which is exactly what made it hard to see: pitzDaily/kEpsilon came out bit-identical at 1, 5, 8,
+// 10 and 15 iterations and differed at 12.
+//
+// Split into a GATHER over cells (fixed order, no atomics) and a separate zeroing pass over faces. The
+// split is required, not cosmetic: the gather must read the ORIGINAL upper/lower, and a single kernel
+// cannot order "everyone reads" before "everyone zeroes". Two launches give that ordering for free.
+//
+// Per cell c the contributions are, in this order:
+//   faces where c is OWNER      f in [ownerStart[c], ownerStart[c+1])   ->  -upper[f]*eps0[nei[f]]
+//   faces where c is NEIGHBOUR  f = losort[k], k in [losortStart[c], losortStart[c+1])
+//                                                                      ->  -lower[f]*eps0[own[f]]
+// which is the same set of terms the scatter produced, just accumulated in a fixed sequence.
 __global__
-void svFaceKernel(
+void svGatherKernel(
+    int nC,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ isW,
+    const scalar* __restrict__ eps0,
+    const scalar* __restrict__ upper,
+    const scalar* __restrict__ lower,
+    scalar* __restrict__ source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    scalar s = 0.0;
+    for (label f = ownerStart[c]; f < ownerStart[c+1]; ++f)
+    {
+        const int n = nei[f];
+        if (isW[n]) s -= upper[f] * eps0[n];
+    }
+    for (label k = losortStart[c]; k < losortStart[c+1]; ++k)
+    {
+        const label f = losort[k];
+        const int o = own[f];
+        if (isW[o]) s -= lower[f] * eps0[o];
+    }
+    if (s != 0.0) source[c] += s;
+}
+// Zeroing pass: independent per face, no accumulation, so it needs no ordering guarantee of its own.
+__global__
+void svZeroFaceKernel(
     int nIf,
     const label* __restrict__ own,
     const label* __restrict__ nei,
     const label* __restrict__ isW,
-    const scalar* __restrict__ eps0,
     scalar* __restrict__ upper,
-    scalar* __restrict__ lower,
-    scalar* __restrict__ source)
+    scalar* __restrict__ lower)
 {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f >= nIf) return;
-
-    const int o = own[f], n = nei[f];
-    const bool ow = isW[o], nw = isW[n];
-    if (ow) atomicAdd(&source[n], -lower[f] * eps0[o]);
-    if (nw) atomicAdd(&source[o], -upper[f] * eps0[n]);
-    if (ow || nw) { upper[f] = 0.0; lower[f] = 0.0; }
+    if (isW[own[f]] || isW[nei[f]]) { upper[f] = 0.0; lower[f] = 0.0; }
 }
 
 
@@ -323,14 +365,20 @@ void deviceSolveScalarTransport(
     { DeviceBuffer<scalar> t; deviceHadamard(t, aDelta, field); deviceAxpy(1.0, t, src); }
     if (fvoSetMask && fvoSetVal)   // fvOptions scalarFixedValueConstraint (OF: before boundaryManipulate)
     {
-        svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), fvoSetMask->data(), fvoSetVal->data(), aU.data(), aL.data(), src.data());
+        svGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
+                                            dm.losort.data(), dm.losortStart.data(), fvoSetMask->data(), fvoSetVal->data(),
+                                            aU.data(), aL.data(), src.data());
+        svZeroFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), fvoSetMask->data(), aU.data(), aL.data());
         svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), fvoSetMask->data(), aIC.data(), aBC.data());
         svCellKernel<<<nBlocks(nC), TPB>>>(nC, fvoSetMask->data(), aRD.data(), fvoSetVal->data(), src.data());
         cudaCheck(cudaGetLastError(), "fvOptionsSetValues");
     }
         if (wall && eps0)   // eps near-wall setValues constraint (k has none)
     {
-        svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), wall->isWallCell.data(), eps0->data(), aU.data(), aL.data(), src.data());
+        svGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
+                                            dm.losort.data(), dm.losortStart.data(), wall->isWallCell.data(), eps0->data(),
+                                            aU.data(), aL.data(), src.data());
+        svZeroFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), wall->isWallCell.data(), aU.data(), aL.data());
         svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), wall->isWallCell.data(), aIC.data(), aBC.data());
         svCellKernel<<<nBlocks(nC), TPB>>>(nC, wall->isWallCell.data(), aRD.data(), eps0->data(), src.data());
         if (ami && ami->n) interfaceZeroWallIfCoeff(*ami, wall->isWallCell);   // wall/interface cells: don't perturb the fixed eps

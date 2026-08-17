@@ -115,13 +115,17 @@ BRAE_HD inline scalar blendedNutValue(scalar magUp, scalar magGradU, scalar y, s
     return fmax(scalar(0.0), uTau*uTau / (magGradU + scalar(1e-300)) - nu);
 }
 
-// Shared near-wall production for the kEpsilon and kOmegaSST wall functions: compute nutw + |grad(U)|_wall and scatter
-// the turbulence production into G0[c]. The G0 term is IDENTICAL for both models (this enforces that by construction,
-// the komega wall kernel used to carry a hand-copy); each caller then adds only its distinct eps0 / omega0 term.
-// __device__ (uses atomicAdd), called from the wall kernels only.
+// Shared near-wall production for the kEpsilon and kOmegaSST wall functions: compute nutw + |grad(U)|_wall and
+// RETURN this face's turbulence-production contribution. The term is IDENTICAL for both models (this enforces
+// that by construction, the komega wall kernel used to carry a hand-copy); each caller then adds only its
+// distinct eps0 / omega0 term.
+//
+// It used to atomicAdd straight into G0[c]. It returns instead, so the caller -- which now owns a whole cell
+// and iterates that cell's wall faces in a fixed order -- accumulates in a register and writes once. Same
+// arithmetic, no atomics, and the result no longer depends on face scheduling order.
 // nutWall: 0 = nutkWallFunction (k-based), 1 = nutUSpalding, 2 = nutUBlended (velocity-based) -- MUST match the
 // momentum wall-shear choice (ctl.nutWall) so the near-wall production uses the same nutw OpenFOAM does.
-__device__ inline void wallProductionG0(
+__device__ inline scalar wallProductionG0(
     int c,
     int wf,
     scalar y,
@@ -141,8 +145,7 @@ __device__ inline void wallProductionG0(
     scalar E,
     scalar atmZ0,        // >0 -> atmNutkWallFunction (rough) for the k-based path; 0 -> nutkWallFunction (smooth)
     bool   atmBoundNut,
-    int nutWall,
-    scalar* G0)
+    int nutWall)
 {
     const scalar dux = (wux[wf]-Ux[c])*dc, duy = (wuy[wf]-Uy[c])*dc, duz = (wuz[wf]-Uz[c])*dc;
     const scalar magG = sqrt(dux*dux + duy*duy + duz*duz);   // |snGrad U| = magGradU
@@ -160,7 +163,7 @@ __device__ inline void wallProductionG0(
         nutw = (nutWall == 1) ? spaldingNutValue(magUp, magG, y, nu, kappa, E, scalar(0.0))
                               : blendedNutValue (magUp, magG, y, nu, kappa, E, scalar(0.0));
     }
-    atomicAdd(&G0[c], invNwC * (nutw + nu) * magG * Cmu25 * sqrt(kc) / (kappa * y));
+    return invNwC * (nutw + nu) * magG * Cmu25 * sqrt(kc) / (kappa * y);
 }
 
 std::vector<scalar> nutkWallFunction(

@@ -80,16 +80,34 @@ void gsColorT(
     x[c] = (b[c] - off) / safeDiag(diag[c]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0
 }
 
+// RESTRICTION, fine residual -> coarse right-hand side.
+//
+// This is the hottest nondeterminism site in the solver: it runs on every level of every V-cycle of every
+// PCG iteration, and by construction many fine cells land on one coarse cell. The scatter form
+//
+//     if (c < nF) atomicAdd(&rc[map[c]], r[c]);
+//
+// therefore summed in whatever order the blocks finished, so the coarse right-hand side -- and with it the
+// preconditioned direction, the Krylov path and the iterate the solve stops at -- differed between two
+// runs of the same binary on the same case.
+//
+// The gather form sums each coarse cell's fine cells in ascending fine index from the CSR inverse of `map`
+// (AMGLevel::galCellStart/galCellList, built once because agglomeration is static). One thread per COARSE
+// cell, and it WRITES rather than accumulating, so the caller no longer has to pre-zero rc.
 template <typename T>
 __global__
-void restrictT(
-    int nF,
-    const label* __restrict__ map,
+void restrictGatherT(
+    int nCoarse,
+    const label* __restrict__ cellStart,
+    const label* __restrict__ cellList,
     const T* __restrict__ r,
     T* __restrict__ rc)
 {
-    const int c = blockIdx.x*blockDim.x + threadIdx.x;
-    if (c < nF) atomicAdd(&rc[map[c]], r[c]);
+    const int ci = blockIdx.x*blockDim.x + threadIdx.x;
+    if (ci >= nCoarse) return;
+    T s = T(0);
+    for (label k = cellStart[ci]; k < cellStart[ci+1]; ++k) s += r[cellList[k]];
+    rc[ci] = s;
 }
 template <typename T>
 __global__

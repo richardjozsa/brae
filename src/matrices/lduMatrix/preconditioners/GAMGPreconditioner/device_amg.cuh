@@ -46,6 +46,14 @@ struct AMGLevel {
     DeviceBuffer<label>  cOwn, cNei, cOwnerStart, cLosort, cLosortStart;  // grid-(k+1) addressing (SpMV gather)
     DeviceBuffer<label>  faceRestrict, faceFlip;               // grid-k face -> grid-(k+1) face (>=0) / -1-coarseCell
     DeviceBuffer<scalar> cDiag, cUpper, cLower;                // grid-(k+1) matrix (rebuilt by Galerkin)
+    // DETERMINISTIC GALERKIN GATHER (see the note above galDiagGatherK in device_amg.cu).
+    // The inverses of map/faceRestrict, as CSR lists over the COARSE entities. Agglomeration is static
+    // for the life of the mesh, so these are built once on the host and reused by every solve; they let
+    // the coarse operator be assembled by a fixed-order gather instead of an atomicAdd scatter, which is
+    // what makes the whole solve reproducible run to run.
+    DeviceBuffer<label>  galCellStart, galCellList;             // coarse cell <- fine cells
+    DeviceBuffer<label>  galDFaceStart, galDFaceList;           // coarse cell <- fine faces interior to it
+    DeviceBuffer<label>  galFaceStart, galFaceList, galFaceFlipList;  // coarse face <- fine faces
     // SMOOTHED AGGREGATION (BRAE_AMG_SA)
     // The tentative prolongator (= map) smoothed by one Jacobi step P=(I-omega D^-1 A)P_tent, stored sparse (CSR by
     // fine row). Built ONCE from the geometric (face-weight) proxy Laplacian; sparsity + values are fixed, so the

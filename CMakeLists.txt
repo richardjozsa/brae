@@ -85,6 +85,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/lduMatrix/device_spmv.cu
     src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
+    src/applications/solvers/simpleFoam/UEqn_cpp.cu
     src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
@@ -406,6 +407,14 @@ target_link_libraries(test_pbicgstab PRIVATE brae_core)
 add_test(NAME pbicgstab
          COMMAND test_pbicgstab ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
 
+# The _cpp reference for UEqn.H, validated by decomposition against the same OpenFOAM momentum dump:
+# core vs OpenFOAM, then the dev2 term's effect isolated, then relaxation, then the MRF/fvOptions refusals.
+add_executable(test_ueqn_cpp tests/test_ueqn_cpp.cu)
+target_include_directories(test_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ueqn_cpp PRIVATE brae_core)
+add_test(NAME ueqn_cpp
+         COMMAND test_ueqn_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
+
 add_executable(test_momentum_matrix tests/test_momentum_matrix.cu)
 target_include_directories(test_momentum_matrix PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_momentum_matrix PRIVATE brae_core)
@@ -469,6 +478,20 @@ target_include_directories(test_kepsilon_correct PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_kepsilon_correct PRIVATE brae_core)
 add_test(NAME kepsilon_correct
          COMMAND test_kepsilon_correct ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+
+# DETERMINISM GATE. Two runs of the same binary on the same case must agree bit for bit. This is a
+# prerequisite for the whole _cpp-vs-CUDA validation plan: a defect smaller than the run-to-run noise floor
+# cannot be detected, and the floor here used to be 3.6e-02 after 20 iterations. Two cases, because the
+# turbulence wall functions were one of the three scatter sites and kEpsilon/kOmegaSST take different ones.
+# SKIP_RETURN_CODE 77 lets it skip cleanly when no GPU binary is present.
+add_test(NAME determinism_kepsilon
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/determinism_gate.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily 20)
+set_tests_properties(determinism_kepsilon PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+add_test(NAME determinism_komega
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/determinism_gate.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyKOmega 20)
+set_tests_properties(determinism_komega PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
 
 # The _cpp reference for divDevReff, proven against the SAME OpenFOAM dump as the inline test above,
 # with a wrong-sign check and a wall-nuEff negative control so the test is known to be able to fail.

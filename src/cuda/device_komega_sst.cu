@@ -347,8 +347,10 @@ void kOmegaSSTIDDESfactorKernel(
 // with cornerWeight invNw. G0 IDENTICAL to the epsilon wall function. Clone of device_kepsilon wallFnKernel.
 __global__
 void wallOmegaG0Kernel(
-    int nWF,
-    const label* __restrict__ wfCell,
+    int nWC,
+    const label* __restrict__ wcCell,
+    const label* __restrict__ wcStart,
+    const label* __restrict__ wcFace,
     const scalar* __restrict__ wfY,
     const scalar* __restrict__ wfDc,
     const scalar* __restrict__ wux,
@@ -372,19 +374,29 @@ void wallOmegaG0Kernel(
     scalar* __restrict__ G0,
     const scalar* __restrict__ nuFace)   // compressible: per-wall-face nu, null -> the scalar nu
 {
-    const int wf = blockIdx.x * blockDim.x + threadIdx.x;
-    if (wf >= nWF) return;
+    // One thread per wall CELL, fixed face order, single write -- the kEpsilon twin. See buildDeviceWallData.
+    const int wc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (wc >= nWC) return;
 
-    const int c = wfCell[wf];
-    const scalar y = wfY[wf], dc = wfDc[wf], kc = k[c];
-    // OF omegaWallFunction and the near-wall G0 both read turbulenceModel::nu(patchi). Under Sutherland with
-    // a hot wall that is several times the freestream value, so the scalar fallback is only for the
-    // constant-property incompressible case.
-    const scalar nuw = nuFace ? nuFace[wf] : nu;
-    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nuw, yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall, G0);
-    const scalar omegaVis = 6.0 * nuw / (beta1 * y * y);
-    const scalar omegaLog = sqrt(kc) / (Cmu25 * kappa * y);
-    atomicAdd(&omega0[c], invNw[c] * sqrt(omegaVis*omegaVis + omegaLog*omegaLog));   // BINOMIAL n=2 (distinct omega wall value)
+    const int c = wcCell[wc];
+    const scalar kc = k[c], iN = invNw[c];
+    scalar g0 = 0.0, w0 = 0.0;
+    for (label j = wcStart[wc]; j < wcStart[wc+1]; ++j)
+    {
+        const label wf = wcFace[j];
+        const scalar y = wfY[wf], dc = wfDc[wf];
+        // OF omegaWallFunction and the near-wall G0 both read turbulenceModel::nu(patchi). Under Sutherland
+        // with a hot wall that is several times the freestream value, so the scalar fallback is only for the
+        // constant-property incompressible case.
+        const scalar nuw = nuFace ? nuFace[wf] : nu;
+        g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
+                               yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
+        const scalar omegaVis = 6.0 * nuw / (beta1 * y * y);
+        const scalar omegaLog = sqrt(kc) / (Cmu25 * kappa * y);
+        w0 += iN * sqrt(omegaVis*omegaVis + omegaLog*omegaLog);   // BINOMIAL n=2 (distinct omega wall value)
+    }
+    G0[c]     = g0;
+    omega0[c] = w0;
 }
 } // namespace
 
@@ -711,8 +723,9 @@ void deviceWallOmegaG0(
     cudaCheck(cudaMemsetAsync(omega0.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "omega0 zero");
     cudaCheck(cudaMemsetAsync(G0.data(),     0, nC*sizeof(scalar), cudaStreamPerThread), "G0 zero");
     const scalar Cmu25 = std::pow(co.betaStar, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
-    if (w.nWF > 0)
-        wallOmegaG0Kernel<<<nBlocks(w.nWF), TPB>>>(w.nWF, w.wfCell.data(), w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
+    if (w.nWC > 0)
+        wallOmegaG0Kernel<<<nBlocks(w.nWC), TPB>>>(w.nWC, w.wcCell.data(), w.wcStart.data(), w.wcFace.data(),
+                                                   w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
                                                    w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(),
                                                    Uy.data(), Uz.data(), nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, co.beta1,
                                                    nutWall, omega0.data(), G0.data(),

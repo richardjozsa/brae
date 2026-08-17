@@ -133,11 +133,15 @@ void vcycleAt(
     residualT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), amg.vR[g].data());
     const int nc = amg.level[g].nCoarse;
     const AMGLevel& Lg = amg.level[g];
-    zeroT<scalar><<<nBlocks(nc),TPB>>>(nc, amg.vB[g+1].data());
     if (amg.saSmooth)                                            // restrict rc = P^T r (sparse smoothed prolongator)
+    {
+        // Sparse-prolongator restriction still scatters; the SA path is opt-in and remains nondeterministic.
+        zeroT<scalar><<<nBlocks(nc),TPB>>>(nc, amg.vB[g+1].data());
         restrictSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vR[g].data(), amg.vB[g+1].data());
-    else
-        restrictT<scalar><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vR[g].data(), amg.vB[g+1].data());
+    }
+    else                                          // fixed-order gather; writes rc, so no pre-zero needed
+        restrictGatherT<scalar><<<nBlocks(nc),TPB>>>(
+            nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vR[g].data(), amg.vB[g+1].data());
     vcycleAt(g+1, amg, amg.level[g].coarseView(), amg.vB[g+1], amg.vX[g+1]);   // recurse to the next coarser grid
     if (amg.corrScaling)
     {
@@ -249,8 +253,8 @@ void vcycleAtF(
     residualT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), amg.vRF[g].data());
     const AMGLevel& Lg = amg.level[g];
     const int nc = Lg.nCoarse;
-    zeroT<float><<<nBlocks(nc),TPB>>>(nc, amg.vBF[g+1].data());
-    restrictT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+    restrictGatherT<float><<<nBlocks(nc),TPB>>>(
+        nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
     const DeviceLduView topoC = Lg.coarseView();
     const LduF Ac = lduF(topoC, amg.fDiag[g+1], amg.fUpper[g+1], amg.fLower[g+1]);
     vcycleAtF(g+1, amg, topoC, Ac, amg.vBF[g+1].data(), amg.vXF[g+1].data());
