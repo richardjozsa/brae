@@ -282,7 +282,20 @@ COMPONENTS = {
              of_file="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.C",
              classification="MODEL", status="REVALIDATE_EXISTING",
              brae_existing="src/cuda/device_kepsilon.cu",
-             brae_target="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/"),
+             brae_reference="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/k_epsilon.cu"
+                            "h (host correct(), moved into the mirrored path)",
+             brae_target="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/",
+             validation="Coefficients checked against the DERIVED schema below -- brae defaults match "
+                        "OpenFOAM exactly (Cmu .09, C1 1.44, C2 1.92, C3 0, sigmak 1.0, sigmaEps 1.3). "
+                        "tests/test_simple_turbulent_cpp.cu wires it into the _cpp loop on "
+                        "validation/pitzDailyTurb from OpenFOAM's converged 1576: the rebuilt loop is "
+                        "BIT-IDENTICAL (rel 0) to the pre-existing OpenFOAM-validated host path on U, p, "
+                        "phi, k, epsilon and nut, with a laminar control (drift 1.3e-01) proving nut "
+                        "really reaches the momentum equation.",
+             note="REUSED, not rewritten: a complete host kEpsilon::correct already existed and is "
+                  "validated against OpenFOAM (correct.dat). The new work is the COUPLING -- nuEff = "
+                  "nu + nut with boundary values from nut's own boundary field, and the LAGGED ordering "
+                  "(turbulence->correct() at the END of the iteration, simpleFoam.C:93-94)."),
         dict(name="kOmegaSST", of_symbol="Foam::RASModels::kOmegaSST",
              of_file="src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST.C",
              classification="MODEL", status="REVALIDATE_EXISTING",
@@ -337,6 +350,19 @@ COMPONENTS = {
              note="pitzDaily and motorBike BOTH select `GAMG` for p. brae substitutes AMG-preconditioned "
                   "PCG. That is a different algorithm with a different iteration count -- the solver must "
                   "say so, not silently substitute."),
+
+        dict(name="cuda_vs_reference", of_symbol="(brae-specific)",
+             of_file="-",
+             classification="GPU_REQUIRED", status="REVALIDATE_EXISTING",
+             brae_existing="src/cuda/device_simple.cu, src/cuda/device_fvm.cu",
+             brae_target="src/applications/solvers/simpleFoam/",
+             validation="tests/test_gpu_vs_cpp.cu -- CUDA against the _cpp reference at STAGE granularity "
+                        "on validation/matrixDumpAsym: rAU 1.2e-16, pEqn upper/lower 0, diag 2.7e-16, "
+                        "pEqn.flux() 0, setReference 0. Two controls fire.",
+             note="Closes the chain OpenFOAM -> _cpp -> CUDA. Every other GPU test compares the device "
+                  "against CPU code written inline in that same test, which proves consistency but not "
+                  "correctness. The stages checked so far are the pressure side; the momentum assembly "
+                  "and the turbulence kernels are not yet compared this way."),
 
         # ---- determinism ---------------------------------------------------------------------
         dict(name="deterministic_assembly", of_symbol="(brae-specific)",
