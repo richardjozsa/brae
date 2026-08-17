@@ -85,12 +85,18 @@ COMPONENTS = {
              of_file="applications/solvers/incompressible/simpleFoam/UEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/simpleFoam/UEqn_cpp.cu",
+             brae_cuda="src/applications/solvers/simpleFoam/UEqn.cu",
              brae_target="src/applications/solvers/simpleFoam/UEqn.cu",
              validation="tests/test_ueqn_cpp.cu -- validated by DECOMPOSITION against "
                         "validation/matrixDumpAsym/momentum.dat: the div/laplacian core matches OpenFOAM to "
                         "1e-11 on diag/upper/lower/source; adding divDevReff provably changes only `source`, "
                         "and by exactly the explicit dev2 term; relaxation raises |diag| and leaves the "
-                        "off-diagonals alone; MRF and fvOptions both throw.",
+                        "off-diagonals alone; MRF and fvOptions both throw. "
+                        "CUDA: tests/test_ueqn_cuda.cu compares the device assembly to the reference "
+                        "field by field on a laminar AND a turbulent case -- relaxed diag 2.0e-16/2.7e-16, "
+                        "upper/lower 0, sources <=1.4e-15, all six boundary-coefficient arrays (25010 "
+                        "faces) EXACTLY 0, addPressureGradient <=1.3e-15. MRF/fvOptions refused on the "
+                        "device path too.",
              note="24 lines in OpenFOAM. The _cpp reference REFUSES MRF and fvOptions rather than ignoring "
                   "them -- brae has shipped a solver that silently ignored MRFProperties and produced a "
                   "converged wrong answer. The CUDA side is not written yet."),
@@ -98,13 +104,19 @@ COMPONENTS = {
              of_file="applications/solvers/incompressible/simpleFoam/pEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/simpleFoam/pEqn_cpp.cu",
+             brae_cuda="src/applications/solvers/simpleFoam/pEqn.cu",
              brae_target="src/applications/solvers/simpleFoam/pEqn.cu",
              validation="tests/test_peqn_cpp.cu -- stage by stage on validation/matrixDumpAsym: rAU and "
                         "HbyA vs OpenFOAM A()/H() (ops.dat) to 1e-11; the pressure Laplacian incl. all "
                         "patch coefficients vs peqn.dat to 1e-11; source == laplacian source + "
                         "div(phiHbyA)*V; setReference asserted to be exactly fvMatrix.C:1011-1023 (it "
                         "DOUBLES the diagonal, it does not overwrite it); correctFlux analytic at p=0; "
-                        "relaxField analytic; MRF/fvOptions/consistent all refused.",
+                        "relaxField analytic; MRF/fvOptions/consistent all refused. "
+                        "CUDA: tests/test_peqn_cuda.cu compares the device stages to the reference on a "
+                        "laminar AND a turbulent case -- rAU 1.7e-16, HbyA <=5.2e-16, phiHbyA int/bnd "
+                        "2.9e-16/7.4e-17, laplacian upper/lower 0 diag 1.9e-16, source 1.3e-14, patch "
+                        "coeffs <=2.8e-16, setReference 1.9e-16, flux correction 2.9e-16, p.relax "
+                        "1.8e-16, corrector <=5.2e-16. All three refusals fire on the device path.",
              note="50 lines. Every intermediate is RETURNED rather than kept local, so the first divergent "
                   "stage can be isolated -- a past investigation ended at `phi = phiHbyA - pEqn.flux()`, "
                   "which is stage 7 here. SIMPLEC (`consistent`) is refused: it needs UEqn.H1() and "
@@ -483,7 +495,7 @@ def emit(solver, d, cases):
             add("      line: %d" % c["of_line"])
         add("    classification: %s" % c["classification"])
         add("    brae_status: %s" % c["status"])
-        for k in ("brae_existing", "brae_reference", "brae_target", "validation"):
+        for k in ("brae_existing", "brae_reference", "brae_cuda", "brae_target", "validation"):
             if c.get(k):
                 add("    %s: %s" % (k, y(c[k])))
         if c.get("note"):
