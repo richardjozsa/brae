@@ -133,17 +133,30 @@ Residuals simpleStep(
     const label nCorr = in.nNonOrthogonalCorrectors + 1;
     for (label corr = 1; corr <= nCorr; ++corr)
     {
-        PressureMatrix P;
+        PressureMatrix& P = w.P;                       // persistent -- see SolverWorkspace
         assemblePEqn(P, st, dm, dbP, rAUface, pin);
 
-        DeviceBuffer<scalar> diagC, b;
+        DeviceBuffer<scalar>& diagC = w.diagC;
+        DeviceBuffer<scalar>& b     = w.b;
         deviceFold(dm, P.diag, P.source, P.iC, P.bC, diagC, b);
         const DeviceLduView A = foldedView(dm, P, diagC);
 
         if (!w.amgBuilt)
         {
-            w.amg = buildAMG(dm.owner.host(), dm.nei.host(),
-                             dm.magSf.host(), dm.nCells);
+            // Face weights SLICED TO INTERNAL FACES, matching how the existing GPU driver builds its
+            // hierarchy (device_simple_foam.cu:341). DeviceMesh::magSf is documented "|Sf|(all faces)" and
+            // is laid out [internal | non-cyclic boundary], while owner/nei are internal-only -- so
+            // handing the whole array to buildAMG pairs an internal-face addressing with a face-weight
+            // array that continues into the boundary. Everything the agglomeration decides (which faces
+            // are strong, hence which cells merge) is downstream of that.
+            const std::vector<label> own = dm.owner.host(), nei = dm.nei.host();
+            const std::vector<scalar> magSfAll = dm.magSf.host();
+            const std::size_t nIf = static_cast<std::size_t>(dm.nInternalFaces);
+            const std::vector<label> ownInt(own.begin(), own.begin() + std::min(nIf, own.size()));
+            const std::vector<label> neiInt(nei.begin(), nei.begin() + std::min(nIf, nei.size()));
+            const std::vector<scalar> fw(magSfAll.begin(),
+                                         magSfAll.begin() + std::min(nIf, magSfAll.size()));
+            w.amg = buildAMG(ownInt, neiInt, fw, dm.nCells);
             w.amgBuilt = true;
         }
         amgGalerkin(w.amg, diagC, P.upper, P.lower);

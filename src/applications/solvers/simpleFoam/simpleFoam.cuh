@@ -107,6 +107,13 @@ struct SolverWorkspace
     AMGData amg;
     bool    amgBuilt = false;
     DeviceBuffer<scalar> ones;
+    // The pressure system's PERSISTENT buffers. The existing GPU driver keeps these as members and
+    // re-Galerkins the hierarchy against the same allocations every iteration; allocating them fresh each
+    // iteration instead gives the AMG state a different fine matrix to attach to each time, and the
+    // cached V-cycle/PCG graphs are keyed on that matrix. Keeping them here matches the pattern that
+    // works and removes a whole class of stale-pointer question.
+    PressureMatrix       P;
+    DeviceBuffer<scalar> diagC, b;
 };
 
 // One SIMPLE iteration, in place on `f`.
