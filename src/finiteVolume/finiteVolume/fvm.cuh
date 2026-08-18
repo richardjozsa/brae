@@ -14,25 +14,55 @@
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
 #include "fvc.cuh"   // SurfaceScalarField
+#include <type_traits>
 #include <vector>
 
 namespace brae {
 namespace fvm {
 
+// corrVec & grad(vf), the contraction OpenFOAM writes as `nonOrthCorrectionVectors() & interpolate(grad)`.
+// scalar field -> grad is a vector -> result scalar; vector field -> grad is a tensor -> result vector.
+inline scalar dotCorr(const vector& c, const vector& gradS)
+{
+    return c.x*gradS.x + c.y*gradS.y + c.z*gradS.z;
+}
+inline vector dotCorr(const vector& c, const tensor& gradV)
+{
+    // grad(U)_ij = d(U_j)/d(x_i) in OpenFOAM's convention, so the contraction is over the FIRST index.
+    return { c.x*gradV.xx + c.y*gradV.yx + c.z*gradV.zx,
+             c.x*gradV.xy + c.y*gradV.yy + c.z*gradV.zy,
+             c.x*gradV.xz + c.y*gradV.yz + c.z*gradV.zz };
+}
+
 // laplacian with a face-varying diffusivity gammaf (e.g. interpolate(rAU)) for the pEqn.
+//
+// `corrected` selects OpenFOAM's NON-ORTHOGONAL correction, and it changes TWO things, not one
+// (gaussLaplacianScheme.C, correctedSnGrad.H:108-119):
+//
+//   implicit:  the face coefficient uses nonOrthDeltaCoeffs = 1/max(n.delta, 0.05|delta|)
+//              instead of deltaCoeffs -- correctedSnGrad::deltaCoeffs() returns mesh.nonOrthDeltaCoeffs()
+//   explicit:  source -= V * fvc::div( gamma*magSf * (corrVecs & interpolate(grad(vf))) )
+//              with corrVecs = n - delta*nonOrthDeltaCoeffs, ZERO on boundary faces
+//              (basicFvGeometryScheme.C:266 and makeNonOrthCorrectionVectors)
+//
+// Only the implicit half lives here; the explicit source is laplacianNonOrthSource() below, kept separate
+// because it is a DEFERRED correction -- it uses the current vf and so must be rebuilt every iteration,
+// while the matrix coefficients are geometry. Splitting them also lets each be compared against OpenFOAM
+// on its own rather than as one number.
 template <typename T>
 FvMatrix<T> laplacian(
     const SurfaceScalarField& gammaf,
     const GeometricField<T>& vf,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    bool corrected)
 {
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
-    const std::vector<scalar>& dc    = g.deltaCoeffs();
+    const std::vector<scalar>& dc    = corrected ? g.nonOrthDeltaCoeffs() : g.deltaCoeffs();
     const std::vector<scalar>& magSf = g.magSf();
 
     FvMatrix<T> M;
@@ -65,6 +95,59 @@ FvMatrix<T> laplacian(
         }
     }
     return M;
+}
+
+// The EXPLICIT non-orthogonal correction, as an extensive per-cell source contribution:
+//     V * fvc::div( gamma*magSf * (corrVecs & interpolate(grad(vf))) )
+// which OpenFOAM SUBTRACTS from the laplacian's source (gaussLaplacianScheme.C). Returned rather than
+// applied so the caller supplies the sign for its own equation, and so it can be compared on its own.
+//
+// Boundary faces contribute nothing: OpenFOAM sets the correction vectors to zero there
+// (makeNonOrthCorrectionVectors). The 1/V of fvc::div and the V of the extensive source cancel, so no
+// volume factor appears below.
+//
+// G is the gradient's element type (vector for a scalar field, tensor for a vector field), taken as a
+// second template parameter -- deriving it with std::conditional puts it in a non-deduced context and
+// breaks overload resolution for every other laplacian call site.
+template <typename T, typename G>
+std::vector<T> laplacianNonOrthSource(
+    const SurfaceScalarField& gammaf,
+    const GeometricField<T>& vf,
+    const std::vector<G>& gradVf,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    (void)vf; (void)patches;
+    const label nC  = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& w  = g.weights();
+    const std::vector<scalar>& magSf = g.magSf();
+    const std::vector<vector>& cv = g.nonOrthCorrectionVectors();
+
+    std::vector<T> src(nC, T{});
+    for (label f = 0; f < nIf; ++f)
+    {
+        const G gf = w[f] * gradVf[own[f]] + (1.0 - w[f]) * gradVf[nei[f]];
+        const T corr = (gammaf.internal[f] * magSf[f]) * dotCorr(cv[f], gf);
+        src[own[f]] += corr;
+        src[nei[f]] -= corr;
+    }
+    return src;
+}
+
+// Orthogonal (OpenFOAM `orthogonal`/`uncorrected`): the original 5-argument form, behaviour unchanged.
+template <typename T>
+FvMatrix<T> laplacian(
+    const SurfaceScalarField& gammaf,
+    const GeometricField<T>& vf,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    return laplacian<T>(gammaf, vf, m, g, patches, false);
 }
 
 template <typename T>

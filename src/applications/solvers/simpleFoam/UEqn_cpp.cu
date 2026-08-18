@@ -64,9 +64,21 @@ FvVectorMatrix assembleUEqn(
 
     FvVectorMatrix M = fvm::div(*in.phi, *in.phiBnd, U, m, patches);
 
+    // `bounded`: - fvm::Sp(fvc::div(phi), U). Applied BEFORE relax, as OpenFOAM does -- it is part of the
+    // matrix the relaxation then acts on, not a correction bolted on afterwards.
+    if (in.bounded)
+    {
+        SurfaceScalarField phis;
+        phis.internal = *in.phi;
+        phis.boundary = *in.phiBnd;
+        const std::vector<scalar> divPhi = fvc::div(phis, m, g, patches);
+        const std::vector<scalar>& V = g.V();
+        for (std::size_t c = 0; c < M.diag.size(); ++c) M.diag[c] -= divPhi[c] * V[c];
+    }
+
     // turbulence->divDevReff(U): implicit -laplacian(nuEff,U) into the matrix AND the explicit
     // -div(nuEff*dev2(T(grad U))) into the source. Both halves, one call, so they cannot drift apart.
-    addDivDevReff(M, U, *in.nuEff, *in.nuEffBnd, m, g, patches);
+    addDivDevReff(M, U, *in.nuEff, *in.nuEffBnd, m, g, patches, in.correctedLaplacian);
 
     // UEqn.relax(). OpenFOAM guards this with if(relaxEquation(name)); a factor of 1 is the identity, and
     // relaxMatrix already early-returns on alpha <= 0.

@@ -101,7 +101,8 @@ void addDivDevReff(
     const std::vector<std::vector<scalar>>& nuEffBnd,
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
-    const std::vector<FvPatch>&   patches);
+    const std::vector<FvPatch>&   patches,
+    bool                          correctedLaplacian = false);
 
 } // namespace cpu
 } // namespace brae

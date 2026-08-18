@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see linearViscousStress_cpp.cuh for the OpenFOAM provenance.
 #include "linearViscousStress_cpp.cuh"
+#include "fvm.cuh"
 
 namespace brae {
 namespace cpu {
@@ -76,12 +77,29 @@ void addDivDevReff(
     const std::vector<std::vector<scalar>>& nuEffBnd,
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
-    const std::vector<FvPatch>&   patches)
+    const std::vector<FvPatch>&   patches,
+    bool                          correctedLaplacian)
 {
     // Implicit half: OpenFOAM writes `- fvm::laplacian(nuEff, U)` inside divDevReff, and UEqn.H adds
     // divDevReff to the equation -- so the laplacian enters with coefficient -1.
     const SurfaceScalarField gammaf = effectiveFaceViscosity(nuEff, nuEffBnd, m, g, patches);
-    addEqual(UEqn, fvm::laplacian<vector>(gammaf, U, m, g, patches), -1.0);
+    addEqual(UEqn, fvm::laplacian<vector>(gammaf, U, m, g, patches, correctedLaplacian), -1.0);
+
+    // ...and, when `corrected`, its explicit deferred correction. OpenFOAM subtracts it from the
+    // laplacian's source; divDevReff carries the laplacian with a MINUS sign, so it enters here with the
+    // opposite one -- the same side-change bookkeeping as the dev2 term below.
+    if (correctedLaplacian)
+    {
+        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        const std::vector<vector> corr =
+            fvm::laplacianNonOrthSource<vector, tensor>(gammaf, U, gradU, m, g, patches);
+        for (std::size_t c = 0; c < corr.size(); ++c)
+        {
+            UEqn.source[c].x -= corr[c].x;
+            UEqn.source[c].y -= corr[c].y;
+            UEqn.source[c].z -= corr[c].z;
+        }
+    }
 
     // Explicit half. OpenFOAM's equation reads  M(U) + divDevReff(U) == 0, i.e. the explicit term sits on
     // the LEFT. brae's FvMatrix solves  M.psi = source, so a left-hand explicit term crosses to the right

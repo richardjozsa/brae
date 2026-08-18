@@ -77,6 +77,7 @@ struct StepInput
     scalar tolU = 1e-10, relTolU = 0.0;
     scalar tolP = 1e-10, relTolP = 0.0;
     int    maxIter = 2000;
+    bool   correctedLaplacian = false;           // `corrected` laplacianSchemes
     bool   hasMRF = false;                       // refused downstream
     bool   hasFvOptions = false;                 // refused downstream
 };

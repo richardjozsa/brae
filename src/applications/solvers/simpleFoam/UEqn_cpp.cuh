@@ -72,6 +72,16 @@ struct MomentumInput
     const std::vector<scalar>*              nuEff = nullptr;     // cells
     const std::vector<std::vector<scalar>>* nuEffBnd = nullptr;  // [patch][face]
     scalar relaxU = 1.0;                                         // relaxationFactors/equations U
+    // `bounded Gauss <scheme>` on div(phi,U): OpenFOAM's boundedConvectionScheme adds
+    //     - fvm::Sp(fvc::div(phi), U)
+    // i.e. diag -= V*div(phi). It vanishes at convergence, where div(phi) -> 0, so a converged comparison
+    // cannot see it missing -- only the approach to convergence can, which is why it needs its own flag
+    // rather than being inferred.
+    bool   bounded = false;
+    // `corrected`/`limited` laplacianSchemes: use nonOrthDeltaCoeffs implicitly AND add the explicit
+    // deferred correction to the source (gaussLaplacianScheme.C). OpenFOAM's default when the word is
+    // absent, so most real cases set it.
+    bool   correctedLaplacian = false;
     bool   hasMRF = false;                                       // present in the case -> must refuse
     bool   hasFvOptions = false;                                 // present in the case -> must refuse
 };

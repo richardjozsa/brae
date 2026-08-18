@@ -51,6 +51,7 @@ Residuals simpleStep(
     mi.phi = &f.phi.internal;  mi.phiBnd = &f.phi.boundary;
     mi.nuEff = nuEffPtr;       mi.nuEffBnd = nuEffBndPtr;
     mi.relaxU = in.relaxU;
+    mi.correctedLaplacian = in.correctedLaplacian;
     mi.hasMRF = in.hasMRF;     mi.hasFvOptions = in.hasFvOptions;
 
     const FvVectorMatrix UEqn = assembleUEqn(f.U, mi, m, g, patches);
@@ -70,6 +71,7 @@ Residuals simpleStep(
     pi.relaxP = in.relaxP;
     pi.pRefCell = f.pRefCell;  pi.pRefValue = f.pRefValue;
     pi.consistent = ctl.consistent();
+    pi.correctedLaplacian = in.correctedLaplacian;
     pi.hasMRF = in.hasMRF;     pi.hasFvOptions = in.hasFvOptions;
 
     const PressureStages st = pressurePredictor(UEqn, f.U, f.p, pi, m, g, patches);
