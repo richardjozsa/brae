@@ -18,6 +18,8 @@
 #include "near_wall_dist.cuh"
 #include "solver_dispatch.cuh"   // readDdtSchemeWord: the same steady/transient test the dispatcher uses
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
@@ -372,6 +374,8 @@ bool simpleFoamV2Selected()
 }
 
 
+namespace { double g_hookSeconds = 0.0; double g_refreshSeconds = 0.0; }
+
 int runSimpleFoamV2(const std::string& caseDir)
 {
     const EnvelopeReport env = simpleFoamV2Envelope(caseDir);
@@ -477,6 +481,11 @@ int runSimpleFoamV2(const std::string& caseDir)
     DeviceBuffer<label> bndIsWall;
     DeviceBuffer<scalar> bndY;
     scalar relaxK = 0.7, relaxEps = 0.7;
+    // k/epsilon linear-solver settings, read from fvSolution below. Declared here because the turbulence
+    // hook is a lambda defined above that point and captures them by reference; it does not run until the
+    // outer loop, by which time they are set.
+    scalar tolKE = 1e-10, relTolKE = 0.0;
+    bool   gsKE  = false;
 
     StepInput in;
     if (ras)
@@ -545,10 +554,24 @@ int runSimpleFoamV2(const std::string& caseDir)
 
         in.correct = [&]()
         {
+            // Phase timing, on demand: the wall-clock investigation needed to know how much of an outer
+            // iteration is the turbulence hook (which round-trips nut to the host) versus the solve.
+            const auto tHook0 = std::chrono::steady_clock::now();
+            // Solver settings from the CASE, exactly as for U and p. This was hardcoded to tol=1e-10
+            // with relTol 0 and BiCGStab, so k and epsilon were driven to near machine precision every
+            // outer iteration while the case asks for 1e-05 / relTol 0.1 / symGaussSeidel. Measured: the
+            // turbulence hook was 168 ms of a ~300 ms outer iteration on 440k cells -- 56% of the run --
+            // and almost none of that was the nuEff host copy (6 ms); it was over-solving these two.
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                   dK, dEps, dNut, gf.phiInt, gf.phiBnd,
-                                  nu, relaxEps, relaxK, 1e-10);
+                                  nu, relaxEps, relaxK, tolKE,
+                                  /*bounded*/false, /*boundedEps*/false,
+                                  /*limitedK*/false, /*limitedEps*/false, 2.0, 2.0,
+                                  KEpsilonCoeffs{}, relTolKE, /*keCheckEvery*/1,
+                                  /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
+                                  gsKE, gsKE);
 
+            const auto tRefresh0 = std::chrono::steady_clock::now();
             // nuEff for the NEXT iteration: nu + nut, with the boundary value from the wall function --
             // NOT the owner cell's. That distinction is the defect that once made boundary viscosity
             // 2000x too small; deviceBoundaryNut is what applies the wall function per face.
@@ -571,6 +594,9 @@ int runSimpleFoamV2(const std::string& caseDir)
             for (const auto& v : nuEffB) for (scalar x : v) flat.push_back(x);
             flat.resize(dm.nBndFaces, nu);
             dNuBnd.copyFrom(flat);
+            const auto tNow = std::chrono::steady_clock::now();
+            g_hookSeconds    += std::chrono::duration<double>(tNow - tHook0).count();
+            g_refreshSeconds += std::chrono::duration<double>(tNow - tRefresh0).count();
         };
     }
 
@@ -595,14 +621,49 @@ int runSimpleFoamV2(const std::string& caseDir)
             in.relTolP = sp->scalarOr("relTol", 0.0);
             in.maxIter = static_cast<int>(sp->scalarOr("maxIter", 1000));
         }
+        // k and epsilon take their own entry, which in most tutorials is the same regex key as U's.
+        if (const FoamDict* sk = solvers->subDict("k"))
+        {
+            tolKE    = sk->scalarOr("tolerance", tolKE);
+            relTolKE = sk->scalarOr("relTol", 0.0);
+            gsKE     = (sk->wordOr("solver", "") == "smoothSolver" &&
+                        (sk->wordOr("smoother", "") == "symGaussSeidel" ||
+                         sk->wordOr("smoother", "") == "GaussSeidel"));
+            std::printf("  k/epsilon solves: tol=%.1e relTol=%.3g  solver=%s\n",
+                        tolKE, relTolKE, gsKE ? "smoothSolver/symGaussSeidel" : "Jacobi-BiCGStab");
+        }
         if (const FoamDict* su = solvers->subDict("U"))
         {
             in.tolU    = su->scalarOr("tolerance", in.tolU);
             in.relTolU = su->scalarOr("relTol", 0.0);
+            // OpenFOAM's selection, exactly: `solver smoothSolver` + a GaussSeidel-family smoother.
+            // Anything else (PBiCG[Stab], GAMG, ...) keeps Jacobi-BiCGStab, which is announced below as
+            // the substitution it is.
+            const std::string usolv = su->wordOr("solver", "");
+            const std::string usm   = su->wordOr("smoother", "");
+            in.uSymGaussSeidel = (usolv == "smoothSolver" &&
+                                  (usm == "symGaussSeidel" || usm == "GaussSeidel"));
+            if (!in.uSymGaussSeidel && !usolv.empty())
+                std::printf("NOTICE (simpleFoam v2): system/fvSolution asks for `%s` on U; brae runs a "
+                            "Jacobi-preconditioned BiCGStab instead. Same matrix, different Krylov "
+                            "method and iteration count.\n", usolv.c_str());
         }
     }
     std::printf("  linear solves: p tol=%.1e relTol=%.3g   U tol=%.1e relTol=%.3g   maxIter=%d\n",
                 in.tolP, in.relTolP, in.tolU, in.relTolU, in.maxIter);
+    // Both are pure execution strategy -- same matrix, same stopping criterion -- so they are on by
+    // default and env-overridable for A/B measurement rather than being case settings.
+    // The AMG hierarchy is already reused across ITERATIONS (SolverWorkspace::amgBuilt); this reuses it
+    // across RUNS. Opt-in, because it writes a file into the case.
+    if (const char* e = std::getenv("BRAE_AMG_CACHE"))
+        if (e[0] == '1') in.amgCacheDir = caseDir + "/constant/polyMesh";
+    if (const char* e = std::getenv("BRAE_VCYCLE_GRAPH")) in.captureVcycle = (e[0] == '1');
+    if (const char* e = std::getenv("BRAE_PCG_CHECK_EVERY")) in.pcgCheckEvery = std::max(1, std::atoi(e));
+    std::printf("  pressure: V-cycle graph %s, residual read every %d PCG iteration(s)\n",
+                in.captureVcycle ? "ON" : "off", in.pcgCheckEvery);
+    std::printf("  U solver: %s\n",
+                in.uSymGaussSeidel ? "smoothSolver/symGaussSeidel (as the case asks)"
+                                   : "Jacobi-BiCGStab");
     in.momentumPredictor = cd.momentumPredictor;
     in.nNonOrthogonalCorrectors = cd.nNonOrthogonalCorrectors;
     in.pRefCell = f.pRefCell; in.pRefValue = f.pRefValue;
@@ -641,6 +702,12 @@ int runSimpleFoamV2(const std::string& caseDir)
     }
     if (ctl.converged())
         std::printf("SIMPLE solution converged in %d iterations\n", static_cast<int>(iter));
+    if (std::getenv("BRAE_PHASE_TIME"))
+        std::printf("  [phase] turbulence hook %.3f s (%.1f ms/iter), of which the nuEff host "
+                    "round-trip %.3f s (%.1f ms/iter), over %d iterations\n",
+                    g_hookSeconds,    iter ? 1e3 * g_hookSeconds    / (double)iter : 0.0,
+                    g_refreshSeconds, iter ? 1e3 * g_refreshSeconds / (double)iter : 0.0,
+                    static_cast<int>(iter));
 
     // ---- write -------------------------------------------------------------------------------
     {

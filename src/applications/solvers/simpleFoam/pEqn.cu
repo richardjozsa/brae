@@ -195,6 +195,12 @@ void pressurePredictor(
         // way. Reusing the laplacian keeps this term consistent with the pressure equation it corrects,
         // by construction rather than by coincidence -- including the `corrected` deltaCoeffs, which OF's
         // snGrad(p) also takes.
+        // grad(p) ONCE for both corrections below. It was computed twice here -- gaussGrad is 565 us on a
+        // 440k mesh and was 13% of GPU time across the outer iteration, so a duplicate is not free.
+        DeviceBuffer<scalar> pb, gx, gy, gz;
+        deviceBCValue(*dbP, *p, pb);
+        deviceGaussGrad(dm, *p, pb, gx, gy, gz);
+
         DeviceBuffer<scalar> drAtUf;
         deviceInterpolate(dm, drAtU, drAtUf);
         {
@@ -207,9 +213,7 @@ void pressurePredictor(
         // Zero on an orthogonal mesh; NOT zero on pitzDaily.
         if (in.correctedLaplacian)
         {
-            DeviceBuffer<scalar> pb, gx, gy, gz, ffc;
-            deviceBCValue(*dbP, *p, pb);
-            deviceGaussGrad(dm, *p, pb, gx, gy, gz);
+            DeviceBuffer<scalar> ffc;
             deviceLaplacianCorrFlux(dm, drAtUf, gx, gy, gz, ffc);
             deviceAxpy(1.0, ffc, st.phiHbyAInt);
         }
@@ -223,9 +227,6 @@ void pressurePredictor(
         // HbyA -= (rAU - rAtU)*grad(p)  ==  HbyA += drAtU*grad(p). AFTER the flux, which consumed the
         // uncorrected HbyA; this feeds only the velocity corrector.
         {
-            DeviceBuffer<scalar> pb, gx, gy, gz;
-            deviceBCValue(*dbP, *p, pb);
-            deviceGaussGrad(dm, *p, pb, gx, gy, gz);
             const DeviceBuffer<scalar>* gp[3] = {&gx, &gy, &gz};
             for (int k = 0; k < 3; ++k)
             {

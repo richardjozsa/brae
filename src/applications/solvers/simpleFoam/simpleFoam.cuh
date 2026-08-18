@@ -76,8 +76,24 @@ struct StepInput
     scalar relaxU = 0.7;
     scalar relaxP = 0.3;
     scalar tolU = 1e-10, relTolU = 0.0;
+    // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver, and
+    // pitzDaily -- like most tutorials -- asks for smoothSolver/symGaussSeidel. Routing that through
+    // Jacobi-BiCGStab is a silent solver substitution AND the dominant cost: measured ~42 BiCGStab
+    // iterations per component per outer step, ~90% of all linear-algebra time on this path.
+    bool   uSymGaussSeidel = false;
     scalar tolP = 1e-10, relTolP = 0.0;
     int    maxIter = 2000;
+    // V-cycle graph replay and PCG residual-read cadence. NOTE: on CUDA >= 13 deviceAMGPCG dispatches
+    // first to its DEVICE-RESIDENT conditional-graph PCG (BRAE_PCG_DEVICE, default on), which captures
+    // the whole Krylov loop and ignores both of these -- measured A/B: 17.9 s on vs 18.7 s off at 440k.
+    // These therefore only reach the host-driven fallback. They are passed explicitly rather than left
+    // to defaults so the fallback is not silently the slow one.
+    // Reuse the AMG hierarchy STRUCTURE across runs. The agglomeration is the build cost and depends only
+    // on the mesh (the matrix VALUES are re-Galerkined every iteration regardless), so it serializes next
+    // to constant/polyMesh and is reloaded when it is newer than `owner`. Empty = no caching.
+    std::string amgCacheDir;
+    bool   captureVcycle = true;
+    int    pcgCheckEvery = 1;
     bool   momentumPredictor = true;
     bool   bounded = false;              // div(phi,U) `bounded`
     bool   linearUpwind = false;         // div(phi,U) `linearUpwind`: deferred correction, upwind matrix

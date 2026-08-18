@@ -98,11 +98,20 @@ Residuals simpleStep(
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC, b);
             const DeviceLduView A = foldedView(dm, Mp, diagC);
             const scalar nf = deviceNormFactor(A, *U[k], b, w.ones);
-            const DeviceSolverPerf perf =
-                deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter);
+            // The solver the CASE asked for. deviceSymGaussSeidel is OpenFOAM's smoothSolver +
+            // symGaussSeidelSmoother (multicolor, internal-face LDU only -- no coupled interfaces, which
+            // this path refuses anyway).
+            DeviceSolverPerf perf;
+            if (in.uSymGaussSeidel)
+                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter, &perf);
+            else
+                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter);
             // OpenFOAM's residualControl watches the FIRST component's initial residual under the field
             // name; keep that convention so simpleControl's criteria mean the same thing here.
             if (k == 0) res["U"] = perf.initialResidual;
+            if (std::getenv("BRAE_SOLVER_ITERS"))
+                std::printf("    [U%d] nIter=%d init=%.3e final=%.3e\n",
+                            k, perf.nIterations, perf.initialResidual, perf.finalResidual);
         }
     }
 
@@ -162,15 +171,24 @@ Residuals simpleStep(
             const std::vector<label> neiInt(nei.begin(), nei.begin() + std::min(nIf, nei.size()));
             const std::vector<scalar> fw(magSfAll.begin(),
                                          magSfAll.begin() + std::min(nIf, magSfAll.size()));
-            w.amg = buildAMG(ownInt, neiInt, fw, dm.nCells);
+            w.amg = in.amgCacheDir.empty()
+                  ? buildAMG(ownInt, neiInt, fw, dm.nCells)
+                  : buildOrLoadAMG(ownInt, neiInt, fw, dm.nCells, in.amgCacheDir, true);
             w.amgBuilt = true;
         }
         amgGalerkin(w.amg, diagC, P.upper, P.lower);
 
         const scalar nf = deviceNormFactor(A, f.p, b, w.ones);
         const DeviceSolverPerf perf =
-            deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIter);
+            deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIter,
+                         in.captureVcycle, in.pcgCheckEvery);
         if (corr == 1) res["p"] = perf.initialResidual;   // the FIRST solve's residual, as OpenFOAM reports
+        // Solver-iteration counts, on demand. The wall-clock question on this path turned out to be "how
+        // many Krylov iterations", not "how fast is a kernel": every iteration ends in a scalar
+        // device-to-host read to test convergence, and those reads are blocking.
+        if (std::getenv("BRAE_SOLVER_ITERS"))
+            std::printf("    [p] nIter=%d init=%.3e final=%.3e\n",
+                        perf.nIterations, perf.initialResidual, perf.finalResidual);
 
         if (corr == nCorr)
         {
