@@ -56,6 +56,27 @@ SurfaceScalarField rhoFlux(const std::vector<scalar>& rho,
                            const PrimitiveMesh& m, const FvGeometry& g,
                            const std::vector<FvPatch>& patches);
 
+// fvc::snGrad(vf) -- the explicit surface-normal gradient, needed by SIMPLEC's phiHbyA correction.
+//
+// provenance: snGradScheme.C (snGrad(vf, deltaCoeffs)) and correctedSnGrad.C (the correction).
+//
+//   internal:  dc[f]*(vf[nei] - vf[own]),  dc = nonOrthDeltaCoeffs when `corrected`, else deltaCoeffs
+//              plus, when corrected, corrVecs[f] & interpolate(grad(vf))[f]
+//   boundary:  pvf.snGrad() on UNCOUPLED patches -- the patch's OWN deltaCoeffs, NOT the corrected ones
+//              (snGradScheme.C passes tdeltaCoeffs only in the pvf.coupled() branch), and no correction,
+//              since the non-orthogonal correction vectors are zero there.
+//
+// The boundary value is assembled from the patch's gradient coefficients rather than from a separate
+// snGrad() method: snGrad == gradientInternalCoeffs*psi_c + gradientBoundaryCoeffs by construction, so
+// reusing them keeps this consistent with fvm::laplacian's boundary treatment by definition instead of
+// by coincidence -- zeroGradient gives 0 from both, fixedValue gives dc*(value - psi_c) from both.
+SurfaceScalarField snGrad(
+    const GeometricField<scalar>& vf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches,
+    bool                          corrected);
+
 // interpolate a volScalarField (cell array) to faces: linear internal; boundary = cell value
 // (zeroGradient/extrapolated, as for rAU = 1/A()).
 SurfaceScalarField interpolate(const std::vector<scalar>& vol,

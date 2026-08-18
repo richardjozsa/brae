@@ -128,6 +128,7 @@ int main(int argc, char** argv)
     mi.relaxU = relaxU;
     mi.bounded = true;
     mi.correctedLaplacian = true;   // exercised on both paths -- see the controls below
+    mi.linearUpwind = true;
     const FvVectorMatrix ref = cpu::assembleUEqn(U, mi, m, g, fvp);
 
     // ---- the CUDA path ----------------------------------------------------------------------
@@ -161,6 +162,7 @@ int main(int argc, char** argv)
     gi.relaxU = relaxU;
     gi.bounded = true;              // exercised on both paths -- see the control below
     gi.correctedLaplacian = true;
+    gi.linearUpwind = true;
 
     gpu::MomentumMatrix M;
     gpu::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, gi);
@@ -241,6 +243,26 @@ int main(int argc, char** argv)
         const scalar r = mg > 0 ? mx / mg : mx;
         std::printf("  %-54s rel=%.3e\n", "control: `bounded` changes the diagonal", r);
         check(r > 1e-12, "the bounded term actually contributes (control)");
+    }
+
+    // CONTROL: and for `linearUpwind`. It touches ONLY the source -- linearUpwind derives from `upwind`,
+    // so the matrix is unchanged -- and it does NOT vanish at convergence, unlike `bounded`. Both facts
+    // are asserted: a diagonal that moved would mean the implicit weights had been changed too, which is
+    // not what OpenFOAM does.
+    {
+        cpu::MomentumInput noL = mi; noL.linearUpwind = false;
+        const FvVectorMatrix refNoL = cpu::assembleUEqn(U, noL, m, g, fvp);
+        scalar dD = 0, dS = 0, mS = 0;
+        for (std::size_t c = 0; c < ref.diag.size(); ++c)
+        {
+            dD = std::fmax(dD, std::fabs(ref.diag[c] - refNoL.diag[c]));
+            dS = std::fmax(dS, std::fabs(component(ref.source[c], 0) - component(refNoL.source[c], 0)));
+            mS = std::fmax(mS, std::fabs(component(ref.source[c], 0)));
+        }
+        const scalar rS = mS > 0 ? dS / mS : dS;
+        std::printf("  %-54s rel=%.3e\n", "control: `linearUpwind` moves the source", rS);
+        check(rS > 1e-12, "the linearUpwind correction contributes (control)");
+        check(dD == 0.0, "linearUpwind leaves the matrix alone -- it is a deferred source only");
     }
 
     // CONTROL: same argument for `corrected`. Unlike `bounded` this does NOT vanish at convergence -- it

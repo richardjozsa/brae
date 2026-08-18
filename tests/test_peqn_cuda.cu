@@ -135,6 +135,7 @@ int main(int argc, char** argv)
     cpu::PressureInput rpin;
     rpin.pRefCell = -1;
     rpin.correctedLaplacian = true;   // exercised on both paths -- see the control below
+    rpin.consistent = true;           // SIMPLEC -- exercised on both paths, with its own control
     const cpu::PressureStages rst = cpu::pressurePredictor(refU, U, p, rpin, m, g, fvp);
     const FvScalarMatrix refP = cpu::assemblePEqn(rst, p, rpin, m, g, fvp);
 
@@ -180,11 +181,12 @@ int main(int argc, char** argv)
     gpu::PressureInput gpin;
     gpin.pRefCell = -1;
     gpin.correctedLaplacian = true;
+    gpin.consistent = true;
     gpin.takeUAtBoundary = &dTakeU;
     gpin.adjustable = &dAdjust;
 
     gpu::PressureStages gst;
-    gpu::pressurePredictor(gst, dm, dbU, MU, dUx, dUy, dUz, gpin);
+    gpu::pressurePredictor(gst, dm, dbU, MU, dUx, dUy, dUz, gpin, &dbP, &dP);
 
     // ---- stages 1-3 -------------------------------------------------------------------------
     std::printf("  -- stages 1-3: rAU, HbyA (constrained), phiHbyA\n");
@@ -204,7 +206,10 @@ int main(int argc, char** argv)
 
     // ---- stage 4-5 --------------------------------------------------------------------------
     std::printf("  -- stages 4-5: laplacian(rAU,p) == div(phiHbyA), setReference\n");
-    DeviceBuffer<scalar> dRAUface(fvc::interpolate(rst.rAU, m, g, fvp).internal);
+    // rAtU, not rAU: pEqn.H's laplacian diffusivity is rAtU, which SIMPLEC makes different. Building it
+    // from rAU here compared the device's rAtU laplacian against a reference rAU one -- a harness
+    // disagreement, not a solver one, and it showed up as 6.4e-01 on every coefficient.
+    DeviceBuffer<scalar> dRAUface(fvc::interpolate(rst.rAtU, m, g, fvp).internal);
     gpu::PressureMatrix P;
     gpu::assemblePEqn(P, gst, dm, dbP, dRAUface, gpin, &dP);
     cmp(P.upper.host(),  refP.upper,  "pEqn upper",  1e-13);
@@ -306,18 +311,48 @@ int main(int argc, char** argv)
     // ---- masks and refusals -----------------------------------------------------------------
     std::printf("  -- masks and refusals\n");
     check(masksDiffer, "assignable and fixesValue masks DIFFER on this case (control)");
-    const char* names[3] = {"MRF", "fvOptions", "consistent (SIMPLEC)"};
+    // `consistent` is no longer here: SIMPLEC is implemented and is exercised above. fixedFluxPressure
+    // takes its place -- pEqn.H reaches it through constrainPressure, which is not ported.
+    const char* names[3] = {"MRF", "fvOptions", "fixedFluxPressure"};
     for (int which = 0; which < 3; ++which)
     {
         gpu::PressureInput bad = gpin;
         if (which == 0) bad.hasMRF = true;
         else if (which == 1) bad.hasFvOptions = true;
-        else bad.consistent = true;
+        else bad.hasFixedFluxPressure = true;
         gpu::PressureStages s2;
         bool threw = false;
-        try { gpu::pressurePredictor(s2, dm, dbU, MU, dUx, dUy, dUz, bad); }
+        try { gpu::pressurePredictor(s2, dm, dbU, MU, dUx, dUy, dUz, bad, &dbP, &dP); }
         catch (const std::runtime_error&) { threw = true; }
         check(threw, (std::string(names[which]) + " is refused on the CUDA path").c_str());
+    }
+
+    // SIMPLEC without the pressure field must be REFUSED, not silently downgraded to plain SIMPLE:
+    // rAtU's corrections need snGrad(p) and grad(p), and a nullptr quietly meaning "skip them" would
+    // solve SIMPLE while the case asked for SIMPLEC.
+    {
+        gpu::PressureStages s3;
+        bool threw = false;
+        try { gpu::pressurePredictor(s3, dm, dbU, MU, dUx, dUy, dUz, gpin, nullptr, nullptr); }
+        catch (const std::runtime_error&) { threw = true; }
+        check(threw, "SIMPLEC without p is refused on the CUDA path");
+    }
+
+    // CONTROL: SIMPLEC must actually change the answer, or comparing it proves nothing. rAtU differs
+    // from rAU by the off-diagonal row sum, so this is a large effect, not a subtle one.
+    {
+        cpu::PressureInput noC = rpin; noC.consistent = false;
+        const cpu::PressureStages r2 = cpu::pressurePredictor(refU, U, p, noC, m, g, fvp);
+        scalar dR = 0, mR = 0, dF = 0, mF = 0;
+        for (std::size_t c = 0; c < rst.rAtU.size(); ++c)
+        { dR = std::fmax(dR, std::fabs(rst.rAtU[c] - r2.rAtU[c])); mR = std::fmax(mR, std::fabs(rst.rAtU[c])); }
+        for (std::size_t f = 0; f < rst.phiHbyA.internal.size(); ++f)
+        { dF = std::fmax(dF, std::fabs(rst.phiHbyA.internal[f] - r2.phiHbyA.internal[f]));
+          mF = std::fmax(mF, std::fabs(rst.phiHbyA.internal[f])); }
+        std::printf("  %-54s rel=%.3e\n", "control: SIMPLEC changes rAtU",   mR > 0 ? dR / mR : dR);
+        std::printf("  %-54s rel=%.3e\n", "control: SIMPLEC changes phiHbyA", mF > 0 ? dF / mF : dF);
+        check(dR > 0.0, "rAtU differs from rAU under SIMPLEC (control)");
+        check(dF > 0.0, "the SIMPLEC flux correction contributes (control)");
     }
 
     std::printf("%s\n", g_fails == 0 ? "PASS" : "FAIL");

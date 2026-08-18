@@ -24,11 +24,12 @@ void refuseUnsupported(const PressureInput& in)
         throw std::runtime_error(
             "pEqn_cpp: the case declares fvOptions, which pEqn.H applies as fvOptions.correct(U) "
             "(pEqn.H:49). Refusing rather than solving a different equation.");
-    if (in.consistent)
+    if (in.hasFixedFluxPressure)
         throw std::runtime_error(
-            "pEqn_cpp: SIMPLE/consistent (SIMPLEC) is set. pEqn.H:10-16 then replaces rAU with "
-            "1/(1/rAU - UEqn.H1()) and corrects phiHbyA and HbyA with fvc::snGrad(p); neither H1() nor "
-            "snGrad is ported. Refusing rather than silently running plain SIMPLE.");
+            "pEqn_cpp: a pressure patch is fixedFluxPressure, which pEqn.H updates through "
+            "constrainPressure(p, U, phiHbyA, rAtU, MRF) (pEqn.H:21) so the patch gradient matches the "
+            "flux actually being imposed. Not ported; refusing rather than solving with a stale patch "
+            "gradient.");
 }
 
 } // namespace
@@ -127,6 +128,50 @@ PressureStages pressurePredictor(
         st.phiAdjusted = (massCorr != 1.0);
     }
 
+    // ---- SIMPLEC (pEqn.H:8-16) -----------------------------------------------------------------
+    //
+    //     tmp<volScalarField> rAtU(rAU);
+    //     if (simple.consistent())
+    //     {
+    //         rAtU = 1.0/(1.0/rAU - UEqn.H1());
+    //         phiHbyA += fvc::interpolate(rAtU() - rAU)*fvc::snGrad(p)*mesh.magSf();
+    //         HbyA -= (rAU - rAtU())*fvc::grad(p);
+    //     }
+    //
+    // AFTER adjustPhi, which is where OpenFOAM puts it -- the correction is not part of the flux that
+    // global continuity is enforced on. Moving it earlier would rescale it.
+    st.rAtU = st.rAU;
+    if (in.consistent)
+    {
+        const std::vector<scalar> H1 = matrixH1<vector>(UEqn, m, g, patches);
+        for (std::size_t c = 0; c < st.rAtU.size(); ++c)
+            st.rAtU[c] = 1.0 / (1.0 / st.rAU[c] - H1[c]);
+
+        // phiHbyA += interpolate(rAtU - rAU)*snGrad(p)*magSf, on internal AND boundary faces.
+        std::vector<scalar> dR(st.rAU.size());
+        for (std::size_t c = 0; c < dR.size(); ++c) dR[c] = st.rAtU[c] - st.rAU[c];
+        const SurfaceScalarField dRf  = fvc::interpolate(dR, m, g, patches);
+        const SurfaceScalarField snGp = fvc::snGrad(p, m, g, patches, in.correctedLaplacian);
+        const std::vector<scalar>& magSf = g.magSf();
+        for (std::size_t f = 0; f < st.phiHbyA.internal.size(); ++f)
+            st.phiHbyA.internal[f] += dRf.internal[f] * snGp.internal[f] * magSf[f];
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            for (label i = 0; i < patches[pi].size; ++i)
+                st.phiHbyA.boundary[pi][i] +=
+                    dRf.boundary[pi][i] * snGp.boundary[pi][i] * magSf[patches[pi].start + i];
+
+        // HbyA -= (rAU - rAtU)*fvc::grad(p). Internal cells only: HbyA's boundary is consumed by
+        // fvc::flux(HbyA) above, which has already run, and by U's boundary, which correctBoundaryConditions
+        // overwrites.
+        const std::vector<vector> gradP = fvc::gaussGrad(p, m, g, patches);
+        for (std::size_t c = 0; c < st.HbyA.size(); ++c)
+        {
+            st.HbyA[c].x -= (st.rAU[c] - st.rAtU[c]) * gradP[c].x;
+            st.HbyA[c].y -= (st.rAU[c] - st.rAtU[c]) * gradP[c].y;
+            st.HbyA[c].z -= (st.rAU[c] - st.rAtU[c]) * gradP[c].z;
+        }
+    }
+
     return st;
 }
 
@@ -144,7 +189,7 @@ FvScalarMatrix assemblePEqn(
     // The face diffusivity is fvc::interpolate(rAU), whose boundary value is the owner cell's -- rAU is an
     // extrapolatedCalculated field (fvMatrix::A() sets that type), so this is the correct boundary value
     // rather than a convenience.
-    const SurfaceScalarField rAUf = fvc::interpolate(st.rAU, m, g, patches);
+    const SurfaceScalarField rAUf = fvc::interpolate(st.rAtU, m, g, patches);
     FvScalarMatrix pEqn = fvm::laplacian<scalar>(rAUf, p, m, g, patches, in.correctedLaplacian);
     if (in.correctedLaplacian)
     {
@@ -152,6 +197,10 @@ FvScalarMatrix assemblePEqn(
         const std::vector<scalar> corr =
             fvm::laplacianNonOrthSource<scalar, vector>(rAUf, p, gradP, m, g, patches);
         for (std::size_t c = 0; c < corr.size(); ++c) pEqn.source[c] -= corr[c];
+        // ...and STORE the face flux, which fvMatrix::flux() adds back (fvMatrix.C:1688). Without it
+        // `phi = phiHbyA - pEqn.flux()` drops the correction that the source above put in, and phi stops
+        // being conservative on a non-orthogonal mesh.
+        pEqn.faceFluxCorrection = fvm::laplacianCorrFlux<scalar, vector>(rAUf, gradP, m, g);
     }
 
     // == fvc::div(phiHbyA). brae's FvMatrix solves M.psi = source, and fvc::div returns a per-volume
@@ -204,9 +253,9 @@ std::vector<vector> correctVelocity(
     const std::vector<vector> gradP = fvc::gaussGrad(pRelaxed, m, g, patches);
     std::vector<vector> U(st.HbyA.size());
     for (std::size_t c = 0; c < U.size(); ++c)
-        U[c] = {st.HbyA[c].x - st.rAU[c] * gradP[c].x,
-                st.HbyA[c].y - st.rAU[c] * gradP[c].y,
-                st.HbyA[c].z - st.rAU[c] * gradP[c].z};
+        U[c] = {st.HbyA[c].x - st.rAtU[c] * gradP[c].x,
+                st.HbyA[c].y - st.rAtU[c] * gradP[c].y,
+                st.HbyA[c].z - st.rAtU[c] * gradP[c].z};
     return U;
 }
 

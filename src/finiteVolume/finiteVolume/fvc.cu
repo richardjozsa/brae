@@ -258,5 +258,53 @@ std::vector<vector> div(
     return d;
 }
 
+SurfaceScalarField snGrad(
+    const GeometricField<scalar>& vf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches,
+    bool                          corrected)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& dc = corrected ? g.nonOrthDeltaCoeffs() : g.deltaCoeffs();
+
+    SurfaceScalarField sf;
+    sf.internal.resize(nIf);
+    for (label f = 0; f < nIf; ++f)
+        sf.internal[f] = dc[f] * (vf.internal[nei[f]] - vf.internal[own[f]]);
+
+    // correctedSnGrad::fullGradCorrection -- linear interpolation of grad(vf) dotted with the correction
+    // vectors, which are zero on boundary faces.
+    if (corrected)
+    {
+        const std::vector<vector>  gradVf   = gaussGrad(vf, m, g, patches);
+        const std::vector<vector>& corrVecs = g.nonOrthCorrectionVectors();
+        const std::vector<scalar>& w        = g.weights();
+        for (label f = 0; f < nIf; ++f)
+        {
+            const vector& go = gradVf[own[f]];
+            const vector& gn = gradVf[nei[f]];
+            const vector  gf { w[f] * go.x + (1.0 - w[f]) * gn.x,
+                               w[f] * go.y + (1.0 - w[f]) * gn.y,
+                               w[f] * go.z + (1.0 - w[f]) * gn.z };
+            sf.internal[f] += corrVecs[f].x * gf.x + corrVecs[f].y * gf.y + corrVecs[f].z * gf.z;
+        }
+    }
+
+    sf.boundary.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        const std::vector<scalar> gIC = vf.boundary[pi]->gradientInternalCoeffs();
+        const std::vector<scalar> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
+        sf.boundary[pi].resize(fp.size);
+        for (label i = 0; i < fp.size; ++i)
+            sf.boundary[pi][i] = gIC[i] * vf.internal[fp.faceCells[i]] + gBC[i];
+    }
+    return sf;
+}
+
 } // namespace fvc
 } // namespace brae

@@ -63,6 +63,7 @@ Residuals simpleStep(
     mi.nuEffBndFace = in.nuEffBndFace;
     mi.relaxU = in.relaxU;
     mi.bounded = in.bounded;
+    mi.linearUpwind = in.linearUpwind;
     mi.correctedLaplacian = in.correctedLaplacian;
     mi.hasMRF = in.hasMRF;          mi.hasFvOptions = in.hasFvOptions;
 
@@ -116,10 +117,12 @@ Residuals simpleStep(
     pin.takeUAtBoundary = in.takeUAtBoundary;
 
     PressureStages st;
-    pressurePredictor(st, dm, dbU, MU, f.Ux, f.Uy, f.Uz, pin);
+    pressurePredictor(st, dm, dbU, MU, f.Ux, f.Uy, f.Uz, pin, &dbP, &f.p);
 
     DeviceBuffer<scalar> rAUface;
-    deviceInterpolate(dm, st.rAU, rAUface);
+    // rAtU, not rAU: they are the same buffer unless SIMPLEC is on, and pEqn.H's laplacian takes rAtU
+    // in both cases.
+    deviceInterpolate(dm, st.rAtU, rAUface);
 
     if (in.probe)
     {

@@ -565,6 +565,22 @@ set_tests_properties(simplefoam_v2_convergence PROPERTIES SKIP_RETURN_CODE 77 LA
 # NON-ORTHOGONAL CORRECTION vs real OpenFOAM on a genuinely non-orthogonal mesh, with a control requiring
 # that omitting the term is clearly worse -- on a near-orthogonal mesh this gate would pass with the term
 # deleted. Skips (77) where OpenFOAM is not installed.
+# STOCK pitzDaily end to end: SIMPLEC + linearUpwind + bounded + corrected + kEpsilon, unmodified, vs
+# real OpenFOAM. Also asserts SIMPLEC and plain SIMPLE reach the SAME fixed point -- the control that
+# exposed the missing fvMatrix::faceFluxCorrection.
+add_test(NAME stock_pitzdaily_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/stock_pitzdaily_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(stock_pitzdaily_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# linearUpwind vs real OpenFOAM on pitzDaily's own discretisation. Generates the oracle by running
+# simpleFoam itself, and CONTROLS with a plain-upwind run: the deferred correction leaves the matrix
+# untouched, so a port that dropped it converges and looks fine -- only the comparison can see it.
+add_test(NAME linearupwind_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/linearupwind_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(linearupwind_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
 add_test(NAME nonorth_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/nonorth_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/shearedChannel)

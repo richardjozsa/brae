@@ -78,6 +78,10 @@ struct MomentumInput
     // cannot see it missing -- only the approach to convergence can, which is why it needs its own flag
     // rather than being inferred.
     bool   bounded = false;
+    // `Gauss linearUpwind grad(U)` on div(phi,U). linearUpwind derives from `upwind`, so the MATRIX is
+    // unchanged -- the entire scheme is a deferred source correction (linearUpwind.C;
+    // gaussConvectionScheme.C:112-115). It does NOT vanish at convergence, unlike `bounded`.
+    bool   linearUpwind = false;
     // `corrected`/`limited` laplacianSchemes: use nonOrthDeltaCoeffs implicitly AND add the explicit
     // deferred correction to the source (gaussLaplacianScheme.C). OpenFOAM's default when the word is
     // absent, so most real cases set it.

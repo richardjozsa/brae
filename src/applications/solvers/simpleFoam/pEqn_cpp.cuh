@@ -53,7 +53,8 @@
 // REFUSED, not ignored -- same contract as UEqn_cpp:
 //   * MRF          (pEqn.H:5 makeRelative, and inside constrainPressure)
 //   * fvOptions    (pEqn.H:49 correct(U))
-//   * consistent   (SIMPLEC, pEqn.H:10-16) -- needs UEqn.H1() and fvc::snGrad, neither ported yet
+//   * fixedFluxPressure on a p patch -- pEqn.H:21 updates it through constrainPressure, not ported
+// `consistent` (SIMPLEC, pEqn.H:8-16) IS implemented: matrixH1 and fvc::snGrad were added for it.
 // A case that asks for any of them gets an error, not a quietly different equation.
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
@@ -72,7 +73,11 @@ struct PressureInput
     scalar relaxP = 1.0;        // relaxationFactors/fields p
     label  pRefCell = -1;       // setRefCell; -1 => the case does not need a reference
     scalar pRefValue = 0.0;
-    bool   consistent = false;  // SIMPLE/consistent -> SIMPLEC; refused
+    // SIMPLEC. Implemented: rAtU = 1/(1/rAU - UEqn.H1()), with the phiHbyA and HbyA corrections.
+    bool   consistent = false;
+    // A pressure patch of type fixedFluxPressure -- pEqn.H reaches it through constrainPressure, which
+    // is NOT ported, so it must be refused rather than left with a stale gradient.
+    bool   hasFixedFluxPressure = false;
     bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
     bool   hasMRF = false;      // refused
     bool   hasFvOptions = false;// refused
@@ -82,6 +87,12 @@ struct PressureInput
 struct PressureStages
 {
     std::vector<scalar> rAU;        // 1/UEqn.A()
+    // SIMPLEC's rAtU = 1/(1/rAU - UEqn.H1()). EQUAL to rAU when `consistent` is off, and everything
+    // downstream (the laplacian diffusivity, the U corrector) uses rAtU unconditionally -- pEqn.H does
+    // the same with `tmp<volScalarField> rAtU(rAU)`. Keeping two names that are usually the same object
+    // is OpenFOAM's own structure and it is what makes the SIMPLEC branch a two-line diff rather than a
+    // second code path.
+    std::vector<scalar> rAtU;
     std::vector<vector> HbyA;       // constrainHbyA(rAU*UEqn.H(), U, p)
     SurfaceScalarField  phiHbyA;    // fvc::flux(HbyA), after adjustPhi
     bool                phiAdjusted = false;   // did adjustPhi actually scale anything

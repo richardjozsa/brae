@@ -23,11 +23,11 @@ void refuseUnsupported(const PressureInput& in)
         throw std::runtime_error(
             "pEqn(cuda): the case declares fvOptions, which pEqn.H applies as fvOptions.correct(U) "
             "(pEqn.H:49). Not implemented on this path; refusing.");
-    if (in.consistent)
+    if (in.hasFixedFluxPressure)
         throw std::runtime_error(
-            "pEqn(cuda): SIMPLE/consistent (SIMPLEC) is set. pEqn.H:10-16 then replaces rAU with "
-            "1/(1/rAU - UEqn.H1()) and corrects phiHbyA and HbyA with fvc::snGrad(p); neither is ported. "
-            "Refusing rather than silently running plain SIMPLE.");
+            "pEqn(cuda): a pressure patch is fixedFluxPressure, which pEqn.H updates through "
+            "constrainPressure(p, U, phiHbyA, rAtU, MRF) (pEqn.H:21) so the patch gradient matches the "
+            "flux being imposed. Not implemented; refusing rather than solving with a stale gradient.");
 }
 
 // constrainHbyA (constrainHbyA.C): on a patch whose U BC is NOT assignable, HbyA's boundary value is
@@ -84,9 +84,14 @@ void pressurePredictor(
     const DeviceBuffer<scalar>&  Ux,
     const DeviceBuffer<scalar>&  Uy,
     const DeviceBuffer<scalar>&  Uz,
-    const PressureInput&         in)
+    const PressureInput&         in,
+    const DeviceBoundary*        dbP,
+    const DeviceBuffer<scalar>*  p)
 {
     refuseUnsupported(in);
+    if (in.consistent && (!dbP || !p))
+        throw std::runtime_error("pEqn(cuda): SIMPLEC needs snGrad(p) and grad(p), so the pressure field "
+                                 "and its boundary must be supplied to pressurePredictor.");
     if (!in.takeUAtBoundary)
         throw std::runtime_error("pEqn(cuda): constrainHbyA needs the per-face `assignable` mask.");
 
@@ -101,8 +106,10 @@ void pressurePredictor(
     // A() = D/V with D = diag + cmptAv(internalCoeffs). `diag` here is the RELAXED diagonal when the
     // matrix has been relaxed -- OpenFOAM's relax() writes diag_ in place and A() is taken afterwards, so
     // the boundary average is added ON TOP of the relaxed value, not instead of it.
+    // D is kept beyond this block: SIMPLEC's row sum needs the SAME folded diagonal, and recomputing it
+    // there would be a second chance to fold differently.
+    DeviceBuffer<scalar> D;
     {
-        DeviceBuffer<scalar> D;
         deviceCopy(D, UEqn.relaxed ? UEqn.relaxedDiag : UEqn.diag);
         foldBoundaryDiagKernel<<<nBlocks(dm.nCells), TPB>>>(
             dm.nCells, dm.bndCellStart.data(), dm.bndPerm.data(), icAv.data(), D.data());
@@ -156,6 +163,78 @@ void pressurePredictor(
         st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd);
         st.phiAdjusted = (st.massCorr != 1.0);
     }
+
+    // ---- SIMPLEC (pEqn.H:8-16) ---------------------------------------------------------------
+    //
+    //     rAtU = 1.0/(1.0/rAU - UEqn.H1());
+    //     phiHbyA += fvc::interpolate(rAtU - rAU)*fvc::snGrad(p)*mesh.magSf();
+    //     HbyA    -= (rAU - rAtU)*fvc::grad(p);
+    //
+    // AFTER adjustPhi, which is where OpenFOAM puts it: the correction is not part of the flux global
+    // continuity is enforced on, and moving it earlier would rescale it.
+    deviceCopy(st.rAtU, st.rAU);
+    if (in.consistent)
+    {
+        // rAtU = V/rowSum. That IS 1/(1/rAU - H1) and not an approximation of it: A = D/V and
+        // H1 = -sum(offdiag)/V (lduMatrixATmul.C), so V*(A - H1) = D + sum(offdiag) = the row sum of the
+        // folded matrix. D is the diagonal folded above, reused rather than rebuilt.
+        DeviceBuffer<scalar> ones, rowSum;
+        ones.copyFrom(std::vector<scalar>(static_cast<std::size_t>(dm.nCells), scalar(1)));
+        deviceAmul(deviceLduView(dm, D, UEqn.upper, UEqn.lower), ones, rowSum);
+        deviceSimplecRAtU(dm, rowSum, D, st.rAtU);
+
+        DeviceBuffer<scalar> drAtU;
+        deviceCopy(drAtU, st.rAtU);
+        deviceAxpy(-1.0, st.rAU, drAtU);            // drAtU = rAtU - rAU
+
+        // phiHbyA += interpolate(drAtU)*snGrad(p)*magSf.
+        //
+        // Written as a LAPLACIAN FLUX rather than as an explicit snGrad: fvm::laplacian(gamma,p).flux()
+        // on a face is gamma_f*magSf_f*deltaCoeffs_f*(p[nei]-p[own]), which is precisely
+        // gamma_f*magSf_f*snGrad(p)_f, and the boundary coefficients give the patch's own snGrad the same
+        // way. Reusing the laplacian keeps this term consistent with the pressure equation it corrects,
+        // by construction rather than by coincidence -- including the `corrected` deltaCoeffs, which OF's
+        // snGrad(p) also takes.
+        DeviceBuffer<scalar> drAtUf;
+        deviceInterpolate(dm, drAtU, drAtUf);
+        {
+            DeviceBuffer<scalar> ld, lu, ll, fInt;
+            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, in.correctedLaplacian);
+            deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), *p, fInt);
+            deviceAxpy(1.0, fInt, st.phiHbyAInt);
+        }
+        // ...and the non-orthogonal half of that snGrad, which the laplacian coefficients do not carry.
+        // Zero on an orthogonal mesh; NOT zero on pitzDaily.
+        if (in.correctedLaplacian)
+        {
+            DeviceBuffer<scalar> pb, gx, gy, gz, ffc;
+            deviceBCValue(*dbP, *p, pb);
+            deviceGaussGrad(dm, *p, pb, gx, gy, gz);
+            deviceLaplacianCorrFlux(dm, drAtUf, gx, gy, gz, ffc);
+            deviceAxpy(1.0, ffc, st.phiHbyAInt);
+        }
+        {
+            DeviceBuffer<scalar> dIC, dBC, fBnd;
+            deviceBCLaplacianCoeffs(*dbP, drAtU, dIC, dBC);
+            deviceMatrixFluxBoundary(*dbP, dIC, dBC, *p, fBnd);
+            deviceAxpy(1.0, fBnd, st.phiHbyABnd);
+        }
+
+        // HbyA -= (rAU - rAtU)*grad(p)  ==  HbyA += drAtU*grad(p). AFTER the flux, which consumed the
+        // uncorrected HbyA; this feeds only the velocity corrector.
+        {
+            DeviceBuffer<scalar> pb, gx, gy, gz;
+            deviceBCValue(*dbP, *p, pb);
+            deviceGaussGrad(dm, *p, pb, gx, gy, gz);
+            const DeviceBuffer<scalar>* gp[3] = {&gx, &gy, &gz};
+            for (int k = 0; k < 3; ++k)
+            {
+                DeviceBuffer<scalar> t;
+                deviceHadamard(t, drAtU, *gp[k]);
+                deviceAxpy(1.0, t, st.HbyA[k]);
+            }
+        }
+    }
 }
 
 
@@ -177,7 +256,7 @@ void assemblePEqn(
     // extrapolatedCalculated field fvMatrix::A() produces IS the owner cell's -- hence the cell-gamma
     // kernel here rather than the face variant used for nuEff.
     deviceLaplacianCoeffs(dm, rAUface, P.diag, P.upper, P.lower, in.correctedLaplacian);
-    deviceBCLaplacianCoeffs(dbP, st.rAU, P.iC, P.bC);
+    deviceBCLaplacianCoeffs(dbP, st.rAtU, P.iC, P.bC);
 
     // == fvc::div(phiHbyA), extensive: source = V*div(phiHbyA).
     {
@@ -195,7 +274,10 @@ void assemblePEqn(
         deviceGaussGrad(dm, *p, pb, gx, gy, gz);
         deviceLaplacianCorr(dm, rAUface, gx, gy, gz, lc);
         deviceAxpy(1.0, lc, P.source);
+        // ...and the matching FACE FLUX, which correctFlux adds back -- see PressureMatrix.
+        deviceLaplacianCorrFlux(dm, rAUface, gx, gy, gz, P.faceFluxCorr);
     }
+    else P.faceFluxCorr.resize(0);
 
     // pEqn.setReference -- fvMatrix.C:1011-1023: source += diag*value; diag += diag. It DOUBLES the
     // diagonal rather than setting it; a "pin the cell" reading builds a different matrix.
@@ -219,6 +301,8 @@ void correctFlux(
     DeviceBuffer<scalar> fInt, fBnd;
     deviceMatrixFluxInternal(P.view(dm), pSolved, fInt);
     deviceMatrixFluxBoundary(dbP, P.iC, P.bC, pSolved, fBnd);
+    // fvMatrix.C:1688 -- `if (faceFluxCorrectionPtr_) fieldFlux += *faceFluxCorrectionPtr_;`
+    if (P.faceFluxCorr.size() > 0) deviceAxpy(1.0, P.faceFluxCorr, fInt);
 
     deviceCopy(phiInt, st.phiHbyAInt);
     deviceAxpy(-1.0, fInt, phiInt);
@@ -245,11 +329,11 @@ void correctVelocity(
     const DeviceBuffer<scalar>&  gradPy,
     const DeviceBuffer<scalar>&  gradPz)
 {
-    // U = HbyA - rAU*grad(p), with the RELAXED p -- pEqn.H relaxes before this line, so the velocity
+    // U = HbyA - rAtU*grad(p), with the RELAXED p -- pEqn.H relaxes before this line, so the velocity
     // correction and the flux correction deliberately see different pressures.
-    deviceCorrector(st.HbyA[0], st.rAU, gradPx, Ux);
-    deviceCorrector(st.HbyA[1], st.rAU, gradPy, Uy);
-    deviceCorrector(st.HbyA[2], st.rAU, gradPz, Uz);
+    deviceCorrector(st.HbyA[0], st.rAtU, gradPx, Ux);
+    deviceCorrector(st.HbyA[1], st.rAtU, gradPy, Uy);
+    deviceCorrector(st.HbyA[2], st.rAtU, gradPz, Uz);
 }
 
 } // namespace gpu

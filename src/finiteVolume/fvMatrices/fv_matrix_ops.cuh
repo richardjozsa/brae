@@ -34,6 +34,13 @@ inline SurfaceScalarField matrixFlux(
     flux.internal.resize(nIf);
     for (label f = 0; f < nIf; ++f)
         flux.internal[f] = M.upper[f] * pInternal[nei[f]] - M.lower[f] * pInternal[own[f]];
+    // fvMatrix.C:1688 -- `if (faceFluxCorrectionPtr_) fieldFlux += *faceFluxCorrectionPtr_;`.
+    // Omitting this leaves `phi = phiHbyA - pEqn.flux()` non-conservative on a non-orthogonal mesh while
+    // every other check still passes, because the pressure equation carries the correction in its SOURCE
+    // and solves perfectly well without it appearing in the flux.
+    if (!M.faceFluxCorrection.empty())
+        for (label f = 0; f < nIf; ++f)
+            flux.internal[f] += M.faceFluxCorrection[f];
     flux.boundary.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
@@ -162,6 +169,43 @@ std::vector<scalar> matrixA(
     for (label c = 0; c < nC; ++c)
         A[c] = D[c] / g.V()[c];
     return A;
+}
+
+// UEqn.H1() -- fvMatrix.C:H1() over lduMatrix::H1() (lduMatrixATmul.C).
+//
+//     H1[nei[f]] -= lower[f];   H1[own[f]] -= upper[f];        // lduMatrix::H1
+//     H1[c] += boundaryCoeffs[c].component(0)  for COUPLED patches only
+//     H1 /= V
+//
+// SIMPLEC's whole difference from SIMPLE is here: rAtU = 1/(1/rAU - H1) = 1/(A - H1), and because
+// A = (diag + cmptAv(internalCoeffs))/V while H1 = -sum(offdiag)/V, that reciprocal is V over the ROW SUM
+// of the folded matrix. It is written as OpenFOAM writes it rather than as the row sum, so the two halves
+// stay independently checkable against fvMatrix.C.
+//
+// NOTE the asymmetry with matrixA/matrixH: A() takes cmptAv(internalCoeffs) and H() takes component-wise
+// terms, but H1() takes boundaryCoeffs.component(0) -- component ZERO, not the average. It is only
+// reached on coupled patches, which this port refuses, so the term is absent here; the citation is kept
+// so that adding coupled patches does not have to rediscover which component OpenFOAM uses.
+template <typename T>
+std::vector<scalar> matrixH1(
+    const FvMatrix<T>& M,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    const label nC = m.nCells(), nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+
+    std::vector<scalar> H1(nC, 0.0);
+    for (label f = 0; f < nIf; ++f)
+    {
+        H1[nei[f]] -= M.lower[f];
+        H1[own[f]] -= M.upper[f];
+    }
+    (void)patches;   // coupled patches only; refused on this path
+    for (label c = 0; c < nC; ++c) H1[c] /= g.V()[c];
+    return H1;
 }
 
 inline std::vector<vector> matrixH(

@@ -106,6 +106,39 @@ FvMatrix<T> laplacian(
     return M;
 }
 
+// The non-orthogonal correction as a FACE FLUX -- OpenFOAM's faceFluxCorrection
+// (gaussLaplacianScheme.C:186-199, where SfGammaCorr is identically zero because Sf is parallel to its
+// own normal, leaving SfGammaSn*snGradCorrection):
+//
+//     ffc_f = gamma_f * magSf_f * (corrVecs_f & interpolate(grad(vf))_f)
+//
+// The per-cell source below is the DIVERGENCE of this, and is computed from it rather than alongside it,
+// so the two cannot drift apart: fvm::laplacian puts ffc in the matrix's faceFluxCorrection and its
+// divergence in the source, and fvMatrix::flux() adds ffc back. If those two were derived independently,
+// `phi = phiHbyA - pEqn.flux()` would stop being conservative the moment one of them changed.
+template <typename T, typename G>
+std::vector<T> laplacianCorrFlux(
+    const SurfaceScalarField& gammaf,
+    const std::vector<G>& gradVf,
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& w  = g.weights();
+    const std::vector<scalar>& magSf = g.magSf();
+    const std::vector<vector>& cv = g.nonOrthCorrectionVectors();
+
+    std::vector<T> ffc(nIf);
+    for (label f = 0; f < nIf; ++f)
+    {
+        const G gf = w[f] * gradVf[own[f]] + (1.0 - w[f]) * gradVf[nei[f]];
+        ffc[f] = (gammaf.internal[f] * magSf[f]) * dotCorr(cv[f], gf);
+    }
+    return ffc;
+}
+
 // The EXPLICIT non-orthogonal correction, as an extensive per-cell source contribution:
 //     V * fvc::div( gamma*magSf * (corrVecs & interpolate(grad(vf))) )
 // which OpenFOAM SUBTRACTS from the laplacian's source (gaussLaplacianScheme.C). Returned rather than
@@ -137,13 +170,13 @@ std::vector<T> laplacianNonOrthSource(
     const std::vector<vector>& cv = g.nonOrthCorrectionVectors();
 
     std::vector<T> src(nC, T{});
+    const std::vector<T> ffc = laplacianCorrFlux<T, G>(gammaf, gradVf, m, g);
     for (label f = 0; f < nIf; ++f)
     {
-        const G gf = w[f] * gradVf[own[f]] + (1.0 - w[f]) * gradVf[nei[f]];
-        const T corr = (gammaf.internal[f] * magSf[f]) * dotCorr(cv[f], gf);
-        src[own[f]] += corr;
-        src[nei[f]] -= corr;
+        src[own[f]] += ffc[f];
+        src[nei[f]] -= ffc[f];
     }
+    (void)w; (void)magSf; (void)cv;
     return src;
 }
 
@@ -206,6 +239,53 @@ FvMatrix<T> laplacian(
         }
     }
     return M;
+}
+
+// linearUpwind's DEFERRED CORRECTION, as an extensive per-cell contribution.
+//
+// provenance: linearUpwind.C (the `vector` specialisation, which is the one U takes) and
+//             gaussConvectionScheme.C:112-115.
+//
+// linearUpwind derives from `upwind`, so its WEIGHTS are the upwind weights -- the matrix built by
+// fvm::div above is already exactly right and does not change. The whole of the scheme is this explicit
+// term, which OpenFOAM adds as
+//
+//     fvm += fvc::surfaceIntegrate(faceFlux*correction(vf));
+//
+// and fvMatrix::operator+=(DimensionedField) is `source() -= V*su` (fvMatrix.C:1855-1862), while
+// V*surfaceIntegrate is the raw face sum. So the caller SUBTRACTS what this returns. That double
+// negative is the easiest thing to get backwards here, which is why the sign lives in one place.
+//
+//     correction_f = (Cf_f - C_up) & grad(vf)_up,   up = owner if phi_f > 0 else neighbour
+//
+// BOUNDARY FACES CONTRIBUTE NOTHING on uncoupled patches: linearUpwind::correction initialises the
+// surface field to Zero and fills only the `pSfCorr.coupled()` branch. That is not an omission to fix
+// later -- it is the scheme. Coupled patches DO get a correction, and are refused elsewhere.
+template <typename T, typename G>
+std::vector<T> linearUpwindCorrection(
+    const std::vector<scalar>& phiInternal,
+    const std::vector<G>&      gradVf,
+    const PrimitiveMesh&       m,
+    const FvGeometry&          g)
+{
+    const label nC  = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<vector>& C  = g.C();
+    const std::vector<vector>& Cf = g.Cf();
+
+    std::vector<T> corr(nC, T{});
+    for (label f = 0; f < nIf; ++f)
+    {
+        const scalar phi = phiInternal[f];
+        const label  up  = (phi > 0.0) ? own[f] : nei[f];
+        const vector d { Cf[f].x - C[up].x, Cf[f].y - C[up].y, Cf[f].z - C[up].z };
+        const T      fc = phi * dotCorr(d, gradVf[up]);
+        corr[own[f]] += fc;
+        corr[nei[f]] -= fc;
+    }
+    return corr;
 }
 
 template <typename T>

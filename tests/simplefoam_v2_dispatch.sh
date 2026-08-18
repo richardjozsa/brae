@@ -107,9 +107,12 @@ try_refusal fvoptions \
   "open(d+'/constant/fvOptions','w').write('// test\n')" \
   "fvOptions"
 
-try_refusal simplec \
-  "s=open(d+'/system/fvSolution').read(); s=re.sub(r'consistent\s+\S+;','consistent      yes;',s); open(d+'/system/fvSolution','w').write(s)" \
-  "SIMPLEC"
+# SIMPLEC is no longer a refusal -- it is implemented, and section 4d below asserts it RUNS. What IS
+# still refused on that path is constrainPressure, i.e. a fixedFluxPressure pressure patch: brae maps
+# that type to zeroGradient, which is the same boundary condition only when the imposed flux is zero.
+try_refusal fixedfluxp \
+  "import re,glob,os;f=[x for x in glob.glob(d+'/0/p')][0];s=open(f).read();s=re.sub(r'(upperWall\s*\{[^}]*?type\s+)\w+;', r'\\1fixedFluxPressure;', s, count=1, flags=re.S);open(f,'w').write(s)" \
+  "fixedFluxPressure"
 
 # `bounded` is SUPPORTED: -fvm::Sp(fvc::div(phi),U) is implemented on both paths and matched to 2.9e-16.
 # It used to be a refusal; assert it RUNS, since the term vanishes at convergence and a converged field
@@ -135,9 +138,17 @@ try_refusal limitedlaplacian \
     "import re,sys;p=sys.argv[1]+'/system/fvSchemes';s=open(p).read();open(p,'w').write(re.sub(r'laplacianSchemes\s*\{[^}]*\}','laplacianSchemes\n{\n    default         Gauss linear limited 0.33;\n}',s))" \
     "limited"
 
+# `linearUpwind` is no longer a refusal -- it is implemented, and the supported case above uses it.
+# `limitedLinear` still is: it has its own limiter and its own weights.
 try_refusal divscheme \
-  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss linearUpwind grad(U);',s); open(d+'/system/fvSchemes','w').write(s)" \
-  "implicit weights only"
+  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss limitedLinear 1;',s); open(d+'/system/fvSchemes','w').write(s)" \
+  "limitedLinear"
+
+# ...and so is a linearUpwind whose NAMED gradient is not the one brae computes. The scheme is supported;
+# `cellLimited Gauss linear 1` under it is not, and the correction does not vanish at convergence.
+try_refusal lugradscheme \
+  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss linearUpwind grad(U);',s); s=re.sub(r'gradSchemes\s*\{[^}]*\}','gradSchemes\n{\n    default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;\n}',s); open(d+'/system/fvSchemes','w').write(s)" \
+  "cellLimited"
 
 try_refusal transient \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'default\s+steadyState;','default         Euler;',s); open(d+'/system/fvSchemes','w').write(s)" \
@@ -147,6 +158,21 @@ try_refusal transient \
 # be a refusal, and flipping it is the point of that work -- so assert it RUNS and writes the turbulence
 # fields, not merely that it is accepted. A case that ran without writing k/epsilon/nut would mean the
 # hook was never called.
+echo "== 4d. SIMPLEC is supported: the rebuilt path runs it =="
+# It used to be a refusal. Assert it RUNS and SAYS so -- SIMPLEC changes the iteration and not the
+# converged answer, so a silent skip would still converge to a plausible result.
+supported "$W/simplec"
+python3 - "$W/simplec" <<'PY'
+import re, sys
+p = sys.argv[1] + '/system/fvSolution'; s = open(p).read()
+assert s.count('consistent') == 1
+open(p, 'w').write(re.sub(r'consistent\s+\S+;', 'consistent      yes;', s))
+PY
+( cd "$W/simplec" && BRAE_SIMPLEFOAM_V2=1 "$BRAE" > log 2>&1 )
+if [ $? -eq 0 ]; then ok "SIMPLEC: exit 0"; else bad "SIMPLEC: refused or crashed"; sed -n '1,5p' "$W/simplec/log"; fi
+grep -q "SIMPLE/consistent" "$W/simplec/log" && ok "SIMPLEC: the solver states it is applying it" \
+                                             || bad "SIMPLEC: ran without saying so"
+
 echo "== 4b. RAS/kEpsilon is supported: the turbulence hook runs =="
 supported "$W/ras"
 python3 - "$W/ras" <<'PYEOF'

@@ -9,8 +9,13 @@
 # The oracle is generated HERE by running real simpleFoam, not checked in: the point is agreement with
 # OpenFOAM, and a stored reference cannot be re-derived if the case changes.
 #
-# The control is the whole test. Without the correction the same solver is 8.5e-02 on U; with it, 6.9e-04.
+# The control is the whole test. Without the correction the same solver is 8.5e-02 on U; with it, 3.1e-05.
 # Asserting only the second number would pass on a mesh where the term does not matter.
+#
+# That 3.1e-05 was 6.9e-04 until fvMatrix's faceFluxCorrection was ported: the correction was in the
+# pressure equation's SOURCE but not in pEqn.flux(), so `phi = phiHbyA - pEqn.flux()` dropped it and phi
+# was not conservative. The pressure equation solved perfectly well either way, which is why only a
+# comparison against OpenFOAM could see it.
 set -u
 SRC="${1:?case dir}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,9 +51,10 @@ python3 - "$CORR" "$UNCO" "$CUDA" <<'PY'
 import sys
 corr, unco, cuda = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
 fails = 0
-# The correction must bring U close to OpenFOAM. 5e-3 is an order above the measured 6.9e-04.
-if corr <= 5e-3: print("  ok:   corrected U error %.3e <= 5e-03" % corr)
-else:            print("  FAIL: corrected U error %.3e > 5e-03" % corr); fails += 1
+# The correction must bring U close to OpenFOAM. 1e-4 is above the measured 3.1e-05 without being so
+# loose that a partially-wrong correction would pass -- the pre-faceFluxCorrection 6.9e-04 would not.
+if corr <= 1e-4: print("  ok:   corrected U error %.3e <= 1e-04" % corr)
+else:            print("  FAIL: corrected U error %.3e > 1e-04" % corr); fails += 1
 # CONTROL: and the mesh must be non-orthogonal enough that omitting it is clearly worse. Without this the
 # test would pass on a mesh where the term does nothing -- i.e. it would not be testing the term.
 if unco >= 20*corr: print("  ok:   uncorrected is %.0fx worse (%.3e) -- the case discriminates (control)" % (unco/corr, unco))
@@ -56,8 +62,8 @@ else:               print("  FAIL: uncorrected only %.1fx worse -- this case can
 # The CUDA path carries the same correction and must land on the reference's side of that gap, not the
 # uncorrected one. Bounding it against `unco` rather than against a fixed number keeps the assertion tied
 # to the discriminating quantity: a device correction that were dropped or mis-signed lands near `unco`.
-if cuda <= 5e-3: print("  ok:   CUDA U error %.3e <= 5e-03" % cuda)
-else:            print("  FAIL: CUDA U error %.3e > 5e-03" % cuda); fails += 1
+if cuda <= 1e-4: print("  ok:   CUDA U error %.3e <= 1e-04" % cuda)
+else:            print("  FAIL: CUDA U error %.3e > 1e-04" % cuda); fails += 1
 if cuda <= unco/20: print("  ok:   CUDA is %.0fx better than uncorrected -- the device term is live" % (unco/cuda))
 else:               print("  FAIL: CUDA %.3e is not clearly better than uncorrected %.3e" % (cuda, unco)); fails += 1
 print("PASS" if not fails else "FAIL"); sys.exit(1 if fails else 0)

@@ -80,6 +80,7 @@ struct StepInput
     int    maxIter = 2000;
     bool   momentumPredictor = true;
     bool   bounded = false;              // div(phi,U) `bounded`
+    bool   linearUpwind = false;         // div(phi,U) `linearUpwind`: deferred correction, upwind matrix
     bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
     label  nNonOrthogonalCorrectors = 0;
 

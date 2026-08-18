@@ -10,7 +10,7 @@
 //   setReference     analytic  (fvMatrix.C:1011-1023 is two lines; assert exactly those two)
 //   correctFlux      analytic  (at p == 0 the flux is -boundaryCoeffs, exactly)
 //   relaxField       analytic  (GeometricField.C:1094)
-//   refusals         MRF / fvOptions / consistent must all throw
+//   refusals         MRF / fvOptions / fixedFluxPressure must all throw
 //
 // Run: test_peqn_cpp <caseDir>
 #include "primitive_mesh.cuh"
@@ -205,13 +205,15 @@ int main(int argc, char** argv)
 
     // --- refusals -------------------------------------------------------------------------
     std::printf("  -- refusals\n");
-    const char* names[3] = {"MRF", "fvOptions", "consistent (SIMPLEC)"};
+    // `consistent` is no longer here: SIMPLEC is implemented (matrixH1 + fvc::snGrad). fixedFluxPressure
+    // takes its place -- pEqn.H reaches it through constrainPressure, which is not ported.
+    const char* names[3] = {"MRF", "fvOptions", "fixedFluxPressure"};
     for (int which = 0; which < 3; ++which)
     {
         cpu::PressureInput bad = in;
         if (which == 0) bad.hasMRF = true;
         else if (which == 1) bad.hasFvOptions = true;
-        else bad.consistent = true;
+        else bad.hasFixedFluxPressure = true;
         bool threw = false;
         try { cpu::pressurePredictor(UEqn, U, p, bad, m, g, patches); }
         catch (const std::runtime_error&) { threw = true; }

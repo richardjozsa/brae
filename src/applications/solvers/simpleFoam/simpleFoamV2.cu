@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <regex>
 #include <cmath>
+#include <cstring>
 #include <sstream>
 #include <stdexcept>
 
@@ -77,6 +78,73 @@ std::string divUScheme(const std::string& caseDir)
         break;      // the FIRST such word is the scheme; anything after is its coefficient
     }
     return last;
+}
+
+// The gradient `linearUpwind` NAMES, resolved through gradSchemes -- and whether it is one we compute.
+//
+// `div(phi,U) bounded Gauss linearUpwind grad(U);` does not mean "use fvc::grad". linearUpwind's
+// constructor reads the word after the scheme (linearUpwind.H, gradSchemeName_(schemeData)) and looks it
+// up with mesh.gradScheme(name), which falls back to gradSchemes `default`. brae computes a plain Gauss
+// linear gradient; a case naming cellLimited or leastSquares there would get a DIFFERENT correction,
+// silently, and this correction does NOT vanish at convergence -- so the answer would simply be wrong.
+// Returns the offending scheme word, or empty when the resolved scheme is Gauss linear.
+std::string linearUpwindGradUnsupported(const std::string& caseDir)
+{
+    std::string text;
+    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return ""; }
+
+    // 1. the name linearUpwind gives -- the word immediately after it in the div(phi,U) entry.
+    std::string gradName = "default";
+    {
+        const std::size_t blk = text.find("divSchemes");
+        if (blk != std::string::npos)
+        {
+            const std::size_t open = text.find('{', blk);
+            const std::size_t close = text.find('}', open == std::string::npos ? blk : open);
+            if (open != std::string::npos)
+            {
+                const std::string b =
+                    text.substr(open, (close == std::string::npos ? text.size() : close) - open);
+                static const std::regex re(R"(linearUpwind\s+([^\s;]+))");
+                std::smatch mm;
+                if (std::regex_search(b, mm, re)) gradName = mm[1].str();
+            }
+        }
+    }
+
+    // 2. that name's entry in gradSchemes, falling back to `default`.
+    const std::size_t gblk = text.find("gradSchemes");
+    if (gblk == std::string::npos) return "";          // no block -> OpenFOAM's default is Gauss linear
+    const std::size_t open = text.find('{', gblk);
+    if (open == std::string::npos) return "";
+    const std::size_t close = text.find('}', open);
+    const std::string b = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
+
+    std::string entry;
+    {
+        // The name contains parentheses (`grad(U)`), so every regex metacharacter in it is escaped rather
+        // than pasted in raw -- `grad(U)` as a pattern would match the bare word `gradU`.
+        std::string esc;
+        for (char c : gradName)
+        {
+            if (std::strchr("().[]{}*+?^$|\\", c)) esc += '\\';
+            esc += c;
+        }
+        std::smatch mm;
+        if (std::regex_search(b, mm, std::regex(esc + R"(\s+([^;]*);)"))) entry = mm[1].str();
+        else if (std::regex_search(b, mm, std::regex(R"(default\s+([^;]*);)"))) entry = mm[1].str();
+    }
+    if (entry.empty()) return "";
+
+    // 3. accept only `Gauss linear`.
+    static const std::regex tok(R"([^\s]+)");
+    for (std::sregex_iterator it(entry.begin(), entry.end(), tok), e; it != e; ++it)
+    {
+        const std::string w = it->str();
+        if (w == "Gauss" || w == "linear") continue;
+        return w;
+    }
+    return "";
 }
 
 bool divUBounded(const std::string& caseDir)
@@ -183,10 +251,10 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
 
     if (const FoamDict* s = fvSolution.subDict("SIMPLE"))
     {
-        if (switchOn(*s, "consistent", false))
-            r.blockers.push_back("SIMPLE/consistent is set (SIMPLEC). pEqn.H:10-16 then replaces rAU with "
-                                 "1/(1/rAU - UEqn.H1()) and corrects phiHbyA/HbyA with fvc::snGrad(p); "
-                                 "neither H1() nor snGrad is ported.");
+        // SIMPLEC is implemented (matrixH1 + fvc::snGrad); it is READ here, not refused. What is still
+        // missing is constrainPressure, which pEqn.H calls with rAtU right after -- it only does anything
+        // on a fixedFluxPressure patch, so that patch type is what gets refused, below.
+        (void)s;
     }
 
     // --- this is the STEADY solver ------------------------------------------------------------
@@ -215,10 +283,19 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
                                  "correction than the case asked for.");
 
         const std::string sc = divUScheme(caseDir);
-        if (!sc.empty() && sc != "upwind")
+        if (!sc.empty() && sc != "upwind" && sc != "linearUpwind")
             r.blockers.push_back("div(phi,U) asks for `" + sc + "`; the rebuilt UEqn implements `upwind` "
-                                 "implicit weights only. Running it anyway would solve a different "
+                                 "and `linearUpwind` only. Running it anyway would solve a different "
                                  "discretisation than the case specifies.");
+        if (sc == "linearUpwind")
+        {
+            const std::string bad = linearUpwindGradUnsupported(caseDir);
+            if (!bad.empty())
+                r.blockers.push_back("div(phi,U) is `linearUpwind`, whose named gradient resolves to `" +
+                                     bad + "` in gradSchemes; brae computes a plain Gauss linear gradient. "
+                                     "This correction does not vanish at convergence, so running it would "
+                                     "be wrong rather than merely slower to converge.");
+        }
     }
 
     // --- turbulence ---------------------------------------------------------------------------
@@ -252,6 +329,24 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
             if (isCoupledInterfaceType(b.type) || b.type == "processor")
                 r.blockers.push_back("patch `" + b.name + "` is of coupled type `" + b.type +
                                      "`; the rebuilt components handle no coupled interfaces.");
+    }
+
+    // --- pressure BCs that pEqn.H reaches through constrainPressure ---------------------------
+    // fixedFluxPressure is a fixedGradient patch whose gradient constrainPressure RESETS every outer
+    // iteration to match the flux actually being imposed. brae's field builder maps it to zeroGradient,
+    // which is the right answer only when that flux is zero. Left unchecked the case would run and
+    // quietly impose a different boundary condition than it asked for.
+    {
+        const FoamDict cd0 = readDict(caseDir + "/system/controlDict");
+        const std::string st0 = cd0.wordOr("startFrom", "startTime") == "latestTime"
+                              ? std::string("0") : cd0.wordOr("startTime", "0");
+        std::string ptext;
+        try { ptext = readFileExpanded(caseDir + "/" + st0 + "/p"); } catch (...) { ptext.clear(); }
+        if (ptext.find("fixedFluxPressure") != std::string::npos)
+            r.blockers.push_back("a pressure patch is `fixedFluxPressure`; pEqn.H resets its gradient "
+                                 "every iteration through constrainPressure(p, U, phiHbyA, rAtU, MRF) "
+                                 "(pEqn.H:21), which is not ported. brae would substitute zeroGradient, "
+                                 "which is only the same boundary condition when the imposed flux is 0.");
     }
 
     // --- substitutions that are supported but must be SAID ------------------------------------
@@ -481,13 +576,45 @@ int runSimpleFoamV2(const std::string& caseDir)
 
     in.nuEffCell = &dNuCell; in.nuEffFace = &dNuFace; in.nuEffBndFace = &dNuBnd;
     in.relaxU = relaxU; in.relaxP = relaxP;
+
+    // ---- linear-solver controls, from the case ------------------------------------------------
+    // These were HARDCODED at tolerance 1e-10 / relTol 0, which is four to five orders tighter than any
+    // case asks for. SIMPLE deliberately solves each inner system LOOSELY -- pitzDaily says
+    // `relTol 0.1` -- because the outer iteration is what converges, not the inner solve. Ignoring that
+    // does not give a wrong answer, it gives the right answer for roughly ten times the linear-algebra
+    // work: measured 614 fine-grid SpMV per SIMPLE iteration against the existing solver's 62.
+    //
+    // maxIter follows OpenFOAM's lduMatrix::solver default of 1000, and is READ, because an `maxIter 10`
+    // in a case is a cap on the answer and not a performance hint.
+    if (const FoamDict* solvers = fvSolution.subDict("solvers"))
+    {
+        // subDict resolves OpenFOAM regex keys, so `"(U|k|epsilon|omega|f|v2)"` is found by "U".
+        if (const FoamDict* sp = solvers->subDict("p"))
+        {
+            in.tolP    = sp->scalarOr("tolerance", in.tolP);
+            in.relTolP = sp->scalarOr("relTol", 0.0);
+            in.maxIter = static_cast<int>(sp->scalarOr("maxIter", 1000));
+        }
+        if (const FoamDict* su = solvers->subDict("U"))
+        {
+            in.tolU    = su->scalarOr("tolerance", in.tolU);
+            in.relTolU = su->scalarOr("relTol", 0.0);
+        }
+    }
+    std::printf("  linear solves: p tol=%.1e relTol=%.3g   U tol=%.1e relTol=%.3g   maxIter=%d\n",
+                in.tolP, in.relTolP, in.tolU, in.relTolU, in.maxIter);
     in.momentumPredictor = cd.momentumPredictor;
     in.nNonOrthogonalCorrectors = cd.nNonOrthogonalCorrectors;
     in.pRefCell = f.pRefCell; in.pRefValue = f.pRefValue;
     in.takeUAtBoundary = &dTakeU; in.adjustable = &dAdjust;
     in.consistent = cd.consistent;
+    if (in.consistent)
+        std::printf("  SIMPLE/consistent: SIMPLEC, rAtU = 1/(1/rAU - UEqn.H1())\n");
     // `bounded Gauss <scheme>`: -fvm::Sp(fvc::div(phi), U), implemented on both paths and matched to
     // 2.9e-16 (tests/test_ueqn_cuda.cu), so it is READ rather than refused.
+    in.linearUpwind = (divUScheme(caseDir) == "linearUpwind");
+    if (in.linearUpwind)
+        std::printf("  div(phi,U) is linearUpwind: upwind matrix + the deferred grad correction\n");
     in.bounded = divUBounded(caseDir);
     if (in.bounded) std::printf("  div(phi,U) is bounded: applying -fvm::Sp(fvc::div(phi), U)\n");
 

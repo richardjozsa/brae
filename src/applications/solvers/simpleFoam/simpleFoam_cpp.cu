@@ -53,6 +53,7 @@ Residuals simpleStep(
     mi.relaxU = in.relaxU;
     mi.correctedLaplacian = in.correctedLaplacian;
     mi.bounded = in.bounded;
+    mi.linearUpwind = in.linearUpwind;
     mi.hasMRF = in.hasMRF;     mi.hasFvOptions = in.hasFvOptions;
 
     const FvVectorMatrix UEqn = assembleUEqn(f.U, mi, m, g, patches);

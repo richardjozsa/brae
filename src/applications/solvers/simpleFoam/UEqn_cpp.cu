@@ -44,6 +44,23 @@ FvVectorMatrix momentumCore(
     // why the scheme is a first-class part of the port manifest rather than a detail.
     FvVectorMatrix M = fvm::div(*in.phi, *in.phiBnd, U, m, patches);
 
+    // linearUpwind's deferred correction. OpenFOAM applies it INSIDE fvm::div (gaussConvectionScheme.C:
+    // 112-115), so it lands here, before everything else -- and it is SUBTRACTED, because `fvm += ...`
+    // on an fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862). The gradient is the one the scheme
+    // NAMES (`linearUpwind grad(U)`), resolved through gradSchemes by the caller's envelope check.
+    if (in.linearUpwind)
+    {
+        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        const std::vector<vector> corr =
+            fvm::linearUpwindCorrection<vector, tensor>(*in.phi, gradU, m, g);
+        for (std::size_t c = 0; c < corr.size(); ++c)
+        {
+            M.source[c].x -= corr[c].x;
+            M.source[c].y -= corr[c].y;
+            M.source[c].z -= corr[c].z;
+        }
+    }
+
     // - fvm::laplacian(nuEff, U), the implicit half of divDevReff. Face nuEff takes the BOUNDARY field on
     // boundary faces, not the owner cell value; see interpolateEff in linearViscousStress_cpp.cu.
     addEqual(M, fvm::laplacian<vector>(
@@ -63,6 +80,23 @@ FvVectorMatrix assembleUEqn(
     refuseUnsupported(in);
 
     FvVectorMatrix M = fvm::div(*in.phi, *in.phiBnd, U, m, patches);
+
+    // linearUpwind's deferred correction. OpenFOAM applies it INSIDE fvm::div (gaussConvectionScheme.C:
+    // 112-115), so it lands here, before everything else -- and it is SUBTRACTED, because `fvm += ...`
+    // on an fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862). The gradient is the one the scheme
+    // NAMES (`linearUpwind grad(U)`), resolved through gradSchemes by the caller's envelope check.
+    if (in.linearUpwind)
+    {
+        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        const std::vector<vector> corr =
+            fvm::linearUpwindCorrection<vector, tensor>(*in.phi, gradU, m, g);
+        for (std::size_t c = 0; c < corr.size(); ++c)
+        {
+            M.source[c].x -= corr[c].x;
+            M.source[c].y -= corr[c].y;
+            M.source[c].z -= corr[c].z;
+        }
+    }
 
     // `bounded`: - fvm::Sp(fvc::div(phi), U). Applied BEFORE relax, as OpenFOAM does -- it is part of the
     // matrix the relaxation then acts on, not a correction bolted on afterwards.

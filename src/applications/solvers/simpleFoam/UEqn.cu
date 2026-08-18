@@ -108,6 +108,30 @@ void assembleUEqn(
         }
     }
 
+    // ---- linearUpwind's deferred correction --------------------------------------------------
+    // AFTER divDevReff for the same reason as the block above: that call ASSIGNS the source.
+    //
+    // OpenFOAM applies this inside fvm::div, but it only ever touches `source`, so its position among the
+    // other source contributions is free -- what is NOT free is being after the assignment and before
+    // relax(), which reads the source. SUBTRACTED, because `fvm += fvc::surfaceIntegrate(...)` on an
+    // fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862).
+    //
+    // Per component with the SCALAR gradient of that component, which is what OpenFOAM's `vector`
+    // specialisation computes as one tensor grad: (d & grad(U))_j = d . grad(U_j) under OpenFOAM's
+    // grad(U)_ij = d(U_j)/d(x_i) convention. The two are the same field, not an approximation of it.
+    if (in.linearUpwind)
+    {
+        const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> ub, gx, gy, gz, lu;
+            deviceBCValue(dbU.comp[k], *U[k], ub);
+            deviceGaussGrad(dm, *U[k], ub, gx, gy, gz);
+            deviceLinearUpwindCorr(dm, *in.phiInt, gx, gy, gz, lu);
+            deviceAxpy(-1.0, lu, M.source[k]);
+        }
+    }
+
     // ---- UEqn.relax() -----------------------------------------------------------------------
     // OpenFOAM's fvMatrix::relax is ASYMMETRIC: it ADDS cmptMax(cmptMag(internalCoeffs)) to the diagonal
     // and REMOVES cmptMin(internalCoeffs), which are different quantities and agree only when the three

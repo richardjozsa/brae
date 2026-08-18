@@ -36,11 +36,14 @@ struct EnvelopeReport
 // defect that would otherwise be silent -- a converged, plausible, wrong answer:
 //
 //   MRF / fvOptions            change the momentum equation; UEqn.cu and pEqn.cu refuse them
-//   SIMPLE/consistent          SIMPLEC needs UEqn.H1() and fvc::snGrad; neither is ported
+//   fixedFluxPressure on p     pEqn.H resets its gradient through constrainPressure, which is not
+//                              ported; brae maps the type to zeroGradient, the same BC only at zero flux
 //   ddtSchemes != steadyState  this is the STEADY solver
-//   div(phi,U) scheme          the CUDA UEqn implements upwind; a case asking for limitedLinear,
-//                              linearUpwind or LUST would get a different discretisation, which is
-//                              precisely the class of defect that hid in brae's LUST implicit weights
+//   div(phi,U) scheme          the CUDA UEqn implements upwind and linearUpwind; a case asking for
+//                              limitedLinear or LUST would get a different discretisation, which is
+//                              precisely the class of defect that hid in brae's LUST implicit weights.
+//                              linearUpwind's NAMED gradient is checked too: `grad(U) cellLimited ...`
+//                              is a different correction and is refused rather than approximated
 //   turbulence model           only kEpsilon and laminar are wired
 //   coupled patches            cyclic / cyclicAMI / cyclicACMI / processor are not handled by the
 //                              rebuilt components

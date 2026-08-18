@@ -69,6 +69,9 @@ struct MomentumInput
     const DeviceBuffer<scalar>* nuEffBndFace = nullptr;  // boundary faces -- the PATCH value, not the cell's
     scalar relaxU = 1.0;
     bool   bounded = false;   // `bounded Gauss <scheme>`: diag -= V*div(phi); see UEqn_cpp.cuh
+    // `Gauss linearUpwind grad(U)`: the matrix stays pure upwind and the whole scheme is a deferred
+    // source correction -- see UEqn_cpp.cuh. Unlike `bounded` it does NOT vanish at convergence.
+    bool   linearUpwind = false;
     // `corrected` laplacianSchemes: switches the implicit coefficient to nonOrthDeltaCoeffs AND adds the
     // explicit deferred correction. Both halves, as in the reference -- see UEqn_cpp.cuh.
     bool   correctedLaplacian = false;

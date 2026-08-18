@@ -79,6 +79,7 @@ struct StepInput
     int    maxIter = 2000;
     bool   correctedLaplacian = false;           // `corrected` laplacianSchemes
     bool   bounded = false;                      // div(phi,U) `bounded`
+    bool   linearUpwind = false;                 // div(phi,U) `linearUpwind`
     bool   hasMRF = false;                       // refused downstream
     bool   hasFvOptions = false;                 // refused downstream
 };

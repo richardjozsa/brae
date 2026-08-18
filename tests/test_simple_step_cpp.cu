@@ -100,26 +100,22 @@ int main(int argc, char** argv)
 
     // THE FIXTURE'S ORACLE IS PLAIN SIMPLE, NOT SIMPLEC.
     //
-    // This case's dictionary says `consistent yes`, and pEqn_cpp correctly refuses it -- assert that
-    // first, because it is the refusal contract working on a real case rather than a synthetic flag.
-    // But step.dat was produced by the dumpSimpleStep app, which ran the plain SIMPLE corrector: the
-    // pre-existing test_simple_step reproduces step.dat to 1e-5 with no H1/snGrad terms anywhere. So the
-    // comparison below is run with SIMPLEC switched OFF, and that is a property of the FIXTURE, recorded
-    // here rather than papered over. When SIMPLEC is ported, this needs a SIMPLEC oracle to test against.
+    // This case's dictionary says `consistent yes`, but step.dat was produced by the dumpSimpleStep app,
+    // which ran the plain SIMPLE corrector: the pre-existing test_simple_step reproduces step.dat to 1e-5
+    // with no H1/snGrad terms anywhere. So the comparison below is run with SIMPLEC switched OFF, and
+    // that is a property of the FIXTURE, recorded here rather than papered over.
+    //
+    // This used to assert that SIMPLEC was REFUSED, which was the honest thing while it was unported.
+    // SIMPLEC is implemented now, so the refusal is gone and the mismatch is no longer self-enforcing --
+    // hence the explicit assertion below that the flag really is off before step.dat is compared against.
+    // A SIMPLEC oracle is still needed to test the SIMPLEC path at THIS granularity; end to end it is
+    // covered by ctest stock_pitzdaily_vs_openfoam.
     {
         cpu::SimpleControl simplec(cd);
-        cpu::StepInput probeIn;
-        probeIn.nuEff.assign(nC, nu);
-        probeIn.nuEffBnd.resize(patches.size());
-        for (std::size_t pi = 0; pi < patches.size(); ++pi)
-            probeIn.nuEffBnd[pi].assign(patches[pi].size, nu);
-        cpu::SimpleFields probeF = cpu::createFields(caseDir + "/282", simpleDict, m, g, patches);
-        bool threw = false;
-        try { cpu::simpleStep(probeF, simplec, probeIn, m, g, patches); }
-        catch (const std::runtime_error&) { threw = true; }
-        check(threw, "SIMPLEC is refused on a case that actually asks for it");
+        check(simplec.consistent(), "the fixture really does ask for SIMPLEC (control on the note above)");
     }
     cd.consistent = false;                  // match how step.dat was generated -- see the note above
+    check(!cd.consistent, "SIMPLEC is OFF for the step.dat comparison (fixture guard)");
     cpu::SimpleControl ctl(cd);
 
     // The corrector loop must run exactly nNonOrthogonalCorrectors+1 times and then reset.
