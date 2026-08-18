@@ -391,12 +391,27 @@ COMPONENTS = {
                   "nuEff refresh (nu + nut, boundary value from deviceBoundaryNut's wall function, never "
                   "the owner cell), which is what makes the lagged coupling work without the driver "
                   "knowing the model. "
-                  "OPEN DEFECT: over 20 iterations on pitzDaily the rebuilt path's U residual plateaus at "
-                  "~0.5 while the existing solver falls 1 -> 0.022. A single iteration matches the _cpp "
-                  "reference to 4e-09, so the discrepancy accumulates across iterations and is NOT yet "
-                  "explained. Found and fixed along the way: `bounded` (-fvm::Sp(fvc::div(phi),U)) was "
-                  "missing and the guard was stripping the keyword and accepting the case -- now refused "
-                  "-- but removing it changed the residuals not at all, so it is not the cause."),
+                  "CONVERGENCE GAP -- DIAGNOSED, NOT A PORT DEFECT. tests/diag_simple_loop.cu runs the old "
+                  "HOST driver (simple_foam.cuh), the _cpp driver and the CUDA driver side by side: the "
+                  "_cpp driver reproduces the old host driver BIT-IDENTICALLY (dU = 0.00e+00 every "
+                  "iteration, same residual sequence 1.0/0.278/0.402/0.501/0.555/0.344/0.302/0.589). So "
+                  "there is no accumulating port error -- the rebuilt path is a faithful port of "
+                  "simple_foam.cuh, and simple_foam.cuh itself does not converge on pitzDaily. What "
+                  "converges is the old GPU driver (device_simple_foam.cu), a richer algorithm. The _cpp "
+                  "reference was validated for ONE iteration against OpenFOAM dumpSimpleStep and has never "
+                  "been validated for CONVERGENCE. "
+                  "RULED OUT by direct diff of the two old drivers on the same case, same settings "
+                  "(relax U=0.7 p=0.3, bounded=0, nonOrth=0, consistent=0): the bounded term, the "
+                  "non-orthogonal correction (pitzDaily is near-orthogonal -- the old path gives 0.524859 "
+                  "vs 0.524857 with and without), MRF/fvOptions/porosity/rotorDisk/meanVelocityForce (all "
+                  "inactive), pressure EQUATION relaxation (needs an fvSolution equations/p entry, absent "
+                  "here), relaxation factors, SIMPLEC, the post-solve ordering (identical), and the linear "
+                  "solver tolerances (using the case's 1e-5/1e-6 with relTol 0.1 changes the trajectory "
+                  "but does not converge it). "
+                  "NEXT: the gap is between two PRE-EXISTING brae paths, not in the rebuild. "
+                  "Found and fixed along the way, both genuine silent-substitution holes in the envelope "
+                  "guard: `bounded` (-fvm::Sp(fvc::div(phi),U)) and the non-orthogonal laplacian "
+                  "correction were each accepted by the guard and ignored by the solver; both now refuse."),
 
         dict(name="cuda_vs_reference", of_symbol="(brae-specific)",
              of_file="-",
