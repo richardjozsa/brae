@@ -28,6 +28,8 @@
 #include "simpleFoam.cuh"
 #include "simple_foam.cuh"        // the OLD HOST driver
 #include "device_simple_foam.cuh" // the OLD GPU driver -- the one that converges
+#include "UEqn_cpp.cuh"
+#include "pEqn_cpp.cuh"
 #include "linear_solver_setup.cuh"  // readLinearSolverControls
 #include "scheme_parse.cuh"          // parseFvSchemesControls --
                                     // the SAME setup the brae binary runs, so the comparison is equal
@@ -160,6 +162,8 @@ int main(int argc, char** argv)
     gin.tolU = cin.tolU; gin.relTolU = cin.relTolU;
     gin.tolP = cin.tolP; gin.relTolP = cin.relTolP;
     gpu::SolverWorkspace ws;
+    gpu::StepProbe pr;
+    if (std::getenv("BRAE_DIAG_PROBE")) gin.probe = &pr;
 
     // The OLD host driver, on the same start. Both are host code, so any difference between it and the
     // _cpp driver is pure solver LOGIC -- no linear-solver or precision difference can be blamed.
@@ -192,7 +196,16 @@ int main(int argc, char** argv)
     std::printf("----+-------------+------------+-----------+-----------+----------------\n");
     for (int it = 1; it <= iters; ++it)
     {
+        cpu::SimpleFields fPre = cpu::createFields(caseDir + "/" + t, simpleDict, m, g, fvp);
+        fPre.U.internal = f.U.internal;  fPre.U.evaluateBoundary();
+        fPre.p.internal = f.p.internal;  fPre.p.evaluateBoundary();
+        fPre.phi = f.phi;
+
         const cpu::Residuals cr = cpu::simpleStep(f, ctlC, cin, m, g, fvp);
+        // BRAE_DIAG_FRESHAMG: drop the AMG hierarchy each iteration. It is the only state the CUDA
+        // driver carries besides the fields, so if forcing a rebuild removes the divergence the defect is
+        // in reusing/re-Galerkining it, not in any stage.
+        if (std::getenv("BRAE_DIAG_FRESHAMG")) ws.amgBuilt = false;
         const gpu::Residuals gr = gpu::simpleStep(gf, ws, dm, dbU, dbP, gin);
 
         const std::vector<scalar> ux = gf.Ux.host(), uy = gf.Uy.host(), uz = gf.Uz.host();
@@ -205,6 +218,52 @@ int main(int argc, char** argv)
         std::vector<scalar> ox(nC), oy(nC), oz(nC);
         for (label c = 0; c < nC; ++c)
         { ox[c] = fo.U.internal[c].x; oy[c] = fo.U.internal[c].y; oz[c] = fo.U.internal[c].z; }
+
+        // PROBE: the CUDA driver's internals against the _cpp stages, from the SAME fields. Run with
+        // BRAE_DIAG_SYNC=all so every iteration starts identical; the first line that is not ~1e-15 names
+        // the stage the driver is feeding wrongly.
+        if (std::getenv("BRAE_DIAG_PROBE"))
+        {
+            // Re-run the _cpp stages by hand on the PRE-step fields (fPre), which is what both drivers saw.
+            cpu::MomentumInput rmi;
+            rmi.phi = &fPre.phi.internal; rmi.phiBnd = &fPre.phi.boundary;
+            rmi.nuEff = &nuEffC;          rmi.nuEffBnd = &nuEffB;
+            rmi.relaxU = relaxU;
+            const FvVectorMatrix rU = cpu::assembleUEqn(fPre.U, rmi, m, g, fvp);
+            // The MOMENTUM PREDICTOR, which the driver runs before pressurePredictor. Omitting it here
+            // compared HbyA(U_before) against HbyA(U_after) and reported a 42% "defect" that was entirely
+            // this omission -- the fifth unequal comparison in this investigation.
+            {
+                FvVectorMatrix rMp = rU;
+                cpu::addPressureGradient(rMp, fPre.p, m, g, fvp);
+                solveVector(rMp, fPre.U, m, fvp, cin.tolU, cin.relTolU, cin.maxIter);
+            }
+            cpu::PressureInput rpin;
+            rpin.pRefCell = fPre.pRefCell; rpin.pRefValue = fPre.pRefValue;
+            const cpu::PressureStages rst = cpu::pressurePredictor(rU, fPre.U, fPre.p, rpin, m, g, fvp);
+            const FvScalarMatrix rP = cpu::assemblePEqn(rst, fPre.p, rpin, m, g, fvp);
+
+            auto rel = [](const std::vector<scalar>& a, const std::vector<scalar>& b)
+            {
+                scalar mx = 0, mg = 0;
+                const std::size_t n = std::min(a.size(), b.size());
+                for (std::size_t i = 0; i < n; ++i)
+                { mx = std::fmax(mx, std::fabs(a[i]-b[i])); mg = std::fmax(mg, std::fabs(b[i])); }
+                return mg > 0 ? mx/mg : mx;
+            };
+            std::vector<scalar> rHx(nC), rphiB;
+            for (label c = 0; c < nC; ++c) rHx[c] = rst.HbyA[c].x;
+            for (const auto& v : rst.phiHbyA.boundary) for (scalar x : v) rphiB.push_back(x);
+
+            std::printf("      probe: rAU=%.2e rAUf=%.2e HbyAx=%.2e phiHbyA=%.2e phiHbyAb=%.2e "
+                        "pDiag=%.2e pUp=%.2e pSrc=%.2e\n",
+                        rel(pr.rAU, rst.rAU),
+                        rel(pr.rAUface, fvc::interpolate(rst.rAU, m, g, fvp).internal),
+                        rel(pr.HbyA[0], rHx),
+                        rel(pr.phiHbyAInt, rst.phiHbyA.internal),
+                        rel(pr.phiHbyABnd, rphiB),
+                        rel(pr.pDiag, rP.diag), rel(pr.pUpper, rP.upper), rel(pr.pSource, rP.source));
+        }
 
         // With BRAE_DIAG_SYNC=all every iteration starts from IDENTICAL inputs, so these three numbers
         // are "one CUDA iteration vs one _cpp iteration from the same fields" -- measured fresh each time
