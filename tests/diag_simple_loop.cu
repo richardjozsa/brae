@@ -100,6 +100,8 @@ int main(int argc, char** argv)
     cpu::StepInput cin;
     cin.nu = nu; cin.nuEff = nuEffC; cin.nuEffBnd = nuEffB;
     cin.relaxU = relaxU; cin.relaxP = relaxP;
+    // The non-orth flag comes from the SAME parse the old GPU driver uses (set below), so the two columns
+    // cannot end up running different schemes -- the failure mode that produced five false findings here.
     // Solver tolerances from the CASE, not the struct defaults -- the existing solver uses
     // fvSolution/solvers/{p,U}/tolerance (p 1e-6, U 1e-5 on pitzDaily) and the rebuilt runner was
     // hardcoding 1e-10 for both.
@@ -191,6 +193,9 @@ int main(int argc, char** argv)
                 (int)dctl.bounded, (int)dctl.nonOrth, (int)dctl.linearUpwind,
                 (int)dctl.consistent, (int)dctl.gsU);
     DeviceSimpleSolver dev(m, g, fvp, fd.U, fd.p, fd.phi, dctl);
+
+    cin.correctedLaplacian = dctl.nonOrth;   // same parse as the GPU column
+    std::printf("  _cpp correctedLaplacian = %d\n", (int)cin.correctedLaplacian);
 
     std::printf("\n it |  OLD host U |  OLD GPU U |    _cpp U |   cuda U  | dU(host vs GPU)\n");
     std::printf("----+-------------+------------+-----------+-----------+----------------\n");
