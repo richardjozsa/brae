@@ -26,6 +26,16 @@ std::vector<vector> gaussGrad(const GeometricField<scalar>& p,
                               const FvGeometry& g,
                               const std::vector<FvPatch>& patches);
 
+// Array form, for a scalar field that is not a GeometricField. limitedLinear on a VECTOR needs
+// fvc::grad(magSqr(U)) (LimitedScheme.C::calcLimiter with limitFuncs::magSqr), and magSqr(U) is a derived
+// field with no patch objects of its own -- only values. Building a synthetic GeometricField for it would
+// mean inventing boundary types it does not have.
+std::vector<vector> gaussGrad(const std::vector<scalar>& internal,
+                              const std::vector<std::vector<scalar>>& boundary,
+                              const PrimitiveMesh& m,
+                              const FvGeometry& g,
+                              const std::vector<FvPatch>& patches);
+
 // Gauss gradient of a volVectorField -> volTensorField (grad(U)_ij = sum Sf_i U_j / V).
 std::vector<tensor> gaussGrad(const GeometricField<vector>& U,
                               const PrimitiveMesh& m,

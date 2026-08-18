@@ -3,6 +3,7 @@
 #include "device_blas.cuh"
 #include "device_divdevreff.cuh"
 #include "device_simple.cuh"
+#include <cmath>
 #include <stdexcept>
 
 namespace brae {
@@ -44,7 +45,70 @@ void assembleUEqn(
     // Upwind implicit weights, matching the reference's fvm::div. The weights of this operator are where
     // brae's LUST defect lived, which is why the CUDA-vs-reference test compares them coefficient by
     // coefficient rather than through a residual.
-    deviceDivUpwindCoeffs(dm, *in.phiInt, M.diag, M.upper, M.lower);
+    // The scheme's own implicit weights. `upwind` and `linearUpwind` share the upwind weights -- the
+    // latter is a deferred correction only -- so both take the plain kernel.
+    switch (in.scheme)
+    {
+        case cpu::DivScheme::limitedLinearV:
+        {
+            // The kernel takes CONTIGUOUS 3-arrays (it indexes U[0..2]), not an array of pointers, so
+            // the components are gathered into one. Three device copies per assembly; the alternative is
+            // a second kernel signature.
+            const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
+            DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3], ub;
+            for (int k = 0; k < 3; ++k)
+            {
+                deviceCopy(Uarr[k], *Usrc[k]);
+                deviceBCValue(dbU.comp[k], *Usrc[k], ub);
+                deviceGaussGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k]);
+            }
+            deviceDivLimitedVCoeffs(dm, *in.phiInt, Uarr, gx, gy, gz,
+                                    2.0 / std::fmax(in.schemeCoeff, 1e-15),
+                                    M.diag, M.upper, M.lower);
+            break;
+        }
+        case cpu::DivScheme::limitedLinear:
+        {
+            // limitedLinear on a VECTOR limits on the SCALAR magSqr(U) (LimitedScheme.H instantiates it
+            // as NVDTVD + limitFuncs::magSqr), not per component and not the V form.
+            DeviceBuffer<scalar> mag2, t, ub, gx, gy, gz, m2b;
+            const DeviceBuffer<scalar>* U3[3] = {&Ux, &Uy, &Uz};
+            mag2.resize(dm.nCells);
+            for (int k = 0; k < 3; ++k)
+            {
+                deviceHadamard(t, *U3[k], *U3[k]);
+                deviceAxpy(1.0, t, mag2);
+            }
+            m2b.resize(dm.nBndFaces);
+            for (int k = 0; k < 3; ++k)
+            {
+                deviceBCValue(dbU.comp[k], *U3[k], ub);
+                deviceHadamard(t, ub, ub);
+                deviceAxpy(1.0, t, m2b);
+            }
+            deviceGaussGrad(dm, mag2, m2b, gx, gy, gz);
+            deviceDivLimitedCoeffs(dm, *in.phiInt, mag2, gx, gy, gz,
+                                   2.0 / std::fmax(in.schemeCoeff, 1e-15),
+                                   M.diag, M.upper, M.lower);
+            break;
+        }
+        case cpu::DivScheme::LUST:
+        {
+            // weights = 0.75*linear + 0.25*upwind, and the coefficients are LINEAR in the weights
+            // (lower = -w*phi, upper = lower + phi, diag = negSumDiag), so blending the two coefficient
+            // sets is exact rather than an approximation of the blended-weight kernel.
+            DeviceBuffer<scalar> cD, cU, cL, uD, uU, uL;
+            deviceDivCentralCoeffs(dm, *in.phiInt, cD, cU, cL);
+            deviceDivUpwindCoeffs (dm, *in.phiInt, uD, uU, uL);
+            deviceCopy(M.diag,  cD); deviceScale(M.diag,  0.75); deviceAxpy(0.25, uD, M.diag);
+            deviceCopy(M.upper, cU); deviceScale(M.upper, 0.75); deviceAxpy(0.25, uU, M.upper);
+            deviceCopy(M.lower, cL); deviceScale(M.lower, 0.75); deviceAxpy(0.25, uL, M.lower);
+            break;
+        }
+        default:
+            deviceDivUpwindCoeffs(dm, *in.phiInt, M.diag, M.upper, M.lower);
+            break;
+    }
 
     // ---- - fvm::laplacian(nuEff, U) ---------------------------------------------------------
     // The implicit half of divDevReff. Face nuEff is passed in already interpolated, and the BOUNDARY
@@ -119,7 +183,12 @@ void assembleUEqn(
     // Per component with the SCALAR gradient of that component, which is what OpenFOAM's `vector`
     // specialisation computes as one tensor grad: (d & grad(U))_j = d . grad(U_j) under OpenFOAM's
     // grad(U)_ij = d(U_j)/d(x_i) convention. The two are the same field, not an approximation of it.
-    if (in.linearUpwind)
+    // How much of linearUpwind's correction this scheme carries: 1 for linearUpwind, 0.25 for LUST
+    // (LUST.H overrides correction() too), 0 otherwise.
+    const scalar corrFac = (in.scheme == cpu::DivScheme::linearUpwind || in.linearUpwind) ? 1.0
+                         : (in.scheme == cpu::DivScheme::LUST)                            ? 0.25
+                         : 0.0;
+    if (corrFac != 0.0)
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
         for (int k = 0; k < 3; ++k)
@@ -128,7 +197,7 @@ void assembleUEqn(
             deviceBCValue(dbU.comp[k], *U[k], ub);
             deviceGaussGrad(dm, *U[k], ub, gx, gy, gz);
             deviceLinearUpwindCorr(dm, *in.phiInt, gx, gy, gz, lu);
-            deviceAxpy(-1.0, lu, M.source[k]);
+            deviceAxpy(-corrFac, lu, M.source[k]);
         }
     }
 

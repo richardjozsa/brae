@@ -32,6 +32,7 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_ldu.cuh"
+#include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
 
 namespace brae {
 namespace gpu {
@@ -71,7 +72,11 @@ struct MomentumInput
     bool   bounded = false;   // `bounded Gauss <scheme>`: diag -= V*div(phi); see UEqn_cpp.cuh
     // `Gauss linearUpwind grad(U)`: the matrix stays pure upwind and the whole scheme is a deferred
     // source correction -- see UEqn_cpp.cuh. Unlike `bounded` it does NOT vanish at convergence.
-    bool   linearUpwind = false;
+    bool   linearUpwind = false;                 // kept: equivalent to scheme == linearUpwind
+    // The div(phi,U) scheme, shared with the reference (cpu::DivScheme). Each scheme is weights only, a
+    // deferred correction only, or both; the assembly branches on that, not on a name.
+    cpu::DivScheme scheme = cpu::DivScheme::upwind;
+    scalar         schemeCoeff = 1.0;            // the `k` of `limitedLinear k`
     // `corrected` laplacianSchemes: switches the implicit coefficient to nonOrthDeltaCoeffs AND adds the
     // explicit deferred correction. Both halves, as in the reference -- see UEqn_cpp.cuh.
     bool   correctedLaplacian = false;

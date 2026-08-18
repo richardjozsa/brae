@@ -129,6 +129,8 @@ int main(int argc, char** argv)
     mi.bounded = true;
     mi.correctedLaplacian = true;   // exercised on both paths -- see the controls below
     mi.linearUpwind = true;
+    mi.scheme = cpu::DivScheme::limitedLinear;   // exercised on both paths -- see the control below
+    mi.schemeCoeff = 1.0;
     const FvVectorMatrix ref = cpu::assembleUEqn(U, mi, m, g, fvp);
 
     // ---- the CUDA path ----------------------------------------------------------------------
@@ -163,6 +165,8 @@ int main(int argc, char** argv)
     gi.bounded = true;              // exercised on both paths -- see the control below
     gi.correctedLaplacian = true;
     gi.linearUpwind = true;
+    gi.scheme = cpu::DivScheme::limitedLinear;
+    gi.schemeCoeff = 1.0;
 
     gpu::MomentumMatrix M;
     gpu::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, gi);
@@ -171,16 +175,24 @@ int main(int argc, char** argv)
     // The reference's `diag` is the RELAXED diagonal (relaxMatrix writes it in place); the device keeps
     // the raw one and the relaxed one separately, so the relaxed buffer is what corresponds.
     check(M.relaxed, "relaxation ran on the device path");
-    cmp(M.relaxedDiag.host(), ref.diag,  "diag (relaxed)", 1e-12);
-    cmp(M.upper.host(),       ref.upper, "upper",          1e-13);
-    cmp(M.lower.host(),       ref.lower, "lower",          1e-13);
+    // TOLERANCE WITH A LIMITED SCHEME. Upwind weights are exact on both paths (pos0 of the same flux), so
+    // those comparisons sit at 0 or 1e-16. A LIMITER does not: r = 2*(gradcf/gradf) - 1 divides by the
+    // face difference of magSqr(U), which approaches zero in smooth regions, so the ~1e-16 disagreement
+    // between the host and device Gauss gradients (different summation order over faces) is amplified.
+    // Measured 5.5e-12 on the off-diagonals with `limitedLinear 1`. That is the arithmetic of the scheme,
+    // not a porting defect -- the control below proves the limiter is doing real work (4.4e-01 on the
+    // off-diagonals), so this is not a tolerance hiding an absent term.
+    const scalar mTol = (mi.scheme == cpu::DivScheme::upwind) ? 1e-13 : 5e-11;
+    cmp(M.relaxedDiag.host(), ref.diag,  "diag (relaxed)", mTol);
+    cmp(M.upper.host(),       ref.upper, "upper",          mTol);
+    cmp(M.lower.host(),       ref.lower, "lower",          mTol);
 
     const char* sn[3] = {"source x", "source y", "source z"};
     for (int k = 0; k < 3; ++k)
     {
         std::vector<scalar> r(nC);
         for (label c = 0; c < nC; ++c) r[c] = component(ref.source[c], k);
-        cmp(M.source[k].host(), r, sn[k], 1e-11);
+        cmp(M.source[k].host(), r, sn[k], (mi.scheme == cpu::DivScheme::upwind) ? 1e-11 : 5e-10);
     }
 
     // Boundary coefficients, flattened in the device's bndCell order.
@@ -221,7 +233,8 @@ int main(int argc, char** argv)
             std::vector<scalar> r(nC);
             for (label c = 0; c < nC; ++c) r[c] = component(refP.source[c], k);
             cmp(M.source[k].host(), r, k == 0 ? "source x + -grad(p)V"
-                                     : k == 1 ? "source y + -grad(p)V" : "source z + -grad(p)V", 1e-11);
+                                     : k == 1 ? "source y + -grad(p)V" : "source z + -grad(p)V",
+                                     (mi.scheme == cpu::DivScheme::upwind) ? 1e-11 : 5e-10);
         }
         // Control: the gradient must have changed the source, or the check above is vacuous.
         scalar moved = 0;
@@ -243,6 +256,19 @@ int main(int argc, char** argv)
         const scalar r = mg > 0 ? mx / mg : mx;
         std::printf("  %-54s rel=%.3e\n", "control: `bounded` changes the diagonal", r);
         check(r > 1e-12, "the bounded term actually contributes (control)");
+    }
+
+    // CONTROL: the limited scheme must move the MATRIX (it is a weights change, unlike linearUpwind
+    // which is a source-only correction), or comparing CUDA against the reference proves nothing about it.
+    {
+        cpu::MomentumInput noS = mi; noS.scheme = cpu::DivScheme::upwind;
+        const FvVectorMatrix refNoS = cpu::assembleUEqn(U, noS, m, g, fvp);
+        scalar dU = 0, mU = 0;
+        for (std::size_t f = 0; f < ref.upper.size(); ++f)
+        { dU = std::fmax(dU, std::fabs(ref.upper[f] - refNoS.upper[f])); mU = std::fmax(mU, std::fabs(ref.upper[f])); }
+        const scalar r = mU > 0 ? dU / mU : dU;
+        std::printf("  %-54s rel=%.3e\n", "control: `limitedLinear` moves the off-diagonals", r);
+        check(r > 1e-12, "the limited scheme changes the matrix, not just the source (control)");
     }
 
     // CONTROL: and for `linearUpwind`. It touches ONLY the source -- linearUpwind derives from `upwind`,

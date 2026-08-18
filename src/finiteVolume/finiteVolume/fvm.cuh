@@ -288,6 +288,57 @@ std::vector<T> linearUpwindCorrection(
     return corr;
 }
 
+// gaussConvectionScheme::fvmDiv with the scheme's OWN weights, rather than upwind's:
+//     lower = -weights*faceFlux;  upper = lower + faceFlux;  negSumDiag
+// which is gaussConvectionScheme.C:29-31 verbatim. `upwind` is the special case weights = pos0(phi), and
+// the plain overload below keeps that, so every existing call site is unchanged.
+template <typename T>
+FvMatrix<T> div(
+    const std::vector<scalar>& phiInternal,
+    const std::vector<std::vector<scalar>>& phiBoundary,
+    const GeometricField<T>& vf,
+    const std::vector<scalar>& weights,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches)
+{
+    const label nC  = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+
+    FvMatrix<T> M;
+    M.diag.assign(nC, 0.0);
+    M.source.assign(nC, T{});
+    M.upper.resize(nIf);
+    M.lower.resize(nIf);
+    for (label f = 0; f < nIf; ++f)
+    {
+        const scalar phi = phiInternal[f];
+        M.lower[f] = -weights[f] * phi;
+        M.upper[f] = M.lower[f] + phi;
+        M.diag[own[f]] -= M.lower[f];
+        M.diag[nei[f]] -= M.upper[f];
+    }
+    M.internalCoeffs.resize(patches.size());
+    M.boundaryCoeffs.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        const std::vector<T> vIC = vf.boundary[pi]->valueInternalCoeffs();
+        const std::vector<T> vBC = vf.boundary[pi]->valueBoundaryCoeffs();
+        M.internalCoeffs[pi].resize(fp.size);
+        M.boundaryCoeffs[pi].resize(fp.size);
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const scalar pf = (pi < phiBoundary.size() && i < (label)phiBoundary[pi].size())
+                            ? phiBoundary[pi][i] : 0.0;
+            M.internalCoeffs[pi][i] =  pf * vIC[i];
+            M.boundaryCoeffs[pi][i] = (-pf) * vBC[i];
+        }
+    }
+    return M;
+}
+
 template <typename T>
 FvMatrix<T> div(
     const std::vector<scalar>& phiInternal,

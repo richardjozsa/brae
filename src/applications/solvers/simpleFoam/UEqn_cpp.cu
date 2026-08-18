@@ -3,12 +3,82 @@
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"
+#include "limitedSchemes_cpp.cuh"
 #include <stdexcept>
 
 namespace brae {
 namespace cpu {
 
 namespace {
+
+// The convection operator for the requested scheme. Three KINDS, and the branch is the whole point:
+// weights only, deferred correction only, or both -- see DivScheme in UEqn_cpp.cuh.
+FvVectorMatrix divWithScheme(
+    const GeometricField<vector>& U,
+    const MomentumInput&          in,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches)
+{
+    namespace ls = limitedSchemes;
+    switch (in.scheme)
+    {
+        case DivScheme::LUST:
+            return fvm::div(*in.phi, *in.phiBnd, U, ls::lustWeights(*in.phi, g), m, patches);
+
+        case DivScheme::limitedLinearV:
+        {
+            const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+            return fvm::div(*in.phi, *in.phiBnd, U,
+                            ls::limitedLinearVWeights(*in.phi, U, gradU, in.schemeCoeff, m, g),
+                            m, patches);
+        }
+
+        case DivScheme::limitedLinear:
+        {
+            // NOT per-component and NOT the V form: LimitedScheme.H instantiates limitedLinear for a
+            // vector as NVDTVD + limitFuncs::magSqr, so the limiter is built on the SCALAR magSqr(U) and
+            // its Gauss gradient (LimitedScheme.C::calcLimiter).
+            std::vector<scalar> mag2(m.nCells());
+            for (label c = 0; c < m.nCells(); ++c)
+            {
+                const vector& u = U.internal[c];
+                mag2[c] = u.x*u.x + u.y*u.y + u.z*u.z;
+            }
+            std::vector<std::vector<scalar>> mag2b(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const std::vector<vector>& ub = U.boundary[pi]->value();
+                mag2b[pi].resize(patches[pi].size);
+                for (label i = 0; i < patches[pi].size; ++i)
+                    mag2b[pi][i] = ub[i].x*ub[i].x + ub[i].y*ub[i].y + ub[i].z*ub[i].z;
+            }
+            const std::vector<vector> gradM = fvc::gaussGrad(mag2, mag2b, m, g, patches);
+            GeometricField<scalar> shim;      // limitedLinearWeights reads only .internal
+            shim.internal = mag2;
+            return fvm::div(*in.phi, *in.phiBnd, U,
+                            ls::limitedLinearWeights(*in.phi, shim, gradM, in.schemeCoeff, m, g),
+                            m, patches);
+        }
+
+        case DivScheme::upwind:
+        case DivScheme::linearUpwind:
+        default:
+            // linearUpwind DERIVES from upwind: identical weights, its whole effect being the deferred
+            // correction applied by the callers below.
+            return fvm::div(*in.phi, *in.phiBnd, U, m, patches);
+    }
+}
+
+// How much of linearUpwind's deferred correction this scheme carries. LUST is why this is a FACTOR and
+// not a flag: LUST.H overrides correction() as 0.25*linearUpwind::correction, so a port treating LUST as
+// "weights only" would drop a quarter of the scheme silently.
+scalar correctionFactor(const MomentumInput& in)
+{
+    if (in.scheme == DivScheme::linearUpwind || in.linearUpwind) return 1.0;
+    if (in.scheme == DivScheme::LUST)                            return 0.25;
+    return 0.0;
+}
 
 void refuseUnsupported(const MomentumInput& in)
 {
@@ -42,22 +112,23 @@ FvVectorMatrix momentumCore(
 
     // fvm::div(phi, U) -- the convection operator. Its implicit weights come from the div SCHEME, which is
     // why the scheme is a first-class part of the port manifest rather than a detail.
-    FvVectorMatrix M = fvm::div(*in.phi, *in.phiBnd, U, m, patches);
+    FvVectorMatrix M = divWithScheme(U, in, m, g, patches);
 
     // linearUpwind's deferred correction. OpenFOAM applies it INSIDE fvm::div (gaussConvectionScheme.C:
     // 112-115), so it lands here, before everything else -- and it is SUBTRACTED, because `fvm += ...`
     // on an fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862). The gradient is the one the scheme
     // NAMES (`linearUpwind grad(U)`), resolved through gradSchemes by the caller's envelope check.
-    if (in.linearUpwind)
+    const scalar corrFac = correctionFactor(in);
+    if (corrFac != 0.0)
     {
         const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
         const std::vector<vector> corr =
             fvm::linearUpwindCorrection<vector, tensor>(*in.phi, gradU, m, g);
         for (std::size_t c = 0; c < corr.size(); ++c)
         {
-            M.source[c].x -= corr[c].x;
-            M.source[c].y -= corr[c].y;
-            M.source[c].z -= corr[c].z;
+            M.source[c].x -= corrFac * corr[c].x;
+            M.source[c].y -= corrFac * corr[c].y;
+            M.source[c].z -= corrFac * corr[c].z;
         }
     }
 
@@ -79,22 +150,23 @@ FvVectorMatrix assembleUEqn(
 {
     refuseUnsupported(in);
 
-    FvVectorMatrix M = fvm::div(*in.phi, *in.phiBnd, U, m, patches);
+    FvVectorMatrix M = divWithScheme(U, in, m, g, patches);
 
     // linearUpwind's deferred correction. OpenFOAM applies it INSIDE fvm::div (gaussConvectionScheme.C:
     // 112-115), so it lands here, before everything else -- and it is SUBTRACTED, because `fvm += ...`
     // on an fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862). The gradient is the one the scheme
     // NAMES (`linearUpwind grad(U)`), resolved through gradSchemes by the caller's envelope check.
-    if (in.linearUpwind)
+    const scalar corrFac = correctionFactor(in);
+    if (corrFac != 0.0)
     {
         const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
         const std::vector<vector> corr =
             fvm::linearUpwindCorrection<vector, tensor>(*in.phi, gradU, m, g);
         for (std::size_t c = 0; c < corr.size(); ++c)
         {
-            M.source[c].x -= corr[c].x;
-            M.source[c].y -= corr[c].y;
-            M.source[c].z -= corr[c].z;
+            M.source[c].x -= corrFac * corr[c].x;
+            M.source[c].y -= corrFac * corr[c].y;
+            M.source[c].z -= corrFac * corr[c].z;
         }
     }
 

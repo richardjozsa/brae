@@ -138,11 +138,12 @@ try_refusal limitedlaplacian \
     "import re,sys;p=sys.argv[1]+'/system/fvSchemes';s=open(p).read();open(p,'w').write(re.sub(r'laplacianSchemes\s*\{[^}]*\}','laplacianSchemes\n{\n    default         Gauss linear limited 0.33;\n}',s))" \
     "limited"
 
-# `linearUpwind` is no longer a refusal -- it is implemented, and the supported case above uses it.
-# `limitedLinear` still is: it has its own limiter and its own weights.
+# Five div(phi,U) schemes are implemented now (upwind, linearUpwind, limitedLinear, limitedLinearV,
+# LUST) -- section 4e below asserts the three new ones RUN. `vanLeer` is one of the 73 OpenFOAM registers
+# and this port does not, so it stands in as the refusal case.
 try_refusal divscheme \
-  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss limitedLinear 1;',s); open(d+'/system/fvSchemes','w').write(s)" \
-  "limitedLinear"
+  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss vanLeer;',s); open(d+'/system/fvSchemes','w').write(s)" \
+  "vanLeer"
 
 # ...and so is a linearUpwind whose NAMED gradient is not the one brae computes. The scheme is supported;
 # `cellLimited Gauss linear 1` under it is not, and the correction does not vanish at convergence.
@@ -158,6 +159,23 @@ try_refusal transient \
 # be a refusal, and flipping it is the point of that work -- so assert it RUNS and writes the turbulence
 # fields, not merely that it is accepted. A case that ran without writing k/epsilon/nut would mean the
 # hook was never called.
+echo "== 4e. the limited/blended div schemes are supported =="
+# Each must RUN and each must SAY which scheme it applied -- a silent fallback to upwind would still
+# converge to a plausible answer, which is exactly the failure mode this guard exists to prevent.
+for sc in "limitedLinear 1" "limitedLinearV 1" "LUST grad(U)"; do
+    tag=$(echo "$sc" | awk '{print $1}')
+    supported "$W/sch_$tag"
+    python3 - "$W/sch_$tag" "$sc" <<'PY'
+import re, sys
+p = sys.argv[1] + '/system/fvSchemes'; s = open(p).read()
+open(p, 'w').write(re.sub(r'div\(phi,U\)[^;]*;', 'div(phi,U)      bounded Gauss ' + sys.argv[2] + ';', s))
+PY
+    ( cd "$W/sch_$tag" && BRAE_SIMPLEFOAM_V2=1 "$BRAE" > log 2>&1 )
+    if [ $? -eq 0 ]; then ok "$tag: exit 0"; else bad "$tag: refused or crashed"; sed -n '1,5p' "$W/sch_$tag/log"; fi
+    grep -q "div(phi,U) scheme: $tag" "$W/sch_$tag/log" && ok "$tag: the solver states which scheme it applied" \
+                                                        || bad "$tag: ran without saying which scheme"
+done
+
 echo "== 4d. SIMPLEC is supported: the rebuilt path runs it =="
 # It used to be a refusal. Assert it RUNS and SAYS so -- SIMPLEC changes the iteration and not the
 # converged answer, so a silent skip would still converge to a plausible result.

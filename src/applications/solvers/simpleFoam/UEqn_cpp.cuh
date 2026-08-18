@@ -65,6 +65,18 @@ namespace brae {
 namespace cpu {
 
 // Everything UEqn.H needs that is not the mesh. Grouped so the call site reads like the OpenFOAM text.
+// The div(phi,U) scheme. OpenFOAM registers 78 surfaceInterpolationSchemes (ofscan: impls
+// surfaceInterpolationScheme); these are the ones this port implements and gates. Each is one of three
+// KINDS -- weights only, deferred correction only, or both -- and that is what the assembly branches on.
+enum class DivScheme
+{
+    upwind,           // weights = pos0(phi);                       no correction
+    linearUpwind,     // weights UNCHANGED (derives from upwind);   correction from grad(U)
+    limitedLinear,    // weights from the NVDTVD limiter on magSqr(U); no correction
+    limitedLinearV,   // weights from the NVDVTVDV vector limiter;  no correction
+    LUST              // weights = 0.75*linear + 0.25*upwind;       correction = 0.25*linearUpwind's
+};
+
 struct MomentumInput
 {
     const std::vector<scalar>*              phi = nullptr;       // internal face flux
@@ -81,7 +93,9 @@ struct MomentumInput
     // `Gauss linearUpwind grad(U)` on div(phi,U). linearUpwind derives from `upwind`, so the MATRIX is
     // unchanged -- the entire scheme is a deferred source correction (linearUpwind.C;
     // gaussConvectionScheme.C:112-115). It does NOT vanish at convergence, unlike `bounded`.
-    bool   linearUpwind = false;
+    bool   linearUpwind = false;                                 // kept: DivScheme::linearUpwind
+    DivScheme scheme = DivScheme::upwind;
+    scalar    schemeCoeff = 1.0;                                 // the `k` of `limitedLinear k`
     // `corrected`/`limited` laplacianSchemes: use nonOrthDeltaCoeffs implicitly AND add the explicit
     // deferred correction to the source (gaussLaplacianScheme.C). OpenFOAM's default when the word is
     // absent, so most real cases set it.

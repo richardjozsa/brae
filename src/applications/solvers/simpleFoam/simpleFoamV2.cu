@@ -152,6 +152,34 @@ std::string linearUpwindGradUnsupported(const std::string& caseDir)
     return "";
 }
 
+// The numeric coefficient a limited scheme carries: the `1` of `limitedLinear 1`. OpenFOAM reads it off
+// the scheme stream, so it is the first number after the scheme word. It is NOT cosmetic: twoByk = 2/k
+// scales the limiter, and `limitedLinear 0.2` is a materially different scheme from `limitedLinear 1`.
+scalar divUSchemeCoeff(const std::string& caseDir, scalar def)
+{
+    std::string text;
+    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return def; }
+    const std::size_t blk = text.find("divSchemes");
+    if (blk == std::string::npos) return def;
+    const std::size_t open = text.find('{', blk);
+    if (open == std::string::npos) return def;
+    const std::size_t close = text.find('}', open);
+    const std::string b = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
+    static const std::regex re(R"(div\(phi,U\)\s*([^;]*);)");
+    std::smatch mm;
+    std::string entry;
+    if (std::regex_search(b, mm, re)) entry = mm[1].str();
+    else
+    {
+        static const std::regex rd(R"(default\s+([^;]*);)");
+        if (std::regex_search(b, mm, rd)) entry = mm[1].str();
+    }
+    static const std::regex num(R"([-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)");
+    std::smatch nm;
+    if (std::regex_search(entry, nm, num)) return std::atof(nm[0].str().c_str());
+    return def;
+}
+
 bool divUBounded(const std::string& caseDir)
 {
     std::string text;
@@ -288,10 +316,13 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
                                  "correction than the case asked for.");
 
         const std::string sc = divUScheme(caseDir);
-        if (!sc.empty() && sc != "upwind" && sc != "linearUpwind")
-            r.blockers.push_back("div(phi,U) asks for `" + sc + "`; the rebuilt UEqn implements `upwind` "
-                                 "and `linearUpwind` only. Running it anyway would solve a different "
-                                 "discretisation than the case specifies.");
+        // OpenFOAM registers 78 surfaceInterpolationSchemes (ofscan: impls surfaceInterpolationScheme).
+        // These five are the ones ported and gated; anything else is refused by name.
+        if (!sc.empty() && sc != "upwind" && sc != "linearUpwind" && sc != "limitedLinear"
+            && sc != "limitedLinearV" && sc != "LUST")
+            r.blockers.push_back("div(phi,U) asks for `" + sc + "`; the rebuilt UEqn implements `upwind`, "
+                                 "`linearUpwind`, `limitedLinear`, `limitedLinearV` and `LUST`. Running it "
+                                 "anyway would solve a different discretisation than the case specifies.");
         if (sc == "linearUpwind")
         {
             const std::string bad = linearUpwindGradUnsupported(caseDir);
@@ -708,9 +739,20 @@ int runSimpleFoamV2(const std::string& caseDir)
         std::printf("  SIMPLE/consistent: SIMPLEC, rAtU = 1/(1/rAU - UEqn.H1())\n");
     // `bounded Gauss <scheme>`: -fvm::Sp(fvc::div(phi), U), implemented on both paths and matched to
     // 2.9e-16 (tests/test_ueqn_cuda.cu), so it is READ rather than refused.
-    in.linearUpwind = (divUScheme(caseDir) == "linearUpwind");
-    if (in.linearUpwind)
-        std::printf("  div(phi,U) is linearUpwind: upwind matrix + the deferred grad correction\n");
+    {
+        const std::string sc = divUScheme(caseDir);
+        in.scheme = sc == "linearUpwind"   ? cpu::DivScheme::linearUpwind
+                  : sc == "limitedLinear"  ? cpu::DivScheme::limitedLinear
+                  : sc == "limitedLinearV" ? cpu::DivScheme::limitedLinearV
+                  : sc == "LUST"           ? cpu::DivScheme::LUST
+                                           : cpu::DivScheme::upwind;
+        in.linearUpwind = (in.scheme == cpu::DivScheme::linearUpwind);
+        in.schemeCoeff = divUSchemeCoeff(caseDir, 1.0);
+        std::printf("  div(phi,U) scheme: %s", sc.empty() ? "upwind" : sc.c_str());
+        if (in.scheme == cpu::DivScheme::limitedLinear || in.scheme == cpu::DivScheme::limitedLinearV)
+            std::printf(" %g", in.schemeCoeff);
+        std::printf("\n");
+    }
     in.bounded = divUBounded(caseDir);
     if (in.bounded) std::printf("  div(phi,U) is bounded: applying -fvm::Sp(fvc::div(phi), U)\n");
 

@@ -35,6 +35,7 @@
 #include "fv_patch.cuh"
 #include "createFields_cpp.cuh"
 #include "simpleControl_cpp.cuh"
+#include "UEqn_cpp.cuh"        // DivScheme: the div(phi,U) scheme, shared with the CUDA driver
 #include "kepsilon_coeffs.cuh"
 #include "geometric_field.cuh"
 #include <map>
@@ -80,6 +81,8 @@ struct StepInput
     bool   correctedLaplacian = false;           // `corrected` laplacianSchemes
     bool   bounded = false;                      // div(phi,U) `bounded`
     bool   linearUpwind = false;                 // div(phi,U) `linearUpwind`
+    DivScheme scheme = DivScheme::upwind;
+    scalar    schemeCoeff = 1.0;
     bool   hasMRF = false;                       // refused downstream
     bool   hasFvOptions = false;                 // refused downstream
 };

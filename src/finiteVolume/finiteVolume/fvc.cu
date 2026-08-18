@@ -4,6 +4,44 @@ namespace brae {
 namespace fvc {
 
 std::vector<vector> gaussGrad(
+    const std::vector<scalar>& internal,
+    const std::vector<std::vector<scalar>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    const label nC  = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& w  = g.weights();
+    const std::vector<vector>& Sf = g.Sf();
+
+    std::vector<vector> grad(nC, vector{0, 0, 0});
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label o = own[f], n = nei[f];
+        const scalar pf = w[f] * internal[o] + (1.0 - w[f]) * internal[n];
+        const vector Sfssf = Sf[f] * pf;
+        grad[o] += Sfssf;
+        grad[n] = grad[n] - Sfssf;
+    }
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (pi >= boundary.size()) continue;
+        for (label i = 0; i < fp.size && i < (label)boundary[pi].size(); ++i)
+            grad[fp.faceCells[i]] += Sf[fp.start + i] * boundary[pi][i];
+    }
+    for (label c = 0; c < nC; ++c)
+    {
+        const scalar iv = 1.0 / g.V()[c];
+        grad[c] = grad[c] * iv;
+    }
+    return grad;
+}
+
+std::vector<vector> gaussGrad(
     const GeometricField<scalar>& p,
     const PrimitiveMesh& m,
     const FvGeometry& g,
