@@ -10,7 +10,14 @@
 // that two different Krylov methods take the same path, which is not true and not required. The stage
 // tests (test_ueqn_cuda, test_peqn_cuda) are what pin the arithmetic at 1e-16; this pins the composition.
 //
-// Run: test_simple_step_cuda <caseDir> <timeDir> [laminar]
+// MULTI-ITERATION MODE (4th arg): run N iterations of both drivers and require they still agree.
+//
+// This exists because a single iteration cannot see the bug it was written for. The CUDA driver allocated
+// its pressure matrix and folded diagonal fresh every iteration while the AMG hierarchy -- and the V-cycle
+// and PCG graph caches keyed on that matrix -- persisted across them. Iteration 1 was exact (8e-14) and
+// iteration 2 was wrong by 1.3e-01, from identical inputs. Every per-stage test passed throughout.
+//
+// Run: test_simple_step_cuda <caseDir> <timeDir> [laminar] [iters]
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -30,6 +37,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -80,6 +88,7 @@ int main(int argc, char** argv)
     if (argc < 3) { std::printf("usage: %s <caseDir> <timeDir> [laminar]\n", argv[0]); return 2; }
     const std::string caseDir = argv[1], t = argv[2];
     const bool forceLaminar = (argc > 3 && std::string(argv[3]) == "laminar");
+    const int iters = (argc > 4) ? std::atoi(argv[4]) : 1;
     const scalar nu = 1e-5;
 
     PrimitiveMesh m;  m.read(caseDir + "/constant/polyMesh");
@@ -126,7 +135,12 @@ int main(int argc, char** argv)
     cin.nu = nu;
     cin.nuEff = nuEffC; cin.nuEffBnd = nuEffB;
     cin.relaxU = relaxU; cin.relaxP = relaxP;
-    const cpu::Residuals cres = cpu::simpleStep(f, ctl, cin, m, g, fvp);
+    // Tight solves in multi-iteration mode: at the case's usual relTol 0.1 the two Krylov methods stop at
+    // genuinely different iterates and the drift is theirs, not the driver's. The point here is the
+    // DRIVER, so remove the solver as a variable.
+    if (iters > 1) { cin.tolU = cin.tolP = 1e-12; cin.relTolU = cin.relTolP = 0.0; }
+    cpu::Residuals cres;
+    for (int it = 0; it < iters; ++it) cres = cpu::simpleStep(f, ctl, cin, m, g, fvp);
 
     // ---- the CUDA driver, from the SAME starting fields --------------------------------------
     cpu::SimpleFields f0 = cpu::createFields(caseDir + "/" + t, simpleDict, m, g, fvp);
@@ -168,8 +182,11 @@ int main(int argc, char** argv)
     gin.pRefCell = f0.pRefCell; gin.pRefValue = f0.pRefValue;
     gin.takeUAtBoundary = &dTakeU; gin.adjustable = &dAdjust;
 
+    if (iters > 1) { gin.tolU = gin.tolP = 1e-12; gin.relTolU = gin.relTolP = 0.0; }
     gpu::SolverWorkspace ws;
-    const gpu::Residuals gres = gpu::simpleStep(gf, ws, dm, dbU, dbP, gin);
+    gpu::Residuals gres;
+    for (int it = 0; it < iters; ++it) gres = gpu::simpleStep(gf, ws, dm, dbU, dbP, gin);
+    if (iters > 1) std::printf("  (%d iterations, tight solves)\n", iters);
 
     std::printf("  initial residuals   _cpp: U=%.3e p=%.3e   cuda: U=%.3e p=%.3e\n",
                 cres.count("U") ? cres.at("U") : -1.0, cres.count("p") ? cres.at("p") : -1.0,

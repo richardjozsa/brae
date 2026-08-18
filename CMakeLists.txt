@@ -488,6 +488,11 @@ target_include_directories(test_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_step_cuda PRIVATE brae_core)
 add_test(NAME simple_step_cuda
          COMMAND test_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpSimple 282 laminar)
+# 10 iterations: the CUDA driver must still track the _cpp driver. Pins the AMG-hierarchy-vs-transient-
+# pressure-buffer bug, which was exact at iteration 1 and wrong by 1.3e-01 at iteration 2.
+add_test(NAME simple_step_cuda_loop
+         COMMAND test_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpSimple 282 laminar 10)
+
 add_test(NAME simple_step_cuda_turbulent
          COMMAND test_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 
