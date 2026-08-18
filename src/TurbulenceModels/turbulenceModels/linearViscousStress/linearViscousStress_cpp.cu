@@ -85,9 +85,13 @@ void addDivDevReff(
     const SurfaceScalarField gammaf = effectiveFaceViscosity(nuEff, nuEffBnd, m, g, patches);
     addEqual(UEqn, fvm::laplacian<vector>(gammaf, U, m, g, patches, correctedLaplacian), -1.0);
 
-    // ...and, when `corrected`, its explicit deferred correction. OpenFOAM subtracts it from the
-    // laplacian's source; divDevReff carries the laplacian with a MINUS sign, so it enters here with the
-    // opposite one -- the same side-change bookkeeping as the dev2 term below.
+    // ...and, when `corrected`, its explicit deferred correction.
+    //
+    // SIGN. OpenFOAM's laplacian does `fvm.source() -= V*div(faceFluxCorrection)`. divDevReff returns
+    // MINUS that laplacian, so the contribution reaching UEqn is `+V*div(...)`. Writing the laplacian's
+    // own sign here instead made the momentum WORSE with the correction on than off (U error against real
+    // OpenFOAM on shearedChannel: 1.69e-01 corrected vs 8.47e-02 uncorrected) while the pressure -- which
+    // does carry the laplacian's own sign -- improved. That asymmetry is what identified it.
     if (correctedLaplacian)
     {
         const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
@@ -95,9 +99,9 @@ void addDivDevReff(
             fvm::laplacianNonOrthSource<vector, tensor>(gammaf, U, gradU, m, g, patches);
         for (std::size_t c = 0; c < corr.size(); ++c)
         {
-            UEqn.source[c].x -= corr[c].x;
-            UEqn.source[c].y -= corr[c].y;
-            UEqn.source[c].z -= corr[c].z;
+            UEqn.source[c].x += corr[c].x;
+            UEqn.source[c].y += corr[c].y;
+            UEqn.source[c].z += corr[c].z;
         }
     }
 
