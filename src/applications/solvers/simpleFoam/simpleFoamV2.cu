@@ -15,6 +15,9 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_kepsilon.cuh"
+#include "device_komega_sst.cuh"    // deviceKOmegaSSTCorrect building blocks + KOmegaSSTCoeffs
+#include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
+#include "cell_wall_dist.cuh"       // cellWallDist: kOmegaSST's F1/F2 need y at every CELL, not just walls
 #include "near_wall_dist.cuh"
 #include "solver_dispatch.cuh"   // readDdtSchemeWord: the same steady/transient test the dispatcher uses
 
@@ -307,8 +310,10 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            if (model != "kEpsilon")
-                r.blockers.push_back("RASModel is `" + model + "`; the rebuilt path wires kEpsilon only.");
+            if (model != "kEpsilon" && model != "kOmegaSST")
+                r.blockers.push_back("RASModel is `" + model + "`; the rebuilt path wires kEpsilon and "
+                                     "kOmegaSST only. OpenFOAM registers 26 incompressible turbulence "
+                                     "models (ofscan: impls incompressible::turbulenceModel).");
         }
         else if (simType != "laminar")
         {
@@ -486,12 +491,22 @@ int runSimpleFoamV2(const std::string& caseDir)
     // outer loop, by which time they are set.
     scalar tolKE = 1e-10, relTolKE = 0.0;
     bool   gsKE  = false;
+    bool   sstModel = false;
+    std::string secondField = "epsilon";
+    KOmegaSSTCoeffs sstCoeffs;
+    DeviceBuffer<scalar> dY;             // cell wall distance -- kOmegaSST's F1/F2 need it per CELL
 
     StepInput in;
     if (ras)
     {
+        // kOmegaSST's second transport variable is omega, and brae holds it in the same slot epsilon
+        // uses -- the fused device correct() for each model takes that slot and knows what it means.
+        // `ras` here is the simulationType switch, not the dict -- the RAS sub-dictionary is re-fetched.
+        const FoamDict* rasDict = turbProps.subDict("RAS");
+        sstModel = rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSST";
+        secondField = sstModel ? "omega" : "epsilon";
         kF   = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/k"), fvp, nC);
-        epsF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/epsilon"), fvp, nC);
+        epsF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + secondField), fvp, nC);
         nutF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/nut"), fvp, nC);
         kF.evaluateBoundary(); epsF.evaluateBoundary(); nutF.evaluateBoundary();
 
@@ -505,6 +520,14 @@ int runSimpleFoamV2(const std::string& caseDir)
         std::vector<std::vector<vector>> wallU(fvp.size());
         for (std::size_t pi = 0; pi < fvp.size(); ++pi) wallU[pi] = f.U.boundary[pi]->value();
         wall = buildDeviceWallData(m, g, fvp, wallU);
+
+        if (sstModel)
+        {
+            // F1/F2 blend on the wall distance at EVERY cell (kOmegaSSTBase.C), not the near-wall face
+            // distance the wall functions use. Two different quantities with the same symbol in OpenFOAM.
+            dY.copyFrom(cellWallDist(m, g, fvp));
+            readKOmegaSSTCoeffs(turbProps.subDict("RAS"), sstCoeffs);
+        }
 
         {
             const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
@@ -527,7 +550,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             if (const FoamDict* eq = rf->subDict("equations"))
             {
                 relaxK   = eq->scalarOr("k", relaxK);
-                relaxEps = eq->scalarOr("epsilon", relaxEps);
+                relaxEps = eq->scalarOr(secondField, relaxEps);   // `omega` under kOmegaSST
             }
 
         // Seed nuEff from the nut just read, so iteration 1 already uses it.
@@ -562,6 +585,18 @@ int runSimpleFoamV2(const std::string& caseDir)
             // outer iteration while the case asks for 1e-05 / relTol 0.1 / symGaussSeidel. Measured: the
             // turbulence hook was 168 ms of a ~300 ms outer iteration on 440k cells -- 56% of the run --
             // and almost none of that was the nuEff host copy (6 ms); it was over-solving these two.
+            if (sstModel)
+                // Mirrors kOmegaSSTBase::correct(): GbyNu0 -> F1/F2/CDkOmega/S2 -> omega eqn (loose solve,
+                // omega-wall setValues) -> bound -> k eqn -> bound -> correctNut (Bradshaw limiter).
+                deviceKOmegaSSTCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
+                                       dK, dEps, dNut, dY, gf.phiInt, gf.phiBnd,
+                                       nu, relaxEps, relaxK, tolKE,
+                                       /*bounded*/false, /*boundedEps*/false,
+                                       /*limitedK*/false, /*limitedOmega*/false, 2.0, 2.0,
+                                       sstCoeffs, relTolKE, /*keCheckEvery*/1,
+                                       /*linearUpwindK*/false, /*linearUpwindOmega*/false,
+                                       /*nonOrth*/false, /*gradULimitK*/0.0, gsKE, gsKE);
+            else
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                   dK, dEps, dNut, gf.phiInt, gf.phiBnd,
                                   nu, relaxEps, relaxK, tolKE,
@@ -725,7 +760,7 @@ int runSimpleFoamV2(const std::string& caseDir)
         if (ras)
         {
             writeVolField<scalar>(src + "/k",       outDir + "/k",       dK.host(),   fvp);
-            writeVolField<scalar>(src + "/epsilon", outDir + "/epsilon", dEps.host(), fvp);
+            writeVolField<scalar>(src + "/" + secondField, outDir + "/" + secondField, dEps.host(), fvp);
             writeVolField<scalar>(src + "/nut",     outDir + "/nut",     dNut.host(), fvp);
         }
         std::printf("written %s/{U,p%s}\n", outDir.c_str(), ras ? ",k,epsilon,nut" : "");
