@@ -45,6 +45,12 @@ import re, sys, os
 d = sys.argv[1]
 s = open(d + '/system/fvSchemes').read()
 s = re.sub(r'div\(phi,U\)[^;]*;', 'div(phi,U)      Gauss upwind;', s)
+# ...and orthogonal laplacian/snGrad: the rebuilt fvm::laplacian is orthogonal only, so `corrected`
+# (OpenFOAM's default, and what pitzDaily ships) is refused.
+s = re.sub(r'laplacianSchemes\s*\{[^}]*\}',
+           'laplacianSchemes\n{\n    default         Gauss linear orthogonal;\n}', s)
+s = re.sub(r'snGradSchemes\s*\{[^}]*\}',
+           'snGradSchemes\n{\n    default         orthogonal;\n}', s)
 open(d + '/system/fvSchemes', 'w').write(s)
 s = open(d + '/system/fvSolution').read()
 s = re.sub(r'consistent\s+\S+;', 'consistent      no;', s)
@@ -113,6 +119,10 @@ try_refusal simplec \
 try_refusal bounded \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss upwind;',s); open(d+'/system/fvSchemes','w').write(s)" \
   "bounded"
+
+try_refusal nonorth \
+  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'snGradSchemes\\s*\\{[^}]*\\}','snGradSchemes\\n{\\n    default         corrected;\\n}',s); open(d+'/system/fvSchemes','w').write(s)" \
+  "NON-ORTHOGONAL"
 
 try_refusal divscheme \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss linearUpwind grad(U);',s); open(d+'/system/fvSchemes','w').write(s)" \
