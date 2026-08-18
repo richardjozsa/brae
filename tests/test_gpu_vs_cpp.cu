@@ -331,6 +331,24 @@ int main(int argc, char** argv)
         cmp(dnut.host(), kepsilon::nut(kk, ee), "nut = Cmu k^2/eps (deviceNut)", 1e-14);
     }
 
+    // ---- stage: fvc::grad(p) -- deviceGaussGrad vs the host gaussGrad -----------------------
+    // The DRIVER computes grad(p) with deviceGaussGrad; the earlier corrector check supplied gradP from
+    // the host, so this kernel was never compared. It runs twice per iteration (momentum predictor and
+    // velocity corrector), so a systematic bias here biases every field every iteration.
+    {
+        const DeviceBoundary dbPloc = buildDeviceBoundary(p, fvp, g);
+        DeviceBuffer<scalar> dp(p.internal), pb, gx2, gy2, gz2;
+        deviceBCValue(dbPloc, dp, pb);
+        deviceGaussGrad(dm, dp, pb, gx2, gy2, gz2);
+
+        const std::vector<vector> ref = fvc::gaussGrad(p, m, g, fvp);
+        std::vector<scalar> rx(nC), ry(nC), rz(nC);
+        for (label c = 0; c < nC; ++c) { rx[c] = ref[c].x; ry[c] = ref[c].y; rz[c] = ref[c].z; }
+        cmp(gx2.host(), rx, "grad(p) x (deviceGaussGrad)", 1e-12);
+        cmp(gy2.host(), ry, "grad(p) y (deviceGaussGrad)", 1e-12);
+        cmp(gz2.host(), rz, "grad(p) z (deviceGaussGrad)", 1e-12);
+    }
+
     // ---- control: the comparison can detect a difference ------------------------------------
     // Perturb one reference value and require cmp to report a failure. Without this every OK above is
     // only evidence that the comparator ran.

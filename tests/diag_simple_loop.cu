@@ -26,10 +26,15 @@
 #include "simpleFoam_cpp.cuh"
 #include "linearViscousStress_cpp.cuh"
 #include "simpleFoam.cuh"
-#include "simple_foam.cuh"   // the OLD host driver, which converges on this case
+#include "simple_foam.cuh"        // the OLD HOST driver
+#include "device_simple_foam.cuh" // the OLD GPU driver -- the one that converges
+#include "linear_solver_setup.cuh"  // readLinearSolverControls
+#include "scheme_parse.cuh"          // parseFvSchemesControls --
+                                    // the SAME setup the brae binary runs, so the comparison is equal
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -150,6 +155,10 @@ int main(int argc, char** argv)
     gin.nNonOrthogonalCorrectors = cd.nNonOrthogonalCorrectors;
     gin.pRefCell = f0.pRefCell; gin.pRefValue = f0.pRefValue;
     gin.takeUAtBoundary = &dTakeU; gin.adjustable = &dAdjust;
+    // SAME solver tolerances as the _cpp column. Leaving the struct defaults (1e-10, relTol 0) here made
+    // the two columns run different linear solves -- the fourth unequal comparison in this investigation.
+    gin.tolU = cin.tolU; gin.relTolU = cin.relTolU;
+    gin.tolP = cin.tolP; gin.relTolP = cin.relTolP;
     gpu::SolverWorkspace ws;
 
     // The OLD host driver, on the same start. Both are host code, so any difference between it and the
@@ -159,8 +168,28 @@ int main(int argc, char** argv)
     SimpleControls oc;
     oc.nu = nu; oc.relaxU = relaxU; oc.relaxP = relaxP;
 
-    std::printf("\n it |    OLD host U |    _cpp U   _cpp p |   cuda U  |  dU(_cpp vs OLD)\n");
-    std::printf("----+---------------+--------------------+-----------+-----------------\n");
+    // The OLD GPU driver, same start, same controls. This is the one that converges, so putting all four
+    // in one process on identical inputs is what turns "they behave differently" into a per-iteration diff.
+    cpu::SimpleFields fd = cpu::createFields(caseDir + "/" + t, simpleDict, m, g, fvp);
+    // Build the controls the way gpuSimpleFoam.cu does -- parseFvSchemesControls + readLinearSolverControls
+    // -- rather than by hand. Hand-filling is how the previous three comparisons in this investigation ended
+    // up unequal (different relaxation, different turbulence, different scheme), and an unequal comparison
+    // is worse than none: it produces a difference that looks like a finding.
+    DeviceSimpleControls dctl;
+    dctl.caseDir = caseDir;
+    dctl.nu = nu;
+    dctl.turbulent = false;
+    parseFvSchemesControls(caseDir, dctl);
+    readLinearSolverControls(fvSolution, "epsilon", dctl);
+    std::printf("GPU ctl: relaxU=%.3g relaxP=%.3g tolU=%.1e tolP=%.1e bounded=%d nonOrth=%d "
+                "linearUpwind=%d consistent=%d gsU=%d\n",
+                dctl.relaxU, dctl.relaxP, dctl.tolU, dctl.tolP,
+                (int)dctl.bounded, (int)dctl.nonOrth, (int)dctl.linearUpwind,
+                (int)dctl.consistent, (int)dctl.gsU);
+    DeviceSimpleSolver dev(m, g, fvp, fd.U, fd.p, fd.phi, dctl);
+
+    std::printf("\n it |  OLD host U |  OLD GPU U |    _cpp U |   cuda U  | dU(host vs GPU)\n");
+    std::printf("----+-------------+------------+-----------+-----------+----------------\n");
     for (int it = 1; it <= iters; ++it)
     {
         const cpu::Residuals cr = cpu::simpleStep(f, ctlC, cin, m, g, fvp);
@@ -177,11 +206,56 @@ int main(int argc, char** argv)
         for (label c = 0; c < nC; ++c)
         { ox[c] = fo.U.internal[c].x; oy[c] = fo.U.internal[c].y; oz[c] = fo.U.internal[c].z; }
 
-        std::printf("%3d |   %11.4e | %9.2e %9.2e | %9.2e | %9.2e\n", it,
-                    orr.Ux,
-                    cr.count("U") ? cr.at("U") : 0.0, cr.count("p") ? cr.at("p") : 0.0,
+        // With BRAE_DIAG_SYNC=all every iteration starts from IDENTICAL inputs, so these three numbers
+        // are "one CUDA iteration vs one _cpp iteration from the same fields" -- measured fresh each time
+        // rather than once on a converged state. Whichever output is biased names the stage.
+        if (std::getenv("BRAE_DIAG_FIELDS"))
+        {
+            const std::vector<scalar> gx2 = gf.Ux.host(), gy2 = gf.Uy.host(), gz2 = gf.Uz.host();
+            scalar um = 0;
+            for (label c = 0; c < nC; ++c)
+                um = std::fmax(um, std::fmax(std::fabs(f.U.internal[c].x),
+                     std::fmax(std::fabs(f.U.internal[c].y), std::fabs(f.U.internal[c].z))));
+            std::printf("      fields: dU=%.3e  dp=%.3e  dphi=%.3e\n",
+                        relV(f.U.internal, gx2, gy2, gz2, um),
+                        relS(gf.p.host(), f.p.internal),
+                        relS(gf.phiInt.host(), f.phi.internal));
+        }
+
+        // BISECT: after each iteration, overwrite ONE carried quantity of the CUDA state with the _cpp
+        // value. The two agree to 4e-9 for a single iteration, so whichever field restores convergence is
+        // the one the CUDA driver is carrying forward wrongly. BRAE_DIAG_SYNC = U | p | phi | none.
+        {
+            static const char* syncEnv = std::getenv("BRAE_DIAG_SYNC");
+            const std::string sync = syncEnv ? syncEnv : "none";
+            if (sync == "U" || sync == "all")
+            {
+                std::vector<scalar> a(nC), b2(nC), c2(nC);
+                for (label c = 0; c < nC; ++c)
+                { a[c] = f.U.internal[c].x; b2[c] = f.U.internal[c].y; c2[c] = f.U.internal[c].z; }
+                gf.Ux.copyFrom(a); gf.Uy.copyFrom(b2); gf.Uz.copyFrom(c2);
+            }
+            if (sync == "p" || sync == "all") gf.p.copyFrom(f.p.internal);
+            if (sync == "phi" || sync == "all")
+            {
+                gf.phiInt.copyFrom(f.phi.internal);
+                std::vector<scalar> pb;
+                for (const auto& v : f.phi.boundary) for (scalar x : v) pb.push_back(x);
+                pb.resize(dm.nBndFaces, 0.0);
+                gf.phiBnd.copyFrom(pb);
+            }
+        }
+
+        const DeviceSimpleResidual dr = dev.step();
+        const std::vector<vector> dU = dev.U();
+        std::vector<scalar> dx(nC), dy(nC), dz(nC);
+        for (label c = 0; c < nC; ++c) { dx[c] = dU[c].x; dy[c] = dU[c].y; dz[c] = dU[c].z; }
+
+        std::printf("%3d | %11.4e | %10.3e | %9.2e | %9.2e | %9.2e\n", it,
+                    orr.Ux, dr.Ux,
+                    cr.count("U") ? cr.at("U") : 0.0,
                     gr.count("U") ? gr.at("U") : 0.0,
-                    relV(f.U.internal, ox, oy, oz, Umag));
+                    relV(fo.U.internal, dx, dy, dz, Umag));
     }
     return 0;
 }
