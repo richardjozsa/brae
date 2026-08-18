@@ -65,10 +65,12 @@ static scalar relS(const std::vector<scalar>& a, const std::vector<scalar>& b)
 
 int main(int argc, char** argv)
 {
-    if (argc < 4) { std::printf("usage: %s <caseDir> <timeDir> <iters>\n", argv[0]); return 2; }
+    if (argc < 4) { std::printf("usage: %s <caseDir> <timeDir> <iters> [ofRefDir]\n", argv[0]); return 2; }
     const std::string caseDir = argv[1], t = argv[2];
     const int iters = std::atoi(argv[3]);
-    const scalar nu = 1e-5;
+    // nu from the CASE, not a constant. Hardcoding 1e-5 here compared brae at nu=1e-5 against OpenFOAM at
+    // the case's nu=0.01 -- a factor of 1000 in viscosity, reported as a 50% velocity "error".
+    const scalar nu = readDict(std::string(caseDir) + "/constant/transportProperties").scalarOr("nu", 1e-5);
 
     PrimitiveMesh m;  m.read(caseDir + "/constant/polyMesh");
     FvGeometry g;     g.build(m);
@@ -84,7 +86,8 @@ int main(int argc, char** argv)
         if (const FoamDict* eq = rf->subDict("equations")) relaxU = eq->scalarOr("U", relaxU);
         if (const FoamDict* fl = rf->subDict("fields"))    relaxP = fl->scalarOr("p", relaxP);
     }
-    std::printf("relaxU=%.3g relaxP=%.3g  iters=%d  (laminar, nuEff constant)\n", relaxU, relaxP, iters);
+    std::printf("nu=%.4g  relaxU=%.3g relaxP=%.3g  iters=%d  (laminar, nuEff constant)\n",
+                nu, relaxU, relaxP, iters);
 
     cpu::SimpleControlDict cd = cpu::readSimpleControl(fvSolution);
     cd.consistent = false;
@@ -194,7 +197,11 @@ int main(int argc, char** argv)
                 (int)dctl.consistent, (int)dctl.gsU);
     DeviceSimpleSolver dev(m, g, fvp, fd.U, fd.p, fd.phi, dctl);
 
-    cin.correctedLaplacian = dctl.nonOrth;   // same parse as the GPU column
+    // EVERY scheme flag comes from the one parse, for all three host columns. Setting them per column by
+    // hand is what produced five false findings earlier in this investigation.
+    cin.correctedLaplacian = dctl.nonOrth;
+    cin.bounded = dctl.bounded;
+    oc.bounded  = dctl.bounded;
     std::printf("  _cpp correctedLaplacian = %d\n", (int)cin.correctedLaplacian);
 
     std::printf("\n it |  OLD host U |  OLD GPU U |    _cpp U |   cuda U  | dU(host vs GPU)\n");
@@ -320,6 +327,40 @@ int main(int argc, char** argv)
                     cr.count("U") ? cr.at("U") : 0.0,
                     gr.count("U") ? gr.at("U") : 0.0,
                     relV(fo.U.internal, dx, dy, dz, Umag));
+    }
+    // Optional: compare the two HOST paths against a real OpenFOAM reference. The _cpp path carries the
+    // non-orthogonal correction and the old host path does not, so on a non-orthogonal mesh the gap
+    // between them against OpenFOAM is what the correction is worth.
+    if (argc > 4)
+    {
+        const std::string ofDir = argv[4];
+        const FieldData<vector> ofU = readField<vector>(ofDir + "/U");
+        const FieldData<scalar> ofP = readField<scalar>(ofDir + "/p");
+        auto relU = [&](const std::vector<vector>& a)
+        {
+            scalar mx = 0, mg = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                const vector& b = ofU.internalField[c];
+                mx = std::fmax(mx, std::fmax(std::fabs(a[c].x-b.x),
+                     std::fmax(std::fabs(a[c].y-b.y), std::fabs(a[c].z-b.z))));
+                mg = std::fmax(mg, std::fmax(std::fabs(b.x), std::fmax(std::fabs(b.y), std::fabs(b.z))));
+            }
+            return mg > 0 ? mx/mg : mx;
+        };
+        auto relP = [&](const std::vector<scalar>& a)
+        {
+            scalar mx = 0, mg = 0;
+            for (label c = 0; c < nC; ++c)
+            { mx = std::fmax(mx, std::fabs(a[c]-ofP.internalField[c]));
+              mg = std::fmax(mg, std::fabs(ofP.internalField[c])); }
+            return mg > 0 ? mx/mg : mx;
+        };
+        std::printf("\nvs real OpenFOAM (%s):\n", ofDir.c_str());
+        std::printf("  _cpp  (WITH non-orth correction)  U %.4e   p %.4e\n",
+                    relU(f.U.internal), relP(f.p.internal));
+        std::printf("  OLD host (WITHOUT the correction) U %.4e   p %.4e\n",
+                    relU(fo.U.internal), relP(fo.p.internal));
     }
     return 0;
 }

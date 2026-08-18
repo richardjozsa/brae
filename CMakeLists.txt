@@ -554,6 +554,22 @@ add_test(NAME simplefoam_v2_dispatch
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 set_tests_properties(simplefoam_v2_dispatch PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
 
+# CONVERGENCE GATE: run the rebuilt path to convergence and compare with OpenFOAM's own converged fields
+# (validation/pitzDailyTurb/1576, genuine simpleFoam v2412 output). The bounds are what brae's established
+# solver achieves against the same reference in simple_turbulent_full. ~90 s.
+add_test(NAME simplefoam_v2_convergence
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simplefoam_v2_convergence.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+set_tests_properties(simplefoam_v2_convergence PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 600)
+
+# NON-ORTHOGONAL CORRECTION vs real OpenFOAM on a genuinely non-orthogonal mesh, with a control requiring
+# that omitting the term is clearly worse -- on a near-orthogonal mesh this gate would pass with the term
+# deleted. Skips (77) where OpenFOAM is not installed.
+add_test(NAME nonorth_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/nonorth_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/shearedChannel)
+set_tests_properties(nonorth_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+
 add_test(NAME determinism_kepsilon
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/determinism_gate.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily 20)
