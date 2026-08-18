@@ -99,6 +99,37 @@ bool divUBounded(const std::string& caseDir)
     return entry.find("bounded") != std::string::npos;
 }
 
+// Does the case ask for the NON-ORTHOGONAL correction? OpenFOAM's `corrected` snGrad / `Gauss linear
+// corrected` laplacian add the explicit over-relaxed correction for mesh non-orthogonality; only
+// `orthogonal` and `uncorrected` switch it off.
+//
+// The rebuilt path's fvm::laplacian is ORTHOGONAL ONLY (fvm.cuh:4). On a non-orthogonal mesh omitting the
+// correction leaves the pressure equation inconsistent with the flux, so continuity never closes and the
+// residual plateaus instead of falling -- measured on pitzDaily, where the existing GPU solver's Ux
+// residual falls 1 -> 0.234 over 20 iterations while the rebuilt path oscillates around 0.4. It is not a
+// small error that accumulates; it is a term that is simply absent.
+bool nonOrthogonalCorrection(const std::string& caseDir)
+{
+    std::string text;
+    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return false; }
+    for (const char* blkName : {"laplacianSchemes", "snGradSchemes"})
+    {
+        const std::size_t blk = text.find(blkName);
+        if (blk == std::string::npos) continue;
+        const std::size_t open = text.find('{', blk);
+        if (open == std::string::npos) continue;
+        const std::size_t close = text.find('}', open);
+        const std::string b = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
+        // OF's default when the word is absent is `corrected`; `orthogonal`/`uncorrected` disable it.
+        if (b.find("orthogonal") != std::string::npos && b.find("nonOrthogonal") == std::string::npos)
+            continue;                       // `orthogonal` -- correction off
+        if (b.find("uncorrected") != std::string::npos) continue;
+        if (b.find("corrected") != std::string::npos || b.find("limited") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 bool switchOn(const FoamDict& d, const std::string& key, bool def)
 {
     const auto* v = d.find(key);
@@ -158,6 +189,12 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
             r.blockers.push_back("div(phi,U) is `bounded`, which adds -fvm::Sp(fvc::div(phi), U) to the "
                                  "momentum equation. The rebuilt UEqn does not implement it; the term is "
                                  "zero only at convergence, so omitting it changes the path there.");
+
+        if (nonOrthogonalCorrection(caseDir))
+            r.blockers.push_back("laplacianSchemes/snGradSchemes ask for the NON-ORTHOGONAL correction "
+                                 "(`corrected`/`limited`); the rebuilt path's fvm::laplacian is orthogonal "
+                                 "only. On a non-orthogonal mesh the term is not a refinement -- without it "
+                                 "the pressure equation and the flux disagree and continuity never closes.");
 
         const std::string sc = divUScheme(caseDir);
         if (!sc.empty() && sc != "upwind")
