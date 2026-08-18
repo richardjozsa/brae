@@ -1,0 +1,160 @@
+// CUDA implementation -- see UEqn.cuh for the provenance and the contract with the _cpp reference.
+#include "UEqn.cuh"
+#include "device_blas.cuh"
+#include "device_divdevreff.cuh"
+#include "device_simple.cuh"
+#include <stdexcept>
+
+namespace brae {
+namespace gpu {
+
+namespace {
+
+void refuseUnsupported(const MomentumInput& in)
+{
+    // Identical wording and citations to the reference: a component that is out of scope must say so, not
+    // be absent from the code and therefore from the reader's attention.
+    if (in.hasMRF)
+        throw std::runtime_error(
+            "UEqn(cuda): the case declares MRF, which UEqn.H applies via MRF.correctBoundaryVelocity(U) "
+            "and MRF.DDt(U) (simpleFoam/UEqn.H:3,8). Not implemented on this path; refusing rather than "
+            "silently solving a different equation.");
+    if (in.hasFvOptions)
+        throw std::runtime_error(
+            "UEqn(cuda): the case declares fvOptions, which UEqn.H applies as fvOptions(U), "
+            "fvOptions.constrain(UEqn) and fvOptions.correct(U) (simpleFoam/UEqn.H:11,17,23). Not "
+            "implemented on this path; refusing rather than silently solving a different equation.");
+}
+
+} // namespace
+
+
+void assembleUEqn(
+    MomentumMatrix&              M,
+    const DeviceMesh&            dm,
+    const DeviceVectorBoundary&  dbU,
+    const DeviceBuffer<scalar>&  Ux,
+    const DeviceBuffer<scalar>&  Uy,
+    const DeviceBuffer<scalar>&  Uz,
+    const MomentumInput&         in)
+{
+    refuseUnsupported(in);
+
+    // ---- fvm::div(phi, U) -------------------------------------------------------------------
+    // Upwind implicit weights, matching the reference's fvm::div. The weights of this operator are where
+    // brae's LUST defect lived, which is why the CUDA-vs-reference test compares them coefficient by
+    // coefficient rather than through a residual.
+    deviceDivUpwindCoeffs(dm, *in.phiInt, M.diag, M.upper, M.lower);
+
+    // ---- - fvm::laplacian(nuEff, U) ---------------------------------------------------------
+    // The implicit half of divDevReff. Face nuEff is passed in already interpolated, and the BOUNDARY
+    // faces carry the patch value (nut_wall on a wall function), not the owner cell's.
+    {
+        DeviceBuffer<scalar> lD, lU, lL;
+        deviceLaplacianCoeffs(dm, *in.nuEffFace, lD, lU, lL, in.correctedLaplacian);
+        deviceAxpy(-1.0, lD, M.diag);
+        deviceAxpy(-1.0, lU, M.upper);
+        deviceAxpy(-1.0, lL, M.lower);
+    }
+
+    // ---- boundary coefficients, per component -----------------------------------------------
+    // A vector boundary is three scalar boundaries. The div and laplacian internalCoeffs are isotropic;
+    // only the refValue-dependent boundaryCoeffs differ by component, so the scalar kernels are reused
+    // on dbU.comp[k] exactly as the rest of brae does.
+    for (int k = 0; k < 3; ++k)
+    {
+        deviceBCDivCoeffs(dbU.comp[k], *in.phiBnd, M.iC[k], M.bC[k]);
+        DeviceBuffer<scalar> lIC, lBC;
+        deviceBCLaplacianCoeffsFace(dbU.comp[k], *in.nuEffBndFace, lIC, lBC);
+        deviceAxpy(-1.0, lIC, M.iC[k]);
+        deviceAxpy(-1.0, lBC, M.bC[k]);
+    }
+
+    // ---- `bounded`: - fvm::Sp(fvc::div(phi), U) ---------------------------------------------
+    // Before relax, as OpenFOAM does. deviceDiv returns the per-volume divergence, so the extensive
+    // diagonal contribution is V*div(phi).
+    if (in.bounded)
+    {
+        DeviceBuffer<scalar> divPhi, t;
+        deviceDiv(dm, *in.phiInt, *in.phiBnd, divPhi);
+        deviceHadamard(t, divPhi, dm.V);
+        deviceAxpy(-1.0, t, M.diag);
+    }
+
+    // ---- explicit divDevReff: -fvc::div(nuEff*dev2(T(grad U))) ------------------------------
+    // The kernel returns the EXTENSIVE V*div(sigma), which is exactly what the reference adds to `source`
+    // (it computes -div(sigma) per volume and then subtracts it times V). So this is the source, directly.
+    deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
+                     M.source[0], M.source[1], M.source[2]);
+
+    // ---- explicit non-orthogonal correction --------------------------------------------------
+    // AFTER divDevReff, which ASSIGNS the source (device_divdevreff.cu: `dX[c] = d[0]`) rather than
+    // accumulating into it. Adding the correction first compiles and runs and is silently discarded.
+    //
+    // deviceLaplacianCorr returns the LAPLACIAN's own source correction (-V*fvc::div(faceFluxCorr)).
+    // divDevReff carries MINUS the laplacian, so it enters the momentum source with the opposite sign --
+    // the bookkeeping the existing GPU driver does at device_simple_foam.cu:1423-1426, and the sign a
+    // measurement against real OpenFOAM had to settle on the reference side (backwards made U worse).
+    if (in.correctedLaplacian)
+    {
+        const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> ub, gx, gy, gz, lc;
+            deviceBCValue(dbU.comp[k], *U[k], ub);
+            deviceGaussGrad(dm, *U[k], ub, gx, gy, gz);
+            deviceLaplacianCorr(dm, *in.nuEffFace, gx, gy, gz, lc);
+            deviceAxpy(-1.0, lc, M.source[k]);
+        }
+    }
+
+    // ---- UEqn.relax() -----------------------------------------------------------------------
+    // OpenFOAM's fvMatrix::relax is ASYMMETRIC: it ADDS cmptMax(cmptMag(internalCoeffs)) to the diagonal
+    // and REMOVES cmptMin(internalCoeffs), which are different quantities and agree only when the three
+    // components are equal. Both are supplied here rather than approximated by |iC[0]|, so slip and
+    // symmetry patches -- where the components genuinely differ -- stay right.
+    M.relaxed = false;
+    if (in.relaxU > 0.0 && in.relaxU < 1.0)
+    {
+        DeviceBuffer<scalar> iCmaxMag, iCmin;
+        deviceCmptMaxMag3(M.iC[0], M.iC[1], M.iC[2], iCmaxMag);
+        deviceCmptMin3   (M.iC[0], M.iC[1], M.iC[2], iCmin);
+
+        const DeviceLduView A = M.view(dm);
+        deviceRelaxDiag(A, dm, M.iC[0], in.relaxU, M.relaxedDiag, M.delta,
+                        nullptr, iCmaxMag.data(), iCmin.data());
+        M.relaxed = true;
+
+        // source += (relaxedDiag - rawDiag) * psi, per component -- the reference's
+        //     M.source[c] += (M.diag[c] - D0[c]) * psi.internal[c]
+        const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> t;
+            deviceHadamard(t, M.delta, *U[k]);
+            deviceAxpy(1.0, t, M.source[k]);
+        }
+    }
+}
+
+
+void addPressureGradient(
+    MomentumMatrix&              M,
+    const DeviceMesh&            dm,
+    const DeviceBuffer<scalar>&  gradPx,
+    const DeviceBuffer<scalar>&  gradPy,
+    const DeviceBuffer<scalar>&  gradPz)
+{
+    // solve(UEqn == -fvc::grad(p)): source -= grad(p)*V. fvc::grad is per-volume and `source` is
+    // extensive, so the volume factor is explicit here as it is in the reference.
+    const DeviceBuffer<scalar>* gp[3] = {&gradPx, &gradPy, &gradPz};
+    for (int k = 0; k < 3; ++k)
+    {
+        DeviceBuffer<scalar> t;
+        deviceHadamard(t, *gp[k], dm.V);
+        deviceAxpy(-1.0, t, M.source[k]);
+    }
+}
+
+} // namespace gpu
+} // namespace brae

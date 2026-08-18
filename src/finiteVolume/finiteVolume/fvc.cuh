@@ -33,6 +33,13 @@ std::vector<tensor> gaussGrad(const GeometricField<vector>& U,
                               const std::vector<FvPatch>& patches);
 
 // flux(U) = interpolate(U) & Sf  (linear interpolation, face-normal flux).
+// Array form: for a vector field that is not a GeometricField (HbyA in pEqn.H, whose boundary values
+// constrainHbyA partly takes from U). The GeometricField overload delegates to this one.
+SurfaceScalarField flux(const std::vector<vector>& internal,
+                        const std::vector<std::vector<vector>>& boundary,
+                        const PrimitiveMesh& m, const FvGeometry& g,
+                        const std::vector<FvPatch>& patches);
+
 SurfaceScalarField flux(const GeometricField<vector>& U,
                         const PrimitiveMesh& m, const FvGeometry& g,
                         const std::vector<FvPatch>& patches);

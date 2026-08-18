@@ -29,6 +29,7 @@ struct PressureInput
     label  pRefCell = -1;        // -1 => the case needs no reference; adjustPhi is then skipped
     scalar pRefValue = 0.0;
     bool   consistent = false;   // refused
+    bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
     bool   hasMRF = false;       // refused
     bool   hasFvOptions = false; // refused
     // adjustPhi's per-boundary-face mask: 1 where the U patch does NOT fix a value, i.e. where the flux
@@ -89,7 +90,8 @@ void assemblePEqn(
     const DeviceMesh&            dm,
     const DeviceBoundary&        dbP,
     const DeviceBuffer<scalar>&  rAUface,   // fvc::interpolate(rAU), internal faces
-    const PressureInput&         in);
+    const PressureInput&         in,
+    const DeviceBuffer<scalar>*  p = nullptr);   // required when correctedLaplacian: grad(p) for the correction
 
 // Stage 7: phi = phiHbyA - pEqn.flux(), with the SOLVED pressure.
 void correctFlux(

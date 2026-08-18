@@ -201,6 +201,11 @@ int main(int argc, char** argv)
     // hand is what produced five false findings earlier in this investigation.
     cin.correctedLaplacian = dctl.nonOrth;
     cin.bounded = dctl.bounded;
+    // The GPU column takes the SAME two flags, and takes them HERE rather than where the rest of `gin` is
+    // filled in -- that block runs before these are assigned, so copying them there silently handed the
+    // device path the struct defaults and the CUDA column reproduced the uncorrected answer exactly.
+    gin.bounded = cin.bounded;
+    gin.correctedLaplacian = cin.correctedLaplacian;
     oc.bounded  = dctl.bounded;
     std::printf("  _cpp correctedLaplacian = %d\n", (int)cin.correctedLaplacian);
 
@@ -361,6 +366,15 @@ int main(int argc, char** argv)
                     relU(f.U.internal), relP(f.p.internal));
         std::printf("  OLD host (WITHOUT the correction) U %.4e   p %.4e\n",
                     relU(fo.U.internal), relP(fo.p.internal));
+        // The CUDA column, on the same footing: if the device correction were missing or mis-signed it
+        // would land near the OLD-host number instead of near the _cpp one.
+        {
+            const std::vector<scalar> gx = gf.Ux.host(), gy = gf.Uy.host(), gz = gf.Uz.host();
+            std::vector<vector> gU(nC);
+            for (label c = 0; c < nC; ++c) { gU[c].x = gx[c]; gU[c].y = gy[c]; gU[c].z = gz[c]; }
+            std::printf("  CUDA  (WITH non-orth correction)  U %.4e   p %.4e\n",
+                        relU(gU), relP(gf.p.host()));
+        }
     }
     return 0;
 }

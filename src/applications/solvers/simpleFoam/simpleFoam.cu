@@ -62,6 +62,8 @@ Residuals simpleStep(
     mi.nuEffCell = in.nuEffCell;    mi.nuEffFace = in.nuEffFace;
     mi.nuEffBndFace = in.nuEffBndFace;
     mi.relaxU = in.relaxU;
+    mi.bounded = in.bounded;
+    mi.correctedLaplacian = in.correctedLaplacian;
     mi.hasMRF = in.hasMRF;          mi.hasFvOptions = in.hasFvOptions;
 
     MomentumMatrix MU;
@@ -108,6 +110,7 @@ Residuals simpleStep(
     pin.relaxP = in.relaxP;
     pin.pRefCell = in.pRefCell;   pin.pRefValue = in.pRefValue;
     pin.consistent = in.consistent;
+    pin.correctedLaplacian = in.correctedLaplacian;
     pin.hasMRF = in.hasMRF;       pin.hasFvOptions = in.hasFvOptions;
     pin.adjustable = in.adjustable;
     pin.takeUAtBoundary = in.takeUAtBoundary;
@@ -134,7 +137,7 @@ Residuals simpleStep(
     for (label corr = 1; corr <= nCorr; ++corr)
     {
         PressureMatrix& P = w.P;                       // persistent -- see SolverWorkspace
-        assemblePEqn(P, st, dm, dbP, rAUface, pin);
+        assemblePEqn(P, st, dm, dbP, rAUface, pin, &f.p);
 
         DeviceBuffer<scalar>& diagC = w.diagC;
         DeviceBuffer<scalar>& b     = w.b;

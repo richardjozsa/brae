@@ -165,14 +165,18 @@ void assemblePEqn(
     const DeviceMesh&            dm,
     const DeviceBoundary&        dbP,
     const DeviceBuffer<scalar>&  rAUface,
-    const PressureInput&         in)
+    const PressureInput&         in,
+    const DeviceBuffer<scalar>*  p)
 {
     refuseUnsupported(in);
+    if (in.correctedLaplacian && !p)
+        throw std::runtime_error("pEqn(cuda): the non-orthogonal correction needs grad(p), so the pressure "
+                                 "field must be supplied to assemblePEqn.");
 
     // fvm::laplacian(rAU, p). The boundary diffusivity is rAU's own boundary value, which for the
     // extrapolatedCalculated field fvMatrix::A() produces IS the owner cell's -- hence the cell-gamma
     // kernel here rather than the face variant used for nuEff.
-    deviceLaplacianCoeffs(dm, rAUface, P.diag, P.upper, P.lower);
+    deviceLaplacianCoeffs(dm, rAUface, P.diag, P.upper, P.lower, in.correctedLaplacian);
     deviceBCLaplacianCoeffs(dbP, st.rAU, P.iC, P.bC);
 
     // == fvc::div(phiHbyA), extensive: source = V*div(phiHbyA).
@@ -180,6 +184,17 @@ void assemblePEqn(
         DeviceBuffer<scalar> divPhi;
         deviceDiv(dm, st.phiHbyAInt, st.phiHbyABnd, divPhi);
         deviceHadamard(P.source, divPhi, dm.V);
+    }
+
+    // The explicit non-orthogonal correction. The pressure laplacian keeps OpenFOAM's OWN sign here
+    // (source += the laplacian's correction), unlike the momentum one -- device_simple_foam.cu:2649-2651.
+    if (in.correctedLaplacian)
+    {
+        DeviceBuffer<scalar> pb, gx, gy, gz, lc;
+        deviceBCValue(dbP, *p, pb);
+        deviceGaussGrad(dm, *p, pb, gx, gy, gz);
+        deviceLaplacianCorr(dm, rAUface, gx, gy, gz, lc);
+        deviceAxpy(1.0, lc, P.source);
     }
 
     // pEqn.setReference -- fvMatrix.C:1011-1023: source += diag*value; diag += diag. It DOUBLES the

@@ -56,6 +56,14 @@ static void cmp(const std::vector<scalar>& gpu, const std::vector<scalar>& ref,
     std::printf("  %-30s n=%6zu rel=%.3e  %s\n", nm, ref.size(), rel, ok ? "OK" : "FAIL");
 }
 
+static std::vector<scalar> flattenB(const std::vector<std::vector<scalar>>& b, label n)
+{
+    std::vector<scalar> f;
+    for (const auto& v : b) for (scalar x : v) f.push_back(x);
+    f.resize(n, 0.0);
+    return f;
+}
+
 static void check(bool ok, const char* what)
 {
     std::printf("  %-52s %s\n", what, ok ? "OK" : "FAIL");
@@ -329,6 +337,42 @@ int main(int argc, char** argv)
         DeviceBuffer<scalar> dk(kk), de(ee), dnut;
         deviceNut(dk, de, dnut);
         cmp(dnut.host(), kepsilon::nut(kk, ee), "nut = Cmu k^2/eps (deviceNut)", 1e-14);
+    }
+
+    // ---- stage: fvc::div(phi) -- the `bounded` term's ingredient ---------------------------
+    // -fvm::Sp(fvc::div(phi),U) is built from this. The CUDA bounded term measured as a no-op against the
+    // reference, and the kernel sequence matches the existing GPU driver exactly, so the divergence itself
+    // is the thing to check.
+    {
+        DeviceBuffer<scalar> dPhiI(phiF.internalField);
+        DeviceBuffer<scalar> dPhiB(flattenB(phiBnd, dm.nBndFaces));
+        DeviceBuffer<scalar> dDiv;
+        deviceDiv(dm, dPhiI, dPhiB, dDiv);
+
+        SurfaceScalarField phis;
+        phis.internal = phiF.internalField;
+        phis.boundary = phiBnd;
+        const std::vector<scalar> ref = fvc::div(phis, m, g, fvp);
+
+        // Normalised against the FLUX scale, not against div(phi)'s own maximum. div(phi) IS the
+        // near-total cancellation of a cell's face fluxes -- that is what convergence means -- so on a
+        // converged field its maximum is round-off-sized and dividing by it inflates a 4e-12 absolute
+        // difference into 2.8e-09. The quantity the bounded term actually uses is V*div(phi), and the
+        // scale it should be judged against is the face flux it is built from.
+        const std::vector<scalar> got = dDiv.host();
+        const std::vector<scalar>& V = g.V();
+        scalar mxAbs = 0, phiScale = 0, divMax = 0;
+        for (std::size_t c = 0; c < ref.size(); ++c)
+        {
+            mxAbs = std::fmax(mxAbs, std::fabs((got[c] - ref[c]) * V[c]));
+            divMax = std::fmax(divMax, std::fabs(ref[c]));
+        }
+        for (scalar v : phiF.internalField) phiScale = std::fmax(phiScale, std::fabs(v));
+        const scalar rel = phiScale > 0 ? mxAbs / phiScale : mxAbs;
+        const bool ok = rel <= 1e-12;
+        if (!ok) ++g_fails;
+        std::printf("  %-30s n=%6zu rel=%.3e  %s   (max|div(phi)|=%.2e, max|phi|=%.2e)\n",
+                    "V*div(phi) vs max|phi|", ref.size(), rel, ok ? "OK" : "FAIL", divMax, phiScale);
     }
 
     // ---- stage: fvc::grad(p) -- deviceGaussGrad vs the host gaussGrad -----------------------

@@ -45,12 +45,10 @@ import re, sys, os
 d = sys.argv[1]
 s = open(d + '/system/fvSchemes').read()
 s = re.sub(r'div\(phi,U\)[^;]*;', 'div(phi,U)      Gauss upwind;', s)
-# ...and orthogonal laplacian/snGrad: the rebuilt fvm::laplacian is orthogonal only, so `corrected`
-# (OpenFOAM's default, and what pitzDaily ships) is refused.
-s = re.sub(r'laplacianSchemes\s*\{[^}]*\}',
-           'laplacianSchemes\n{\n    default         Gauss linear orthogonal;\n}', s)
-s = re.sub(r'snGradSchemes\s*\{[^}]*\}',
-           'snGradSchemes\n{\n    default         orthogonal;\n}', s)
+# laplacianSchemes is deliberately LEFT ALONE at `Gauss linear corrected`, which is what pitzDaily ships
+# and what OpenFOAM defaults to. It used to be rewritten to `orthogonal` here because the rebuilt
+# fvm::laplacian was orthogonal only; both halves of the correction are now ported on both paths, so the
+# supported case exercises the flag end to end instead of dodging it.
 open(d + '/system/fvSchemes', 'w').write(s)
 s = open(d + '/system/fvSolution').read()
 s = re.sub(r'consistent\s+\S+;', 'consistent      no;', s)
@@ -113,16 +111,29 @@ try_refusal simplec \
   "s=open(d+'/system/fvSolution').read(); s=re.sub(r'consistent\s+\S+;','consistent      yes;',s); open(d+'/system/fvSolution','w').write(s)" \
   "SIMPLEC"
 
-# `bounded Gauss upwind` still names `upwind` as its scheme, so a guard that only read the scheme word
-# accepted it and ran without the -fvm::Sp(fvc::div(phi),U) term. That term is zero at convergence, so a
-# converged comparison cannot see the omission -- the guard is the only thing that can.
-try_refusal bounded \
-  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss upwind;',s); open(d+'/system/fvSchemes','w').write(s)" \
-  "bounded"
+# `bounded` is SUPPORTED: -fvm::Sp(fvc::div(phi),U) is implemented on both paths and matched to 2.9e-16.
+# It used to be a refusal; assert it RUNS, since the term vanishes at convergence and a converged field
+# comparison could not tell whether it was applied.
+echo "== 4c. bounded div(phi,U) is supported =="
+supported "$W/bnd"
+python3 - "$W/bnd" <<'PYEOF'
+import re, sys
+d = sys.argv[1]
+s = open(d + '/system/fvSchemes').read()
+s = re.sub(r'div\(phi,U\)[^;]*;', 'div(phi,U)      bounded Gauss upwind;', s)
+open(d + '/system/fvSchemes', 'w').write(s)
+PYEOF
+( cd "$W/bnd" && BRAE_SIMPLEFOAM_V2=1 "$BRAE" > log 2>&1 )
+brc=$?
+if [ $brc -eq 0 ]; then ok "bounded: exit 0"; else bad "bounded: exit $brc"; sed -n '1,4p' "$W/bnd/log"; fi
+grep -q "is bounded" "$W/bnd/log" && ok "bounded: the solver states it is applying the term" \
+                                  || bad "bounded: applied silently or not at all"
 
-try_refusal nonorth \
-  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'snGradSchemes\\s*\\{[^}]*\\}','snGradSchemes\\n{\\n    default         corrected;\\n}',s); open(d+'/system/fvSchemes','w').write(s)" \
-  "NON-ORTHOGONAL"
+# `limited <coeff>` is limitedSnGrad, which caps the correction -- a DIFFERENT scheme from `corrected`,
+# and the one place where accepting the whole `corrected`/`limited` family would silently over-correct.
+try_refusal limitedlaplacian \
+    "import re,sys;p=sys.argv[1]+'/system/fvSchemes';s=open(p).read();open(p,'w').write(re.sub(r'laplacianSchemes\s*\{[^}]*\}','laplacianSchemes\n{\n    default         Gauss linear limited 0.33;\n}',s))" \
+    "limited"
 
 try_refusal divscheme \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss linearUpwind grad(U);',s); open(d+'/system/fvSchemes','w').write(s)" \

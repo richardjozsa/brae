@@ -22,6 +22,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <regex>
+#include <cmath>
+#include <sstream>
 #include <stdexcept>
 
 namespace brae {
@@ -99,35 +101,55 @@ bool divUBounded(const std::string& caseDir)
     return entry.find("bounded") != std::string::npos;
 }
 
-// Does the case ask for the NON-ORTHOGONAL correction? OpenFOAM's `corrected` snGrad / `Gauss linear
-// corrected` laplacian add the explicit over-relaxed correction for mesh non-orthogonality; only
-// `orthogonal` and `uncorrected` switch it off.
+// Does the LAPLACIAN carry the non-orthogonal correction?
 //
-// The rebuilt path's fvm::laplacian is ORTHOGONAL ONLY (fvm.cuh:4). On a non-orthogonal mesh omitting the
-// correction leaves the pressure equation inconsistent with the flux, so continuity never closes and the
-// residual plateaus instead of falling -- measured on pitzDaily, where the existing GPU solver's Ux
-// residual falls 1 -> 0.234 over 20 iterations while the rebuilt path oscillates around 0.4. It is not a
-// small error that accumulates; it is a term that is simply absent.
-bool nonOrthogonalCorrection(const std::string& caseDir)
+// The laplacian's OWN scheme decides. `laplacianSchemes { default Gauss linear orthogonal; }` builds an
+// orthogonal laplacian whatever `snGradSchemes` says -- snGradSchemes governs EXPLICIT fvc::snGrad, which
+// in simpleFoam appears only in the SIMPLEC branch (already refused). An earlier version of this check
+// blocked on either block and so refused pitzDailyTurb, a case whose laplacian is orthogonal and which
+// the rebuilt path handles exactly.
+//
+// What `laplacianSchemes` asked for: whether the non-orthogonal correction is on, and the name of a
+// scheme that is recognised but not ported (empty when there is none).
+struct LaplacianScheme
 {
+    bool        corrected = true;   // OpenFOAM's default when the word is absent
+    std::string unsupported;
+};
+
+// Both halves of `corrected` are now implemented on both paths (fvm.cuh; UEqn.cu; pEqn.cu), so this READS
+// the scheme instead of refusing it. OpenFOAM's default when the word is absent IS corrected, so an absent
+// block returns true.
+//
+// `limited <coeff>` is NOT the same scheme: limitedSnGrad caps the correction against the orthogonal part,
+// and `limited 1` alone is equivalent to `corrected`. Anything else is reported through `unsupported` so
+// the envelope can refuse it rather than quietly running the uncapped correction.
+LaplacianScheme laplacianScheme(const std::string& caseDir)
+{
+    LaplacianScheme r;
     std::string text;
-    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return false; }
-    for (const char* blkName : {"laplacianSchemes", "snGradSchemes"})
+    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { r.corrected = false; return r; }
+    const std::size_t blk = text.find("laplacianSchemes");
+    if (blk == std::string::npos) return r;                 // absent -> OpenFOAM default is `corrected`
+    const std::size_t open = text.find('{', blk);
+    if (open == std::string::npos) return r;
+    const std::size_t close = text.find('}', open);
+    const std::string b = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
+
+    if (b.find("limited") != std::string::npos)
     {
-        const std::size_t blk = text.find(blkName);
-        if (blk == std::string::npos) continue;
-        const std::size_t open = text.find('{', blk);
-        if (open == std::string::npos) continue;
-        const std::size_t close = text.find('}', open);
-        const std::string b = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
-        // OF's default when the word is absent is `corrected`; `orthogonal`/`uncorrected` disable it.
-        if (b.find("orthogonal") != std::string::npos && b.find("nonOrthogonal") == std::string::npos)
-            continue;                       // `orthogonal` -- correction off
-        if (b.find("uncorrected") != std::string::npos) continue;
-        if (b.find("corrected") != std::string::npos || b.find("limited") != std::string::npos)
-            return true;
+        // `limited 1` is exactly `corrected`; any other coefficient is limitedSnGrad, which is not ported.
+        const std::size_t k = b.find("limited");
+        std::istringstream ls(b.substr(k + 7));
+        scalar coeff = -1.0;
+        if (!(ls >> coeff) || std::fabs(coeff - 1.0) > 1e-12)
+            r.unsupported = "limited";
+        return r;
     }
-    return false;
+    if (b.find("uncorrected") != std::string::npos) { r.corrected = false; return r; }
+    if (b.find("orthogonal") != std::string::npos && b.find("nonOrthogonal") == std::string::npos)
+    { r.corrected = false; return r; }
+    return r;   // `corrected` or unspecified
 }
 
 bool switchOn(const FoamDict& d, const std::string& key, bool def)
@@ -185,16 +207,12 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         // pitzDaily: the existing solver's Ux residual fell 1 -> 0.022 over 20 iterations while the
         // rebuilt path plateaued at ~0.5. The term vanishes at convergence, so a converged comparison
         // cannot see it -- which is precisely why the guard has to.
-        if (divUBounded(caseDir))
-            r.blockers.push_back("div(phi,U) is `bounded`, which adds -fvm::Sp(fvc::div(phi), U) to the "
-                                 "momentum equation. The rebuilt UEqn does not implement it; the term is "
-                                 "zero only at convergence, so omitting it changes the path there.");
-
-        if (nonOrthogonalCorrection(caseDir))
-            r.blockers.push_back("laplacianSchemes/snGradSchemes ask for the NON-ORTHOGONAL correction "
-                                 "(`corrected`/`limited`); the rebuilt path's fvm::laplacian is orthogonal "
-                                 "only. On a non-orthogonal mesh the term is not a refinement -- without it "
-                                 "the pressure equation and the flux disagree and continuity never closes.");
+        const LaplacianScheme lap = laplacianScheme(caseDir);
+        if (!lap.unsupported.empty())
+            r.blockers.push_back("laplacianSchemes asks for `" + lap.unsupported + "`, which caps the "
+                                 "non-orthogonal correction against the orthogonal part (limitedSnGrad). "
+                                 "Only the uncapped `corrected` is ported; running it would apply a larger "
+                                 "correction than the case asked for.");
 
         const std::string sc = divUScheme(caseDir);
         if (!sc.empty() && sc != "upwind")
@@ -468,6 +486,18 @@ int runSimpleFoamV2(const std::string& caseDir)
     in.pRefCell = f.pRefCell; in.pRefValue = f.pRefValue;
     in.takeUAtBoundary = &dTakeU; in.adjustable = &dAdjust;
     in.consistent = cd.consistent;
+    // `bounded Gauss <scheme>`: -fvm::Sp(fvc::div(phi), U), implemented on both paths and matched to
+    // 2.9e-16 (tests/test_ueqn_cuda.cu), so it is READ rather than refused.
+    in.bounded = divUBounded(caseDir);
+    if (in.bounded) std::printf("  div(phi,U) is bounded: applying -fvm::Sp(fvc::div(phi), U)\n");
+
+    // The non-orthogonal correction, both halves: nonOrthDeltaCoeffs in the implicit coefficients and the
+    // deferred correction in the source, in the momentum equation and the pressure equation alike. Matched
+    // to the reference to 5e-16 (tests/test_ueqn_cuda.cu, tests/test_peqn_cuda.cu) and gated against real
+    // OpenFOAM on a non-orthogonal mesh (tests/nonorth_vs_openfoam.sh), so it is READ rather than refused.
+    in.correctedLaplacian = laplacianScheme(caseDir).corrected;
+    std::printf("  laplacianSchemes: non-orthogonal correction %s\n",
+                in.correctedLaplacian ? "ON (`corrected`)" : "OFF (`uncorrected`/`orthogonal`)");
 
     // ---- the SIMPLE loop ---------------------------------------------------------------------
     SolverWorkspace ws;

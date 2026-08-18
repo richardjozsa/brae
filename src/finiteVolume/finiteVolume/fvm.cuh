@@ -78,6 +78,15 @@ FvMatrix<T> laplacian(
         M.diag[own[f]] -= coeff;
         M.diag[nei[f]] -= coeff;
     }
+    // Boundary coefficients take the patch field's OWN deltaCoeffs, not the corrected ones, even when
+    // `corrected` is on. That is OpenFOAM's behaviour and not an omission: gaussLaplacianScheme.C branches
+    // on pvf.coupled() and passes the corrected deltaCoeffs ONLY on the coupled side, calling the
+    // argument-less gradientInternalCoeffs()/gradientBoundaryCoeffs() otherwise.
+    //
+    // GAP, recorded here because it is invisible today: the coupled branch is NOT implemented. It is
+    // unreachable while coupled patches are refused outright by the envelope guard, and must be revisited
+    // the moment cyclic or processor patches are admitted -- on those, `corrected` changes the boundary
+    // coefficients too.
     M.internalCoeffs.resize(patches.size());
     M.boundaryCoeffs.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)

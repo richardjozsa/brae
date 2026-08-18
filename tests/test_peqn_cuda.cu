@@ -134,6 +134,7 @@ int main(int argc, char** argv)
 
     cpu::PressureInput rpin;
     rpin.pRefCell = -1;
+    rpin.correctedLaplacian = true;   // exercised on both paths -- see the control below
     const cpu::PressureStages rst = cpu::pressurePredictor(refU, U, p, rpin, m, g, fvp);
     const FvScalarMatrix refP = cpu::assemblePEqn(rst, p, rpin, m, g, fvp);
 
@@ -147,6 +148,7 @@ int main(int argc, char** argv)
     DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz);
 
     const SurfaceScalarField nuFace = cpu::effectiveFaceViscosity(nuEffC, nuEffB, m, g, fvp);
+    DeviceBuffer<scalar> dP(p.internal);
     DeviceBuffer<scalar> dPhiInt(phiF.internalField);
     DeviceBuffer<scalar> dPhiBnd(flatten(phiBnd, dm.nBndFaces, 0.0));
     DeviceBuffer<scalar> dNuCell(nuEffC), dNuFace(nuFace.internal);
@@ -177,6 +179,7 @@ int main(int argc, char** argv)
 
     gpu::PressureInput gpin;
     gpin.pRefCell = -1;
+    gpin.correctedLaplacian = true;
     gpin.takeUAtBoundary = &dTakeU;
     gpin.adjustable = &dAdjust;
 
@@ -203,7 +206,7 @@ int main(int argc, char** argv)
     std::printf("  -- stages 4-5: laplacian(rAU,p) == div(phiHbyA), setReference\n");
     DeviceBuffer<scalar> dRAUface(fvc::interpolate(rst.rAU, m, g, fvp).internal);
     gpu::PressureMatrix P;
-    gpu::assemblePEqn(P, gst, dm, dbP, dRAUface, gpin);
+    gpu::assemblePEqn(P, gst, dm, dbP, dRAUface, gpin, &dP);
     cmp(P.upper.host(),  refP.upper,  "pEqn upper",  1e-13);
     cmp(P.lower.host(),  refP.lower,  "pEqn lower",  1e-13);
     cmp(P.diag.host(),   refP.diag,   "pEqn diag",   1e-13);
@@ -226,7 +229,7 @@ int main(int argc, char** argv)
         gpu::PressureInput g2 = gpin; g2.pRefCell = 11; g2.pRefValue = 1.75;
         g2.adjustable = &dAdjust;
         gpu::PressureMatrix P2;
-        gpu::assemblePEqn(P2, gst, dm, dbP, dRAUface, g2);
+        gpu::assemblePEqn(P2, gst, dm, dbP, dRAUface, g2, &dP);
         cmp(P2.diag.host(),   refR.diag,   "setReference diag",   1e-13);
         cmp(P2.source.host(), refR.source, "setReference source", 1e-11);
         check(refR.diag[11] != refP.diag[11], "the reference cell really changed (control)");
@@ -267,6 +270,37 @@ int main(int argc, char** argv)
             for (label c = 0; c < nC; ++c) r[c] = component(ref[c], k);
             cmp(o[k]->host(), r, un[k], 1e-12);
         }
+    }
+
+    // CONTROL: `corrected` must actually change the pressure equation, or comparing it proves nothing.
+    // Both halves again -- the implicit one lands on the coefficients, the explicit one on the source.
+    {
+        cpu::PressureInput noC = rpin; noC.correctedLaplacian = false;
+        const FvScalarMatrix refNoC = cpu::assemblePEqn(rst, p, noC, m, g, fvp);
+        scalar dD = 0, mD = 0, dS = 0, mS = 0;
+        for (std::size_t c = 0; c < refP.diag.size(); ++c)
+        {
+            dD = std::fmax(dD, std::fabs(refP.diag[c] - refNoC.diag[c]));
+            mD = std::fmax(mD, std::fabs(refP.diag[c]));
+            dS = std::fmax(dS, std::fabs(refP.source[c] - refNoC.source[c]));
+            mS = std::fmax(mS, std::fabs(refP.source[c]));
+        }
+        const scalar rD = mD > 0 ? dD / mD : dD, rS = mS > 0 ? dS / mS : dS;
+        std::printf("  %-54s rel=%.3e\n", "control: `corrected` moves the p coefficients", rD);
+        std::printf("  %-54s rel=%.3e\n", "control: `corrected` moves the p source", rS);
+        check(rD > 1e-12, "the implicit half of the p non-orth correction contributes (control)");
+        check(rS > 1e-12, "the explicit half of the p non-orth correction contributes (control)");
+    }
+
+    // A missing pressure field with the correction on must be REFUSED, not silently skipped: grad(p) is
+    // required to evaluate it, and a nullptr that quietly meant "no correction" would reproduce exactly
+    // the class of defect this port exists to avoid.
+    {
+        gpu::PressureMatrix Pn;
+        bool threw = false;
+        try { gpu::assemblePEqn(Pn, gst, dm, dbP, dRAUface, gpin, nullptr); }
+        catch (const std::runtime_error&) { threw = true; }
+        check(threw, "corrected laplacian without p is refused on the CUDA path");
     }
 
     // ---- masks and refusals -----------------------------------------------------------------

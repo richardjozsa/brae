@@ -1,0 +1,100 @@
+#pragma once
+// CUDA implementation of simpleFoam's momentum predictor -- the device twin of UEqn_cpp.
+//
+// provenance:
+//   openfoam:  applications/solvers/incompressible/simpleFoam/UEqn.H:1-24
+//   reference: src/applications/solvers/simpleFoam/UEqn_cpp.cu   (validated against OpenFOAM's own dumps)
+//   cuda:      src/applications/solvers/simpleFoam/UEqn.cu
+//   tests:     tests/test_ueqn_cuda.cu   (field by field against the reference)
+//
+// THE CONTRACT WITH THE REFERENCE. This produces the SAME OBJECT the _cpp path produces, in the same
+// decomposition: one shared scalar LDU (diag/upper/lower), a per-component source, and per-component
+// boundary coefficients. It deliberately does NOT fold the boundary into the diagonal or fuse the stages,
+// because a fused kernel can only be compared as a single number and the whole method here is to name the
+// first divergent stage. Folding is a separate, later step (deviceFold), exactly as OpenFOAM keeps
+// internalCoeffs separate until solve time.
+//
+// Sign conventions, taken from the reference rather than re-derived:
+//   * fvm::div(phi,U) enters with +1;
+//   * divDevReff contributes -fvm::laplacian(nuEff,U) to the matrix and -fvc::div(nuEff*dev2(T(grad U)))
+//     to the source, so the Laplacian is SUBTRACTED from diag/upper/lower and from the boundary coeffs;
+//   * the device divDevReff kernel returns the EXTENSIVE V*div(sigma), which is precisely what the
+//     reference adds to `source`, so it is added directly with no volume factor of its own.
+//
+// nuEff is required at BOUNDARY FACES as well as at cells. That is not a convenience: on a wall with a nut
+// wall function the face value differs from the owner cell's by the whole of nut_wall, and using the cell
+// value under-predicts wall shear silently. The reference makes the boundary array a required argument for
+// the same reason.
+//
+// REFUSED, not ignored -- identical to the reference: MRF and fvOptions.
+#include "cf_types.cuh"
+#include "device_buffer.cuh"
+#include "device_mesh.cuh"
+#include "device_boundary.cuh"
+#include "device_ldu.cuh"
+
+namespace brae {
+namespace gpu {
+
+// The device momentum matrix, in the reference's decomposition.
+struct MomentumMatrix
+{
+    DeviceBuffer<scalar> diag, upper, lower;   // raw LDU, before the boundary fold
+    DeviceBuffer<scalar> source[3];            // per component, extensive
+    DeviceBuffer<scalar> iC[3], bC[3];         // boundary coefficients, flattened in bndCell order
+    // After relax(): the relaxed diagonal and delta = relaxedDiag - rawDiag. `delta` is kept because the
+    // reference adds (diag - D0)*psi to the source, and having it explicitly makes that step checkable.
+    DeviceBuffer<scalar> relaxedDiag, delta;
+    bool relaxed = false;
+
+    DeviceLduView view(const DeviceMesh& dm) const
+    {
+        DeviceLduView A{};
+        A.nCells = dm.nCells; A.nInternalFaces = dm.nInternalFaces;
+        A.diag = relaxed ? relaxedDiag.data() : diag.data();
+        A.upper = upper.data(); A.lower = lower.data();
+        A.owner = dm.owner.data(); A.nei = dm.nei.data();
+        A.ownerStart = dm.ownerStart.data();
+        A.losort = dm.losort.data(); A.losortStart = dm.losortStart.data();
+        return A;
+    }
+};
+
+struct MomentumInput
+{
+    const DeviceBuffer<scalar>* phiInt = nullptr;        // internal face flux
+    const DeviceBuffer<scalar>* phiBnd = nullptr;        // boundary face flux
+    const DeviceBuffer<scalar>* nuEffCell = nullptr;     // nCells
+    const DeviceBuffer<scalar>* nuEffFace = nullptr;     // internal faces (interpolated)
+    const DeviceBuffer<scalar>* nuEffBndFace = nullptr;  // boundary faces -- the PATCH value, not the cell's
+    scalar relaxU = 1.0;
+    bool   bounded = false;   // `bounded Gauss <scheme>`: diag -= V*div(phi); see UEqn_cpp.cuh
+    // `corrected` laplacianSchemes: switches the implicit coefficient to nonOrthDeltaCoeffs AND adds the
+    // explicit deferred correction. Both halves, as in the reference -- see UEqn_cpp.cuh.
+    bool   correctedLaplacian = false;
+    bool   hasMRF = false;
+    bool   hasFvOptions = false;
+};
+
+// UEqn.H steps 1-2: fvm::div(phi,U) + turbulence->divDevReff(U), then UEqn.relax().
+// Throws (host-side) on MRF/fvOptions, matching the reference's refusal contract.
+void assembleUEqn(
+    MomentumMatrix&              M,
+    const DeviceMesh&            dm,
+    const DeviceVectorBoundary&  dbU,
+    const DeviceBuffer<scalar>&  Ux,
+    const DeviceBuffer<scalar>&  Uy,
+    const DeviceBuffer<scalar>&  Uz,
+    const MomentumInput&         in);
+
+// UEqn.H step 3: the right-hand side of solve(UEqn == -fvc::grad(p)); source -= grad(p)*V.
+// Applied to a COPY of the matrix by the driver, because pEqn.H needs the original for A() and H().
+void addPressureGradient(
+    MomentumMatrix&              M,
+    const DeviceMesh&            dm,
+    const DeviceBuffer<scalar>&  gradPx,
+    const DeviceBuffer<scalar>&  gradPy,
+    const DeviceBuffer<scalar>&  gradPz);
+
+} // namespace gpu
+} // namespace brae

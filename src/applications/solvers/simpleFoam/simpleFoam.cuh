@@ -79,6 +79,8 @@ struct StepInput
     scalar tolP = 1e-10, relTolP = 0.0;
     int    maxIter = 2000;
     bool   momentumPredictor = true;
+    bool   bounded = false;              // div(phi,U) `bounded`
+    bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
     label  nNonOrthogonalCorrectors = 0;
 
     label  pRefCell = -1;

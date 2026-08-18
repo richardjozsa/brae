@@ -30,6 +30,17 @@ public:
     virtual void evaluate(const std::vector<T>& internal) = 0;
     virtual bool fixesValue() const = 0;
 
+    // OpenFOAM fvPatchField::assignable() -- "may this patch's value be OVERWRITTEN by an assignment to
+    // the field?". Defaults true; false for the fixedValue, mixed and transform families
+    // (fvPatchField.H, fixedValueFvPatchField.H:169, mixed/, transform/).
+    //
+    // This is NOT the same question as fixesValue(), and conflating them is a silent error:
+    //   * slip / partialSlip are NOT assignable but do NOT fix a value;
+    //   * inletOutlet is a mixed BC, so not assignable, and does not fix a value either.
+    // constrainHbyA (simpleFoam/pEqn.H:3) branches on assignable(); adjustPhi (pEqn.H:6) branches on
+    // fixesValue(). Using one for the other changes which patches keep U's boundary value in HbyA.
+    virtual bool assignable() const { return true; }
+
     // Laplacian/gradient matrix coupling: snGrad = gradientInternalCoeffs * phi_P
     // + gradientBoundaryCoeffs. Default (zeroGradient/empty/calculated) contributes nothing.
     virtual std::vector<T> gradientInternalCoeffs() const { return std::vector<T>(patch_.size, T{}); }
@@ -101,6 +112,7 @@ public:
             this->value_[i] = uniform_ ? uniformValue_ : values_[i];
     }
     bool fixesValue() const override { return true; }
+    bool assignable() const override { return false; }   // OF fixedValueFvPatchField.H:169
     int  bcCategory() const override { return 1; }
 
     std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs
@@ -343,6 +355,7 @@ template <typename T>
 class NoSlipPatchField : public fvPatchField<T>
 {
 public:
+    bool assignable() const override { return false; }   // OF: noSlip derives from fixedValue in OpenFOAM
     explicit NoSlipPatchField(const FvPatch& p) : fvPatchField<T>(p) {}
     void evaluate(const std::vector<T>&) override
     {
@@ -387,6 +400,7 @@ template <typename T>
 class SymmetryPlanePatchField : public fvPatchField<T>
 {
 public:
+    bool assignable() const override { return false; }   // OF: symmetry is a transform patch field
     explicit SymmetryPlanePatchField(const FvPatch& p) : fvPatchField<T>(p) {}
     void evaluate(const std::vector<T>& internal) override
     {
@@ -425,6 +439,7 @@ template <typename T>
 class WedgePatchField : public fvPatchField<T>
 {
 public:
+    bool assignable() const override { return false; }   // OF: wedge is a transform patch field
     WedgePatchField(const FvPatch& p, const tensor& faceT, const tensor& cellT)
         : fvPatchField<T>(p), faceT_(faceT), cellT_(cellT) {}
     void evaluate(const std::vector<T>& internal) override
@@ -502,6 +517,7 @@ template <typename T>
 class InletOutletPatchField : public ExtrapolatedValuePatchField<T>   // value()/refValue = inletValue
 {
 public:
+    bool assignable() const override { return false; }   // OF: inletOutlet derives from mixed
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 3; }                  // inletOutlet (device: per-face fixedValue|zeroGradient)
 };
@@ -512,6 +528,7 @@ template <typename T>
 class OutletInletPatchField : public ExtrapolatedValuePatchField<T>   // value()/refValue = outletValue (= freestreamValue)
 {
 public:
+    bool assignable() const override { return false; }   // OF: outletInlet derives from mixed
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 4; }                  // outletInlet (device: per-face fixedValue|zeroGradient, opposite switch)
 };
@@ -527,6 +544,7 @@ template <typename T>
 class PressureInletOutletVelocityPatchField : public ExtrapolatedValuePatchField<T>   // value() = written seed
 {
 public:
+    bool assignable() const override { return false; }   // OF: pressureInletOutletVelocity derives from directionMixed
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 6; }                  // device: pressureInletOutletVelocity (outlet, adjustable flux)
 };
@@ -543,6 +561,7 @@ template <typename T>
 class MixedPatchField : public ExtrapolatedValuePatchField<T>     // value() = refValue (freestreamValue); base evaluate() sets it
 {
 public:
+    bool assignable() const override { return false; }   // OF: mixed
     MixedPatchField(
         const FvPatch& p,
         bool uniform,

@@ -33,17 +33,18 @@ grep -q converged "$W/of/log.of" || { echo "FAIL: OpenFOAM did not converge"; ex
 OFT=$(ls -d "$W/of"/[0-9]* | grep -vE '/0$' | sort -t/ -k99 -n | tail -1)
 echo "  ok:   OpenFOAM reference generated -- $(grep converged "$W/of/log.of" | head -1)"
 
-OUT=$("$DIAG" "$SRC" 0 500 "$OFT" 2>/dev/null | tail -3)
+OUT=$("$DIAG" "$SRC" 0 500 "$OFT" 2>/dev/null | tail -4)
 echo "$OUT" | sed 's/^/  /'
 # The U figure is the field after the literal "U" on each line -- indexed by the marker, not by a column
 # number, so a change in the label's wording cannot silently shift which number is read.
 CORR=$(echo "$OUT" | awk '/WITH non-orth/{for(i=1;i<=NF;i++) if($i=="U"){print $(i+1); exit}}')
 UNCO=$(echo "$OUT" | awk '/WITHOUT the correction/{for(i=1;i<=NF;i++) if($i=="U"){print $(i+1); exit}}')
-[ -n "$CORR" ] && [ -n "$UNCO" ] || { echo "FAIL: could not parse the comparison"; exit 1; }
+CUDA=$(echo "$OUT" | awk '/^ *CUDA/{for(i=1;i<=NF;i++) if($i=="U"){print $(i+1); exit}}')
+[ -n "$CORR" ] && [ -n "$UNCO" ] && [ -n "$CUDA" ] || { echo "FAIL: could not parse the comparison"; exit 1; }
 
-python3 - "$CORR" "$UNCO" <<'PY'
+python3 - "$CORR" "$UNCO" "$CUDA" <<'PY'
 import sys
-corr, unco = float(sys.argv[1]), float(sys.argv[2])
+corr, unco, cuda = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
 fails = 0
 # The correction must bring U close to OpenFOAM. 5e-3 is an order above the measured 6.9e-04.
 if corr <= 5e-3: print("  ok:   corrected U error %.3e <= 5e-03" % corr)
@@ -52,5 +53,12 @@ else:            print("  FAIL: corrected U error %.3e > 5e-03" % corr); fails +
 # test would pass on a mesh where the term does nothing -- i.e. it would not be testing the term.
 if unco >= 20*corr: print("  ok:   uncorrected is %.0fx worse (%.3e) -- the case discriminates (control)" % (unco/corr, unco))
 else:               print("  FAIL: uncorrected only %.1fx worse -- this case cannot test the correction" % (unco/max(corr,1e-30))); fails += 1
+# The CUDA path carries the same correction and must land on the reference's side of that gap, not the
+# uncorrected one. Bounding it against `unco` rather than against a fixed number keeps the assertion tied
+# to the discriminating quantity: a device correction that were dropped or mis-signed lands near `unco`.
+if cuda <= 5e-3: print("  ok:   CUDA U error %.3e <= 5e-03" % cuda)
+else:            print("  FAIL: CUDA U error %.3e > 5e-03" % cuda); fails += 1
+if cuda <= unco/20: print("  ok:   CUDA is %.0fx better than uncorrected -- the device term is live" % (unco/cuda))
+else:               print("  FAIL: CUDA %.3e is not clearly better than uncorrected %.3e" % (cuda, unco)); fails += 1
 print("PASS" if not fails else "FAIL"); sys.exit(1 if fails else 0)
 PY

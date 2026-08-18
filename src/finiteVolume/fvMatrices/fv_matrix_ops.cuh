@@ -18,9 +18,12 @@ namespace brae {
 // pEqn.flux(): conservative face flux of a solved matrix. Mirrors fvMatrix::flux() (orthogonal,
 // no faceFluxCorrection): internal = faceH(p) = upper*p[nei] - lower*p[own]; boundary =
 // internalCoeffs*p[faceCell] - boundaryCoeffs.
+// Array form: the flux depends only on the INTERNAL field (the boundary term uses the face cell's
+// internal value, not the patch value), and a GeometricField cannot be copied -- its patch fields are
+// unique_ptr. The GeometricField overload below delegates.
 inline SurfaceScalarField matrixFlux(
     const FvScalarMatrix& M,
-    const GeometricField<scalar>& p,
+    const std::vector<scalar>& pInternal,
     const PrimitiveMesh& m,
     const std::vector<FvPatch>& patches)
 {
@@ -30,16 +33,25 @@ inline SurfaceScalarField matrixFlux(
     SurfaceScalarField flux;
     flux.internal.resize(nIf);
     for (label f = 0; f < nIf; ++f)
-        flux.internal[f] = M.upper[f] * p.internal[nei[f]] - M.lower[f] * p.internal[own[f]];
+        flux.internal[f] = M.upper[f] * pInternal[nei[f]] - M.lower[f] * pInternal[own[f]];
     flux.boundary.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         flux.boundary[pi].resize(patches[pi].size);
         for (label i = 0; i < patches[pi].size; ++i)
-            flux.boundary[pi][i] = M.internalCoeffs[pi][i] * p.internal[patches[pi].faceCells[i]]
+            flux.boundary[pi][i] = M.internalCoeffs[pi][i] * pInternal[patches[pi].faceCells[i]]
                                  - M.boundaryCoeffs[pi][i];
     }
     return flux;
+}
+
+inline SurfaceScalarField matrixFlux(
+    const FvScalarMatrix& M,
+    const GeometricField<scalar>& p,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches)
+{
+    return matrixFlux(M, p.internal, m, patches);
 }
 
 // fvMatrix::setValues: fix psi at the given cells to the given values (epsilonWallFunction

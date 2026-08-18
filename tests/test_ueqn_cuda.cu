@@ -1,0 +1,283 @@
+// CUDA UEqn against the _cpp reference, field by field.
+//
+// The reference is itself validated against OpenFOAM's own momentum dump (test_ueqn_cpp), so this closes
+// OpenFOAM -> _cpp -> CUDA for the whole momentum assembly rather than for individual kernels.
+//
+// The matrix is compared in its DECOMPOSED form -- diag, upper, lower, the three sources, and every
+// boundary coefficient on every patch -- because a folded or fused comparison collapses convection,
+// diffusion, the explicit stress, the boundary coefficients and relaxation into one number that cannot
+// say which of them is wrong.
+//
+// Run on both a laminar and a turbulent case: with constant nuEff a kernel that mishandles a per-face
+// diffusivity, or reads the owner cell's value on a wall instead of the patch value, still agrees.
+//
+// Run: test_ueqn_cuda <caseDir> <timeDir> [laminar]
+//
+// `laminar` forces nuEff = nu everywhere even when the case ships a nut field. Both fixtures here DO ship
+// one, so without the flag every run would exercise only the varying-viscosity path -- and the constant
+// one is what the OpenFOAM momentum dump was built with, so it is the arithmetic the reference itself was
+// proven on. Both are worth covering, and the flag is what makes the difference visible in the ctest name
+// rather than hidden in a directory listing.
+#include "primitive_mesh.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "geometric_field.cuh"
+#include "fv_patch_field.cuh"
+#include "foam_field_reader.cuh"
+#include "fvc.cuh"
+#include "device_buffer.cuh"
+#include "device_mesh.cuh"
+#include "device_boundary.cuh"
+#include "UEqn_cpp.cuh"
+#include "UEqn.cuh"
+#include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the same face-nuEff rule as the reference
+
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace brae;
+
+static int g_fails = 0;
+
+static void cmp(const std::vector<scalar>& gpu, const std::vector<scalar>& ref,
+                const char* nm, scalar tol)
+{
+    if (gpu.size() != ref.size())
+    {
+        std::printf("  %-32s SIZE MISMATCH %zu vs %zu  FAIL\n", nm, gpu.size(), ref.size());
+        ++g_fails;
+        return;
+    }
+    scalar mx = 0, mg = 0;
+    for (std::size_t i = 0; i < ref.size(); ++i)
+    {
+        mx = std::fmax(mx, std::fabs(gpu[i] - ref[i]));
+        mg = std::fmax(mg, std::fabs(ref[i]));
+    }
+    const scalar rel = mg > 0 ? mx / mg : mx;
+    const bool ok = rel <= tol;
+    if (!ok) ++g_fails;
+    std::printf("  %-32s n=%6zu rel=%.3e  %s\n", nm, ref.size(), rel, ok ? "OK" : "FAIL");
+}
+
+static void check(bool ok, const char* what)
+{
+    std::printf("  %-54s %s\n", what, ok ? "OK" : "FAIL");
+    if (!ok) ++g_fails;
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 3) { std::printf("usage: %s <caseDir> <timeDir>\n", argv[0]); return 2; }
+    const std::string caseDir = argv[1], t = argv[2];
+    const scalar nu = 1e-5;
+
+    PrimitiveMesh m;  m.read(caseDir + "/constant/polyMesh");
+    FvGeometry g;     g.build(m);
+    const std::vector<FvPatch> fvp = buildPatches(m, g);
+    const label nC = m.nCells();
+
+    GeometricField<vector> U =
+        buildField<vector>(readField<vector>(caseDir + "/" + t + "/U"), fvp, nC);
+    U.evaluateBoundary();
+
+    const FieldData<scalar> phiF = readField<scalar>(caseDir + "/" + t + "/phi");
+    std::vector<std::vector<scalar>> phiBnd(fvp.size());
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        phiBnd[pi].assign(fvp[pi].size, 0.0);
+        for (const auto& b : phiF.boundary)
+            if (b.name == fvp[pi].name && b.hasValue && (label)b.values.size() == fvp[pi].size)
+                phiBnd[pi] = b.values;
+    }
+
+    // nuEff: constant on a laminar case, nu + nut where the case has a nut field.
+    const bool forceLaminar = (argc > 3 && std::string(argv[3]) == "laminar");
+    const bool turbulent = !forceLaminar
+                        && (std::filesystem::exists(caseDir + "/" + t + "/nut")
+                            || std::filesystem::exists(caseDir + "/" + t + "/nut.gz"));
+    std::vector<scalar> nuEffC(nC, nu);
+    std::vector<std::vector<scalar>> nuEffB(fvp.size());
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi) nuEffB[pi].assign(fvp[pi].size, nu);
+    if (turbulent)
+    {
+        GeometricField<scalar> nutF =
+            buildField<scalar>(readField<scalar>(caseDir + "/" + t + "/nut"), fvp, nC);
+        nutF.evaluateBoundary();
+        for (label c = 0; c < nC; ++c) nuEffC[c] = nu + nutF.internal[c];
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::vector<scalar>& nb = nutF.boundary[pi]->value();
+            for (label i = 0; i < fvp[pi].size; ++i) nuEffB[pi][i] = nu + nb[i];
+        }
+    }
+
+    std::printf("test_ueqn_cuda:  (%s: nuEff %s)\n",
+            turbulent ? "TURBULENT" : "laminar",
+            turbulent ? "varies per cell and per boundary face" : "is constant");
+
+    // ---- the reference ----------------------------------------------------------------------
+    const scalar relaxU = 0.7;
+    cpu::MomentumInput mi;
+    mi.phi = &phiF.internalField; mi.phiBnd = &phiBnd;
+    mi.nuEff = &nuEffC;           mi.nuEffBnd = &nuEffB;
+    mi.relaxU = relaxU;
+    mi.bounded = true;
+    mi.correctedLaplacian = true;   // exercised on both paths -- see the controls below
+    const FvVectorMatrix ref = cpu::assembleUEqn(U, mi, m, g, fvp);
+
+    // ---- the CUDA path ----------------------------------------------------------------------
+    const DeviceMesh dm = buildDeviceMesh(m, g, fvp);
+    const DeviceVectorBoundary dbU = buildDeviceVectorBoundary(U, fvp, g);
+
+    std::vector<scalar> ux(nC), uy(nC), uz(nC);
+    for (label c = 0; c < nC; ++c) { ux[c] = U.internal[c].x; uy[c] = U.internal[c].y; uz[c] = U.internal[c].z; }
+    DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz);
+
+    // Face nuEff, built the same way the reference does (effectiveFaceViscosity): linear interior, the
+    // PATCH value on boundary faces. Flattened for the device in bndCell order.
+    const SurfaceScalarField nuEffFaceRef =
+        cpu::effectiveFaceViscosity(nuEffC, nuEffB, m, g, fvp);
+    std::vector<scalar> nuBndFlat;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        for (label i = 0; i < fvp[pi].size; ++i) nuBndFlat.push_back(nuEffB[pi][i]);
+    nuBndFlat.resize(dm.nBndFaces, nu);
+
+    std::vector<scalar> phiBndFlat;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        for (label i = 0; i < fvp[pi].size; ++i) phiBndFlat.push_back(phiBnd[pi][i]);
+    phiBndFlat.resize(dm.nBndFaces, 0.0);
+
+    DeviceBuffer<scalar> dPhiInt(phiF.internalField), dPhiBnd(phiBndFlat);
+    DeviceBuffer<scalar> dNuCell(nuEffC), dNuFace(nuEffFaceRef.internal), dNuBnd(nuBndFlat);
+
+    gpu::MomentumInput gi;
+    gi.phiInt = &dPhiInt;         gi.phiBnd = &dPhiBnd;
+    gi.nuEffCell = &dNuCell;      gi.nuEffFace = &dNuFace;  gi.nuEffBndFace = &dNuBnd;
+    gi.relaxU = relaxU;
+    gi.bounded = true;              // exercised on both paths -- see the control below
+    gi.correctedLaplacian = true;
+
+    gpu::MomentumMatrix M;
+    gpu::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, gi);
+
+    // ---- compare ----------------------------------------------------------------------------
+    // The reference's `diag` is the RELAXED diagonal (relaxMatrix writes it in place); the device keeps
+    // the raw one and the relaxed one separately, so the relaxed buffer is what corresponds.
+    check(M.relaxed, "relaxation ran on the device path");
+    cmp(M.relaxedDiag.host(), ref.diag,  "diag (relaxed)", 1e-12);
+    cmp(M.upper.host(),       ref.upper, "upper",          1e-13);
+    cmp(M.lower.host(),       ref.lower, "lower",          1e-13);
+
+    const char* sn[3] = {"source x", "source y", "source z"};
+    for (int k = 0; k < 3; ++k)
+    {
+        std::vector<scalar> r(nC);
+        for (label c = 0; c < nC; ++c) r[c] = component(ref.source[c], k);
+        cmp(M.source[k].host(), r, sn[k], 1e-11);
+    }
+
+    // Boundary coefficients, flattened in the device's bndCell order.
+    const char* bn[3] = {"internalCoeffs x", "internalCoeffs y", "internalCoeffs z"};
+    const char* cn[3] = {"boundaryCoeffs x", "boundaryCoeffs y", "boundaryCoeffs z"};
+    for (int k = 0; k < 3; ++k)
+    {
+        std::vector<scalar> ric, rbc;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                ric.push_back(component(ref.internalCoeffs[pi][i], k));
+                rbc.push_back(component(ref.boundaryCoeffs[pi][i], k));
+            }
+        std::vector<scalar> gic = M.iC[k].host(), gbc = M.bC[k].host();
+        gic.resize(ric.size()); gbc.resize(rbc.size());
+        cmp(gic, ric, bn[k], 1e-12);
+        cmp(gbc, rbc, cn[k], 1e-12);
+    }
+
+    // ---- addPressureGradient ----------------------------------------------------------------
+    {
+        GeometricField<scalar> p =
+            buildField<scalar>(readField<scalar>(caseDir + "/" + t + "/p"), fvp, nC);
+        p.evaluateBoundary();
+        const std::vector<vector> gradP = fvc::gaussGrad(p, m, g, fvp);
+
+        FvVectorMatrix refP = ref;
+        cpu::addPressureGradient(refP, p, m, g, fvp);
+
+        std::vector<scalar> gx(nC), gy(nC), gz(nC);
+        for (label c = 0; c < nC; ++c) { gx[c] = gradP[c].x; gy[c] = gradP[c].y; gz[c] = gradP[c].z; }
+        DeviceBuffer<scalar> dGx(gx), dGy(gy), dGz(gz);
+        gpu::addPressureGradient(M, dm, dGx, dGy, dGz);
+
+        for (int k = 0; k < 3; ++k)
+        {
+            std::vector<scalar> r(nC);
+            for (label c = 0; c < nC; ++c) r[c] = component(refP.source[c], k);
+            cmp(M.source[k].host(), r, k == 0 ? "source x + -grad(p)V"
+                                     : k == 1 ? "source y + -grad(p)V" : "source z + -grad(p)V", 1e-11);
+        }
+        // Control: the gradient must have changed the source, or the check above is vacuous.
+        scalar moved = 0;
+        for (label c = 0; c < nC; ++c)
+            moved = std::fmax(moved, std::fabs(component(refP.source[c], 0) - component(ref.source[c], 0)));
+        check(moved > 0.0, "the pressure gradient actually changed the source (control)");
+    }
+
+    // CONTROL: `bounded` must actually contribute, or comparing it proves nothing. It is SMALL here
+    // (~2e-08 of the diagonal) because pitzDailyTurb/1576 is converged and the term is -V*div(phi), which
+    // vanishes exactly at convergence -- that is the property that makes it invisible to a converged
+    // comparison and the reason it needs its own check rather than being inferred from agreement.
+    {
+        cpu::MomentumInput noB = mi; noB.bounded = false;
+        const FvVectorMatrix refNoB = cpu::assembleUEqn(U, noB, m, g, fvp);
+        scalar mx = 0, mg = 0;
+        for (std::size_t c = 0; c < ref.diag.size(); ++c)
+        { mx = std::fmax(mx, std::fabs(ref.diag[c] - refNoB.diag[c])); mg = std::fmax(mg, std::fabs(ref.diag[c])); }
+        const scalar r = mg > 0 ? mx / mg : mx;
+        std::printf("  %-54s rel=%.3e\n", "control: `bounded` changes the diagonal", r);
+        check(r > 1e-12, "the bounded term actually contributes (control)");
+    }
+
+    // CONTROL: same argument for `corrected`. Unlike `bounded` this does NOT vanish at convergence -- it
+    // is a property of the mesh, not of the solution -- so it must move both the coefficients (implicit
+    // half: nonOrthDeltaCoeffs instead of deltaCoeffs) and the source (explicit half). Checking only one
+    // would pass with the other half missing, which is precisely the failure the reference had to fix.
+    {
+        cpu::MomentumInput noC = mi; noC.correctedLaplacian = false;
+        const FvVectorMatrix refNoC = cpu::assembleUEqn(U, noC, m, g, fvp);
+        scalar dD = 0, mD = 0, dS = 0, mS = 0;
+        for (std::size_t c = 0; c < ref.diag.size(); ++c)
+        {
+            dD = std::fmax(dD, std::fabs(ref.diag[c] - refNoC.diag[c]));
+            mD = std::fmax(mD, std::fabs(ref.diag[c]));
+            dS = std::fmax(dS, std::fabs(component(ref.source[c], 0) - component(refNoC.source[c], 0)));
+            mS = std::fmax(mS, std::fabs(component(ref.source[c], 0)));
+        }
+        const scalar rD = mD > 0 ? dD / mD : dD, rS = mS > 0 ? dS / mS : dS;
+        std::printf("  %-54s rel=%.3e\n", "control: `corrected` moves the coefficients", rD);
+        std::printf("  %-54s rel=%.3e\n", "control: `corrected` moves the source", rS);
+        check(rD > 1e-12, "the implicit half of the non-orth correction contributes (control)");
+        check(rS > 1e-12, "the explicit half of the non-orth correction contributes (control)");
+    }
+
+    // ---- refusals ---------------------------------------------------------------------------
+    for (int which = 0; which < 2; ++which)
+    {
+        gpu::MomentumInput bad = gi;
+        (which == 0 ? bad.hasMRF : bad.hasFvOptions) = true;
+        gpu::MomentumMatrix Mb;
+        bool threw = false;
+        try { gpu::assembleUEqn(Mb, dm, dbU, dUx, dUy, dUz, bad); }
+        catch (const std::runtime_error&) { threw = true; }
+        check(threw, which == 0 ? "MRF is refused on the CUDA path"
+                                : "fvOptions is refused on the CUDA path");
+    }
+
+    std::printf("%s\n", g_fails == 0 ? "PASS" : "FAIL");
+    return g_fails == 0 ? 0 : 1;
+}

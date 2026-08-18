@@ -106,7 +106,8 @@ COMPONENTS = {
                         "device path too.",
              note="24 lines in OpenFOAM. The _cpp reference REFUSES MRF and fvOptions rather than ignoring "
                   "them -- brae has shipped a solver that silently ignored MRFProperties and produced a "
-                  "converged wrong answer. The CUDA side is not written yet."),
+                  "converged wrong answer. The CUDA side (UEqn.cu) mirrors it stage for stage, refusals "
+                  "included, and carries `bounded` and the `corrected` laplacian."),
         dict(name="pEqn", of_symbol="pEqn.H",
              of_file="applications/solvers/incompressible/simpleFoam/pEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
@@ -127,7 +128,9 @@ COMPONENTS = {
              note="50 lines. Every intermediate is RETURNED rather than kept local, so the first divergent "
                   "stage can be isolated -- a past investigation ended at `phi = phiHbyA - pEqn.flux()`, "
                   "which is stage 7 here. SIMPLEC (`consistent`) is refused: it needs UEqn.H1() and "
-                  "fvc::snGrad, neither ported. The CUDA side is not written yet."),
+                  "fvc::snGrad, neither ported. The CUDA side (pEqn.cu) mirrors it stage for stage; "
+                  "assemblePEqn takes p because the `corrected` laplacian needs grad(p), and REFUSES a "
+                  "null p rather than treating it as `no correction`."),
 
         # ---- control -------------------------------------------------------------------------
         dict(name="simpleControl", of_symbol="Foam::simpleControl",
@@ -396,7 +399,7 @@ COMPONENTS = {
                   "NO try/catch around it: selected-but-unsupported must stop, never fall through to the "
                   "old solver. A user who asked for the new path and silently got the old one cannot tell "
                   "from the output which algorithm produced the answer. ENVELOPE TODAY: steady, laminar, "
-                  "upwind div(phi,U), orthogonal laplacian, no MRF/fvOptions/SIMPLEC, no coupled patches -- "
+                  "upwind div(phi,U), orthogonal OR `corrected` laplacian, no MRF/fvOptions/SIMPLEC, no coupled patches -- "
                   "pitzDailyTurb (RAS/kEpsilon) is inside it. The non-orthogonal check reads "
                   "laplacianSchemes ONLY: `laplacianSchemes Gauss linear orthogonal` builds an orthogonal "
                   "laplacian whatever snGradSchemes says, since snGradSchemes governs explicit fvc::snGrad "
@@ -417,9 +420,31 @@ COMPONENTS = {
                   "found by this measurement -- divDevReff returns MINUS the laplacian, so its source "
                   "contribution is +V*div(...) while the pressure laplacian keeps OpenFOAM's own sign; "
                   "writing the laplacian sign in both places made U worse with the correction on (1.69e-01) "
-                  "while p improved, and that asymmetry is what localised it. NOT yet done: the CUDA side "
-                  "of non-orth (deviceLaplacianCorr exists), linearUpwind, and the stock-pitzDaily re-gate "
-                  "which needs both. "
+                  "while p improved, and that asymmetry is what localised it. "
+                  "THE CUDA SIDE IS NOW DONE TOO and carries both halves: deviceLaplacianCoeffs(..., "
+                  "nonOrth=true) for the implicit coefficient and deviceLaplacianCorr for the deferred "
+                  "source, in UEqn.cu (momentum, sign -1 because divDevReff carries minus the laplacian) "
+                  "and pEqn.cu (pressure, sign +1). Matched to the reference at 2.9e-16 on the relaxed "
+                  "diag and <=9.2e-16 on every source component, with controls asserting BOTH halves move "
+                  "something (implicit 2.0e-03, explicit 1.7e-03 on U; 3.5e-03 and 7.0e-02 on p) so the "
+                  "machine-precision agreement is not vacuous. The nonorth_vs_openfoam gate gained a CUDA "
+                  "column that reproduces the reference against real OpenFOAM digit for digit: U 6.9193e-04 "
+                  "and p 3.7529e-04, versus 8.4713e-02 / 1.3702e-01 uncorrected. TWO ORDERING TRAPS, both "
+                  "of which built and ran clean while being wrong: (1) deviceDivDevReff ASSIGNS the "
+                  "momentum source (device_divdevreff.cu, `dX[c] = d[0]`) rather than accumulating, so the "
+                  "correction must be added AFTER it -- added before, it is silently discarded; (2) in the "
+                  "diagnostic the GPU flags were copied from the host struct at the point `gin` is filled "
+                  "in, which runs BEFORE those host flags are assigned, so the device got the struct "
+                  "defaults and the CUDA column reproduced the uncorrected answer to five digits. Both "
+                  "were caught by the gate's control, not by the build. `limited <coeff>` is REFUSED "
+                  "separately: limitedSnGrad caps the correction and only `limited 1` equals `corrected`, "
+                  "so accepting the whole family would over-correct. STILL OPEN for stock pitzDaily: "
+                  "linearUpwind and SIMPLEC (`consistent yes`), which is what that case ships -- both "
+                  "remain blockers. KNOWN NARROW GAP: on COUPLED patches OpenFOAM passes the corrected "
+                  "deltaCoeffs to gradientInternalCoeffs (gaussLaplacianScheme.C, the pvf.coupled() "
+                  "branch) while uncoupled patches use the plain ones; neither brae path does the coupled "
+                  "variant, which is unreachable today because coupled patches are refused outright, and "
+                  "must be revisited when they are added. "
                   "ENVELOPE WIDENING: `bounded` (-fvm::Sp(fvc::div(phi),U)) is DONE on both paths and "
                   "matched to 2.9e-16 (tests/test_ueqn_cuda.cu), with a control asserting the term "
                   "actually contributes -- it is ~2e-08 of the diagonal on a converged case because it "
@@ -427,9 +452,9 @@ COMPONENTS = {
                   "applied. The kernel sequence is the existing GPU driver's (device_simple_foam.cu:1150) "
                   "minus the cyclic/AMI additions. An earlier report that the CUDA term was a NO-OP was "
                   "wrong: the test's struct is `gi` and the patch set `gmi`, so the flag was never "
-                  "enabled. The non-orthogonal correction and linearUpwind remain NOT started -- both "
-                  "need the host fvm::laplacian or a host deferred correction extended; the device "
-                  "already has deviceLaplacianCorr and deviceLinearUpwindCorr. RAS/kEpsilon passes the "
+                  "enabled. linearUpwind remains NOT started -- it needs a host deferred "
+                  "correction from grad(U); the device already has deviceLinearUpwindCorr. "
+                  "RAS/kEpsilon passes the "
                   "envelope check and the hook IS now wired to deviceKEpsilonCorrect: the hook also owns the "
                   "nuEff refresh (nu + nut, boundary value from deviceBoundaryNut's wall function, never "
                   "the owner cell), which is what makes the lagged coupling work without the driver "

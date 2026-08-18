@@ -1,6 +1,7 @@
 // SLICE 0 -- the vertical slice's driver, and for now a byte-faithful COPY of the shared one.
 //
-// COPIED FROM src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu -- identical as of 8d5a706. Tier C (to be re-ported, host first).
+// COPIED FROM src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu -- identical to the donor, verified by tools/slice_provenance.py (a diff, not a sha -- a sha goes
+// stale the moment the donor is touched and a stale one looks exactly like a current one). Tier C (to be re-ported, host first).
 //
 // Nothing is transcribed yet, deliberately. Slice 0's only job is to prove the SEAM: that this folder
 // builds as its own target, links the Tier-A infrastructure it is supposed to share (AMG-PCG, LDU, mesh,
@@ -13,8 +14,7 @@
 //
 // Slice 1+ replaces the pieces below with fresh transcriptions of OpenFOAM's own files
 // (rhoSimpleFoam.C / UEqn.H / EEqn.H / pEqn.H / pcEqn.H, 446 lines in total), one at a time, each
-// validated against OpenFOAM AND against this copy.
-// brae_rhoSimpleFoam -- steady COMPRESSIBLE SIMPLE, single-GPU device-resident.
+// validated against OpenFOAM AND against this copy.// brae_rhoSimpleFoam -- steady COMPRESSIBLE SIMPLE, single-GPU device-resident.
 //
 // Reads a standard OpenFOAM rhoSimpleFoam case and runs the whole loop on the GPU via
 // DeviceSimpleSolver::rhoSimpleStep -- the same three composable phases the steady and PIMPLE solvers
@@ -73,7 +73,7 @@
 
 using namespace brae;
 
-int main(int argc, char** argv)   // slice target: brae_rhoSimpleFoam_slice
+int main(int argc, char** argv)
 {
     try
     {
@@ -410,6 +410,28 @@ int main(int argc, char** argv)   // slice target: brae_rhoSimpleFoam_slice
                    "selectionMode all|cellZone.";
             throw std::runtime_error(msg);
         }
+
+        // MRF: REFUSED on this solver, because it is not merely unimplemented -- it was invisible.
+        //
+        // The compressible driver includes mrf_read.cuh only for readCellZones and never opens
+        // constant/MRFProperties, so a case with an active rotating zone ran with NO rotation at all and
+        // said nothing. That is the same shape as the defects this port keeps turning up: an input read
+        // off disk by nobody, producing a converged and plausible field.
+        //
+        // Implementing it is not a copy of the incompressible path either. OF's UEqn.H here is
+        // `MRF.DDt(rho, U)` -- MRFZoneList.C:210, the DENSITY-WEIGHTED overload -- while brae's
+        // deviceMrfCoriolis takes no rho at all. Reusing the incompressible term would silently drop that
+        // weighting, which on a compressible rotating case is wrong in proportion to the density ratio.
+        //
+        // No rhoSimpleFoam tutorial ships MRFProperties, so nothing regresses by refusing; the point is
+        // that the next case to try it gets an error instead of a wrong answer.
+        if (readMRFProperties(caseDir + "/constant").active)
+            throw std::runtime_error(
+                "brae: constant/MRFProperties has an active zone, and brae's COMPRESSIBLE solver does not "
+                "apply MRF yet. OpenFOAM's rhoSimpleFoam UEqn.H uses the density-weighted MRF.DDt(rho, U) "
+                "(MRFZoneList.C:210); brae's Coriolis term is not density-weighted, so running this case "
+                "would silently drop both the rotation and its rho weighting. Refused rather than solved "
+                "with the wrong physics.");
 
         const std::string second = ctl.sst ? "omega" : "epsilon";
         readRelaxationFactors(fvSolution, ctl);   // shared; adds the alpha<=0 guard this copy lacked

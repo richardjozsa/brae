@@ -74,8 +74,13 @@ std::vector<tensor> gaussGrad(
     return grad;
 }
 
+// Array form. HbyA in pEqn.H is not a GeometricField in the _cpp reference -- it is an internal field
+// plus a boundary field that constrainHbyA has partly overwritten from U -- so the flux operator is
+// expressed over plain arrays and the GeometricField overload delegates to it. One implementation, so the
+// solver path and the field path cannot drift apart.
 SurfaceScalarField flux(
-    const GeometricField<vector>& U,
+    const std::vector<vector>& internal,
+    const std::vector<std::vector<vector>>& boundary,
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches)
@@ -90,19 +95,29 @@ SurfaceScalarField flux(
     phi.internal.resize(nIf);
     for (label f = 0; f < nIf; ++f)
     {
-        const vector Uf = w[f] * U.internal[own[f]] + (1.0 - w[f]) * U.internal[nei[f]];
+        const vector Uf = w[f] * internal[own[f]] + (1.0 - w[f]) * internal[nei[f]];
         phi.internal[f] = dot(Uf, Sf[f]);
     }
     phi.boundary.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& fp = patches[pi];
-        const std::vector<vector>& uv = U.boundary[pi]->value();
         phi.boundary[pi].resize(fp.size);
         for (label i = 0; i < fp.size; ++i)
-            phi.boundary[pi][i] = dot(uv[i], Sf[fp.start + i]);
+            phi.boundary[pi][i] = dot(boundary[pi][i], Sf[fp.start + i]);
     }
     return phi;
+}
+
+SurfaceScalarField flux(
+    const GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    std::vector<std::vector<vector>> bnd(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) bnd[pi] = U.boundary[pi]->value();
+    return flux(U.internal, bnd, m, g, patches);
 }
 
 SurfaceScalarField rhoFlux(
