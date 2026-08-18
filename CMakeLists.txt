@@ -478,6 +478,11 @@ add_test(NAME peqn_matrix
 # END-TO-END gate for the rebuilt simpleFoam: one SIMPLE iteration composed of the _cpp components,
 # against OpenFOAM's own dumpSimpleStep output. Proves the composition, not just the parts.
 # END-TO-END: the CUDA driver against the _cpp driver, one iteration.
+# Diagnostic (not a ctest): both drivers, N iterations, side-by-side residuals + divergence trace.
+add_executable(diag_simple_loop tests/diag_simple_loop.cu)
+target_include_directories(diag_simple_loop PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(diag_simple_loop PRIVATE brae_core)
+
 add_executable(test_simple_step_cuda tests/test_simple_step_cuda.cu)
 target_include_directories(test_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_step_cuda PRIVATE brae_core)
