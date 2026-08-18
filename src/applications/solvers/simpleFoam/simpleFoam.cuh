@@ -52,6 +52,19 @@ struct SolverFields
     DeviceBuffer<scalar> phiInt, phiBnd;
 };
 
+// Optional instrumentation of the driver's internals. The per-stage tests compare each kernel against the
+// _cpp reference and pass at 1e-16, yet the driver's phi output is wrong by 1.17 relative from identical
+// inputs -- so the defect is in what the driver FEEDS a stage, not in the stage. That is invisible from
+// outside, hence this. Host-side vectors, filled only when a probe is attached; nullptr costs nothing.
+struct StepProbe
+{
+    std::vector<scalar> rAU, rAUface;
+    std::vector<scalar> HbyA[3], HbyAb[3];
+    std::vector<scalar> phiHbyAInt, phiHbyABnd;
+    std::vector<scalar> pDiag, pUpper, pLower, pSource, pIC, pBC;
+    std::vector<scalar> pSolved, phiInt, phiBnd;
+};
+
 struct StepInput
 {
     // nuEff for THIS iteration. Supplied by the caller because it comes from the turbulence model, which
@@ -76,6 +89,8 @@ struct StepInput
 
     bool hasMRF = false, hasFvOptions = false, consistent = false;   // all refused downstream
 
+    StepProbe* probe = nullptr;   // optional; see StepProbe
+
     // turbulence->correct(), called at the END of the iteration exactly where simpleFoam.C:94 calls it.
     // A hook rather than a hard dependency because the model is runtime-selected: the driver must not
     // know which one it is, and a driver that hard-codes kEpsilon is the god object starting over.
@@ -83,6 +98,7 @@ struct StepInput
 };
 
 using Residuals = std::map<std::string, scalar>;
+
 
 // Scratch that persists across iterations (the AMG hierarchy is built once per mesh, and `ones` is the
 // unit vector deviceNormFactor needs). Kept out of StepInput so the loop cannot accidentally rebuild it.

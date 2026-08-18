@@ -118,6 +118,16 @@ Residuals simpleStep(
     DeviceBuffer<scalar> rAUface;
     deviceInterpolate(dm, st.rAU, rAUface);
 
+    if (in.probe)
+    {
+        in.probe->rAU = st.rAU.host();
+        in.probe->rAUface = rAUface.host();
+        for (int k = 0; k < 3; ++k)
+        { in.probe->HbyA[k] = st.HbyA[k].host(); in.probe->HbyAb[k] = st.HbyAb[k].host(); }
+        in.probe->phiHbyAInt = st.phiHbyAInt.host();
+        in.probe->phiHbyABnd = st.phiHbyABnd.host();
+    }
+
     // Non-orthogonal corrector loop -- solutionControlI.H:78-95 runs it nNonOrth+1 times, and only the
     // final pass writes phi (simple.finalNonOrthogonalIter()).
     const label nCorr = in.nNonOrthogonalCorrectors + 1;
@@ -145,7 +155,16 @@ Residuals simpleStep(
 
         if (corr == nCorr)
         {
+            if (in.probe)
+            {
+                in.probe->pDiag = P.diag.host();     in.probe->pUpper = P.upper.host();
+                in.probe->pLower = P.lower.host();   in.probe->pSource = P.source.host();
+                in.probe->pIC = P.iC.host();         in.probe->pBC = P.bC.host();
+                in.probe->pSolved = f.p.host();
+            }
             correctFlux(f.phiInt, f.phiBnd, st, P, dm, dbP, f.p);
+            if (in.probe)
+            { in.probe->phiInt = f.phiInt.host(); in.probe->phiBnd = f.phiBnd.host(); }
         }
     }
 
