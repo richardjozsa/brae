@@ -453,6 +453,10 @@ add_executable(test_realizablke_cpp tests/test_realizablke_cpp.cu)
 target_include_directories(test_realizablke_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_realizablke_cpp PRIVATE brae_core)
 
+add_executable(resid_probe tests/resid_probe.cu)
+target_include_directories(resid_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(resid_probe PRIVATE brae_core)
+
 add_executable(test_fvoptions_cpp tests/test_fvoptions_cpp.cu)
 target_include_directories(test_fvoptions_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_fvoptions_cpp PRIVATE brae_core)

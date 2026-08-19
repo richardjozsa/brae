@@ -20,9 +20,15 @@ bool readDimensionedVector(const FoamDict& d, const std::string& key, vector& ou
     std::vector<scalar> nums;
     for (const std::string& tok : *v)
     {
-        try { std::size_t pos = 0; const scalar x = std::stod(tok, &pos);
-              if (pos == tok.size()) nums.push_back(x); }
-        catch (...) { }
+        try
+        {
+            std::size_t pos = 0;
+            const scalar x = std::stod(tok, &pos);
+            if (pos == tok.size()) nums.push_back(x);
+        }
+        catch (...)
+        {
+        }
     }
     // [dimensions](7) then the vector(3); take the LAST three, which is the vector either way.
     if (nums.size() < 3) return false;
@@ -78,7 +84,11 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
     namespace fs = std::filesystem;
     std::string path;
     for (const std::string& p : {caseDir + "/system/fvOptions", caseDir + "/constant/fvOptions"})
-        if (fs::exists(p)) { path = p; break; }
+        if (fs::exists(p))
+        {
+            path = p;
+            break;
+        }
     if (path.empty()) return list;
 
     const FoamDict root = readDict(path);
@@ -93,7 +103,11 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
         o.type = d.wordOr("type", "");
         const std::string act = d.wordOr("active", "true");
         o.active = !(act == "false" || act == "no" || act == "off" || act == "0");
-        if (!o.active) { list.options.push_back(o); continue; }
+        if (!o.active)
+        {
+            list.options.push_back(o);
+            continue;
+        }
 
         if (o.type != "explicitPorositySource")
         {
@@ -117,7 +131,12 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
         const CellSelection sel = resolveCellSelection(
             polyMeshDir, src.wordOr("selectionMode", "all"),
             src.wordOr("cellZone", src.wordOr("cellSet", "")), zones);
-        if (!sel.ok) { o.unsupported = "explicitPorositySource: " + sel.reason; list.options.push_back(o); continue; }
+        if (!sel.ok)
+        {
+            o.unsupported = "explicitPorositySource: " + sel.reason;
+            list.options.push_back(o);
+            continue;
+        }
         o.cells = sel.cells;
         o.allCells = sel.all;
 

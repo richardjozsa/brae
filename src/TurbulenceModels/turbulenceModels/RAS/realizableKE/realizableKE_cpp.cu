@@ -17,9 +17,15 @@ namespace {
 inline void devSymm(const tensor& t, scalar S[9])
 {
     const scalar tr3 = (t.xx + t.yy + t.zz) / 3.0;
-    S[0] = t.xx - tr3;          S[1] = 0.5*(t.xy + t.yx);  S[2] = 0.5*(t.xz + t.zx);
-    S[3] = S[1];                S[4] = t.yy - tr3;         S[5] = 0.5*(t.yz + t.zy);
-    S[6] = S[2];                S[7] = S[5];               S[8] = t.zz - tr3;
+    S[0] = t.xx - tr3;
+    S[1] = 0.5*(t.xy + t.yx);
+    S[2] = 0.5*(t.xz + t.zx);
+    S[3] = S[1];
+    S[4] = t.yy - tr3;
+    S[5] = 0.5*(t.yz + t.zy);
+    S[6] = S[2];
+    S[7] = S[5];
+    S[8] = t.zz - tr3;
 }
 
 } // namespace
@@ -30,7 +36,8 @@ std::vector<scalar> S2(const std::vector<tensor>& gradU)
     std::vector<scalar> out(gradU.size());
     for (std::size_t c = 0; c < gradU.size(); ++c)
     {
-        scalar S[9]; devSymm(gradU[c], S);
+        scalar S[9];
+        devSymm(gradU[c], S);
         scalar m = 0;
         for (int q = 0; q < 9; ++q) m += S[q]*S[q];
         out[c] = 2.0 * m;
@@ -49,7 +56,8 @@ std::vector<scalar> rCmu(const std::vector<tensor>& gradU,
     std::vector<scalar> out(gradU.size());
     for (std::size_t c = 0; c < gradU.size(); ++c)
     {
-        scalar S[9]; devSymm(gradU[c], S);
+        scalar S[9];
+        devSymm(gradU[c], S);
         const scalar magS = std::sqrt(s2[c]);
 
         // ((S&S)&&S): the inner product of S*S with S, i.e. sum_ij (S*S)_ij S_ij.

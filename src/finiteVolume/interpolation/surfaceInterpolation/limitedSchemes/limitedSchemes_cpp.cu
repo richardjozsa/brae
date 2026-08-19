@@ -159,9 +159,15 @@ std::vector<vector> linearUpwindVFaceCorrection(
         const scalar mx = corr.x*maxCorr.x + corr.y*maxCorr.y + corr.z*maxCorr.z;
         if (sq > 0.0)
         {
-            if (mx < 0.0)     corr = vector{0, 0, 0};
-            else if (sq > mx) { const scalar sc = mx/(sq + VSMALL);
-                                corr = vector{corr.x*sc, corr.y*sc, corr.z*sc}; }
+            if (mx < 0.0)
+            {
+                corr = vector{0, 0, 0};
+            }
+            else if (sq > mx)
+            {
+                const scalar sc = mx / (sq + VSMALL);
+                corr = vector{corr.x*sc, corr.y*sc, corr.z*sc};
+            }
         }
         out[f] = corr;
     }
