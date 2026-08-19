@@ -18,6 +18,7 @@
 #include "geometric_field.cuh"
 #include "foam_field_reader.cuh"
 #include "fvc.cuh"
+#include "fvm.cuh"
 #include <cstdio>
 #include <cmath>
 #include <string>
@@ -117,6 +118,52 @@ int main(int argc, char** argv)
         const scalar dv = maxAbsDiff(b, sx);
         std::printf("  %-60s max|d|=%.3e\n", "limitedLinearV vs per-component limitedLinear", dv);
         check(dv > 1e-6, "the V form really couples the components (control)");
+    }
+
+    // ---- linearUpwindV: the limiter's exact postcondition ------------------------------------
+    // After limiting, every face correction must satisfy either corr == 0 or
+    // 0 <= magSqr(corr) <= (corr & maxCorr). That is the limiter restated, so it holds by construction --
+    // which is the point: it fails loudly if a branch was transcribed wrongly. The controls are that the
+    // limiter must actually FIRE (zero some faces, scale others) and that the result must differ from the
+    // unlimited linearUpwind correction, or linearUpwindV would just be linearUpwind under another name.
+    {
+        namespace lsx = limitedSchemes;
+        const std::vector<vector> fc = lsx::linearUpwindVFaceCorrection(phi, U, gradU, m, g);
+        const std::vector<scalar>& w = g.weights();
+        const std::vector<label>& own = m.owner();
+        const std::vector<label>& nei = m.neighbour();
+        label nZero = 0, nScaled = 0, nBad = 0;
+        for (label f = 0; f < nIf; ++f)
+        {
+            const label P = own[f], N = nei[f];
+            const bool out = (phi[f] > 0.0);
+            const scalar a = out ? (1.0 - w[f]) : w[f];
+            const vector& vP = U.internal[P]; const vector& vN = U.internal[N];
+            const vector mc = out ? vector{a*(vN.x-vP.x), a*(vN.y-vP.y), a*(vN.z-vP.z)}
+                                  : vector{a*(vP.x-vN.x), a*(vP.y-vN.y), a*(vP.z-vN.z)};
+            const scalar sq = fc[f].x*fc[f].x + fc[f].y*fc[f].y + fc[f].z*fc[f].z;
+            const scalar mx = fc[f].x*mc.x + fc[f].y*mc.y + fc[f].z*mc.z;
+            if (sq == 0.0) { ++nZero; continue; }
+            if (mx < 0.0 || sq > mx*(1.0 + 1e-9)) ++nBad;
+            if (sq < mx*(1.0 - 1e-9)) {} else ++nScaled;
+        }
+        std::printf("  linearUpwindV faces: %d zeroed, %d at the limit, %d violating\n",
+                    (int)nZero, (int)nScaled, (int)nBad);
+        check(nBad == 0, "every limited face satisfies 0 <= magSqr(corr) <= corr & maxCorr");
+        check(nZero > 0, "the limiter zeroes faces where the correction opposes the jump (control)");
+
+        // ...and it must not equal the UNLIMITED linearUpwind correction.
+        const std::vector<vector> lu =
+            fvm::linearUpwindCorrection<vector, tensor>(phi, gradU, m, g);
+        const std::vector<vector> lv = lsx::linearUpwindVCorrection(phi, U, gradU, m, g);
+        scalar d = 0, mg = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            d  = std::fmax(d,  std::fabs(lu[c].x - lv[c].x));
+            mg = std::fmax(mg, std::fabs(lu[c].x));
+        }
+        std::printf("  %-60s rel=%.3e\n", "linearUpwindV vs unlimited linearUpwind", mg > 0 ? d/mg : d);
+        check(d > 0.0, "linearUpwindV differs from linearUpwind -- the limiter is live (control)");
     }
 
     std::printf("%s\n", g_fails == 0 ? "PASS" : "FAIL");

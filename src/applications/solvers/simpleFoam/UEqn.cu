@@ -185,6 +185,22 @@ void assembleUEqn(
     // grad(U)_ij = d(U_j)/d(x_i) convention. The two are the same field, not an approximation of it.
     // How much of linearUpwind's correction this scheme carries: 1 for linearUpwind, 0.25 for LUST
     // (LUST.H overrides correction() too), 0 otherwise.
+    // linearUpwindV: a DIFFERENT correction, limited across the three components at once, so it cannot
+    // be expressed as a factor on linearUpwind's.
+    if (in.scheme == cpu::DivScheme::linearUpwindV)
+    {
+        const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
+        DeviceBuffer<scalar> gx[3], gy[3], gz[3], ub, cx, cy, cz;
+        for (int k = 0; k < 3; ++k)
+        {
+            deviceBCValue(dbU.comp[k], *Usrc[k], ub);
+            deviceGaussGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k]);
+        }
+        deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
+        const DeviceBuffer<scalar>* cc[3] = {&cx, &cy, &cz};
+        for (int k = 0; k < 3; ++k) deviceAxpy(-1.0, *cc[k], M.source[k]);
+    }
+
     const scalar corrFac = (in.scheme == cpu::DivScheme::linearUpwind || in.linearUpwind) ? 1.0
                          : (in.scheme == cpu::DivScheme::LUST)                            ? 0.25
                          : 0.0;

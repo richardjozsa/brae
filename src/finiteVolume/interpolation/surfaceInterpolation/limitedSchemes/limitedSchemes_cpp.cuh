@@ -75,6 +75,41 @@ std::vector<scalar> limitedLinearVWeights(
     const PrimitiveMesh&              m,
     const FvGeometry&                 g);
 
+// linearUpwindV's DEFERRED CORRECTION, as an extensive per-cell contribution (linearUpwindV.C).
+//
+// linearUpwindV derives from `upwind` exactly as linearUpwind does -- same weights, correction only --
+// but the correction is a DIFFERENT function, not a scaled one, so it cannot be folded into a factor:
+//
+//     phi_f > 0:  corr = (Cf - C[own]) & grad(vf)[own],   maxCorr = (1-w)*(vf[nei] - vf[own])
+//     phi_f < 0:  corr = (Cf - C[nei]) & grad(vf)[nei],   maxCorr =    w *(vf[own] - vf[nei])
+//     s = magSqr(corr);  mx = corr & maxCorr
+//     if (s > 0) { if (mx < 0) corr = 0;  else if (s > mx) corr *= mx/(s + VSMALL); }
+//
+// The limiter is what distinguishes it: the correction may not overshoot the owner-to-neighbour jump
+// PROJECTED ON ITS OWN DIRECTION, and it is zeroed outright when it points against that jump. That test
+// couples the three components -- magSqr and the dot product are over the vector -- so this cannot be
+// applied per component, which is the same trap `limitedLinear` vs `limitedLinearV` sets.
+//
+// Returned as faceSum(phi_f * corr_f) per cell, the form the caller SUBTRACTS (fvMatrix::operator+= is
+// `source -= V*su`), matching fvm::linearUpwindCorrection.
+// The FACE corrections, before they are summed into cells. Exposed because the limiter has an exact
+// postcondition that is only checkable per face -- after limiting, either corr == 0 or
+// 0 <= magSqr(corr) <= (corr & maxCorr) -- and the per-cell sum below is computed FROM this, so a test
+// of one is a test of the other.
+std::vector<vector> linearUpwindVFaceCorrection(
+    const std::vector<scalar>&    phi,
+    const GeometricField<vector>& vf,
+    const std::vector<tensor>&    gradVf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g);
+
+std::vector<vector> linearUpwindVCorrection(
+    const std::vector<scalar>&    phi,
+    const GeometricField<vector>& vf,
+    const std::vector<tensor>&    gradVf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g);
+
 } // namespace limitedSchemes
 } // namespace cpu
 } // namespace brae

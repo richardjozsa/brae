@@ -129,8 +129,16 @@ int main(int argc, char** argv)
     mi.bounded = true;
     mi.correctedLaplacian = true;   // exercised on both paths -- see the controls below
     mi.linearUpwind = true;
-    mi.scheme = cpu::DivScheme::limitedLinear;   // exercised on both paths -- see the control below
+    // The scheme under comparison, selectable so one binary covers all of them. Default limitedLinear
+    // (a weights change); BRAE_TEST_SCHEME=linearUpwindV picks the limited-correction one instead.
+    const char* schEnv = std::getenv("BRAE_TEST_SCHEME");
+    const std::string sch = schEnv ? schEnv : "limitedLinear";
+    mi.scheme = sch == "linearUpwindV" ? cpu::DivScheme::linearUpwindV
+              : sch == "LUST"          ? cpu::DivScheme::LUST
+              : sch == "limitedLinearV"? cpu::DivScheme::limitedLinearV
+                                       : cpu::DivScheme::limitedLinear;
     mi.schemeCoeff = 1.0;
+    std::printf("  div(phi,U) scheme under test: %s\n", sch.c_str());
     const FvVectorMatrix ref = cpu::assembleUEqn(U, mi, m, g, fvp);
 
     // ---- the CUDA path ----------------------------------------------------------------------
@@ -165,8 +173,8 @@ int main(int argc, char** argv)
     gi.bounded = true;              // exercised on both paths -- see the control below
     gi.correctedLaplacian = true;
     gi.linearUpwind = true;
-    gi.scheme = cpu::DivScheme::limitedLinear;
-    gi.schemeCoeff = 1.0;
+    gi.scheme = mi.scheme;
+    gi.schemeCoeff = mi.schemeCoeff;
 
     gpu::MomentumMatrix M;
     gpu::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, gi);
@@ -182,7 +190,13 @@ int main(int argc, char** argv)
     // Measured 5.5e-12 on the off-diagonals with `limitedLinear 1`. That is the arithmetic of the scheme,
     // not a porting defect -- the control below proves the limiter is doing real work (4.4e-01 on the
     // off-diagonals), so this is not a tolerance hiding an absent term.
-    const scalar mTol = (mi.scheme == cpu::DivScheme::upwind) ? 1e-13 : 5e-11;
+    // Only the r-RATIO limiters need the looser bound, and the measurement says which: limitedLinear
+    // 5.5e-12 and limitedLinearV 1.4e-13, because r = 2*(gradcf/gradf) - 1 divides by a face difference
+    // that approaches zero. linearUpwindV and LUST hit 1e-16 -- neither divides by anything small -- so
+    // giving them the loose bound would hide a real defect in them.
+    const bool ratioLimiter = (mi.scheme == cpu::DivScheme::limitedLinear
+                            || mi.scheme == cpu::DivScheme::limitedLinearV);
+    const scalar mTol = ratioLimiter ? 5e-11 : 1e-13;
     cmp(M.relaxedDiag.host(), ref.diag,  "diag (relaxed)", mTol);
     cmp(M.upper.host(),       ref.upper, "upper",          mTol);
     cmp(M.lower.host(),       ref.lower, "lower",          mTol);
@@ -192,7 +206,7 @@ int main(int argc, char** argv)
     {
         std::vector<scalar> r(nC);
         for (label c = 0; c < nC; ++c) r[c] = component(ref.source[c], k);
-        cmp(M.source[k].host(), r, sn[k], (mi.scheme == cpu::DivScheme::upwind) ? 1e-11 : 5e-10);
+        cmp(M.source[k].host(), r, sn[k], ratioLimiter ? 5e-10 : 1e-11);
     }
 
     // Boundary coefficients, flattened in the device's bndCell order.
@@ -234,7 +248,7 @@ int main(int argc, char** argv)
             for (label c = 0; c < nC; ++c) r[c] = component(refP.source[c], k);
             cmp(M.source[k].host(), r, k == 0 ? "source x + -grad(p)V"
                                      : k == 1 ? "source y + -grad(p)V" : "source z + -grad(p)V",
-                                     (mi.scheme == cpu::DivScheme::upwind) ? 1e-11 : 5e-10);
+                                     ratioLimiter ? 5e-10 : 1e-11);
         }
         // Control: the gradient must have changed the source, or the check above is vacuous.
         scalar moved = 0;
@@ -267,8 +281,13 @@ int main(int argc, char** argv)
         for (std::size_t f = 0; f < ref.upper.size(); ++f)
         { dU = std::fmax(dU, std::fabs(ref.upper[f] - refNoS.upper[f])); mU = std::fmax(mU, std::fabs(ref.upper[f])); }
         const scalar r = mU > 0 ? dU / mU : dU;
-        std::printf("  %-54s rel=%.3e\n", "control: `limitedLinear` moves the off-diagonals", r);
-        check(r > 1e-12, "the limited scheme changes the matrix, not just the source (control)");
+        std::printf("  %-54s rel=%.3e\n", "control: the scheme moves the off-diagonals", r);
+        // linearUpwindV is a CORRECTION-only scheme (it derives from upwind), so its matrix is upwind's
+        // by construction -- asserting it moved would be asserting the opposite of the port.
+        if (mi.scheme == cpu::DivScheme::linearUpwindV)
+            check(r == 0.0, "linearUpwindV leaves the matrix at upwind's -- correction only (control)");
+        else
+            check(r > 1e-12, "the limited scheme changes the matrix, not just the source (control)");
     }
 
     // CONTROL: and for `linearUpwind`. It touches ONLY the source -- linearUpwind derives from `upwind`,

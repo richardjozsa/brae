@@ -16,7 +16,8 @@
 #include "device_boundary.cuh"
 #include "device_kepsilon.cuh"
 #include "device_komega_sst.cuh"    // deviceKOmegaSSTCorrect building blocks + KOmegaSSTCoeffs
-#include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
+#include "komega_sst_coeffs.cuh"
+#include "realizableKE_cpp.cuh"   // RealizableKECoeffs + readRealizableKECoeffs    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
 #include "cell_wall_dist.cuh"       // cellWallDist: kOmegaSST's F1/F2 need y at every CELL, not just walls
 #include "near_wall_dist.cuh"
 #include "solver_dispatch.cuh"   // readDdtSchemeWord: the same steady/transient test the dispatcher uses
@@ -319,11 +320,12 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         // OpenFOAM registers 78 surfaceInterpolationSchemes (ofscan: impls surfaceInterpolationScheme).
         // These five are the ones ported and gated; anything else is refused by name.
         if (!sc.empty() && sc != "upwind" && sc != "linearUpwind" && sc != "limitedLinear"
-            && sc != "limitedLinearV" && sc != "LUST")
+            && sc != "limitedLinearV" && sc != "LUST" && sc != "linearUpwindV")
             r.blockers.push_back("div(phi,U) asks for `" + sc + "`; the rebuilt UEqn implements `upwind`, "
-                                 "`linearUpwind`, `limitedLinear`, `limitedLinearV` and `LUST`. Running it "
+                                 "`linearUpwind`, `linearUpwindV`, `limitedLinear`, `limitedLinearV` and "
+                                 "`LUST`. Running it "
                                  "anyway would solve a different discretisation than the case specifies.");
-        if (sc == "linearUpwind")
+        if (sc == "linearUpwind" || sc == "linearUpwindV")
         {
             const std::string bad = linearUpwindGradUnsupported(caseDir);
             if (!bad.empty())
@@ -341,10 +343,11 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            if (model != "kEpsilon" && model != "kOmegaSST")
-                r.blockers.push_back("RASModel is `" + model + "`; the rebuilt path wires kEpsilon and "
-                                     "kOmegaSST only. OpenFOAM registers 26 incompressible turbulence "
-                                     "models (ofscan: impls incompressible::turbulenceModel).");
+            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE")
+                r.blockers.push_back("RASModel is `" + model + "`; the rebuilt path wires kEpsilon, "
+                                     "realizableKE and kOmegaSST only. OpenFOAM registers 26 "
+                                     "incompressible turbulence models (ofscan: impls "
+                                     "incompressible::turbulenceModel).");
         }
         else if (simType != "laminar")
         {
@@ -525,6 +528,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     bool   sstModel = false;
     std::string secondField = "epsilon";
     KOmegaSSTCoeffs sstCoeffs;
+    KEpsilonCoeffs  keCoeffs;
     DeviceBuffer<scalar> dY;             // cell wall distance -- kOmegaSST's F1/F2 need it per CELL
 
     StepInput in;
@@ -535,6 +539,18 @@ int runSimpleFoamV2(const std::string& caseDir)
         // `ras` here is the simulationType switch, not the dict -- the RAS sub-dictionary is re-fetched.
         const FoamDict* rasDict = turbProps.subDict("RAS");
         sstModel = rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSST";
+        // realizableKE rides the SAME fused device kEpsilon through KEpsilonCoeffs::realizable: variable
+        // Cmu, the strain-based epsilon production and the C2*eps^2/(k + sqrt(nu*eps)) destruction are
+        // all selected by that flag, so this is a coefficient change and not a second model path.
+        if (rasDict && rasDict->wordOr("RASModel", "") == "realizableKE")
+        {
+            keCoeffs.realizable = true;
+            RealizableKECoeffs rc;
+            readRealizableKECoeffs(rasDict, rc);
+            keCoeffs.A0 = rc.A0;  keCoeffs.C2 = rc.C2;
+            keCoeffs.sigmaK = rc.sigmak;  keCoeffs.sigmaEps = rc.sigmaEps;
+            keCoeffs.kappa = rc.kappa;  keCoeffs.E = rc.E;
+        }
         secondField = sstModel ? "omega" : "epsilon";
         kF   = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/k"), fvp, nC);
         epsF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + secondField), fvp, nC);
@@ -633,7 +649,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   nu, relaxEps, relaxK, tolKE,
                                   /*bounded*/false, /*boundedEps*/false,
                                   /*limitedK*/false, /*limitedEps*/false, 2.0, 2.0,
-                                  KEpsilonCoeffs{}, relTolKE, /*keCheckEvery*/1,
+                                  keCoeffs, relTolKE, /*keCheckEvery*/1,
                                   /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
                                   gsKE, gsKE);
 
@@ -695,7 +711,10 @@ int runSimpleFoamV2(const std::string& caseDir)
             gsKE     = (sk->wordOr("solver", "") == "smoothSolver" &&
                         (sk->wordOr("smoother", "") == "symGaussSeidel" ||
                          sk->wordOr("smoother", "") == "GaussSeidel"));
-            std::printf("  k/epsilon solves: tol=%.1e relTol=%.3g  solver=%s\n",
+            if (keCoeffs.realizable)
+            std::printf("  RASModel realizableKE: variable Cmu (A0=%g C2=%g sigmaEps=%g)\n",
+                        keCoeffs.A0, keCoeffs.C2, keCoeffs.sigmaEps);
+        std::printf("  k/epsilon solves: tol=%.1e relTol=%.3g  solver=%s\n",
                         tolKE, relTolKE, gsKE ? "smoothSolver/symGaussSeidel" : "Jacobi-BiCGStab");
         }
         if (const FoamDict* su = solvers->subDict("U"))
@@ -742,6 +761,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     {
         const std::string sc = divUScheme(caseDir);
         in.scheme = sc == "linearUpwind"   ? cpu::DivScheme::linearUpwind
+                  : sc == "linearUpwindV"  ? cpu::DivScheme::linearUpwindV
                   : sc == "limitedLinear"  ? cpu::DivScheme::limitedLinear
                   : sc == "limitedLinearV" ? cpu::DivScheme::limitedLinearV
                   : sc == "LUST"           ? cpu::DivScheme::LUST

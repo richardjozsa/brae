@@ -63,6 +63,7 @@ FvVectorMatrix divWithScheme(
 
         case DivScheme::upwind:
         case DivScheme::linearUpwind:
+        case DivScheme::linearUpwindV:
         default:
             // linearUpwind DERIVES from upwind: identical weights, its whole effect being the deferred
             // correction applied by the callers below.
@@ -118,6 +119,19 @@ FvVectorMatrix momentumCore(
     // 112-115), so it lands here, before everything else -- and it is SUBTRACTED, because `fvm += ...`
     // on an fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862). The gradient is the one the scheme
     // NAMES (`linearUpwind grad(U)`), resolved through gradSchemes by the caller's envelope check.
+    // linearUpwindV carries a DIFFERENT correction, not a scaled one, so it branches before the factor.
+    if (in.scheme == DivScheme::linearUpwindV)
+    {
+        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        const std::vector<vector> corr =
+            limitedSchemes::linearUpwindVCorrection(*in.phi, U, gradU, m, g);
+        for (std::size_t c = 0; c < corr.size(); ++c)
+        {
+            M.source[c].x -= corr[c].x;
+            M.source[c].y -= corr[c].y;
+            M.source[c].z -= corr[c].z;
+        }
+    }
     const scalar corrFac = correctionFactor(in);
     if (corrFac != 0.0)
     {
@@ -156,6 +170,19 @@ FvVectorMatrix assembleUEqn(
     // 112-115), so it lands here, before everything else -- and it is SUBTRACTED, because `fvm += ...`
     // on an fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862). The gradient is the one the scheme
     // NAMES (`linearUpwind grad(U)`), resolved through gradSchemes by the caller's envelope check.
+    // linearUpwindV carries a DIFFERENT correction, not a scaled one, so it branches before the factor.
+    if (in.scheme == DivScheme::linearUpwindV)
+    {
+        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        const std::vector<vector> corr =
+            limitedSchemes::linearUpwindVCorrection(*in.phi, U, gradU, m, g);
+        for (std::size_t c = 0; c < corr.size(); ++c)
+        {
+            M.source[c].x -= corr[c].x;
+            M.source[c].y -= corr[c].y;
+            M.source[c].z -= corr[c].z;
+        }
+    }
     const scalar corrFac = correctionFactor(in);
     if (corrFac != 0.0)
     {

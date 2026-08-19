@@ -86,6 +86,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
     src/applications/solvers/simpleFoam/UEqn.cu
@@ -430,6 +431,15 @@ add_test(NAME ueqn_cuda
 add_test(NAME ueqn_cuda_turbulent
          COMMAND test_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 
+# One binary, one scheme each: CUDA against the _cpp reference at MATRIX granularity for every ported
+# div(phi,U) scheme. The tolerances differ by scheme on purpose -- the r-ratio limiters divide by a face
+# difference that approaches zero and land at 1e-12/1e-13, while linearUpwindV and LUST hit 1e-16.
+foreach(_sch limitedLinear limitedLinearV LUST linearUpwindV)
+    add_test(NAME ueqn_cuda_scheme_${_sch}
+             COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_SCHEME=${_sch}
+                     $<TARGET_FILE:test_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+endforeach()
+
 add_executable(test_ueqn_cpp tests/test_ueqn_cpp.cu)
 target_include_directories(test_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_ueqn_cpp PRIVATE brae_core)
@@ -437,6 +447,10 @@ target_link_libraries(test_ueqn_cpp PRIVATE brae_core)
 add_executable(test_komegasst_cpp tests/test_komegasst_cpp.cu)
 target_include_directories(test_komegasst_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_komegasst_cpp PRIVATE brae_core)
+
+add_executable(test_realizablke_cpp tests/test_realizablke_cpp.cu)
+target_include_directories(test_realizablke_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_realizablke_cpp PRIVATE brae_core)
 
 add_executable(test_limitedschemes_cpp tests/test_limitedschemes_cpp.cu)
 target_include_directories(test_limitedschemes_cpp PRIVATE ${BRAE_HEADER_DIRS})
@@ -607,6 +621,13 @@ set_tests_properties(linearupwind_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LAB
 # control proving the V form couples the components rather than limiting them independently.
 add_test(NAME limitedschemes_cpp
          COMMAND test_limitedschemes_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+# realizableKE _cpp reference vs real OpenFOAM. Same residual oracle as kOmegaSST, plus the two controls
+# that say WHICH model was ported: rCmu must genuinely vary (a constant 0.09 is standard k-epsilon, which
+# would still work), and S2 must use devSymm rather than the symm that kOmegaSST uses.
+add_test(NAME realizablke_cpp
+         COMMAND test_realizablke_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyRKE 2000)
+set_tests_properties(realizablke_cpp PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(NAME komegasst_cpp
          COMMAND test_komegasst_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST 2000)

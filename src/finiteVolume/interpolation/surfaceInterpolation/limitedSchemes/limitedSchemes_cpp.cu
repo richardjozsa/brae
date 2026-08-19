@@ -120,6 +120,77 @@ std::vector<scalar> limitedLinearVWeights(
     return w;
 }
 
+std::vector<vector> linearUpwindVFaceCorrection(
+    const std::vector<scalar>&    phi,
+    const GeometricField<vector>& vf,
+    const std::vector<tensor>&    gradVf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& w  = g.weights();
+    const std::vector<vector>& C  = g.C();
+    const std::vector<vector>& Cf = g.Cf();
+    constexpr scalar VSMALL = 1.0e-300;
+
+    std::vector<vector> out(nIf);
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label P = own[f], N = nei[f];
+        const bool  outflow = (phi[f] > 0.0);
+        const label up = outflow ? P : N;
+        const vector d { Cf[f].x - C[up].x, Cf[f].y - C[up].y, Cf[f].z - C[up].z };
+        const tensor& gc = gradVf[up];
+        // (d & gradVf)_j = d_i * gradVf_ij, under OpenFOAM's grad(U)_ij = d(U_j)/d(x_i)
+        vector corr { d.x*gc.xx + d.y*gc.yx + d.z*gc.zx,
+                      d.x*gc.xy + d.y*gc.yy + d.z*gc.zy,
+                      d.x*gc.xz + d.y*gc.yz + d.z*gc.zz };
+
+        const vector& vP = vf.internal[P];
+        const vector& vN = vf.internal[N];
+        const scalar  a  = outflow ? (1.0 - w[f]) : w[f];
+        const vector  maxCorr = outflow
+            ? vector{ a*(vN.x - vP.x), a*(vN.y - vP.y), a*(vN.z - vP.z) }
+            : vector{ a*(vP.x - vN.x), a*(vP.y - vN.y), a*(vP.z - vN.z) };
+
+        const scalar sq = corr.x*corr.x + corr.y*corr.y + corr.z*corr.z;
+        const scalar mx = corr.x*maxCorr.x + corr.y*maxCorr.y + corr.z*maxCorr.z;
+        if (sq > 0.0)
+        {
+            if (mx < 0.0)     corr = vector{0, 0, 0};
+            else if (sq > mx) { const scalar sc = mx/(sq + VSMALL);
+                                corr = vector{corr.x*sc, corr.y*sc, corr.z*sc}; }
+        }
+        out[f] = corr;
+    }
+    return out;
+}
+
+
+std::vector<vector> linearUpwindVCorrection(
+    const std::vector<scalar>&    phi,
+    const GeometricField<vector>& vf,
+    const std::vector<tensor>&    gradVf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g)
+{
+    // faceSum(phi_f * corr_f), computed FROM the face corrections so the two cannot drift apart.
+    const std::vector<vector> corr = linearUpwindVFaceCorrection(phi, vf, gradVf, m, g);
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    std::vector<vector> src(m.nCells(), vector{0, 0, 0});
+    for (label f = 0; f < nIf; ++f)
+    {
+        const vector fc { phi[f]*corr[f].x, phi[f]*corr[f].y, phi[f]*corr[f].z };
+        src[own[f]] += fc;
+        src[nei[f]] -= fc;
+    }
+    return src;
+}
+
 } // namespace limitedSchemes
 } // namespace cpu
 } // namespace brae

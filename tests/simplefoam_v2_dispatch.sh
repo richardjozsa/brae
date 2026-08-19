@@ -162,7 +162,7 @@ try_refusal transient \
 echo "== 4e. the limited/blended div schemes are supported =="
 # Each must RUN and each must SAY which scheme it applied -- a silent fallback to upwind would still
 # converge to a plausible answer, which is exactly the failure mode this guard exists to prevent.
-for sc in "limitedLinear 1" "limitedLinearV 1" "LUST grad(U)"; do
+for sc in "limitedLinear 1" "limitedLinearV 1" "LUST grad(U)" "linearUpwindV grad(U)"; do
     tag=$(echo "$sc" | awk '{print $1}')
     supported "$W/sch_$tag"
     python3 - "$W/sch_$tag" "$sc" <<'PY'

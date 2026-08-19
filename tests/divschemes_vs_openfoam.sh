@@ -12,6 +12,8 @@
 #   limitedLinear   weights only, limiter on the SCALAR magSqr(U)  (LimitedScheme.H: NVDTVD + magSqr)
 #   limitedLinearV  weights only, ONE vector limiter per face      (NVDVTVDV)
 #   LUST            weights 0.75*linear+0.25*upwind AND 0.25 of linearUpwind's deferred correction
+#   linearUpwindV   weights UNCHANGED; a DIFFERENT correction -- linearUpwind's, limited so it cannot
+#                   overshoot the owner-to-neighbour jump along its own direction (linearUpwindV.C)
 set -u
 SRC="${1:?case dir}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -74,7 +76,7 @@ PY
 }
 
 fails=0
-for sc in "limitedLinear 1" "limitedLinearV 1" "LUST grad(U)"; do
+for sc in "limitedLinear 1" "limitedLinearV 1" "LUST grad(U)" "linearUpwindV grad(U)"; do
     tag=$(echo "$sc" | awk '{print $1}')
     mkcase "$W/of" "$sc"
     ( cd "$W/of" && timeout 1800 simpleFoam > log.of 2>&1 ) || { echo "FAIL: OpenFOAM did not run ($tag)"; fails=1; continue; }
