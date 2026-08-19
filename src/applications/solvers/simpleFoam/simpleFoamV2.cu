@@ -87,6 +87,65 @@ std::string divUScheme(const std::string& caseDir)
     return last;
 }
 
+// div(phi,k) / div(phi,epsilon) / div(phi,omega). The turbulence scalars get their OWN entry, and the
+// SST tutorials point it at `bounded Gauss limitedLinear 1` while pitzDaily's kEpsilon asks for plain
+// `Gauss upwind`. That is a different MATRIX, not a looser tolerance: measured against OpenFOAM's own
+// initial residual on pitzDailySST, running upwind where the case asks for limitedLinear is 8.3x out on
+// omega and 82x on k. The entries are usually written through a `$turbulence` macro, which
+// readFileExpanded resolves before this sees them.
+struct TurbDivScheme
+{
+    std::string scheme;          // the scheme word: `upwind`, `limitedLinear`, ...
+    scalar      coeff = 1.0;     // its coefficient, `limitedLinear 1` -> 1
+    bool        bounded = false; // the `bounded` prefix -> -fvm::Sp(fvc::div(phi), var)
+    bool        found = false;
+};
+
+TurbDivScheme divTurbScheme(const std::string& caseDir, const std::string& key)
+{
+    TurbDivScheme out;
+    std::string text;
+    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return out; }
+    const std::size_t blk = text.find("divSchemes");
+    if (blk == std::string::npos) return out;
+    const std::size_t open = text.find('{', blk);
+    if (open == std::string::npos) return out;
+    const std::size_t close = text.find('}', open);
+    const std::string b = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
+
+    std::string esc;
+    for (char c : key)
+    {
+        if (std::strchr("().[]{}*+?^$|\\", c)) esc += '\\';
+        esc += c;
+    }
+    std::smatch mm;
+    std::string entry;
+    if (std::regex_search(b, mm, std::regex(esc + R"(\s*([^;]*);)"))) entry = mm[1].str();
+    else if (std::regex_search(b, mm, std::regex(R"(default\s+([^;]*);)"))) entry = mm[1].str();
+    if (entry.empty()) return out;
+
+    out.found = true;
+    static const std::regex tok(R"([^\s]+)");
+    for (std::sregex_iterator it(entry.begin(), entry.end(), tok), e; it != e; ++it)
+    {
+        const std::string w = it->str();
+        if (w == "bounded")
+        {
+            out.bounded = true;
+            continue;
+        }
+        if (w == "Gauss" || w == "none") continue;
+        if (std::regex_match(w, std::regex(R"([-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)")))
+        {
+            if (!out.scheme.empty()) out.coeff = std::atof(w.c_str());
+            continue;
+        }
+        if (out.scheme.empty()) out.scheme = w;
+    }
+    return out;
+}
+
 // The gradient `linearUpwind` NAMES, resolved through gradSchemes -- and whether it is one we compute.
 //
 // `div(phi,U) bounded Gauss linearUpwind grad(U);` does not mean "use fvc::grad". linearUpwind's
@@ -373,6 +432,22 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
             r.blockers.push_back("simulationType is `" + simType + "`; the rebuilt path supports laminar "
                                  "and RAS/kEpsilon only.");
         }
+
+        if (simType == "RAS")
+        {
+            const FoamDict* ras = turbProps.subDict("RAS");
+            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            const std::string second = (model == "kOmegaSST") ? "omega" : "epsilon";
+            for (const std::string& key : {std::string("div(phi,k)"), "div(phi," + second + ")"})
+            {
+                const TurbDivScheme ts = divTurbScheme(caseDir, key);
+                if (ts.found && ts.scheme != "upwind" && ts.scheme != "limitedLinear")
+                    r.blockers.push_back("`" + key + "` is `" + ts.scheme + "`; the rebuilt turbulence "
+                                         "transport implements `upwind` and `limitedLinear` only. "
+                                         "Running a different scheme's matrix under this name would be "
+                                         "wrong, not merely slower.");
+            }
+        }
     }
 
     // --- coupled patches ----------------------------------------------------------------------
@@ -544,6 +619,10 @@ int runSimpleFoamV2(const std::string& caseDir)
     // outer loop, by which time they are set.
     scalar tolKE = 1e-10, relTolKE = 0.0;
     bool   gsKE  = false;
+    // div(phi,k) / div(phi,<second>): scheme, its coefficient as the device's twoByk, and `bounded`.
+    bool   limitedK = false, limitedEps = false;
+    bool   boundedK = false, boundedEps = false;
+    scalar twoBykK = 2.0, twoBykEps = 2.0;
     bool   sstModel = false;
     std::string secondField = "epsilon";
     KOmegaSSTCoeffs sstCoeffs;
@@ -560,7 +639,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     bool hasNutCalc = false;
     bool keNut = false;
     DeviceBuffer<label>  nutCalcMask;
-    DeviceBuffer<scalar> nb, nutKb, nutEb;
+    DeviceBuffer<scalar> nb, nutKb, nutEb, sstGradU;
     auto refreshBoundaryNut = [&]()
     {
         if (keNut)
@@ -574,6 +653,21 @@ int runSimpleFoamV2(const std::string& caseDir)
                           keNut ? &nutCalcMask : nullptr,
                           keNut ? &nutKb : nullptr,
                           keNut ? &nutEb : nullptr);
+
+        // kOmegaSST's `calculated` patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
+        // expression from kEpsilon's Cmu*k_b^2/eps_b, and one that needs the BOUNDARY F2 and S2 (hence
+        // the boundary gradU). Overwrites those faces only; walls keep the wall-function value above.
+        // The tutorials ship the inlet as `calculated; value uniform 0`, so without this a run started
+        // from 0/ carries zero eddy viscosity on the inlet for its whole length.
+        if (sstModel && hasNutCalc)
+        {
+            deviceBCValue(dbK, dK, nutKb);
+            deviceBCValue(dbEps, dEps, nutEb);
+            deviceGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, sstGradU);
+            deviceSSTNutBoundary(dbU, nutKb, nutEb, dY, nullptr, nu,
+                                 sstGradU, static_cast<int>(nC), gf.Ux, gf.Uy, gf.Uz,
+                                 nutCalcMask, sstCoeffs, dNut, nb);
+        }
     };
 
     StepInput in;
@@ -666,7 +760,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                 // That was a real defect, but it is NOT the whole of the 50% simpleCar disagreement: with
                 // it fixed that case's epsilon residual is still 127x OpenFOAM's, and 76% of what remains
                 // now sits in the INTERIOR, so the rest of the cause is not a boundary treatment at all.
-                const bool isWall = epsF.boundary[pi]->isEpsilonWallFunction();
+                const bool isWall = epsF.boundary[pi]->isTurbulenceWallFunction();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     isW.push_back(isWall ? 1 : 0);
@@ -683,6 +777,24 @@ int runSimpleFoamV2(const std::string& caseDir)
                 relaxK   = eq->scalarOr("k", relaxK);
                 relaxEps = eq->scalarOr(secondField, relaxEps);   // `omega` under kOmegaSST
             }
+
+        // div(phi,k) and div(phi,<second>) carry their own scheme; the envelope above has already
+        // refused anything but upwind and limitedLinear. limitedLinear's device form takes
+        // twoByk = 2/coeff, and reduces to upwind at limiter 0, so upwind stays bit-identical.
+        {
+            const TurbDivScheme tk = divTurbScheme(caseDir, "div(phi,k)");
+            const TurbDivScheme te = divTurbScheme(caseDir, "div(phi," + secondField + ")");
+            limitedK    = (tk.scheme == "limitedLinear");
+            limitedEps  = (te.scheme == "limitedLinear");
+            twoBykK     = 2.0 / std::max(tk.coeff, static_cast<scalar>(1e-15));
+            twoBykEps   = 2.0 / std::max(te.coeff, static_cast<scalar>(1e-15));
+            boundedK    = tk.bounded;
+            boundedEps  = te.bounded;
+            std::printf("  div(phi,k): %s%s   div(phi,%s): %s%s\n",
+                        tk.bounded ? "bounded " : "", tk.scheme.empty() ? "upwind" : tk.scheme.c_str(),
+                        secondField.c_str(),
+                        te.bounded ? "bounded " : "", te.scheme.empty() ? "upwind" : te.scheme.c_str());
+        }
 
         // Seed nuEff from the nut just read, so iteration 1 already uses it.
         {
@@ -722,17 +834,26 @@ int runSimpleFoamV2(const std::string& caseDir)
                 deviceKOmegaSSTCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                        dK, dEps, dNut, dY, gf.phiInt, gf.phiBnd,
                                        nu, relaxEps, relaxK, tolKE,
-                                       /*bounded*/false, /*boundedEps*/false,
-                                       /*limitedK*/false, /*limitedOmega*/false, 2.0, 2.0,
+                                       boundedK, boundedEps,
+                                       limitedK, limitedEps, twoBykK, twoBykEps,
                                        sstCoeffs, relTolKE, /*keCheckEvery*/1,
                                        /*linearUpwindK*/false, /*linearUpwindOmega*/false,
-                                       /*nonOrth*/false, /*gradULimitK*/0.0, gsKE, gsKE);
+                                       /*nonOrth*/false, /*gradULimitK*/0.0, gsKE, gsKE,
+                                       /*ami*/nullptr, /*cyc*/nullptr, /*gammaIntEff*/nullptr,
+                                       /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
+                                       /*kDdt*/{}, /*sDdt*/{},
+                                       /*des*/false, /*iddes*/false, /*hmax*/nullptr, /*hwn*/nullptr,
+                                       /*rho*/nullptr, /*muLam*/nullptr,
+                                       /*nuWallFace*/nullptr, /*rhoBnd*/nullptr,
+                                       // DkEff(patchi)/DomegaEff(patchi) = alphaK(F1)*nut_b + nu, from
+                                       // nut's OWN boundary rather than the interpolated cell value.
+                                       &nb);
             else
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                   dK, dEps, dNut, gf.phiInt, gf.phiBnd,
                                   nu, relaxEps, relaxK, tolKE,
-                                  /*bounded*/false, /*boundedEps*/false,
-                                  /*limitedK*/false, /*limitedEps*/false, 2.0, 2.0,
+                                  boundedK, boundedEps,
+                                  limitedK, limitedEps, twoBykK, twoBykEps,
                                   keCoeffs, relTolKE, /*keCheckEvery*/1,
                                   /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
                                   gsKE, gsKE,
@@ -961,7 +1082,10 @@ int runSimpleFoamV2(const std::string& caseDir)
             writeVolField<scalar>(src + "/" + secondField, outDir + "/" + secondField, dEps.host(), fvp);
             writeVolField<scalar>(src + "/nut",     outDir + "/nut",     dNut.host(), fvp);
         }
-        std::printf("written %s/{U,p%s}\n", outDir.c_str(), ras ? ",k,epsilon,nut" : "");
+        // The second field is `omega` under kOmegaSST; the file was always written under its right name,
+        // but this line claimed `epsilon` for every model.
+        const std::string turbFields = ras ? (",k," + secondField + ",nut") : std::string();
+        std::printf("written %s/{U,p%s}\n", outDir.c_str(), turbFields.c_str());
     }
     return static_cast<int>(iter);
 }

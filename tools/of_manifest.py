@@ -347,7 +347,12 @@ COMPONENTS = {
                         "requires to breach its bound. END TO END from 0/ (sst_cpp_full): U 1.9e-04, "
                         "p 7.4e-04, k 9.2e-04, omega 9.4e-03, nut 2.4e-03 L2-relative against "
                         "OpenFOAM's converged fields -- at parity with the established CUDA solver on "
-                        "the same case (1.7e-04 / 5.1e-04 / 6.8e-04 / 1.3e-02 / 3.9e-03).",
+                        "the same case (1.7e-04 / 5.1e-04 / 6.8e-04 / 1.3e-02 / 3.9e-03). CUDA: "
+                        "tests/sst_cuda_vs_openfoam.sh runs the SAME case through the V2 driver and "
+                        "reaches U 1.05x, omega 1.16x and k 1.45x of OpenFOAM's initial residual at its "
+                        "converged state -- the _cpp reference's own numbers to within 0.4% (U to seven "
+                        "digits) -- and end to end U 2.2e-04, p 7.4e-04, k 9.3e-04, omega 2.2e-02, "
+                        "nut 4.8e-03.",
              note="The _cpp reference could NOT run an SST case until this, and a single-iteration "
                   "probe did not show it: probing from the converged state gave 1.2-1.5x while the "
                   "same code from 0/ reached omega 1e+46 by iteration 200. Three defects, all of them "
@@ -362,7 +367,19 @@ COMPONENTS = {
                   "`value uniform 0` kept zero eddy viscosity for the whole run. The patch "
                   "diffusivity DkEff(patchi) = alphaK(F1)*nut_b + nu is now taken from nut's own "
                   "boundary as well; on THIS case that is worth 2.7% because the near-inlet cell nut "
-                  "is close to the boundary value, unlike kEpsilon's pitzDaily where it is 12x off."),
+                  "is close to the boundary value, unlike kEpsilon's pitzDaily where it is 12x off. "
+                  "PORTED TO CUDA one module at a time against that working _cpp, testing after each: "
+                  "(1) the div(phi,k)/div(phi,omega) scheme read from fvSchemes instead of hardcoded "
+                  "upwind, which alone moved omega 19x -> 6.8x and k 125x -> 23x and also wired the "
+                  "`bounded` prefix the kEpsilon path had been dropping; (2) the `calculated` nut "
+                  "evaluation; (3) the patch diffusivity. (2) and (3) are inert at the fixed point by "
+                  "construction and only the end-to-end mode exercises them. Foam::bound was ALREADY "
+                  "correct on the device. Comparing module by module against the _cpp is what exposed "
+                  "the wall mask: it keyed on isEpsilonWallFunction while omegaWallFunction mapped to a "
+                  "plain zeroGradient field, so every kOmegaSST case on the rebuilt driver ran with NO "
+                  "wall faces -- no wall nut, hence wrong wall shear and everything downstream, "
+                  "measuring U 48x and omega 6.8x off OpenFOAM. The predicate is now "
+                  "isTurbulenceWallFunction and both wall functions answer it."),
 
         dict(name="bound", of_symbol="Foam::bound",
              of_file="src/finiteVolume/cfdTools/general/bound/bound.C",

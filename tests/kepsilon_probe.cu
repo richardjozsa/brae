@@ -146,7 +146,7 @@ int main(int argc, char** argv)
                 // counting them tags the whole domain as boundary and the split says nothing.
                 if (fvp[pi].type == "empty") continue;
 
-                const int what = ee.boundary[pi]->isEpsilonWallFunction() ? 1 : 2;
+                const int what = ee.boundary[pi]->isTurbulenceWallFunction() ? 1 : 2;
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     int& t = tag[fvp[pi].faceCells[i]];
@@ -180,7 +180,7 @@ int main(int argc, char** argv)
                 }
                 std::printf("      patch %-14s (%-22s) %6.2f%%\n",
                             fvp[pi].name.c_str(),
-                            ee.boundary[pi]->isEpsilonWallFunction() ? "epsilonWallFunction" : "other",
+                            ee.boundary[pi]->isTurbulenceWallFunction() ? "epsilonWallFunction" : "other",
                             tot > 0 ? 100.0*sp/tot : 0.0);
             }
         }

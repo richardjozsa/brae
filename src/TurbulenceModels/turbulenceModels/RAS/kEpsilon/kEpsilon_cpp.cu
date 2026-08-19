@@ -148,7 +148,7 @@ void correct(
     std::vector<label> nw(nC, 0);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        if (!epsilon.boundary[pi]->isEpsilonWallFunction()) continue;
+        if (!epsilon.boundary[pi]->isTurbulenceWallFunction()) continue;
         for (label i = 0; i < patches[pi].size; ++i)
         {
             ++nw[patches[pi].faceCells[i]];
@@ -160,7 +160,7 @@ void correct(
     std::vector<scalar> G0(nC, 0.0);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        if (!epsilon.boundary[pi]->isEpsilonWallFunction()) continue;
+        if (!epsilon.boundary[pi]->isTurbulenceWallFunction()) continue;
 
         const FvPatch& wp = patches[pi];
         const std::vector<scalar>& yw = yWall[pi];
@@ -325,7 +325,7 @@ void correct(
     nutF = correctNut(k.internal, epsilon.internal, co);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        if (epsilon.boundary[pi]->isEpsilonWallFunction())
+        if (epsilon.boundary[pi]->isTurbulenceWallFunction())
         {
             nutField.boundary[pi]->setValue(
                 nutkWallFunction(patches[pi], yWall[pi], k.internal, nu, co.Cmu, co.kappa, co.E));

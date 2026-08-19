@@ -633,6 +633,20 @@ add_test(NAME sst_cpp_full
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST full)
 set_tests_properties(sst_cpp_full PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
 
+# The SAME case through the CUDA V2 driver, ported onto the _cpp path one module at a time. The fast entry
+# also asserts brae RESOLVES div(phi,k) to `bounded limitedLinear` rather than silently running upwind, and
+# is what catches the wall mask: keying it on epsilonWallFunction left every kOmegaSST case with no wall
+# faces at all, measuring U 48x and omega 6.8x off OpenFOAM.
+add_test(NAME sst_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sst_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
+set_tests_properties(sst_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME sst_cuda_full
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sst_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST full)
+set_tests_properties(sst_cuda_full PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
