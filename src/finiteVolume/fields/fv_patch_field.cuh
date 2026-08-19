@@ -50,6 +50,12 @@ public:
     // internal cell, valueIC=1, gradIC=0); 1 = fixedValue (fixedValue/noSlip: value=ref, valueIC=0,
     // gradIC=-deltaCoeffs); 2 = calculated (value=ref but extrapolated coeffs).
     virtual int bcCategory() const { return 0; }
+    // Is this an epsilonWallFunction? OpenFOAM's epsilon wall treatment keys on the BC TYPE, not on the
+    // patch type: createAveragingWeights counts the adjacent faces whose epsilon field carries an
+    // epsilonWallFunction, so a `wall` patch with a plain fixedValue or zeroGradient epsilon must NOT
+    // contribute a wall constraint or an averaging weight. brae otherwise maps the type to zeroGradient
+    // and would lose that distinction.
+    virtual bool isEpsilonWallFunction() const { return false; }
     // wedge (axisymmetric constraint): the HALF-angle and FULL-angle rotation tensors, or null on every
     // other patch type. The device builder reads them to set the per-component valueFraction and to
     // recompute the rotated value each step.
@@ -311,6 +317,17 @@ public:
         this->value_ = this->patchInternalField(internal);
     }
     bool fixesValue() const override { return false; }
+};
+
+// epsilonWallFunction: a zeroGradient boundary value, with the near-wall CELL constrained separately by
+// the turbulence model (setValues) and the production there replaced. The class exists only so the model
+// can tell which patches carry it -- see isEpsilonWallFunction above.
+template <typename T>
+class EpsilonWallFunctionPatchField : public ZeroGradientPatchField<T>
+{
+public:
+    explicit EpsilonWallFunctionPatchField(const FvPatch& p) : ZeroGradientPatchField<T>(p) {}
+    bool isEpsilonWallFunction() const override { return true; }
 };
 
 // fixedGradient: the normal gradient is prescribed, the value follows.
@@ -930,7 +947,8 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     if (d.type == "pressureInletOutletVelocity")
         return std::make_unique<PressureInletOutletVelocityPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "kqRWallFunction")      return std::make_unique<ZeroGradientPatchField<T>>(p); // zeroGradient wrapper
-    if (d.type == "epsilonWallFunction")  return std::make_unique<ZeroGradientPatchField<T>>(p); // boundary face = cell value; near-wall constraint applied separately
+    // boundary face = cell value; the near-wall constraint is applied by the turbulence model
+    if (d.type == "epsilonWallFunction")  return std::make_unique<EpsilonWallFunctionPatchField<T>>(p);
     if (d.type == "omegaWallFunction")    return std::make_unique<ZeroGradientPatchField<T>>(p); // kOmegaSST: same as epsilon, wall value set by deviceWallOmegaG0 + setValues
     if (d.type == "nutkWallFunction")     return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // alphatWallFunction: alphat_w = rho_w*nut_w/Prt, i.e. the SAME expression deviceAlphat applies in the

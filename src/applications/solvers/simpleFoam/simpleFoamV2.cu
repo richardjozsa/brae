@@ -550,6 +550,32 @@ int runSimpleFoamV2(const std::string& caseDir)
     KEpsilonCoeffs  keCoeffs;
     DeviceBuffer<scalar> dY;             // cell wall distance -- kOmegaSST's F1/F2 need it per CELL
 
+    // OpenFOAM prints an Initial residual for every turbulence solve; comparing those against its log is
+    // how this path is checked against the oracle (tests/boundary_nut_vs_openfoam.sh).
+    const bool printTurbResid = std::getenv("BRAE_TURB_RESID") != nullptr;
+
+    // nut at boundary FACES, read twice per outer iteration: once as the k/epsilon patch diffusivity
+    // (before the solve) and once for the momentum nuEff (after it). Declared out here with the rest of
+    // the hook's state because the `if (ras)` block below only FILLS it -- the hook itself runs later.
+    bool hasNutCalc = false;
+    bool keNut = false;
+    DeviceBuffer<label>  nutCalcMask;
+    DeviceBuffer<scalar> nb, nutKb, nutEb;
+    auto refreshBoundaryNut = [&]()
+    {
+        if (keNut)
+        {
+            deviceBCValue(dbK, dK, nutKb);
+            deviceBCValue(dbEps, dEps, nutEb);
+        }
+        deviceBoundaryNut(dbNut, bndIsWall, bndY, dK, dNut, nu, nb,
+                          keCoeffs, /*atmZ0*/0.0, /*atmBoundNut*/true,
+                          /*nuFace*/nullptr,
+                          keNut ? &nutCalcMask : nullptr,
+                          keNut ? &nutKb : nullptr,
+                          keNut ? &nutEb : nullptr);
+    };
+
     StepInput in;
     if (ras)
     {
@@ -581,6 +607,33 @@ int runSimpleFoamV2(const std::string& caseDir)
         dbEps = buildDeviceBoundary(epsF, fvp, g);
         dbNut = buildDeviceBoundary(nutF, fvp, g);
 
+        // OF fills nut by FIELD ASSIGNMENT (nut_ = Cmu*sqr(k_)/epsilon_), which writes the BOUNDARY from
+        // the boundary k and epsilon; correctBoundaryConditions() then leaves a `calculated` patch alone.
+        // So such a patch carries Cmu*k_b^2/eps_b, NOT the adjacent cell value -- and that boundary nut is
+        // what sets the patch diffusivity DkEff(patchi)/DepsilonEff(patchi) in the k and epsilon
+        // laplacians. Measured on pitzDaily: the inlet's nut_b is 8.52e-04 against a cell value 12x
+        // larger, and taking the cell value put 90.5% of the whole epsilon residual on that one patch --
+        // the 10x baseline against OpenFOAM's own log. realizableKE's nut carries a variable rCmu and the
+        // SST's is a different expression again, so only kEpsilon may evaluate it this way.
+        {
+            std::vector<label> cm;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+
+                // A non-wall `fixedValue` nut is PINNED by the case -- conventionally to 0 -- and must not
+                // be lumped in with `calculated`, which means "correctNut filled this in".
+                const bool calc = (fvp[pi].type != "wall") && (nutF.boundary[pi]->bcCategory() == 2);
+                if (calc) hasNutCalc = true;
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    cm.push_back(calc ? 1 : 0);
+                }
+            }
+            if (hasNutCalc) nutCalcMask.copyFrom(cm);
+            keNut = hasNutCalc && !sstModel && !keCoeffs.realizable;
+        }
+
         // Wall geometry for the wall functions. wallU is the patch velocity; a static mesh with no
         // movingWallVelocity means the field's own boundary value is what the solver imposes.
         std::vector<std::vector<vector>> wallU(fvp.size());
@@ -601,7 +654,19 @@ int runSimpleFoamV2(const std::string& caseDir)
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
                 if (isCoupledInterfaceType(fvp[pi].type)) continue;
-                const bool isWall = (fvp[pi].type == "wall");
+
+                // OpenFOAM keys the epsilon/omega wall treatment on the BC TYPE, not on the mesh patch
+                // type: createAveragingWeights counts the faces whose epsilon field carries an
+                // epsilonWallFunction (epsilonWallFunctionFvPatchScalarField.C:100-118). The two coincide
+                // on pitzDaily, where the walls carry the wall function, so keying on `type == "wall"`
+                // looked right for a long time. They do NOT coincide on simpleCar: its 0/epsilon sets
+                // "(body|upperWall|lowerWall)" to epsilonWallFunction but then a trailing ".*" entry
+                // overrides it to zeroGradient -- last matching regex wins, in OpenFOAM and here alike --
+                // so OpenFOAM applies NO wall function there and brae was applying one on three patches.
+                // That was a real defect, but it is NOT the whole of the 50% simpleCar disagreement: with
+                // it fixed that case's epsilon residual is still 127x OpenFOAM's, and 76% of what remains
+                // now sits in the INTERIOR, so the rest of the cause is not a boundary treatment at all.
+                const bool isWall = epsF.boundary[pi]->isEpsilonWallFunction();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     isW.push_back(isWall ? 1 : 0);
@@ -621,8 +686,7 @@ int runSimpleFoamV2(const std::string& caseDir)
 
         // Seed nuEff from the nut just read, so iteration 1 already uses it.
         {
-            DeviceBuffer<scalar> nb;
-            deviceBoundaryNut(dbNut, bndIsWall, bndY, dK, dNut, nu, nb);
+            refreshBoundaryNut();
             const std::vector<scalar> nutC = dNut.host(), nutB = nb.host();
             for (label c = 0; c < nC; ++c) nuEffC[c] = nu + nutC[c];
             std::size_t j = 0;
@@ -646,6 +710,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             // Phase timing, on demand: the wall-clock investigation needed to know how much of an outer
             // iteration is the turbulence hook (which round-trips nut to the host) versus the solve.
             const auto tHook0 = std::chrono::steady_clock::now();
+            clearTurbulenceReport();
             // Solver settings from the CASE, exactly as for U and p. This was hardcoded to tol=1e-10
             // with relTol 0 and BiCGStab, so k and epsilon were driven to near machine precision every
             // outer iteration while the case asks for 1e-05 / relTol 0.1 / symGaussSeidel. Measured: the
@@ -670,14 +735,32 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   /*limitedK*/false, /*limitedEps*/false, 2.0, 2.0,
                                   keCoeffs, relTolKE, /*keCheckEvery*/1,
                                   /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
-                                  gsKE, gsKE);
+                                  gsKE, gsKE,
+                                  /*ami*/nullptr, /*cyc*/nullptr,
+                                  /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
+                                  /*kDdt*/{}, /*eDdt*/{},
+                                  /*rho*/nullptr, /*muLam*/nullptr,
+                                  /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
+                                  // DkEff(patchi)/DepsilonEff(patchi) from nut's OWN boundary.
+                                  &nb);
+
+            // OpenFOAM prints an Initial residual for every turbulence solve, and comparing those against
+            // its log is how this path is checked against the oracle. Off unless asked for, so that the
+            // gates that parse this log keep seeing the output they were written against.
+            if (printTurbResid)
+            {
+                for (const ScalarSolveEntry& e : turbulenceReport())
+                {
+                    std::printf("    Solving for %s, Initial residual = %.9e, No Iterations %d\n",
+                                e.field.c_str(), e.perf.initialResidual, e.perf.nIterations);
+                }
+            }
 
             const auto tRefresh0 = std::chrono::steady_clock::now();
             // nuEff for the NEXT iteration: nu + nut, with the boundary value from the wall function --
             // NOT the owner cell's. That distinction is the defect that once made boundary viscosity
             // 2000x too small; deviceBoundaryNut is what applies the wall function per face.
-            DeviceBuffer<scalar> nb;
-            deviceBoundaryNut(dbNut, bndIsWall, bndY, dK, dNut, nu, nb);
+            refreshBoundaryNut();
 
             const std::vector<scalar> nutC = dNut.host(), nutB = nb.host();
             for (label c = 0; c < nC; ++c) nuEffC[c] = nu + nutC[c];

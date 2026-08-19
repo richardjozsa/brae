@@ -87,6 +87,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
@@ -453,6 +454,10 @@ add_executable(test_realizablke_cpp tests/test_realizablke_cpp.cu)
 target_include_directories(test_realizablke_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_realizablke_cpp PRIVATE brae_core)
 
+add_executable(kepsilon_probe tests/kepsilon_probe.cu)
+target_include_directories(kepsilon_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(kepsilon_probe PRIVATE brae_core)
+
 add_executable(resid_probe tests/resid_probe.cu)
 target_include_directories(resid_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(resid_probe PRIVATE brae_core)
@@ -605,6 +610,14 @@ add_test(NAME stock_pitzdaily_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/stock_pitzdaily_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 set_tests_properties(stock_pitzdaily_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# The k/epsilon PATCH diffusivity: OF's `calculated` nut patches carry Cmu*k_b^2/eps_b, not the cell value,
+# and DkEff(patchi)/DepsilonEff(patchi) are built from it. Started from OpenFOAM's own converged fields so
+# the initial residual measures the discretisation directly; needs no OpenFOAM install, only its log.
+add_test(NAME boundary_nut_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/boundary_nut_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb)
+set_tests_properties(boundary_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
