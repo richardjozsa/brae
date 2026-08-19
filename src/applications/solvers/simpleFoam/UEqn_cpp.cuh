@@ -59,6 +59,7 @@
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
 #include "fvc.cuh"
+#include "fvOptions_cpp.cuh"
 #include <vector>
 
 namespace brae {
@@ -103,7 +104,14 @@ struct MomentumInput
     // absent, so most real cases set it.
     bool   correctedLaplacian = false;
     bool   hasMRF = false;                                       // present in the case -> must refuse
-    bool   hasFvOptions = false;                                 // present in the case -> must refuse
+    bool   hasFvOptions = false;                                 // an UNIMPLEMENTED option -> must refuse
+    // The parsed fvOptions. UEqn.H applies it three times; only `== fvOptions(U)` is implemented, and an
+    // option whose type is not ported sets hasFvOptions instead of appearing here.
+    const fvOptions::OptionList* options = nullptr;
+    // The LAMINAR kinematic viscosity, which is what DarcyForchheimer uses -- DarcyForchheimer.C looks up
+    // the field NAMED "nu", not the turbulent nuEff. Using nuEff there would make the Darcy resistance
+    // scale with the turbulence model, which OpenFOAM does not do.
+    scalar nuLaminar = 0.0;
 };
 
 // Step 1+2 of UEqn.H: fvm::div(phi,U) + turbulence->divDevReff(U), then UEqn.relax().

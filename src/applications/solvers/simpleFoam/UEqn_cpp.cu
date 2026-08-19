@@ -213,6 +213,11 @@ FvVectorMatrix assembleUEqn(
     // -div(nuEff*dev2(T(grad U))) into the source. Both halves, one call, so they cannot drift apart.
     addDivDevReff(M, U, *in.nuEff, *in.nuEffBnd, m, g, patches, in.correctedLaplacian);
 
+    // == fvOptions(U). BEFORE relax, as UEqn.H has it: the source is part of the matrix relaxation then
+    // acts on. The double negation (`eqn -= porosityEqn` inside, `UEqn == fvOptions(U)` outside) cancels,
+    // so the porosity enters as written -- see fvOptions_cpp.cuh.
+    if (in.options) fvOptions::addSup(*in.options, M, U, in.nuLaminar, g);
+
     // UEqn.relax(). OpenFOAM guards this with if(relaxEquation(name)); a factor of 1 is the identity, and
     // relaxMatrix already early-returns on alpha <= 0.
     if (in.relaxU > 0.0 && in.relaxU < 1.0)

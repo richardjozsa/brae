@@ -103,9 +103,26 @@ try_refusal mrf \
   "open(d+'/constant/MRFProperties','w').write('// test\n')" \
   "MRFProperties"
 
+# An EMPTY fvOptions file is now correctly ACCEPTED -- the framework parses it, finds no options, and
+# there is nothing to apply. What is refused is an option whose TYPE is not ported: the framework being
+# present must not read as "fvOptions is supported", since ofscan counts 46 implementations and this port
+# has one. `actuationDiskSource` is what turbineSiting asks for.
 try_refusal fvoptions \
-  "open(d+'/constant/fvOptions','w').write('// test\n')" \
-  "fvOptions"
+  "open(d+'/constant/fvOptions','w').write('disk1\\n{\\n    type actuationDiskSource;\\n    active true;\\n}\\n')" \
+  "actuationDiskSource"
+
+# ...and the porosity IS accepted, with an empty file accepted too.
+try_supported() {   # try_supported <label> <python-mutator>
+    local d="$W/ok_$1"; supported "$d"
+    python3 -c "
+import re,sys
+d = sys.argv[1]
+$2
+" "$d"
+    ( cd "$d" && BRAE_SIMPLEFOAM_V2=1 "$BRAE" > log 2>&1 )
+    if [ $? -eq 0 ]; then ok "$1: accepted"; else bad "$1: refused"; sed -n '1,5p' "$d/log"; fi
+}
+try_supported emptyfvoptions "open(d+'/constant/fvOptions','w').write('// no options\\n')"
 
 # SIMPLEC is no longer a refusal -- it is implemented, and section 4d below asserts it RUNS. What IS
 # still refused on that path is constrainPressure, i.e. a fixedFluxPressure pressure patch: brae maps

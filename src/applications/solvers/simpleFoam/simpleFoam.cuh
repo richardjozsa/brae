@@ -99,6 +99,8 @@ struct StepInput
     bool   linearUpwind = false;         // div(phi,U) `linearUpwind`: deferred correction, upwind matrix
     cpu::DivScheme scheme = cpu::DivScheme::upwind;   // the div(phi,U) scheme, shared with the reference
     scalar         schemeCoeff = 1.0;                 // the `k` of `limitedLinear k`
+    const DevicePorosity* porosity = nullptr;         // explicitPorositySource/DarcyForchheimer
+    scalar         nuLaminar = 0.0;
     bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
     label  nNonOrthogonalCorrectors = 0;
 

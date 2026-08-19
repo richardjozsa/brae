@@ -17,7 +17,8 @@
 #include "device_kepsilon.cuh"
 #include "device_komega_sst.cuh"    // deviceKOmegaSSTCorrect building blocks + KOmegaSSTCoeffs
 #include "komega_sst_coeffs.cuh"
-#include "realizableKE_cpp.cuh"   // RealizableKECoeffs + readRealizableKECoeffs    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
+#include "realizableKE_cpp.cuh"   // RealizableKECoeffs + readRealizableKECoeffs
+#include "fvOptions_cpp.cuh"       // the fvOptions framework + explicitPorositySource    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
 #include "cell_wall_dist.cuh"       // cellWallDist: kOmegaSST's F1/F2 need y at every CELL, not just walls
 #include "near_wall_dist.cuh"
 #include "solver_dispatch.cuh"   // readDdtSchemeWord: the same steady/transient test the dispatcher uses
@@ -279,9 +280,27 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         r.blockers.push_back("constant/MRFProperties is present. UEqn.H applies MRF via "
                              "correctBoundaryVelocity(U) and MRF.DDt(U) (UEqn.H:3,8) and pEqn.H via "
                              "makeRelative(phiHbyA) (pEqn.H:5); the rebuilt path implements none of it.");
+    // fvOptions: the FRAMEWORK is ported (dictionary, cellSetOption selection, and `== fvOptions(U)`),
+    // and so is explicitPorositySource/DarcyForchheimer. ofscan counts 46 fv::option implementations, so
+    // the list is read and any option whose TYPE is not implemented is refused BY NAME -- reading the
+    // framework as "fvOptions is supported" would be the silent substitution this guard exists for.
+    // Still not implemented for ANY option: fvOptions.constrain(UEqn) and fvOptions.correct(U).
     if (fileExists(caseDir + "/constant/fvOptions") || fileExists(caseDir + "/system/fvOptions"))
-        r.blockers.push_back("fvOptions is present. UEqn.H applies it three times (UEqn.H:11,17,23) and "
-                             "pEqn.H once (pEqn.H:49); the rebuilt path implements none of it.");
+    {
+        PrimitiveMesh mo;
+        bool meshOk = true;
+        try { mo.read(caseDir + "/constant/polyMesh"); } catch (...) { meshOk = false; }
+        if (meshOk)
+        {
+            const cpu::fvOptions::OptionList ol = cpu::fvOptions::read(caseDir, mo);
+            const std::string bad = ol.firstUnsupported();
+            if (!bad.empty())
+                r.blockers.push_back("fvOptions declares `" + bad + "`, which the rebuilt path does not "
+                                     "implement. Ported: explicitPorositySource/DarcyForchheimer, applied "
+                                     "as UEqn.H's `== fvOptions(U)`. OpenFOAM registers 46 fv::option "
+                                     "implementations (ofscan: impls option).");
+        }
+    }
 
     if (const FoamDict* s = fvSolution.subDict("SIMPLE"))
     {
@@ -746,6 +765,40 @@ int runSimpleFoamV2(const std::string& caseDir)
     if (const char* e = std::getenv("BRAE_PCG_CHECK_EVERY")) in.pcgCheckEvery = std::max(1, std::atoi(e));
     std::printf("  pressure: V-cycle graph %s, residual read every %d PCG iteration(s)\n",
                 in.captureVcycle ? "ON" : "off", in.pcgCheckEvery);
+    // ---- fvOptions: upload the porous zone ----------------------------------------------------
+    // The device kernel takes DIAGONAL d/f and applies the 0.5 itself, so the RAW f goes across and a
+    // ROTATED coordinate system has to be refused rather than silently flattened -- dropping the
+    // off-diagonals of a rotated D would apply the resistance along the wrong axes.
+    DevicePorosity porosity;
+    {
+        const cpu::fvOptions::OptionList ol = cpu::fvOptions::read(caseDir, m);
+        for (const auto& o : ol.options)
+        {
+            if (!o.active || !o.unsupported.empty()) continue;
+            const scalar offD = std::fabs(o.D.xy) + std::fabs(o.D.xz) + std::fabs(o.D.yz)
+                              + std::fabs(o.D.yx) + std::fabs(o.D.zx) + std::fabs(o.D.zy);
+            const scalar offF = std::fabs(o.F.xy) + std::fabs(o.F.xz) + std::fabs(o.F.yz)
+                              + std::fabs(o.F.yx) + std::fabs(o.F.zx) + std::fabs(o.F.zy);
+            const scalar sc = std::fabs(o.D.xx) + std::fabs(o.D.yy) + std::fabs(o.D.zz) + 1.0;
+            if (offD + offF > 1e-10*sc)
+                throw std::runtime_error(
+                    "fvOptions `" + o.name + "`: the DarcyForchheimer coordinateSystem is rotated, so D "
+                    "and F have off-diagonal entries. The device porosity kernel takes diagonal "
+                    "coefficients only; refusing rather than dropping them.");
+            porosity.active = true;
+            porosity.cells.copyFrom(o.cells);
+            porosity.d = vector{o.D.xx, o.D.yy, o.D.zz};
+            // F already carries the 0.5 (calcTransformModelData); the kernel applies it again, so the
+            // RAW f is what it wants back.
+            porosity.f = vector{2.0*o.F.xx, 2.0*o.F.yy, 2.0*o.F.zz};
+            std::printf("  fvOptions `%s`: explicitPorositySource/DarcyForchheimer on %d cells, "
+                        "d=(%.4g %.4g %.4g)\n", o.name.c_str(), (int)o.cells.size(),
+                        porosity.d.x, porosity.d.y, porosity.d.z);
+        }
+    }
+    in.porosity  = porosity.active ? &porosity : nullptr;
+    in.nuLaminar = nu;
+
     std::printf("  U solver: %s\n",
                 in.uSymGaussSeidel ? "smoothSolver/symGaussSeidel (as the case asks)"
                                    : "Jacobi-BiCGStab");

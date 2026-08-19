@@ -217,6 +217,16 @@ void assembleUEqn(
         }
     }
 
+    // ---- == fvOptions(U) ----------------------------------------------------------------------
+    // BEFORE relax, as UEqn.H has it. The diagonal takes the isotropic part implicitly and the source
+    // the anisotropic remainder, which is what keeps a 5e7 Darcy coefficient stable.
+    if (in.porosity && in.porosity->active)
+    {
+        deviceFvoPorosityDiag(*in.porosity, in.nuLaminar, dm.V, Ux, Uy, Uz, M.diag);
+        for (int k = 0; k < 3; ++k)
+            deviceFvoPorositySource(*in.porosity, k, in.nuLaminar, dm.V, Ux, Uy, Uz, M.source[k]);
+    }
+
     // ---- UEqn.relax() -----------------------------------------------------------------------
     // OpenFOAM's fvMatrix::relax is ASYMMETRIC: it ADDS cmptMax(cmptMag(internalCoeffs)) to the diagonal
     // and REMOVES cmptMin(internalCoeffs), which are different quantities and agree only when the three

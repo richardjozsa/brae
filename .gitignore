@@ -23,6 +23,9 @@ validation/*
 !validation/mrfBox/
 !validation/of_apps/
 !validation/pitzDaily/
+!validation/pitzDailyRKE/
+!validation/pitzDailySST/
+!validation/simpleCarPorous/
 !validation/pitzDaily282/
 !validation/pitzDailyTurb/
 !validation/pitzDailyTurbBig/

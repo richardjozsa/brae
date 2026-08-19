@@ -66,6 +66,8 @@ Residuals simpleStep(
     mi.linearUpwind = in.linearUpwind;
     mi.scheme       = in.scheme;
     mi.schemeCoeff  = in.schemeCoeff;
+    mi.porosity     = in.porosity;
+    mi.nuLaminar    = in.nuLaminar;
     mi.correctedLaplacian = in.correctedLaplacian;
     mi.hasMRF = in.hasMRF;          mi.hasFvOptions = in.hasFvOptions;
 

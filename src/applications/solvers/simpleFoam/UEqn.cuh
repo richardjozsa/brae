@@ -32,6 +32,7 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_ldu.cuh"
+#include "device_fvoptions.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
 #include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
 
 namespace brae {
@@ -81,7 +82,11 @@ struct MomentumInput
     // explicit deferred correction. Both halves, as in the reference -- see UEqn_cpp.cuh.
     bool   correctedLaplacian = false;
     bool   hasMRF = false;
-    bool   hasFvOptions = false;
+    bool   hasFvOptions = false;   // an UNIMPLEMENTED option -> refuse
+    // explicitPorositySource/DarcyForchheimer, evaluated on the device each iteration from the current U.
+    // nuLaminar, not nuEff: DarcyForchheimer.C looks up the field NAMED "nu".
+    const DevicePorosity* porosity = nullptr;
+    scalar nuLaminar = 0.0;
 };
 
 // UEqn.H steps 1-2: fvm::div(phi,U) + turbulence->divDevReff(U), then UEqn.relax().

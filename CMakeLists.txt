@@ -87,6 +87,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
+    src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
     src/applications/solvers/simpleFoam/UEqn.cu
@@ -452,6 +453,10 @@ add_executable(test_realizablke_cpp tests/test_realizablke_cpp.cu)
 target_include_directories(test_realizablke_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_realizablke_cpp PRIVATE brae_core)
 
+add_executable(test_fvoptions_cpp tests/test_fvoptions_cpp.cu)
+target_include_directories(test_fvoptions_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_fvoptions_cpp PRIVATE brae_core)
+
 add_executable(test_limitedschemes_cpp tests/test_limitedschemes_cpp.cu)
 target_include_directories(test_limitedschemes_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_limitedschemes_cpp PRIVATE brae_core)
@@ -596,6 +601,20 @@ add_test(NAME stock_pitzdaily_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/stock_pitzdaily_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 set_tests_properties(stock_pitzdaily_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
+# topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
+# with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
+add_test(NAME fvoptions_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/fvoptions_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(fvoptions_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# fvOptions framework + porosity, unit level: the dictionary, the cellZone selection and the resistance
+# expression, asserted against OpenFOAM's source and against what the case says.
+add_test(NAME fvoptions_cpp
+         COMMAND test_fvoptions_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleCarPorous 0)
+set_tests_properties(fvoptions_cpp PROPERTIES SKIP_RETURN_CODE 77)
 
 # limitedLinear / limitedLinearV / LUST end to end vs real OpenFOAM, each with a plain-upwind control
 # run against the same oracle. The control asserts on k, not U: every one of these schemes lands within
