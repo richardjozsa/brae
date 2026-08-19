@@ -15,11 +15,11 @@ constexpr scalar SMALL_  = 1e-15;
 
 void refuseUnsupported(const PressureInput& in)
 {
-    if (in.hasMRF)
+    if (in.hasMRF && !in.mrf)
         throw std::runtime_error(
             "pEqn_cpp: the case declares MRF, which pEqn.H applies via MRF.makeRelative(phiHbyA) "
-            "(pEqn.H:5) and inside constrainPressure (pEqn.H:21). Refusing rather than solving a "
-            "different equation.");
+            "(pEqn.H:5) and inside constrainPressure (pEqn.H:21). No zones were supplied; refusing "
+            "rather than solving a different equation.");
     if (in.hasFvOptions)
         throw std::runtime_error(
             "pEqn_cpp: the case declares fvOptions, which pEqn.H applies as fvOptions.correct(U) "
@@ -79,6 +79,9 @@ PressureStages pressurePredictor(
 
     // phiHbyA = fvc::flux(HbyA)
     st.phiHbyA = fvc::flux(st.HbyA, HbyAb, m, g, patches);
+
+    // MRF.makeRelative(phiHbyA) -- pEqn.H:5, BEFORE adjustPhi.
+    if (in.mrf) MRF::makeRelative(st.phiHbyA, *in.mrf, g, patches);
 
     // adjustPhi(phiHbyA, U, p) -- adjustPhi.C. Only when p needs a reference, i.e. no patch fixes p.
     // Scales the ADJUSTABLE outflow so that global continuity closes before the pressure solve; without

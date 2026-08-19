@@ -56,6 +56,7 @@
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include "MRF_cpp.cuh"
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
 #include "fvc.cuh"
@@ -82,6 +83,10 @@ enum class DivScheme
 
 struct MomentumInput
 {
+    // MRF.DDt(U), UEqn.H:8. Null with hasMRF set is a REFUSAL, not a no-op: a case that declares MRF
+    // and gets none of it converges to a confidently wrong answer.
+    const std::vector<MRF::Zone>* mrf = nullptr;
+
     const std::vector<scalar>*              phi = nullptr;       // internal face flux
     const std::vector<std::vector<scalar>>* phiBnd = nullptr;    // boundary face flux
     const std::vector<scalar>*              nuEff = nullptr;     // cells

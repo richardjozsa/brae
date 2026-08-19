@@ -90,6 +90,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
     src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
+    src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
     src/applications/solvers/simpleFoam/UEqn.cu
@@ -647,6 +648,13 @@ add_test(NAME sst_cuda_full
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST full)
 set_tests_properties(sst_cuda_full PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# MRF end to end on the _cpp path vs real OpenFOAM, with the control that makes it mean something: with
+# the zones dropped this case has no driving force at all and every field reads 1.000 against OpenFOAM.
+add_test(NAME mrf_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mrf_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/mixerVessel2D)
+set_tests_properties(mrf_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
@@ -738,6 +746,10 @@ target_link_libraries(test_simple_sst_cpp PRIVATE brae_core)
 add_executable(v2_envelope tests/v2_envelope.cu)
 target_include_directories(v2_envelope PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(v2_envelope PRIVATE brae_core)
+
+add_executable(test_simple_mrf_cpp tests/test_simple_mrf_cpp.cu)
+target_include_directories(test_simple_mrf_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_mrf_cpp PRIVATE brae_core)
 add_test(NAME simple_turbulent_cpp
          COMMAND test_simple_turbulent_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 

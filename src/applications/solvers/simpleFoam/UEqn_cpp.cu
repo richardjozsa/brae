@@ -87,10 +87,10 @@ void refuseUnsupported(const MomentumInput& in)
     // constraint, the correction). Neither is optional when the case declares it. Refusing here is the
     // point: brae has already shipped a compressible path that read MRFProperties, ignored it, converged,
     // and reported nothing wrong.
-    if (in.hasMRF)
+    if (in.hasMRF && !in.mrf)
         throw std::runtime_error(
             "UEqn_cpp: the case declares MRF, which UEqn.H applies via MRF.correctBoundaryVelocity(U) and "
-            "MRF.DDt(U) (simpleFoam/UEqn.H:3,8). The _cpp reference does not implement it; refusing rather "
+            "MRF.DDt(U) (simpleFoam/UEqn.H:3,8). No zones were supplied to this assembly; refusing rather "
             "than silently solving a different equation.");
     if (in.hasFvOptions)
         throw std::runtime_error(
@@ -216,6 +216,10 @@ FvVectorMatrix assembleUEqn(
     // == fvOptions(U). BEFORE relax, as UEqn.H has it: the source is part of the matrix relaxation then
     // acts on. The double negation (`eqn -= porosityEqn` inside, `UEqn == fvOptions(U)` outside) cancels,
     // so the porosity enters as written -- see fvOptions_cpp.cuh.
+    // + MRF.DDt(U), UEqn.H:8. Part of the LHS expression, so it is in the matrix BEFORE relax, exactly
+    // as fvOptions' source is. Explicit in U: OpenFOAM builds a volVectorField from the current U.
+    if (in.mrf) MRF::addCoriolis(*in.mrf, U.internal, g.V(), M.source);
+
     if (in.options) fvOptions::addSup(*in.options, M, U, in.nuLaminar, g);
 
     // UEqn.relax(). OpenFOAM guards this with if(relaxEquation(name)); a factor of 1 is the identity, and

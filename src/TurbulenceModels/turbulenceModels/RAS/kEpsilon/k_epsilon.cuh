@@ -20,8 +20,44 @@
 #include <cmath>
 #include <vector>
 
+#include "limitedSchemes_cpp.cuh"
+
 namespace brae {
 namespace kepsilon {
+
+// `bounded Gauss limitedLinear <k>` on div(phi,k) / div(phi,epsilon) -- what the mixerVessel2D and
+// pitzDailySST families ask for. Upwind is not a looser tolerance here, it is a different matrix; on
+// pitzDailySST the same substitution measured 8.3x (omega) and 82x (k) against OpenFOAM's own initial
+// residual. Both default OFF, so every existing caller assembles exactly the matrix it did before.
+struct TurbDiv
+{
+    bool   bounded = false;
+    bool   limitedLinear = false;
+    scalar coeff = 1.0;
+};
+
+inline FvScalarMatrix divTurb(
+    const SurfaceScalarField&     phi,
+    const GeometricField<scalar>& vf,
+    const TurbDiv&                sch,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches)
+{
+    if (!sch.limitedLinear)
+    {
+        return fvm::div(phi.internal, phi.boundary, vf, m, patches);
+    }
+    std::vector<std::vector<scalar>> vfb(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        vfb[pi] = vf.boundary[pi]->value();
+    }
+    const std::vector<vector> gradVf = fvc::gaussGrad(vf.internal, vfb, m, g, patches);
+    return fvm::div(phi.internal, phi.boundary, vf,
+                    cpu::limitedSchemes::limitedLinearWeights(phi.internal, vf, gradVf, sch.coeff, m, g),
+                    m, patches);
+}
 
 constexpr scalar Cmu     = 0.09;
 constexpr scalar C1      = 1.44;
@@ -88,6 +124,31 @@ inline std::vector<scalar> DepsilonEff(
     return d;
 }
 
+// DkEff/DepsilonEff are volScalarFields in OpenFOAM -- nut_/sigma + nu() -- so their BOUNDARY comes from
+// nut's own boundary field, not from interpolating the cell value out to the face. On a wall that is the
+// wall-function nut; on a `calculated` patch it is Cmu*k_b^2/eps_b, which at pitzDaily's inlet is twelve
+// times smaller than the adjacent cell and put 90% of the whole epsilon residual on that one patch.
+inline SurfaceScalarField effectiveDiffusivity(
+    const std::vector<scalar>&              DCell,
+    const std::vector<std::vector<scalar>>* nutBnd,
+    scalar                                  sigma,
+    scalar                                  nu,
+    const PrimitiveMesh&                    m,
+    const FvGeometry&                       g,
+    const std::vector<FvPatch>&             patches)
+{
+    SurfaceScalarField sf = fvc::interpolate(DCell, m, g, patches);
+    if (!nutBnd) return sf;
+    for (std::size_t pi = 0; pi < patches.size() && pi < nutBnd->size(); ++pi)
+    {
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            sf.boundary[pi][i] = (*nutBnd)[pi][i] / sigma + nu;
+        }
+    }
+    return sf;
+}
+
 // kEqn = div(phi,k) - laplacian(DkEff,k) + Sp(eps/k, k) == G.
 inline FvScalarMatrix kEqn(
     const GeometricField<scalar>& k,
@@ -99,13 +160,19 @@ inline FvScalarMatrix kEqn(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
-    const KEpsilonCoeffs& co = {})
+    const KEpsilonCoeffs& co = {},
+    const TurbDiv& sch = {},
+    const std::vector<std::vector<scalar>>* nutBnd = nullptr)
 {
-    const SurfaceScalarField Dkf = fvc::interpolate(DkEff(nutf, nu, co), m, g, patches);
-    FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, k, m, patches);
+    const SurfaceScalarField Dkf =
+        effectiveDiffusivity(DkEff(nutf, nu, co), nutBnd, co.sigmaK, nu, m, g, patches);
+    FvScalarMatrix M = divTurb(phi, k, sch, m, g, patches);
     addEqual(M, fvm::laplacian(Dkf, k, m, g, patches), -1.0);
+    const std::vector<scalar> divPhi =
+        sch.bounded ? fvc::div(phi, m, g, patches) : std::vector<scalar>(m.nCells(), 0.0);
     for (label c = 0; c < m.nCells(); ++c)
     {
+        if (sch.bounded) M.diag[c] -= divPhi[c] * g.V()[c];   // - Sp(fvc::div(phi), k)
         M.diag[c]   += (eps[c] / k.internal[c]) * g.V()[c];   // + Sp(eps/k, k)
         M.source[c] += G[c] * g.V()[c];                       // == G
     }
@@ -123,13 +190,19 @@ inline FvScalarMatrix epsilonEqn(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
-    const KEpsilonCoeffs& co = {})
+    const KEpsilonCoeffs& co = {},
+    const TurbDiv& sch = {},
+    const std::vector<std::vector<scalar>>* nutBnd = nullptr)
 {
-    const SurfaceScalarField Def = fvc::interpolate(DepsilonEff(nutf, nu, co), m, g, patches);
-    FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, eps, m, patches);
+    const SurfaceScalarField Def =
+        effectiveDiffusivity(DepsilonEff(nutf, nu, co), nutBnd, co.sigmaEps, nu, m, g, patches);
+    FvScalarMatrix M = divTurb(phi, eps, sch, m, g, patches);
+    const std::vector<scalar> divPhiE =
+        sch.bounded ? fvc::div(phi, m, g, patches) : std::vector<scalar>(m.nCells(), 0.0);
     addEqual(M, fvm::laplacian(Def, eps, m, g, patches), -1.0);
     for (label c = 0; c < m.nCells(); ++c)
     {
+        if (sch.bounded) M.diag[c] -= divPhiE[c] * g.V()[c];            // - Sp(fvc::div(phi), epsilon)
         M.diag[c]   += (co.C2 * eps.internal[c] / k[c]) * g.V()[c];     // + Sp(C2*eps/k, eps)
         M.source[c] += (co.C1 * co.Cmu * k[c] * GbyNuF[c]) * g.V()[c];  // == C1*Cmu*k*GbyNu
     }
@@ -163,9 +236,17 @@ inline void correct(
     scalar tol,
     scalar relTol,
     int maxIter,
-    const KEpsilonCoeffs& co = {})
+    const KEpsilonCoeffs& co = {},
+    const TurbDiv& sch = {})
 {
     const label nC = m.nCells();
+    // nut's OWN boundary, as it stands entering this correct() -- the wall-function value the previous
+    // correctNut wrote. DkEff(patchi)/DepsilonEff(patchi) are built from it, not from the cell value.
+    std::vector<std::vector<scalar>> nutBndVals(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        nutBndVals[pi] = nutField.boundary[pi]->value();
+    }
     const scalar kappa = co.kappa;
     const scalar Cmu25 = std::pow(co.Cmu, 0.25), Cmu75 = std::pow(co.Cmu, 0.75);
     std::vector<scalar>& nutF = nutField.internal;
@@ -217,7 +298,8 @@ inline void correct(
 
     // epsilon equation. + fvm::SuSp(((2/3)C1 - C3)*divU, eps): implicit where the coeff > 0,
     // explicit (old eps) where < 0. (Near-wall rows are overwritten by setValues below.)
-    FvScalarMatrix epsEqn = epsilonEqn(eps, k.internal, gByNu, nutF, phi, nu, m, g, patches, co);
+    FvScalarMatrix epsEqn =
+        epsilonEqn(eps, k.internal, gByNu, nutF, phi, nu, m, g, patches, co, sch, &nutBndVals);
     for (label c = 0; c < nC; ++c)
     {
         const scalar sp = ((2.0 / 3.0) * co.C1 - C3) * divU[c];
@@ -232,7 +314,8 @@ inline void correct(
     eps.evaluateBoundary();
 
     // k equation (uses the wall-overridden G). + fvm::SuSp((2/3)*divU, k).
-    FvScalarMatrix kEqnM = kEqn(k, eps.internal, G, nutF, phi, nu, m, g, patches, co);
+    FvScalarMatrix kEqnM =
+        kEqn(k, eps.internal, G, nutF, phi, nu, m, g, patches, co, sch, &nutBndVals);
     for (label c = 0; c < nC; ++c)
     {
         const scalar sp = (2.0 / 3.0) * divU[c];

@@ -12,6 +12,7 @@ validation/*
 !validation/cyclicChannelAMI/
 !validation/cyclicWedge/
 !validation/kEpsCase/
+!validation/mixerVessel2D/
 !validation/kEpsCorrect/
 !validation/komegaCoeffs/
 !validation/lmFlatPlate/

@@ -60,6 +60,7 @@
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include "MRF_cpp.cuh"
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
 #include "fvc.cuh"
@@ -70,6 +71,10 @@ namespace cpu {
 
 struct PressureInput
 {
+    // MRF.makeRelative(phiHbyA), pEqn.H:5 -- between fvc::flux(HbyA) and adjustPhi, because adjustPhi
+    // balances the flux it is given.
+    const std::vector<MRF::Zone>* mrf = nullptr;
+
     scalar relaxP = 1.0;        // relaxationFactors/fields p
     label  pRefCell = -1;       // setRefCell; -1 => the case does not need a reference
     scalar pRefValue = 0.0;

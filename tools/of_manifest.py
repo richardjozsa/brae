@@ -402,8 +402,31 @@ COMPONENTS = {
              brae_existing="src/finiteVolume/cfdTools/MRF/device_mrf.cu",
              schema_for="MRFZone",
              brae_target="src/finiteVolume/cfdTools/general/MRF/",
+             brae_reference="src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu",
+             validation="tests/mrf_cpp_vs_openfoam.sh, END TO END on validation/mixerVessel2D (cellZone "
+                        "`rotor`, omega 104.72 about z) against real OpenFOAM's converged 500: U 4.8e-02, "
+                        "p 1.2e-02, k 5.1e-02, epsilon 1.7e-01 L2-relative. THE CONTROL IS THE POINT -- "
+                        "with the zones dropped the case has no driving force at all, the flow is "
+                        "quiescent and every field reads 1.000, so MRF is 100% of this case's physics "
+                        "rather than a correction to it. Each hook was checked the same way: dropping "
+                        "DDt alone costs 158x on the momentum residual and dropping makeRelative 30x on "
+                        "pressure.",
              note="Reached four times in the closure: correctBoundaryVelocity, DDt, makeRelative, update. "
-                  "Silently ignoring it produced a converged wrong answer on the compressible path."),
+                  "Silently ignoring it produced a converged wrong answer on the compressible path. "
+                  "DDt is EXPLICIT: MRFZoneList::DDt builds a volVectorField of Omega x U from the "
+                  "current U, which UEqn.H adds to the LHS, so it lands as source -= V*(Omega x U) and "
+                  "is lagged like any other deferred term. update() is moving-mesh only and inert on a "
+                  "steady static mesh; constrainPressure (pEqn.H:21) does nothing without a "
+                  "fixedFluxPressure patch, which is outside this path's envelope anyway. STILL OPEN: "
+                  "assembled at OpenFOAM's OWN converged state the initial residuals are 10x (U) and "
+                  "52x (p) its own -- the established CUDA solver is 20x on the same measurement, so "
+                  "the rebuild is twice as close, but the difference is real and unexplained. It is not "
+                  "the turbulence closure (which cannot affect the first iteration) and not any single "
+                  "hook (each is load-bearing). NOT TESTED BY THIS CASE: OpenFOAM's internalFaces are "
+                  "the faces with EITHER cell in the zone, not both -- mixerVessel2D bounds its zone "
+                  "with a PATCH, so both readings select the same 3024 faces and measure identically. "
+                  "brae existing (device_mrf.cu) uses BOTH, and gating that needs a case whose zone "
+                  "meets the mesh across internal faces."),
         dict(name="fvOptions", of_symbol="Foam::fv::options",
              of_file="src/finiteVolume/cfdTools/general/fvOptions/fvOptions.C",
              classification="DISPATCH", status="REVALIDATE_EXISTING",

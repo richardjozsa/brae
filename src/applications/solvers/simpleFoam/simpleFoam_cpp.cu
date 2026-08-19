@@ -48,6 +48,10 @@ Residuals simpleStep(
     const std::vector<scalar> pPrev = f.p.internal;
 
     // ---- UEqn.H ----------------------------------------------------------------------------
+    // MRF.correctBoundaryVelocity(U) -- UEqn.H:3, the FIRST thing the momentum block does. The included
+    // patch faces take the frame velocity, so the convection and the wall shear both see it.
+    if (in.mrf) MRF::correctBoundaryVelocity(f.U, *in.mrf, patches);
+
     MomentumInput mi;
     mi.phi = &f.phi.internal;  mi.phiBnd = &f.phi.boundary;
     mi.nuEff = nuEffPtr;       mi.nuEffBnd = nuEffBndPtr;
@@ -58,6 +62,7 @@ Residuals simpleStep(
     mi.scheme       = in.scheme;
     mi.schemeCoeff  = in.schemeCoeff;
     mi.hasMRF = in.hasMRF;     mi.hasFvOptions = in.hasFvOptions;
+    mi.mrf = in.mrf;
 
     const FvVectorMatrix UEqn = assembleUEqn(f.U, mi, m, g, patches);
 
@@ -78,6 +83,7 @@ Residuals simpleStep(
     pi.consistent = ctl.consistent();
     pi.correctedLaplacian = in.correctedLaplacian;
     pi.hasMRF = in.hasMRF;     pi.hasFvOptions = in.hasFvOptions;
+    pi.mrf = in.mrf;
 
     const PressureStages st = pressurePredictor(UEqn, f.U, f.p, pi, m, g, patches);
 
@@ -120,9 +126,13 @@ Residuals simpleStep(
         }
         else
         {
+            kepsilon::TurbDiv sch;
+            sch.bounded       = in.turb->boundedTurb;
+            sch.limitedLinear = in.turb->limitedLinearTurb;
+            sch.coeff         = in.turb->turbLimiterCoeff;
             kepsilon::correct(f.U, *in.turb->k, *in.turb->epsilon, *in.turb->nut, f.phi, in.nu,
                               m, g, patches, in.turb->relaxEpsilon, in.turb->relaxK,
-                              in.turb->tol, in.turb->relTol, in.turb->maxIter, in.turb->coeffs);
+                              in.turb->tol, in.turb->relTol, in.turb->maxIter, in.turb->coeffs, sch);
         }
     }
 

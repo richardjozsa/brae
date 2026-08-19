@@ -98,7 +98,9 @@ struct StepInput
     bool   linearUpwind = false;                 // div(phi,U) `linearUpwind`
     DivScheme scheme = DivScheme::upwind;
     scalar    schemeCoeff = 1.0;
-    bool   hasMRF = false;                       // refused downstream
+    // MRF zones, already resolved against the mesh. hasMRF WITHOUT these is still a refusal.
+    const std::vector<MRF::Zone>* mrf = nullptr;
+    bool   hasMRF = false;                       // refused downstream when `mrf` is null
     bool   hasFvOptions = false;                 // refused downstream
 };
 
