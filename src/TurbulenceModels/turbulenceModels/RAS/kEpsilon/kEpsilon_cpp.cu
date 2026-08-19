@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see kEpsilon_cpp.cuh for the OpenFOAM provenance and the wall note.
 #include "kEpsilon_cpp.cuh"
+#include "bound_cpp.cuh"
 #include "nut_wall_function.cuh"
 #include "near_wall_dist.cuh"
 #include "pbicgstab.cuh"
@@ -263,11 +264,11 @@ void correct(
         const SolverPerformance p = pbicgstab(M, epsilon.internal, m, patches, tol, relTol, maxIter);
         if (res) res->epsilon = p.initialResidual;
 
-        for (label c = 0; c < nC; ++c)
-        {
-            epsilon.internal[c] = std::fmax(epsilon.internal[c], 1e-15);
-        }
+        // Foam::bound(epsilon_, epsilonMin_): a cell that solved NEGATIVE takes its neighbours'
+        // average, not a floor. Inert under upwind convection, which does not produce one -- see
+        // bound_cpp.cuh for where a floor is fatal.
         epsilon.evaluateBoundary();
+        bound(epsilon, 1e-15, m, g, patches);
     }
 
     // k equation
@@ -305,11 +306,8 @@ void correct(
         const SolverPerformance p = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter);
         if (res) res->k = p.initialResidual;
 
-        for (label c = 0; c < nC; ++c)
-        {
-            k.internal[c] = std::fmax(k.internal[c], 1e-15);
-        }
         k.evaluateBoundary();
+        bound(k, 1e-15, m, g, patches);   // Foam::bound(k_, kMin_)
     }
 
     // correctNut.

@@ -37,6 +37,7 @@
 #include "simpleControl_cpp.cuh"
 #include "UEqn_cpp.cuh"        // DivScheme: the div(phi,U) scheme, shared with the CUDA driver
 #include "kepsilon_coeffs.cuh"
+#include "komega_sst_coeffs.cuh"
 #include "geometric_field.cuh"
 #include <map>
 #include <string>
@@ -59,6 +60,20 @@ struct TurbulenceState
     GeometricField<scalar>* epsilon = nullptr;
     GeometricField<scalar>* nut = nullptr;
     KEpsilonCoeffs coeffs{};
+
+    // kOmegaSST rides the SAME slots: `epsilon` above holds omega. It additionally needs the CELL wall
+    // distance -- F1/F2 blend on it at every cell, which is a different quantity from the near-wall face
+    // distance the wall functions use -- and its own coefficients.
+    bool sst = false;
+    KOmegaSSTCoeffs sstCoeffs{};
+    std::vector<scalar> y;
+
+    // div(phi,k) / div(phi,omega). `bounded Gauss limitedLinear 1` in the SST tutorials, plain
+    // `Gauss upwind` in pitzDaily's kEpsilon -- a different matrix, not a different tolerance.
+    bool   boundedTurb = false;
+    bool   limitedLinearTurb = false;
+    scalar turbLimiterCoeff = 1.0;
+
     scalar relaxK = 0.7, relaxEpsilon = 0.7;
     scalar tol = 1e-10, relTol = 0.0;
     int    maxIter = 2000;

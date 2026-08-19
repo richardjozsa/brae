@@ -89,6 +89,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
+    src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
     src/applications/solvers/simpleFoam/UEqn.cu
@@ -619,6 +620,19 @@ add_test(NAME boundary_nut_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb)
 set_tests_properties(boundary_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# kOmegaSST on the _cpp path vs real OpenFOAM. The fast entry probes one iteration from OpenFOAM's own
+# converged state and carries its own upwind negative control; the slow one runs the case end to end from
+# 0/, which is what exposed the omega blow-up that the probe could not see.
+add_test(NAME sst_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sst_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
+set_tests_properties(sst_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME sst_cpp_full
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sst_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST full)
+set_tests_properties(sst_cpp_full PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
@@ -702,6 +716,10 @@ add_test(NAME divdevreff
 add_executable(test_simple_turbulent_cpp tests/test_simple_turbulent_cpp.cu)
 target_include_directories(test_simple_turbulent_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_turbulent_cpp PRIVATE brae_core)
+
+add_executable(test_simple_sst_cpp tests/test_simple_sst_cpp.cu)
+target_include_directories(test_simple_sst_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_sst_cpp PRIVATE brae_core)
 add_test(NAME simple_turbulent_cpp
          COMMAND test_simple_turbulent_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 

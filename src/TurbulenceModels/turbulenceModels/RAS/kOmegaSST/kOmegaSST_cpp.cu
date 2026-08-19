@@ -3,6 +3,9 @@
 #include "nut_wall_function.cuh"
 #include "near_wall_dist.cuh"
 #include "pbicgstab.cuh"
+#include "limitedSchemes_cpp.cuh"
+#include "bound_cpp.cuh"
+#include "fvc.cuh"
 #include <cmath>
 #include <stdexcept>
 #include <cstdio>
@@ -14,7 +17,76 @@ namespace kOmegaSST {
 
 namespace {
 
+namespace ls = limitedSchemes;
+
+// gaussConvectionScheme with the SCHEME's weights. `limitedLinear <coeff>` limits on the transported
+// scalar itself (NVDTVD on vf, not on magSqr as the vector form does), so vf and its gradient are the
+// field being solved for.
 inline scalar blend(scalar F1, scalar psi1, scalar psi2) { return F1 * (psi1 - psi2) + psi2; }
+
+// DkEff/DomegaEff are volScalarFields in OpenFOAM -- alphaK(F1)*nut_ + nu() -- so their BOUNDARY comes
+// from the operands' boundary fields, not from interpolating the cell value out to the face. nut's own
+// boundary is what matters most: on a `calculated` patch OF carries the evaluated eddy viscosity, which
+// at an inlet differs from the adjacent cell by more than 10x. Interpolating the cell value there is the
+// same defect that put 90% of the kEpsilon epsilon residual on pitzDaily's inlet.
+//
+// F1 is likewise a volScalarField with its own boundary; this uses the OWNER CELL's F1 for the blend and
+// nut's true boundary value, which is the part that measurably moves the residual.
+SurfaceScalarField effectiveDiffusivity(
+    const std::vector<scalar>&       DCell,
+    const GeometricField<scalar>&    nutField,
+    const std::vector<scalar>&       f1,
+    scalar                           alpha1,
+    scalar                           alpha2,
+    scalar                           nu,
+    const PrimitiveMesh&             m,
+    const FvGeometry&                g,
+    const std::vector<FvPatch>&      patches)
+{
+    static const bool dbg = std::getenv("BRAE_SST_DIFF_DEBUG") != nullptr;
+    SurfaceScalarField sf = fvc::interpolate(DCell, m, g, patches);
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const std::vector<scalar>& nb = nutField.boundary[pi]->value();
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const label c = patches[pi].faceCells[i];
+            const scalar was = sf.boundary[pi][i];
+            sf.boundary[pi][i] = blend(f1[c], alpha1, alpha2) * nb[i] + nu;
+            if (dbg && i == 5)
+                std::printf("      [Deff] patch %-12s face %d: interp %.6e -> nut_b %.6e (nut_b=%.3e)\n",
+                            patches[pi].name.c_str(), i, was, sf.boundary[pi][i], nb[i]);
+        }
+    }
+    return sf;
+}
+
+FvScalarMatrix divWithScheme(
+    const SurfaceScalarField&        phi,
+    const GeometricField<scalar>&    vf,
+    bool                             limitedLinear,
+    scalar                           limiterCoeff,
+    const PrimitiveMesh&             m,
+    const FvGeometry&                g,
+    const std::vector<FvPatch>&      patches)
+{
+    if (!limitedLinear)
+    {
+        return fvm::div(phi.internal, phi.boundary, vf, m, patches);
+    }
+
+    std::vector<std::vector<scalar>> vfb(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        vfb[pi] = vf.boundary[pi]->value();
+    }
+    const std::vector<vector> gradVf = fvc::gaussGrad(vf.internal, vfb, m, g, patches);
+    return fvm::div(phi.internal, phi.boundary, vf,
+                    ls::limitedLinearWeights(phi.internal, vf, gradVf, limiterCoeff, m, g),
+                    m, patches);
+}
+
+
 
 } // namespace
 
@@ -132,7 +204,10 @@ void correct(
     scalar                         relTol,
     int                            maxIter,
     const KOmegaSSTCoeffs&         co,
-    SSTResiduals*                  res)
+    SSTResiduals*                  res,
+    bool                           bounded,
+    bool                           limitedLinear,
+    scalar                         limiterCoeff)
 {
     if (co.F3)
         throw std::runtime_error(
@@ -213,9 +288,11 @@ void correct(
         std::vector<scalar> DomegaEff(nC);
         for (label c = 0; c < nC; ++c)
             DomegaEff[c] = blend(f1[c], co.alphaOmega1, co.alphaOmega2)*nutF[c] + nu;
-        const SurfaceScalarField Df = fvc::interpolate(DomegaEff, m, g, patches);
+        const SurfaceScalarField Df =
+            effectiveDiffusivity(DomegaEff, nutField, f1, co.alphaOmega1, co.alphaOmega2,
+                                 nu, m, g, patches);
 
-        FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, omega, m, patches);
+        FvScalarMatrix M = divWithScheme(phi, omega, limitedLinear, limiterCoeff, m, g, patches);
         addEqual(M, fvm::laplacian(Df, omega, m, g, patches), -1.0);
         for (label c = 0; c < nC; ++c)
         {
@@ -233,6 +310,9 @@ void correct(
             const scalar sp2 = (f1[c] - 1.0) * CD[c] / omega.internal[c];
             M.diag[c]   += V * std::fmax(sp2, 0.0);
             M.source[c] -= V * std::fmin(sp2, 0.0) * omega.internal[c];
+            // `bounded`: - Sp(fvc::div(phi), omega). Vanishes where phi is conservative, so it cannot
+            // move a converged answer -- it is there to keep the transported scalar bounded on the way.
+            if (bounded) M.diag[c] -= divU[c] * V;
         }
         relaxMatrix(M, omega, m, patches, relaxOmega);
         setValues(M, omega.internal, m, patches, wallCells, omVals);
@@ -241,8 +321,23 @@ void correct(
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("    [omega] init=%.3e final=%.3e nIter=%d\n",
                         po.initialResidual, po.finalResidual, po.nIterations);
-        for (label c = 0; c < nC; ++c) omega.internal[c] = std::fmax(omega.internal[c], 1e-15);
+        static const bool dbgBound = std::getenv("BRAE_SST_BOUND_DEBUG") != nullptr;
+        if (dbgBound)
+        {
+            scalar mn = omega.internal[0];
+            int nNeg = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                mn = std::fmin(mn, omega.internal[c]);
+                if (omega.internal[c] < 0.0) ++nNeg;
+            }
+            std::printf("      [bound] omega min %.6e   negative cells %d\n", mn, nNeg);
+        }
+        // Foam::bound(omega_, omegaMin_). A FLOOR here is not the same thing and is not survivable:
+        // the next iteration divides CDkOmega by this, so a floored cell contributes ~1e15. See
+        // bound_cpp.cuh for the measurement.
         omega.evaluateBoundary();
+        bound(omega, 1e-15, m, g, patches);
     }
 
     // ---- k equation ------------------------------------------------------------------------------
@@ -250,9 +345,11 @@ void correct(
         std::vector<scalar> DkEff(nC);
         for (label c = 0; c < nC; ++c)
             DkEff[c] = blend(f1[c], co.alphaK1, co.alphaK2)*nutF[c] + nu;
-        const SurfaceScalarField Df = fvc::interpolate(DkEff, m, g, patches);
+        const SurfaceScalarField Df =
+            effectiveDiffusivity(DkEff, nutField, f1, co.alphaK1, co.alphaK2,
+                                 nu, m, g, patches);
 
-        FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, k, m, patches);
+        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, m, g, patches);
         addEqual(M, fvm::laplacian(Df, k, m, g, patches), -1.0);
         for (label c = 0; c < nC; ++c)
         {
@@ -263,6 +360,7 @@ void correct(
             M.diag[c]   += V * std::fmax(sp, 0.0);
             M.source[c] -= V * std::fmin(sp, 0.0) * k.internal[c];
             M.diag[c]   += co.betaStar * omega.internal[c] * V;      // - Sp(epsilonByk, k)
+            if (bounded) M.diag[c] -= divU[c] * V;                   // - Sp(fvc::div(phi), k)
         }
         relaxMatrix(M, k, m, patches, relaxK);
         const SolverPerformance pk = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter);
@@ -270,8 +368,8 @@ void correct(
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("    [k] init=%.3e final=%.3e nIter=%d\n",
                         pk.initialResidual, pk.finalResidual, pk.nIterations);
-        for (label c = 0; c < nC; ++c) k.internal[c] = std::fmax(k.internal[c], 1e-15);
         k.evaluateBoundary();
+        bound(k, 1e-15, m, g, patches);   // Foam::bound(k_, kMin_)
     }
 
     // ---- correctNut ------------------------------------------------------------------------------
@@ -286,6 +384,74 @@ void correct(
         if (patches[pi].type != "wall") continue;
         nutField.boundary[pi]->setValue(
             nutkWallFunction(patches[pi], yWall[pi], k.internal, nu, co.betaStar, co.kappa, co.E));
+    }
+
+    // OpenFOAM assigns nut_ as a FIELD -- nut_ = a1*k/max(a1*omega, b1*F23*sqrt(S2)) -- and a field
+    // assignment writes the BOUNDARY as well, from the boundary k and omega. correctBoundaryConditions()
+    // then leaves a `calculated` patch alone, so those patches carry the evaluated value rather than the
+    // adjacent cell's. Only wall patches were being written here, which the single-iteration probe could
+    // never catch: it reads nut's boundary from OpenFOAM's converged file, where it is already right.
+    // Running from 0/ is what exposes it -- the tutorials ship `calculated; value uniform 0` at the
+    // inlet, so the inlet eddy viscosity stayed ZERO for the entire run.
+    //
+    // Every operand is taken at the BOUNDARY, as a field expression does: k and omega from their patch
+    // values, S2 from the boundary gradU (gaussGrad's boundary correction replaces the normal component
+    // with the snGrad, gb = gc + n*(snGrad - n&gc)), and F2 from those with the owner cell's y.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type == "wall") continue;
+        if (nutField.boundary[pi]->bcCategory() != 2) continue;   // fixedValue means the case PINNED it
+
+        const std::vector<scalar>& kb = k.boundary[pi]->value();
+        const std::vector<scalar>& ob = omega.boundary[pi]->value();
+        const std::vector<vector>& ub = U.boundary[pi]->value();
+        std::vector<scalar> vals(patches[pi].size);
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const label c = patches[pi].faceCells[i];
+            if (!(ob[i] > 0.0) || !(y[c] > 0.0))
+            {
+                vals[i] = nutF[c];
+                continue;
+            }
+
+            const tensor& t = gradU[c];
+            const scalar gc[9] = { t.xx, t.xy, t.xz, t.yx, t.yy, t.yz, t.zx, t.zy, t.zz };
+            const vector& n = patches[pi].nf[i];
+            const scalar nv[3] = { n.x, n.y, n.z };
+            const vector sng = (ub[i] - U.internal[c]) * patches[pi].deltaCoeffs[i];
+            const scalar sn[3] = { sng.x, sng.y, sng.z };
+
+            scalar ngc[3];
+            for (int j = 0; j < 3; ++j)
+            {
+                ngc[j] = nv[0]*gc[0*3+j] + nv[1]*gc[1*3+j] + nv[2]*gc[2*3+j];
+            }
+            scalar gb[9];
+            for (int a = 0; a < 3; ++a)
+            {
+                for (int b = 0; b < 3; ++b)
+                {
+                    gb[a*3+b] = gc[a*3+b] + nv[a]*(sn[b] - ngc[b]);
+                }
+            }
+            scalar ss = 0.0;
+            for (int a = 0; a < 3; ++a)
+            {
+                for (int b = 0; b < 3; ++b)
+                {
+                    const scalar sab = 0.5*(gb[a*3+b] + gb[b*3+a]);
+                    ss += sab*sab;
+                }
+            }
+            const scalar S2b = 2.0*ss;
+
+            const scalar arg2 = std::fmax(2.0*std::sqrt(std::fmax(kb[i], 0.0))/(co.betaStar*ob[i]*y[c]),
+                                          500.0*nu/(y[c]*y[c]*ob[i]));
+            const scalar F2b  = std::tanh(arg2*arg2);
+            vals[i] = co.a1*kb[i] / std::fmax(co.a1*ob[i], co.b1*F2b*std::sqrt(std::fmax(S2b, 0.0)));
+        }
+        nutField.boundary[pi]->setValue(vals);
     }
 }
 

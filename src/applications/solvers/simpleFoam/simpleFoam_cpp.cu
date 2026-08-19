@@ -5,6 +5,7 @@
 #include "solve_vector.cuh"
 #include "gamg.cuh"
 #include "k_epsilon.cuh"
+#include "kOmegaSST_cpp.cuh"
 
 namespace brae {
 namespace cpu {
@@ -109,9 +110,20 @@ Residuals simpleStep(
     // non-Newtonian one is a separate manifest component and is not covered.
     if (in.turb)
     {
-        kepsilon::correct(f.U, *in.turb->k, *in.turb->epsilon, *in.turb->nut, f.phi, in.nu,
-                          m, g, patches, in.turb->relaxEpsilon, in.turb->relaxK,
-                          in.turb->tol, in.turb->relTol, in.turb->maxIter, in.turb->coeffs);
+        if (in.turb->sst)
+        {
+            kOmegaSST::correct(f.U, *in.turb->k, *in.turb->epsilon, *in.turb->nut, f.phi, in.turb->y,
+                               in.nu, m, g, patches, in.turb->relaxEpsilon, in.turb->relaxK,
+                               in.turb->tol, in.turb->relTol, in.turb->maxIter, in.turb->sstCoeffs,
+                               /*res*/nullptr, in.turb->boundedTurb, in.turb->limitedLinearTurb,
+                               in.turb->turbLimiterCoeff);
+        }
+        else
+        {
+            kepsilon::correct(f.U, *in.turb->k, *in.turb->epsilon, *in.turb->nut, f.phi, in.nu,
+                              m, g, patches, in.turb->relaxEpsilon, in.turb->relaxK,
+                              in.turb->tol, in.turb->relTol, in.turb->maxIter, in.turb->coeffs);
+        }
     }
 
     return res;

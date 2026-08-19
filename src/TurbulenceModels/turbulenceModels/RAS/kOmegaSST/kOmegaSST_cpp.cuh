@@ -110,7 +110,14 @@ void correct(
     scalar                         relTol,
     int                            maxIter,
     const KOmegaSSTCoeffs&         co = {},
-    SSTResiduals*                  res = nullptr);   // the two INITIAL residuals, in OF's normalisation
+    SSTResiduals*                  res = nullptr,    // the two INITIAL residuals, in OF's normalisation
+    // div(phi,k) and div(phi,omega). The SST tutorials ask for `bounded Gauss limitedLinear 1` on both,
+    // which is a DIFFERENT matrix from upwind -- limitedLinear supplies the convection weights, and
+    // `bounded` subtracts Sp(fvc::div(phi), var). pitzDaily's kEpsilon asks for plain `Gauss upwind`,
+    // so the defaults keep that and every existing call site is unchanged.
+    bool                           bounded = false,
+    bool                           limitedLinear = false,
+    scalar                         limiterCoeff = 1.0);
 
 } // namespace kOmegaSST
 } // namespace cpu

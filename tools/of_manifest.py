@@ -337,7 +337,46 @@ COMPONENTS = {
              of_file="src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST.C",
              classification="MODEL", status="REVALIDATE_EXISTING",
              brae_existing="src/cuda/device_komega_sst.cu",
-             brae_target="src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/"),
+             brae_reference="src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu",
+             brae_target="src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/",
+             validation="tests/sst_cpp_vs_openfoam.sh, on validation/pitzDailySST against real "
+                        "OpenFOAM (log.simpleFoam, whose 2000/ this repo carries and which a rerun "
+                        "reproduces bit-identically). FIXED POINT, one iteration from OpenFOAM's own "
+                        "converged fields: omega 3.288e-04 vs 2.836e-04 (1.16x) and k 3.683e-05 vs "
+                        "2.537e-05 (1.45x), with an upwind control at 8.3x and 82x that the gate "
+                        "requires to breach its bound. END TO END from 0/ (sst_cpp_full): U 1.9e-04, "
+                        "p 7.4e-04, k 9.2e-04, omega 9.4e-03, nut 2.4e-03 L2-relative against "
+                        "OpenFOAM's converged fields -- at parity with the established CUDA solver on "
+                        "the same case (1.7e-04 / 5.1e-04 / 6.8e-04 / 1.3e-02 / 3.9e-03).",
+             note="The _cpp reference could NOT run an SST case until this, and a single-iteration "
+                  "probe did not show it: probing from the converged state gave 1.2-1.5x while the "
+                  "same code from 0/ reached omega 1e+46 by iteration 200. Three defects, all of them "
+                  "end-to-end-only. (1) div(phi,k)/div(phi,omega) were upwind where the tutorials ask "
+                  "for `bounded Gauss limitedLinear 1` -- a different matrix, not a looser tolerance. "
+                  "(2) A negative omega was FLOORED to SMALL instead of taking Foam::bound's "
+                  "neighbour average; the next iteration divides CDkOmega by it, so a floored cell "
+                  "contributes ~1e15. OpenFOAM bounds omega 258 times on this case, first at "
+                  "min -2445.7, against brae's -2534.0 on the same iteration -- upwind never produces "
+                  "the negative cell, which is why the floor survived until (1) was fixed. "
+                  "(3) correctNut wrote only wall patches, so a `calculated` inlet shipped as "
+                  "`value uniform 0` kept zero eddy viscosity for the whole run. The patch "
+                  "diffusivity DkEff(patchi) = alphaK(F1)*nut_b + nu is now taken from nut's own "
+                  "boundary as well; on THIS case that is worth 2.7% because the near-inlet cell nut "
+                  "is close to the boundary value, unlike kEpsilon's pitzDaily where it is 12x off."),
+
+        dict(name="bound", of_symbol="Foam::bound",
+             of_file="src/finiteVolume/cfdTools/general/bound/bound.C",
+             classification="SHARED_NUMERICAL", status="PORTED",
+             brae_reference="src/finiteVolume/cfdTools/general/bound/bound_cpp.cu",
+             brae_target="src/finiteVolume/cfdTools/general/bound/",
+             validation="Exercised by every RAS correct(); the discriminating case is "
+                        "tests/sst_cpp_vs_openfoam.sh full mode, which diverges to omega 1e+46 with a "
+                        "floor in place of it and converges to 9.4e-03 of OpenFOAM with it.",
+             note="NOT a clamp. vsf = max(max(vsf, average(max(vsf, lowerBound))*pos0(-vsf)), "
+                  "lowerBound): a cell that solved NEGATIVE takes the area-weighted average of its "
+                  "neighbours, and only a merely-small cell is floored. Both lower bounds are SMALL, "
+                  "so the floor and OpenFOAM agree everywhere except the negative cell -- which is "
+                  "exactly the cell that matters."),
 
         # ---- MRF / fvOptions -----------------------------------------------------------------
         dict(name="MRFZoneList", of_symbol="Foam::MRFZoneList",
