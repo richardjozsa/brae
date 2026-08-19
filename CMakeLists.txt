@@ -734,6 +734,10 @@ target_link_libraries(test_simple_turbulent_cpp PRIVATE brae_core)
 add_executable(test_simple_sst_cpp tests/test_simple_sst_cpp.cu)
 target_include_directories(test_simple_sst_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_sst_cpp PRIVATE brae_core)
+
+add_executable(v2_envelope tests/v2_envelope.cu)
+target_include_directories(v2_envelope PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(v2_envelope PRIVATE brae_core)
 add_test(NAME simple_turbulent_cpp
          COMMAND test_simple_turbulent_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 

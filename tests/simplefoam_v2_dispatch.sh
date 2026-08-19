@@ -84,6 +84,24 @@ fi
 echo "== 4. selected + unsupported: REFUSES, with the reason =="
 # Each of these is a component the rebuilt path does not implement, and each would otherwise produce a
 # converged, plausible, wrong answer.
+# The mirror of try_refusal: the mutation must be ACCEPTED, and brae must still SAY what it is doing.
+# Accepting silently is its own defect -- the point of the envelope is that nothing is substituted
+# without being named.
+try_notice() {    # try_notice <label> <mutator-python> <expected-substring>
+    local d="$W/note_$1"
+    supported "$d"
+    python3 - "$d" <<PY
+import re, sys, os
+d = sys.argv[1]
+$2
+PY
+    ( cd "$d" && BRAE_SIMPLEFOAM_V2=1 "$BRAE" > log 2>&1 )
+    local rc=$?
+    if [ $rc -ne 0 ]; then bad "$1: refused (exit $rc), but OpenFOAM accepts this"; sed -n '1,4p' "$d/log"; return; fi
+    if grep -q "$3" "$d/log"; then ok "$1: accepted, and said so"; else
+        bad "$1: accepted SILENTLY, without naming it ($3)"; sed -n '1,4p' "$d/log"; fi
+}
+
 try_refusal() {   # try_refusal <label> <mutator-python> <expected-substring>
     local d="$W/ref_$1"
     supported "$d"
@@ -168,9 +186,13 @@ try_refusal lugradscheme \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss linearUpwind grad(U);',s); s=re.sub(r'gradSchemes\s*\{[^}]*\}','gradSchemes\n{\n    default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;\n}',s); open(d+'/system/fvSchemes','w').write(s)" \
   "cellLimited"
 
-try_refusal transient \
+# ddtSchemes is NOT a refusal, because it is not one for OpenFOAM either: simpleFoam's UEqn carries no
+# fvm::ddt term, so the entry is never consulted. OpenFOAM's OWN squareBend tutorial ships
+# `application simpleFoam` with `ddtSchemes default Euler` and runs it -- this was a refusal here, and it
+# blocked a case the reference solver accepts. It must be ACCEPTED and ANNOUNCED as inert instead.
+try_notice transient \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'default\s+steadyState;','default         Euler;',s); open(d+'/system/fvSchemes','w').write(s)" \
-  "steadyState"
+  "inert"
 
 # RAS/kEpsilon is SUPPORTED: the driver's turbulence hook is wired to the device k-epsilon. This used to
 # be a refusal, and flipping it is the point of that work -- so assert it RUNS and writes the turbulence

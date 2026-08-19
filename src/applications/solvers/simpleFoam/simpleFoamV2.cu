@@ -371,10 +371,16 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
 
     // --- this is the STEADY solver ------------------------------------------------------------
     {
+        // NOT a blocker, because it is not one for OpenFOAM either: simpleFoam's UEqn is
+        // div(phi,U) + MRF.DDt(U) + divDevReff(U) == fvOptions(U) -- there is no fvm::ddt term, so
+        // ddtSchemes is never consulted and the entry is inert. OpenFOAM's OWN squareBend tutorial ships
+        // `application simpleFoam` with `ddtSchemes default Euler` and runs it; refusing here blocked a
+        // case the reference solver accepts, which is the opposite of matching it.
         const std::string ddt = readDdtSchemeWord(caseDir + "/system/fvSchemes");
         if (!ddt.empty() && ddt != "steadyState")
-            r.blockers.push_back("ddtSchemes.default is `" + ddt + "`, not steadyState. simpleFoam is the "
-                                 "steady solver; a transient case belongs to pimpleFoam.");
+            r.notices.push_back("ddtSchemes.default is `" + ddt + "`, not steadyState. simpleFoam assembles "
+                                "no ddt term, so this entry is inert here -- as it is in OpenFOAM. The run "
+                                "is STEADY regardless of what it asks for.");
     }
 
     // --- the convection scheme ----------------------------------------------------------------
@@ -441,7 +447,11 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
             for (const std::string& key : {std::string("div(phi,k)"), "div(phi," + second + ")"})
             {
                 const TurbDivScheme ts = divTurbScheme(caseDir, key);
-                if (ts.found && ts.scheme != "upwind" && ts.scheme != "limitedLinear")
+                // An EMPTY scheme word means the case has no such entry and none was inherited -- a
+                // SpalartAllmaras case transports nuTilda and never names div(phi,k). Refusing on that
+                // would be refusing a field the model does not solve.
+                if (ts.found && !ts.scheme.empty()
+                    && ts.scheme != "upwind" && ts.scheme != "limitedLinear")
                     r.blockers.push_back("`" + key + "` is `" + ts.scheme + "`; the rebuilt turbulence "
                                          "transport implements `upwind` and `limitedLinear` only. "
                                          "Running a different scheme's matrix under this name would be "
