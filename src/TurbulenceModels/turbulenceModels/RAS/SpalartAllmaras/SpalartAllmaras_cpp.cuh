@@ -51,6 +51,8 @@ struct Coeffs
     scalar Cw3      = 2.0;
     scalar Cv1      = 7.1;
     scalar Cs       = 0.3;
+    scalar E        = 9.8;      // nutUSpaldingWallFunction: Spalding law E
+    scalar nutKappa = 0.41;     // ...and its kappa (the wall function reads its OWN, not the model's)
     // Only reached when the ft2 term is switched on, which OpenFOAM defaults to OFF.
     bool   ft2      = false;
     scalar Ct3      = 1.2;

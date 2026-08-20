@@ -11,6 +11,7 @@ validation/*
 !validation/cyclicChannel/
 !validation/cyclicChannelAMI/
 !validation/cyclicWedge/
+!validation/airFoil2D/
 !validation/kEpsCase/
 !validation/mixerVessel2D/
 !validation/kEpsCorrect/

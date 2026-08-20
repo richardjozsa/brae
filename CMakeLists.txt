@@ -664,6 +664,14 @@ add_test(NAME mrf_cuda_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/mixerVessel2D)
 set_tests_properties(mrf_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
 
+# SpalartAllmaras end to end on the _cpp path vs real OpenFOAM, with a laminar control. This is the case
+# that exposed nut's wall value being taken from the nut_ = nuTilda*fv1 assignment instead of
+# nutUSpaldingWallFunction -- see the script header for the three defects it cost.
+add_test(NAME sa_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(sa_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.

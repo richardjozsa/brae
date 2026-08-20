@@ -4,6 +4,7 @@
 #include "pbicgstab.cuh"
 #include "limitedSchemes_cpp.cuh"
 #include "bound_cpp.cuh"
+#include "nut_wall_function.cuh"
 
 #include <cmath>
 #include <cstdlib>
@@ -205,8 +206,13 @@ void correct(
     nuTilda.evaluateBoundary();
     bound(nuTilda, 0.0, m, g, patches);
 
-    // correctNut: nut = nuTilda*fv1, a FIELD assignment, so the boundary comes from nuTilda's and
-    // fv1's own boundary values rather than the adjacent cell's.
+    // correctNut: nut_ = nuTilda*fv1 is a FIELD assignment, so the boundary takes nuTilda's own boundary
+    // -- and then correctBoundaryConditions() runs, which is NOT a no-op. A wall carrying
+    // nutUSpaldingWallFunction OVERWRITES what the assignment just put there with the Spalding wall
+    // viscosity, and nuTilda is fixedValue ZERO at a wall, so the assignment alone leaves nut_wall = 0.
+    // OpenFOAM converges airFoil2D's wall nut to ~4.5e-03; taking the assignment's zero instead removes
+    // the wall's entire eddy viscosity, and with it the wall shear -- 25% of this case's momentum
+    // residual sat on those 78 faces.
     for (label c = 0; c < nC; ++c)
     {
         const scalar ch = nuTilda.internal[c] / nu;
@@ -222,6 +228,22 @@ void correct(
             const scalar ch = nb[i] / nu;
             const scalar chi3 = ch * ch * ch;
             vals[i] = nb[i] * (chi3 / (chi3 + Cv1cubed));
+        }
+
+        // correctBoundaryConditions(): a velocity-based wall function computes its own value.
+        if (nutField.boundary[pi]->isNutUSpalding())
+        {
+            const std::vector<scalar>& seed = nutField.boundary[pi]->value();
+            const std::vector<vector>& uw = U.boundary[pi]->value();
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                const label c = patches[pi].faceCells[i];
+                const scalar magUp = mag(U.internal[c] - uw[i]);
+                const scalar magGradU = magUp * patches[pi].deltaCoeffs[i];
+                const scalar yw = (patches[pi].deltaCoeffs[i] > 0.0) ? 1.0 / patches[pi].deltaCoeffs[i] : 0.0;
+                vals[i] = spaldingNutValue(magUp, magGradU, yw, nu, co.nutKappa, co.E,
+                                           i < static_cast<label>(seed.size()) ? seed[i] : 0.0);
+            }
         }
         nutField.boundary[pi]->setValue(vals);
     }

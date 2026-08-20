@@ -56,6 +56,12 @@ public:
     // contribute a wall constraint or an averaging weight. brae otherwise maps the type to zeroGradient
     // and would lose that distinction.
     virtual bool isTurbulenceWallFunction() const { return false; }
+    // Is this nut patch a nutUSpaldingWallFunction? It reads as `calculated` to the matrix -- the value is
+    // supplied, not derived from a gradient -- but a model's correctNut must NOT overwrite it with the
+    // nut_ = f(nuTilda) field assignment: correctBoundaryConditions() lets the wall function recompute it
+    // from Spalding's law, and for SpalartAllmaras (nuTilda fixedValue 0 at a wall) the assignment would
+    // otherwise leave the wall with NO eddy viscosity at all.
+    virtual bool isNutUSpalding() const { return false; }
     // wedge (axisymmetric constraint): the HALF-angle and FULL-angle rotation tensors, or null on every
     // other patch type. The device builder reads them to set the per-component valueFraction and to
     // recompute the rotated value each step.
@@ -543,6 +549,17 @@ public:
     int bcCategory() const override { return 2; }
 };
 
+// nutUSpaldingWallFunction: a `calculated` value as far as the matrix is concerned, but one the turbulence
+// model has to recompute from the velocity every correctNut rather than overwrite. Same shape as the
+// device's deviceBoundaryNutSpalding; this only makes the patch identifiable on the host.
+template <typename T>
+class NutUSpaldingPatchField : public CalculatedPatchField<T>
+{
+public:
+    using CalculatedPatchField<T>::CalculatedPatchField;
+    bool isNutUSpalding() const override { return true; }
+};
+
 // inletOutlet: flux-conditional mix (OF mixed, valueFraction = neg(phi), refValue = inletValue, refGrad = 0).
 // Per face: inflow (phi<0) -> fixedValue = inletValue; outflow (phi>=0) -> zeroGradient. The host evaluate()
 // does not see the flux; the DEVICE recomputes the per-face fixedValue|zeroGradient choice every iteration from
@@ -606,31 +623,45 @@ public:
         bool uniform,
         T uval,
         std::vector<T> vals,
-        bool velocitySign)
+        bool velocitySign,
+        // The freestream family (freestreamVelocity/freestreamPressure) is the one whose valueFraction
+        // brae actually maintains -- see evaluate() for why that gates the blend.
+        bool freestream = false)
         : ExtrapolatedValuePatchField<T>(p, uniform, uval, std::move(vals)),
-          velocitySign_(velocitySign), vf_(p.size, 0.5) {}
+          velocitySign_(velocitySign), freestream_(freestream), vf_(p.size, 0.5) {}
     bool fixesValue() const override { return true; }               // OF mixedFvPatchField::fixesValue() == true
     int  bcCategory() const override { return 5; }                  // device: mixed (per-face valueFraction blend)
 
-    // OF mixedFvPatchField::evaluate is a BLEND, not the refValue:
+    // OF mixedFvPatchField::evaluate -- a BLEND, not the refValue:
     //     value = lerp(patchInternalField + refGrad/deltaCoeffs, refValue, valueFraction)
-    // brae does NOT do that, and this is a LOCATED, UNFIXED defect rather than an oversight. Measured on
-    // airFoil2D, taking refValue outright puts the whole far field at freestreamValue (0) instead of the
-    // field OpenFOAM converges to -- its inlet p runs 0.74 to -1.77 across the patch -- and implementing
-    // the blend cut the pressure residual at OpenFOAM's own converged state by 17x, from 2.57e-01 to
-    // 1.49e-02 against OpenFOAM's 7.51e-05.
+    // Taking refValue outright puts a far-field patch at freestreamValue everywhere instead of the field
+    // OpenFOAM converges to; on airFoil2D its inlet p runs 0.74 to -1.77 across the patch, and the
+    // pressure residual at OpenFOAM's own converged state was 17x worse without this.
     //
-    // It is not applied because two other gated comparisons get WORSE, and both for the same reason: the
-    // blend is only as good as the valueFraction it blends with.
-    //   * mx_vs_openfoam -- this class also serves the `mixed` T patch basicThermo maps onto mixedEnergy,
-    //     which in OF overrides updateCoeffs() to rebuild refValue/refGrad/valueFraction in ENERGY space
-    //     from the thermo. brae has no such conversion, so the seeded vf is not the one OF blends with
-    //     (hotWall: OF 467.8 against a blended 367.9).
-    //   * restart_vs_openfoam -- at READ time no iteration has run, so vf is still the 0.5 seed while the
-    //     file's `value` already holds OpenFOAM's converged blend. Blending on the seed discards it
-    //     (p L2rel 4.8e-03 against a 1e-03 bound).
-    // Doing this properly means carrying the read `value` through construction AND giving mixedEnergy its
-    // updateCoeffs, which is its own piece of work. See tests/sa_cpp_vs_openfoam.sh for what it costs.
+    // GATED ON `freestream_`, and the reason is not caution. OF's evaluate calls updateCoeffs() FIRST, and
+    // the other shape this class serves -- the `mixed` T patch basicThermo maps onto mixedEnergy --
+    // overrides updateCoeffs to rebuild refValue/refGrad/valueFraction in ENERGY space from the thermo.
+    // brae carries no such conversion, so its seeded valueFraction is not the one OF blends with, and
+    // blending on it measurably disagrees (mx_vs_openfoam, hotWall: OF 467.8 against a blended 367.9).
+    // The freestream family is maintained -- updateMixedFreestream rewrites vf from the flow angle every
+    // iteration -- so the blend runs exactly where its inputs are real.
+    void evaluate(const std::vector<T>& internal) override
+    {
+        // OF's evaluate calls updateCoeffs() FIRST, and for this family updateCoeffs IS the flow-angle
+        // valueFraction -- so a blend is only defined once that has run. Until then (construction, and the
+        // evaluateBoundary that follows a field read) the value stands as read: on a restart the file's
+        // `value` is already OpenFOAM's converged blend, and re-blending it against the 0.5 seed threw it
+        // away (restart_vs_openfoam, p L2rel 4.8e-03 against a 1e-03 bound).
+        if (!freestream_ || !vfUpdated_ || internal.empty()) return;
+
+        const std::vector<T> pif = this->patchInternalField(internal);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            T inner = pif[i];
+            if (!refGrad_.empty()) inner = inner + refGrad_[i] * (1.0 / this->patch_.deltaCoeffs[i]);
+            this->value_[i] = inner * (1.0 - vf_[i]) + this->refValue(i) * vf_[i];
+        }
+    }
     const std::vector<scalar>* valueFractionPtr() const override { return &vf_; }
     // mixedEnergy / an external-convection wall carries refGradient beside refValue. Stored per face and
     // handed to DeviceBoundary::refGrad through the same hook fixedGradient uses (B5); the kernels apply
@@ -638,7 +669,12 @@ public:
     const std::vector<T>* refGradPtr() const override { return refGrad_.empty() ? nullptr : &refGrad_; }
     void setRefGrad(std::vector<T> g) { refGrad_ = std::move(g); }
     // A plain `mixed` patch STATES its valueFraction; only the freestream family recomputes it per step.
-    void setValueFraction(std::vector<scalar> f) { vf_ = std::move(f); }
+    // Recording that it HAS been recomputed is what licenses evaluate() to blend -- see there.
+    void setValueFraction(std::vector<scalar> f)
+    {
+        vf_ = std::move(f);
+        vfUpdated_ = true;
+    }
     bool mixedVelocitySign() const override { return velocitySign_; }
     // OF mixed coeffs with refGrad = 0 (host correctness; the device blends the same way in its kernels):
     std::vector<T> gradientInternalCoeffs() const override        // -vf*deltaCoeffs
@@ -671,6 +707,8 @@ public:
     }
 private:
     bool                velocitySign_;  // true: vf=0.5-0.5 U.n/|U| (velocity); false: 0.5+0.5 ... (pressure)
+    bool                freestream_;    // this class also serves the plain `mixed`/mixedEnergy shape
+    bool                vfUpdated_ = false;   // has a real valueFraction been computed yet?
     std::vector<scalar> vf_;            // per-face valueFraction (seed 0.5; device recomputes from the flow angle)
 
     std::vector<T> refGrad_;
@@ -952,10 +990,16 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<InletOutletPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues);
     // freestreamVelocity / freestreamPressure derive from mixedFvPatchField in OF -> CONTINUOUS Robin blend
     // vf = 0.5 -/+ 0.5*(U.n)/|U| (flow-angle, not the binary switch). The device recomputes vf each step.
+    // NOT seeded from the file's `value`, though OF's mixed constructor does keep it: doing that moved
+    // naca0012's compressible restart (restart_vs_openfoam, p 1e-03 -> 2.8e-03). The device path builds
+    // its boundary from this object and does not go through setValueFraction, so the two disagree about
+    // what value_ means there; that is its own piece of work, separate from the blend below.
     if (d.type == "freestreamVelocity")   // mixed, velocity sign (0.5 - 0.5 U.n/|U|)
-        return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues, true);
+        return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
+                                                    true, /*freestream*/true);
     if (d.type == "freestreamPressure")   // mixed, pressure sign (0.5 + 0.5 U.n/|U|)
-        return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues, false);
+        return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
+                                                    false, /*freestream*/true);
     // Plain `mixed` (Robin): refValue + refGradient + valueFraction, all given by the case. Unlike
     // freestream*/inletOutlet the valueFraction is FIXED, not recomputed from the flux, so the device does
     // not need a per-step update -- the seeded vf is the answer. This is the shape basicThermo maps a
@@ -1020,7 +1064,10 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
               "for the Jayatilleke port.");
     }
     if (d.type == "atmNutkWallFunction")  return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values); // atmospheric rough-wall nut (z0); device wall nut from deviceBoundaryNut with atmZ0>0
-    if (d.type == "nutUSpaldingWallFunction") return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values); // SA wall nut (value set by deviceBoundaryNutSpalding)
+    // SA wall nut. Device: deviceBoundaryNutSpalding. Host: the model's correctNut recomputes it -- see
+    // isNutUSpalding, and SpalartAllmaras_cpp.cu for what taking the field assignment there costs.
+    if (d.type == "nutUSpaldingWallFunction")
+        return std::make_unique<NutUSpaldingPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // nutLowReWallFunction: OF calcNut()=0 (resolved viscous sublayer). cf's nutkWallFunction already yields nut=0 for
     // yPlus<yPlusLam, so on the low-Re mesh this BC is used on it is the same; nutUBlendedWallFunction is the same
     // log-law wall-nut family as nutk. Both -> Calculated (device wall nut from deviceBoundaryNut). Validated vs OF.

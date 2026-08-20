@@ -59,6 +59,11 @@ Residuals simpleStep(
             Ub[pi] = f.U.boundary[pi]->value();
         }
         updateMixedFreestream(f.U.boundary, Ub, patches);
+        // p too: the momentum equation reads p's boundary VALUE through -fvc::grad(p), and in OpenFOAM
+        // that value is the blend the previous iteration's updateCoeffs left there. Seeding it on the
+        // first iteration as well is what makes iteration 1 comparable rather than a special case.
+        updateMixedFreestream(f.p.boundary, Ub, patches);
+        f.p.evaluateBoundary();
     }
 
     // ---- UEqn.H ----------------------------------------------------------------------------
