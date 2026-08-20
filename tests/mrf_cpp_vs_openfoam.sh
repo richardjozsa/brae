@@ -12,20 +12,23 @@
 # with it removed would be measuring nothing. Each hook was checked the same way while porting: removing
 # DDt alone costs 158x on the momentum residual and removing makeRelative 30x on pressure.
 #
-# THE BOUND IS LOOSE AND SAYS SO. brae reaches U 4.8e-02 / p 1.2e-02 / k 5.1e-02 / epsilon 1.7e-01
-# against OpenFOAM's converged fields -- an order of magnitude looser than what the kEpsilon and
-# kOmegaSST gates hold. Assembled at OpenFOAM's OWN converged state the initial residuals are 10x (U) and
-# 52x (p) its own, so there is a real discretisation difference still unaccounted for. It is NOT the
-# turbulence closure (which cannot affect the first iteration), NOT any single MRF hook (each is
-# load-bearing and directionally right), and NOT the internalFaces classification (this mesh cannot
-# discriminate it -- see below). The established CUDA solver is 20x on the same measurement, so the
-# rebuilt path is already twice as close; the bound is set where the rebuild actually is, and tightening
-# it is the open work.
+# WHAT THE BOUND CAUGHT. It was first set at 2e-01 because brae reached only U 4.8e-02 / p 1.2e-02 /
+# epsilon 1.7e-01, with initial residuals at OpenFOAM's own converged state 10x (U) and 52x (p) its own.
+# Localizing that residual put 93.8% of it on ONE patch -- the rotor wall -- and the cause was brae's
+# noSlip boundary condition, which returned a hardcoded ZERO from valueBoundaryCoeffs and re-zeroed its
+# value on every evaluate(). That bakes in "this wall is stationary", which is true of every case that
+# does not rotate and false of every case that does: MRF makes the rotor wall MOVE at Omega x r.
+# OpenFOAM's noSlip is a fixedValue whose coefficients come from the live patch value, so the assignment
+# sticks. Fixing it took U from 1.60e-04 to 1.53e-05 against OpenFOAM's 1.54e-05 -- 0.7% -- and the
+# rotor's share of the residual from 93.8% to 3.6%.
 #
-# WHAT THIS CASE CANNOT TEST: OpenFOAM's internalFaces are the faces with EITHER cell in the zone, not
-# both. Here the rotor zone is bounded by a PATCH rather than by internal faces, so both readings select
-# the same 3024 faces and measure identically. A case whose MRF zone meets the rest of the mesh across
-# internal faces is needed to gate that, and this one must not be read as having done so.
+# WHAT THIS CASE CANNOT TEST, and the precise reason: OpenFOAM's internalFaces are the faces with EITHER
+# cell in the zone, not both. This zone DOES have an internal interface -- 96 faces of the 3024, so the
+# two readings select different face sets -- yet they produce bit-identical answers, because those 96
+# faces carry a frame flux of 6.4e-13 against 1.5e-04 on the zone's interior faces. The interface is a
+# circle of constant radius about the rotation axis: its normals are radial, Omega x r is circumferential,
+# and the dot product vanishes by geometry. Gating OR-vs-AND therefore needs a zone whose boundary is NOT
+# a surface of revolution about its own axis, and this case must not be read as having done so.
 set -u
 SRC="${1:?case dir}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,10 +38,10 @@ SRC="$(cd "$SRC" && pwd)"
 [ -d "$SRC/500" ] || { echo "SKIP: no OpenFOAM converged state at $SRC/500"; exit 77; }
 
 echo "== MRF on: must match OpenFOAM =="
-MRF_CPP_TOL=2e-01 "$BIN" "$SRC" 0 500 500 || { echo "FAIL: the _cpp MRF did not match OpenFOAM end to end"; exit 1; }
+MRF_CPP_TOL=3e-02 "$BIN" "$SRC" 0 500 500 || { echo "FAIL: the _cpp MRF did not match OpenFOAM end to end"; exit 1; }
 
 echo "== control: MRF off must NOT match =="
-out=$(SIMPLE_MRF_OFF=1 MRF_CPP_TOL=2e-01 "$BIN" "$SRC" 0 500 500 2>&1)
+out=$(SIMPLE_MRF_OFF=1 MRF_CPP_TOL=3e-02 "$BIN" "$SRC" 0 500 500 2>&1)
 rc=$?
 echo "$out" | tail -2
 if [ $rc -eq 0 ]; then

@@ -367,29 +367,48 @@ private:
     std::vector<T> grad_;
 };
 
-// noSlip: fixed zero (velocity wall).
+// noSlip: a fixedValue velocity wall whose value STARTS at zero -- which is not the same thing as a
+// wall whose value IS zero, and the difference is not academic.
+//
+// OpenFOAM's noSlipFvPatchVectorField derives from fixedValueFvPatchVectorField with no updateCoeffs
+// override, and fixedValue's coefficients are built from *this -- the LIVE patch value. MRFZone::
+// correctBoundaryVelocity then writes Omega x (Cf - origin) onto exactly such patches with
+// `Ubf[patchi] == pfld`, and operator== assigns the underlying Field whatever assignable() says (that
+// is why OpenFOAM uses == there and not =). So under MRF the rotor wall genuinely MOVES.
+//
+// This class used to return a hardcoded zero from the base valueBoundaryCoeffs and re-zero value_ on
+// every evaluate(), i.e. it baked in "this wall is stationary". Correct for every case that does not
+// rotate, and wrong for every case that does: on mixerVessel2D it put 93.8% of the whole momentum
+// residual on the rotor patch. For a wall that never gets assigned, value_ stays zero and every
+// coefficient below is identical to what the hardcoded version produced.
 template <typename T>
 class NoSlipPatchField : public fvPatchField<T>
 {
 public:
-    bool assignable() const override { return false; }   // OF: noSlip derives from fixedValue in OpenFOAM
+    bool assignable() const override { return false; }   // OF fixedValueFvPatchField.H:169
     explicit NoSlipPatchField(const FvPatch& p) : fvPatchField<T>(p) {}
-    void evaluate(const std::vector<T>&) override
-    {
-        for (label i = 0; i < this->patch_.size; ++i)
-            this->value_[i] = T{};
-    }
+    // fixedValue's evaluate does NOT re-establish the value -- the field IS the value. Zeroing here
+    // would discard whatever correctBoundaryVelocity just wrote.
+    void evaluate(const std::vector<T>&) override {}
     bool fixesValue() const override { return true; }
     int  bcCategory() const override { return 1; }
 
-    std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs (refValue 0)
+    std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs
     {
         std::vector<T> r(this->patch_.size);
         for (label i = 0; i < this->patch_.size; ++i)
             r[i] = tUniform<T>(-this->patch_.deltaCoeffs[i]);
         return r;
     }
+    std::vector<T> gradientBoundaryCoeffs() const override        // deltaCoeffs * the LIVE value
+    {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+            r[i] = this->value_[i] * this->patch_.deltaCoeffs[i];
+        return r;
+    }
     std::vector<T> valueInternalCoeffs() const override { return std::vector<T>(this->patch_.size, T{}); } // 0
+    std::vector<T> valueBoundaryCoeffs() const override { return this->value_; }
 };
 
 // empty: 2D front/back. Value tracks the internal field (the out-of-plane component is zero,
