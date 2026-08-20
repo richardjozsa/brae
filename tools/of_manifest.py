@@ -333,9 +333,21 @@ COMPONENTS = {
                   "U 1.2e-02, p 3.3e-02, nuTilda 3.4e-01 against the _cpp's 6.2e-05 / 7.5e-05 / 1.3e-02, "
                   "so it is NOT gated yet. The SA terms themselves are NOT the cause: dumped cell by cell "
                   "(BRAE_DUMP_SA vs BRAE_DUMP_SA_CPP), gradNt2 is identical to 2.4e-11 and every formula "
-                  "matches; the divergence enters through Omega/Stilda (median per-cell 1.1e-03 but max "
-                  "8.4), which fw amplifies wherever Stilda is small -- the far field -- because "
-                  "r = nuTilda/(Stilda*(kappa*y)^2) is unbounded below in Stilda."),
+                  "matches; the divergence enters through Omega/Stilda. tests/gradu_probe.cu settles "
+                  "what that is: computing gradU on BOTH paths from ONE velocity field, with no "
+                  "iteration between them to drift, the device gaussGrad and the host one agree to "
+                  "2.5e-15 -- machine precision -- on the 143 cells where |Omega| > 10, and the "
+                  "per-cell relative difference then climbs monotonically as Omega falls (2.6e-03 "
+                  "above 0.1, 4.5 above 1e-03, 3.2e+02 below it, over 3302 far-field cells). The "
+                  "OPERATOR is therefore right and the MODEL is ill-conditioned there: SA divides by "
+                  "Stilda, which IS Omega plus a term that vanishes with it, so a difference far "
+                  "below the discretisation error becomes an O(100) difference in r and hence in fw. "
+                  "Closing the CUDA/_cpp gap therefore means making the two paths agree on the "
+                  "FREESTREAM BOUNDARY far more tightly than they do -- the same read-time mixed "
+                  "`value` work already deferred for the compressible path -- not fixing an SA term. "
+                  "The probe also shows the host is 22x CLOSER than the device to OpenFOAM's own "
+                  "written inlet value (1.19e-02 against 2.63e-01) once both have updated their "
+                  "valueFraction once."),
         dict(name="kEpsilon", of_symbol="Foam::RASModels::kEpsilon",
              of_file="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.C",
              classification="MODEL", status="REVALIDATE_EXISTING",
