@@ -220,6 +220,18 @@ void assembleUEqn(
     // ---- == fvOptions(U) ----------------------------------------------------------------------
     // BEFORE relax, as UEqn.H has it. The diagonal takes the isotropic part implicitly and the source
     // the anisotropic remainder, which is what keeps a 5e7 Darcy coefficient stable.
+    // + MRF.DDt(U), UEqn.H:8. Part of the LHS expression, so it is in the matrix BEFORE relax -- the
+    // same slot fvOptions' source occupies. EXPLICIT in U: OpenFOAM builds a volVectorField of
+    // Omega x U from the current U rather than an implicit Coriolis operator, so it is lagged like any
+    // other deferred term and lands as source -= V*(Omega x U).
+    if (in.mrf && !in.mrf->empty())
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            deviceMrfCoriolisZone(*in.mrf, dm.V, Ux, Uy, Uz, k, M.source[k]);
+        }
+    }
+
     if (in.porosity && in.porosity->active)
     {
         deviceFvoPorosityDiag(*in.porosity, in.nuLaminar, dm.V, Ux, Uy, Uz, M.diag);

@@ -67,6 +67,7 @@ Residuals simpleStep(
     mi.scheme       = in.scheme;
     mi.schemeCoeff  = in.schemeCoeff;
     mi.porosity     = in.porosity;
+    mi.mrf          = in.mrf;
     mi.nuLaminar    = in.nuLaminar;
     mi.correctedLaplacian = in.correctedLaplacian;
     mi.hasMRF = in.hasMRF;          mi.hasFvOptions = in.hasFvOptions;
@@ -126,6 +127,7 @@ Residuals simpleStep(
     pin.consistent = in.consistent;
     pin.correctedLaplacian = in.correctedLaplacian;
     pin.hasMRF = in.hasMRF;       pin.hasFvOptions = in.hasFvOptions;
+    pin.mrf = in.mrf;
     pin.adjustable = in.adjustable;
     pin.takeUAtBoundary = in.takeUAtBoundary;
 

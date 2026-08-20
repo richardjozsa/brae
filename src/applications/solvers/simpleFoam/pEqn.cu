@@ -1,5 +1,6 @@
 // CUDA implementation -- see pEqn.cuh for the provenance and the contract with the _cpp reference.
 #include "pEqn.cuh"
+#include <cstdlib>
 #include "device_blas.cuh"
 #include "device_simple.cuh"
 #include <cuda_runtime.h>
@@ -15,7 +16,7 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 void refuseUnsupported(const PressureInput& in)
 {
-    if (in.hasMRF)
+    if (in.hasMRF && !in.mrf)
         throw std::runtime_error(
             "pEqn(cuda): the case declares MRF, which pEqn.H applies via MRF.makeRelative(phiHbyA) "
             "(pEqn.H:5) and inside constrainPressure (pEqn.H:21). Not implemented on this path; refusing.");
@@ -150,6 +151,13 @@ void pressurePredictor(
     // ---- phiHbyA = fvc::flux(HbyA) -----------------------------------------------------------
     deviceVectorFlux(dm, st.HbyA[0], st.HbyA[1], st.HbyA[2], st.phiHbyAInt);
     deviceBoundaryFlux(dm, st.HbyAb[0], st.HbyAb[1], st.HbyAb[2], st.phiHbyABnd);
+
+    // ---- MRF.makeRelative(phiHbyA) -- pEqn.H:5, BEFORE adjustPhi -----------------------------
+    // adjustPhi balances the flux it is handed, so the frame flux has to be out of it first.
+    if (in.mrf && !in.mrf->empty())
+    {
+        deviceMrfMakeRelative(*in.mrf, st.phiHbyAInt, st.phiHbyABnd);
+    }
 
     // ---- adjustPhi(phiHbyA, U, p) ------------------------------------------------------------
     // Only when p needs a reference. Without it a closed-outlet case hands the singular pressure operator

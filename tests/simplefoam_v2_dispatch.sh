@@ -117,9 +117,19 @@ PY
         bad "$1: refused but did not name the reason ($3)"; sed -n '1,4p' "$d/log"; fi
 }
 
-try_refusal mrf \
-  "open(d+'/constant/MRFProperties','w').write('// test\n')" \
-  "MRFProperties"
+# MRF is IMPLEMENTED now (correctBoundaryVelocity, DDt, makeRelative), so declaring it is no longer a
+# refusal. What IS still one -- and is the real hazard -- is a zone naming a cellZone the mesh does
+# not carry: brae would find no cells, rotate nothing, and converge to a confidently wrong answer,
+# which is exactly the failure mode that shipped once before on the compressible path.
+try_refusal mrf_missing_zone \
+  "open(d+'/constant/MRFProperties','w').write('MRF1\n{\n    cellZone nosuchzone;\n    active yes;\n    origin (0 0 0);\n    axis (0 0 1);\n    omega 10;\n}\n')" \
+  "nosuchzone"
+
+# ...while an MRFProperties that declares no zones at all is ACCEPTED, because OpenFOAM applies
+# nothing for it either. Refusing here would block a case the reference solver runs.
+try_notice mrf_empty \
+  "open(d+'/constant/MRFProperties','w').write('// no zones\n')" \
+  "Time ="
 
 # An EMPTY fvOptions file is now correctly ACCEPTED -- the framework parses it, finds no options, and
 # there is nothing to apply. What is refused is an option whose TYPE is not ported: the framework being

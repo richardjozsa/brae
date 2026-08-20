@@ -17,6 +17,7 @@
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
+#include "device_MRF.cuh"
 #include "device_ldu.cuh"
 #include "UEqn.cuh"
 
@@ -25,6 +26,9 @@ namespace gpu {
 
 struct PressureInput
 {
+    // MRF.makeRelative(phiHbyA), pEqn.H:5 -- between fvc::flux(HbyA) and adjustPhi.
+    const std::vector<DeviceMRFZone>* mrf = nullptr;
+
     scalar relaxP = 1.0;
     label  pRefCell = -1;        // -1 => the case needs no reference; adjustPhi is then skipped
     scalar pRefValue = 0.0;

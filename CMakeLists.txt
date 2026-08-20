@@ -91,6 +91,7 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
     src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
+    src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
     src/applications/solvers/simpleFoam/UEqn.cu
@@ -655,6 +656,13 @@ add_test(NAME mrf_cpp_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/mixerVessel2D)
 set_tests_properties(mrf_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# The SAME case through the CUDA V2 driver, ported onto the _cpp path one hook at a time. Its control
+# removes constant/MRFProperties, which exercises the real dictionary path rather than a debug switch.
+add_test(NAME mrf_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mrf_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/mixerVessel2D)
+set_tests_properties(mrf_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
@@ -750,6 +758,10 @@ target_link_libraries(v2_envelope PRIVATE brae_core)
 add_executable(test_simple_mrf_cpp tests/test_simple_mrf_cpp.cu)
 target_include_directories(test_simple_mrf_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_mrf_cpp PRIVATE brae_core)
+
+add_executable(mrf_probe tests/mrf_probe.cu)
+target_include_directories(mrf_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(mrf_probe PRIVATE brae_core)
 add_test(NAME simple_turbulent_cpp
          COMMAND test_simple_turbulent_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 

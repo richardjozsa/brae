@@ -18,6 +18,9 @@
 #include "device_komega_sst.cuh"    // deviceKOmegaSSTCorrect building blocks + KOmegaSSTCoeffs
 #include "komega_sst_coeffs.cuh"
 #include "realizableKE_cpp.cuh"   // RealizableKECoeffs + readRealizableKECoeffs
+#include "MRF_cpp.cuh"
+#include "device_MRF.cuh"
+#include "mrf_read.cuh"          // readCellZones
 #include "fvOptions_cpp.cuh"       // the fvOptions framework + explicitPorositySource    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
 #include "cell_wall_dist.cuh"       // cellWallDist: kOmegaSST's F1/F2 need y at every CELL, not just walls
 #include "near_wall_dist.cuh"
@@ -335,10 +338,20 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
     const FoamDict turbProps  = readDict(caseDir + "/constant/turbulenceProperties");
 
     // --- things that change the equations and are not implemented ---------------------------
-    if (fileExists(caseDir + "/constant/MRFProperties"))
-        r.blockers.push_back("constant/MRFProperties is present. UEqn.H applies MRF via "
-                             "correctBoundaryVelocity(U) and MRF.DDt(U) (UEqn.H:3,8) and pEqn.H via "
-                             "makeRelative(phiHbyA) (pEqn.H:5); the rebuilt path implements none of it.");
+    // MRF is IMPLEMENTED: correctBoundaryVelocity (UEqn.H:3), DDt (UEqn.H:8) and makeRelative
+    // (pEqn.H:5), on the same cpu::MRF::Zone the _cpp reference is gated on. update() is moving-mesh
+    // only and inert on a steady static mesh; constrainPressure (pEqn.H:21) needs a fixedFluxPressure
+    // patch, which is refused on its own below. What IS still refused is a zone naming a cellZone the
+    // mesh does not carry -- silently applying no rotation there is the failure mode this guards.
+    for (const cpu::MRF::ZoneSpec& sp : cpu::MRF::readMRFProperties(caseDir + "/constant"))
+    {
+        const std::map<std::string, std::vector<label>> zoneMap =
+            readCellZones(caseDir + "/constant/polyMesh");
+        if (zoneMap.find(sp.cellZone) == zoneMap.end())
+            r.blockers.push_back("MRFProperties names cellZone `" + sp.cellZone +
+                                 "`, which is not in constant/polyMesh/cellZones. Running would apply "
+                                 "no rotation at all rather than the rotation the case asks for.");
+    }
     // fvOptions: the FRAMEWORK is ported (dictionary, cellSetOption selection, and `== fvOptions(U)`),
     // and so is explicitPorositySource/DarcyForchheimer. ofscan counts 46 fv::option implementations, so
     // the list is read and any option whose TYPE is not implemented is refused BY NAME -- reading the
@@ -564,6 +577,44 @@ int runSimpleFoamV2(const std::string& caseDir)
 
     const label endTime = static_cast<label>(controlDict.scalarOr("endTime", 100));
 
+    // ---- MRF ---------------------------------------------------------------------------------
+    // HOOK 1, UEqn.H:3 -- MRF.correctBoundaryVelocity(U). It runs HERE, before the device boundary is
+    // built, because the included patch faces take the frame velocity Omega x (Cf - origin) and that
+    // value has to be in the field the DeviceVectorBoundary is built from. brae's noSlip is a fixedValue
+    // whose matrix coefficients come from its live value, exactly as OpenFOAM's does, so the assignment
+    // reaches internalCoeffs/boundaryCoeffs.
+    std::vector<cpu::MRF::Zone>  mrfZones;
+    std::vector<DeviceMRFZone>   dMrf;
+    {
+        const std::vector<cpu::MRF::ZoneSpec> specs = cpu::MRF::readMRFProperties(caseDir + "/constant");
+        if (!specs.empty())
+        {
+            const std::map<std::string, std::vector<label>> zoneMap =
+                readCellZones(caseDir + "/constant/polyMesh");
+            for (const cpu::MRF::ZoneSpec& sp : specs)
+            {
+                const auto it = zoneMap.find(sp.cellZone);
+                if (it == zoneMap.end())
+                    throw std::runtime_error(
+                        "simpleFoam v2: MRF cellZone `" + sp.cellZone +
+                        "` is not in constant/polyMesh/cellZones.");
+                mrfZones.push_back(cpu::MRF::buildZone(sp, it->second, m, fvp));
+            }
+            cpu::MRF::correctBoundaryVelocity(f.U, mrfZones, fvp);
+            for (const cpu::MRF::Zone& z : mrfZones)
+            {
+                dMrf.push_back(buildDeviceMRFZone(z, m, g, fvp));
+            }
+            std::printf("  MRF: %zu zone(s)", mrfZones.size());
+            for (const cpu::MRF::Zone& z : mrfZones)
+            {
+                std::printf("   Omega (%.4g %.4g %.4g) over %zu cells",
+                            z.Omega.x, z.Omega.y, z.Omega.z, z.cells.size());
+            }
+            std::printf("\n");
+        }
+    }
+
     // ---- device state ------------------------------------------------------------------------
     const DeviceMesh dm = buildDeviceMesh(m, g, fvp);
     const DeviceVectorBoundary dbU = buildDeviceVectorBoundary(f.U, fvp, g);
@@ -681,6 +732,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     };
 
     StepInput in;
+    in.mrf = dMrf.empty() ? nullptr : &dMrf;
     if (ras)
     {
         // kOmegaSST's second transport variable is omega, and brae holds it in the same slot epsilon
