@@ -54,6 +54,7 @@ struct Option
     // A rotorDiskSource: implemented, but its parameters and geometry come from readFvOptions
     // and the mesh rather than from this list. Recorded so the driver knows one is present.
     bool rotorDisk = false;
+        bool actuationDisk = false;   // actuationDiskSource: built from readFvOptions, not from here
 
     std::string        name;
     std::string        type;

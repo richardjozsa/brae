@@ -91,6 +91,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/rotorDiskSource_cpp.cu
+    src/finiteVolume/cfdTools/general/fvOptions/actuationDiskSource_cpp.cu
     src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
@@ -127,6 +128,7 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
+    src/finiteVolume/cfdTools/fvOptions/actuation_disk.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_cache.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_coarse.cu
@@ -697,6 +699,22 @@ add_test(NAME rotordisk_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/rotorDisk)
 set_tests_properties(rotordisk_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# fv::actuationDiskSource (Froude) against the Uref/a/thrust OpenFOAM writes for itself, evaluated at the
+# field OpenFOAM computed that row FROM -- which makes it exact to 13 digits rather than approximate.
+add_test(NAME actuationdisk_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/actuationdisk_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/turbineSiting 600)
+set_tests_properties(actuationdisk_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# The SAME case through the CUDA V2 driver, end to end against real OpenFOAM at DEEP convergence. This is
+# what pins the SIGN the thrust is applied with, which the .dat oracle above cannot see: it compares
+# numbers computed from a given velocity, and those are identical whichever way the disk pushes. Its
+# control is the same run with the turbines removed.
+add_test(NAME turbinesiting_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turbinesiting_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/turbineSiting)
+set_tests_properties(turbinesiting_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.
@@ -812,6 +830,10 @@ target_link_libraries(test_celllimited_cpp PRIVATE brae_core)
 add_executable(rotordisk_probe tests/rotordisk_probe.cu)
 target_include_directories(rotordisk_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(rotordisk_probe PRIVATE brae_core)
+
+add_executable(actuationdisk_probe tests/actuationdisk_probe.cu)
+target_include_directories(actuationdisk_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(actuationdisk_probe PRIVATE brae_core)
 add_test(NAME celllimited_cpp
          COMMAND test_celllimited_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 

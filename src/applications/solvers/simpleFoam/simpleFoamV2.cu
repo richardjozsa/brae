@@ -422,7 +422,8 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
             const std::string bad = ol.firstUnsupported();
             if (!bad.empty())
                 r.blockers.push_back("fvOptions declares `" + bad + "`, which the rebuilt path does not "
-                                     "implement. Ported: explicitPorositySource/DarcyForchheimer, applied "
+                                     "implement. Ported: explicitPorositySource/DarcyForchheimer, "
+                                     "rotorDiskSource and actuationDiskSource, applied "
                                      "as UEqn.H's `== fvOptions(U)`. OpenFOAM registers 46 fv::option "
                                      "implementations (ofscan: impls option).");
         }
@@ -780,6 +781,11 @@ int runSimpleFoamV2(const std::string& caseDir)
     // how this path is checked against the oracle (tests/boundary_nut_vs_openfoam.sh).
     const bool printTurbResid = std::getenv("BRAE_TURB_RESID") != nullptr;
 
+    // atmNutkWallFunction parameters, read from 0/nut's own boundary below (OF decides the wall model
+    // per BC, not per turbulence model).
+    scalar atmZ0       = 0.0;
+    bool   atmBoundNut = true;
+
     // nut at boundary FACES, read twice per outer iteration: once as the k/epsilon patch diffusivity
     // (before the solve) and once for the momentum nuEff (after it). Declared out here with the rest of
     // the hook's state because the `if (ras)` block below only FILLS it -- the hook itself runs later.
@@ -804,7 +810,7 @@ int runSimpleFoamV2(const std::string& caseDir)
         // seeding from the adjacent cell instead leaves the wall 14% out at convergence.
         if (!saModel)
         deviceBoundaryNut(dbNut, bndIsWall, bndY, dK, dNut, nu, nb,
-                          keCoeffs, /*atmZ0*/0.0, /*atmBoundNut*/true,
+                          keCoeffs, atmZ0, atmBoundNut,
                           /*nuFace*/nullptr,
                           keNut ? &nutCalcMask : nullptr,
                           keNut ? &nutKb : nullptr,
@@ -905,7 +911,28 @@ int runSimpleFoamV2(const std::string& caseDir)
         kF   = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + firstField), fvp, nC);
         if (!saModel)
             epsF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + secondField), fvp, nC);
-        nutF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/nut"), fvp, nC);
+        const FieldData<scalar> nutFd = readField<scalar>(caseDir + "/" + startTime + "/nut");
+        nutF = buildField<scalar>(nutFd, fvp, nC);
+        // atmNutkWallFunction: the ATMOSPHERIC rough-wall nut, nut = nu*(y+*kappa/log(max(Edash,1+1e-4)) - 1)
+        // with Edash built from the surface roughness z0. Running it as the smooth nutkWallFunction is not a
+        // small error on a terrain case -- z0 IS the terrain, and the whole boundary layer hangs off it.
+        // brae carries ONE z0 for the solver, so two different roughnesses have to be refused rather than
+        // averaged into a landscape the case never described.
+        for (const PatchFieldData<scalar>& pb : nutFd.boundary)
+        {
+            if (pb.type != "atmNutkWallFunction") continue;
+            if (atmZ0 > 0 && std::fabs(pb.ablZ0 - atmZ0) > 1e-12*std::max<scalar>(atmZ0, pb.ablZ0))
+                throw std::runtime_error(
+                    "brae: 0/nut has atmNutkWallFunction patches with different roughness lengths (z0 "
+                    + std::to_string(atmZ0) + " and " + std::to_string(pb.ablZ0) + "). This driver applies "
+                    "one z0 to every rough wall, so running would give patches a roughness the case does "
+                    "not ask for.");
+            atmZ0       = pb.ablZ0;
+            atmBoundNut = pb.atmBoundNut;
+        }
+        if (atmZ0 > 0)
+            std::printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s)\n",
+                        (double)atmZ0, atmBoundNut ? "true" : "false");
         kF.evaluateBoundary();
         if (!saModel) epsF.evaluateBoundary();
         nutF.evaluateBoundary();
@@ -1154,7 +1181,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        /*linearUpwindK*/false, /*linearUpwindOmega*/false,
                                        /*nonOrth*/false, /*gradULimitK*/0.0, gsKE, gsKE,
                                        /*ami*/nullptr, /*cyc*/nullptr, /*gammaIntEff*/nullptr,
-                                       /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
+                                       /*nutWall*/0, atmZ0, atmBoundNut,
                                        /*kDdt*/{}, /*sDdt*/{},
                                        /*des*/false, /*iddes*/false, /*hmax*/nullptr, /*hwn*/nullptr,
                                        /*rho*/nullptr, /*muLam*/nullptr,
@@ -1172,7 +1199,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
                                   gsKE, gsKE,
                                   /*ami*/nullptr, /*cyc*/nullptr,
-                                  /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
+                                  /*nutWall*/0, atmZ0, atmBoundNut,
                                   /*kDdt*/{}, /*eDdt*/{},
                                   /*rho*/nullptr, /*muLam*/nullptr,
                                   /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
@@ -1293,7 +1320,7 @@ int runSimpleFoamV2(const std::string& caseDir)
         for (const auto& o : ol.options)
         {
             if (!o.active || !o.unsupported.empty()) continue;
-            if (o.rotorDisk) continue;   // built below, from readFvOptions + the mesh
+            if (o.rotorDisk || o.actuationDisk) continue;   // built below, from readFvOptions + the mesh
             const scalar offD = std::fabs(o.D.xy) + std::fabs(o.D.xz) + std::fabs(o.D.yz)
                               + std::fabs(o.D.yx) + std::fabs(o.D.zx) + std::fabs(o.D.zy);
             const scalar offF = std::fabs(o.F.xy) + std::fabs(o.F.xz) + std::fabs(o.F.yz)
@@ -1320,7 +1347,8 @@ int runSimpleFoamV2(const std::string& caseDir)
     // rotorDiskSource. The parameters come from readFvOptions (the same reader the shipped solver uses)
     // and the per-cell geometry from the mesh. The force itself is the blade-element calculation gated
     // against OpenFOAM's own reported drag/lift/AOA in tests/rotordisk_vs_openfoam.sh.
-    DeviceRotorDisk rotor;
+    DeviceRotorDisk     rotor;
+    DeviceActuationDisk actuationDisk;
     {
         std::map<std::string, std::vector<label>> rzones;
         {
@@ -1329,6 +1357,14 @@ int runSimpleFoamV2(const std::string& caseDir)
             if (a.good() || b.good()) rzones = readCellZones(caseDir + "/constant/polyMesh");
         }
         const FvOptionsData fvo = readFvOptions(caseDir, rzones, g.V(), nC, g.C());
+        // A source brae recognises by name but cannot apply here would otherwise run as if it were not
+        // in the case at all -- a turbine site with no turbines converges perfectly well.
+        if (!fvo.unsupported.empty())
+        {
+            std::string msg = "brae: fvOptions this driver cannot apply:";
+            for (const std::string& u : fvo.unsupported) msg += "\n  - " + u;
+            throw std::runtime_error(msg);
+        }
         if (fvo.rotor.active)
         {
             rotor = buildDeviceRotorDisk(fvo.rotor, g.C(), g.Sf(), m.owner(), m.neighbour(),
@@ -1336,8 +1372,19 @@ int runSimpleFoamV2(const std::string& caseDir)
             std::printf("  fvOptions rotorDisk: %d cells, rMax %.4g, omega %.4g rad/s, %d blades\n",
                         rotor.n, rotor.rMax, rotor.omega, (int)rotor.nBlades);
         }
+        if (fvo.adActive)
+        {
+            actuationDisk = buildDeviceActuationDisk(fvo, dm.V, nC);
+            for (std::size_t di = 0; di < actuationDisk.disks.size(); ++di)
+            {
+                const auto& d = actuationDisk.disks[di];
+                std::printf("  fvOptions actuationDisk %zu: area %.4g, a %.6g, disk volume %.6g, "
+                            "%d monitor cell(s)\n", di + 1, d.area, d.a, d.vtot, (int)d.nmon);
+            }
+        }
     }
-    in.rotor = rotor.active ? &rotor : nullptr;
+    in.rotor         = rotor.active ? &rotor : nullptr;
+    in.actuationDisk = actuationDisk.active ? &actuationDisk : nullptr;
 
     in.nuLaminar = nu;
 

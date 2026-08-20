@@ -33,6 +33,7 @@
 #include "device_boundary.cuh"
 #include "device_MRF.cuh"
 #include "rotor_disk.cuh"
+#include "actuation_disk.cuh"
 #include "device_ldu.cuh"
 #include "device_fvoptions.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
 #include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
@@ -98,6 +99,9 @@ struct MomentumInput
     // rotorDiskSource. OF addSup is `eqn -= force` with force PER VOLUME, and operator-= is
     // source += V*su, so the extensive source GAINS the raw force. See rotorDiskSource_cpp.cuh.
     const DeviceRotorDisk* rotor = nullptr;
+    // actuationDiskSource. OF writes the thrust straight into eqn.source() with `+=`, so unlike
+    // rotorDiskSource there is no fvMatrix operator between the model and the matrix.
+    const DeviceActuationDisk* actuationDisk = nullptr;
     // MRF.DDt(U), UEqn.H:8 -- the zones already resolved against the mesh and uploaded.
     const std::vector<DeviceMRFZone>* mrf = nullptr;
     scalar nuLaminar = 0.0;

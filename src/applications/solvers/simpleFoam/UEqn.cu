@@ -260,14 +260,25 @@ void assembleUEqn(
         }
     }
 
-    // == fvOptions(U): rotorDiskSource. OF's addSup divides the force by V and then `eqn -= force`
-    // ADDS V*force to the source, so the extensive source gains the raw blade-element force.
+    // == fvOptions(U): rotorDiskSource. Two operators, not one. addSup does `eqn -= force` with force
+    // PER VOLUME, and fvMatrix::operator-=(DimensionedField) is `source() += V*su`, so the OPTION
+    // matrix's source gains V*force. simpleFoam then writes `UEqn == fvOptions(U)`, and the free
+    // operator== is `UEqn - fvOptions(U)` -- so the MOMENTUM source LOSES it. The blade-element force is
+    // the force on the BLADE; what the fluid feels is the reaction, which is what that minus delivers.
     if (in.rotor && in.rotor->active)
     {
         DeviceBuffer<scalar> fx, fy, fz;
         deviceRotorForce(*in.rotor, dm.nCells, Ux, Uy, Uz, fx, fy, fz);
         DeviceBuffer<scalar>* fc[3] = {&fx, &fy, &fz};
-        for (int k = 0; k < 3; ++k) deviceAxpy(1.0, *fc[k], M.source[k]);
+        for (int k = 0; k < 3; ++k) deviceAxpy(-1.0, *fc[k], M.source[k]);
+    }
+
+    // == fvOptions(U): actuationDiskSource (Froude). Applied AFTER the rotor for no reason but order;
+    // the two sources simply superpose, as any number of turbines on one mesh do.
+    if (in.actuationDisk && in.actuationDisk->active)
+    {
+        DeviceBuffer<scalar>* src[3] = {&M.source[0], &M.source[1], &M.source[2]};
+        deviceActuationDiskAddSup(*in.actuationDisk, Ux, Uy, Uz, src);
     }
 
     if (in.porosity && in.porosity->active)

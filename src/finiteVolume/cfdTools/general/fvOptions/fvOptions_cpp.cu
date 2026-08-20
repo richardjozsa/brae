@@ -119,6 +119,17 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
             list.options.push_back(o);
             continue;
         }
+        // actuationDiskSource (Froude) is implemented (actuationDiskSource_cpp.cu + actuation_disk.cu,
+        // gated by tests/actuationdisk_vs_openfoam.sh against the Uref and thrust OpenFOAM writes for
+        // itself). Like the rotor, its parameters come from readFvOptions, which has the mesh; what is
+        // refused there -- variableScaling, a Function1 Cp/Ct -- reaches the driver as an unsupported
+        // entry rather than through this list.
+        if (o.type == "actuationDiskSource")
+        {
+            o.actuationDisk = true;
+            list.options.push_back(o);
+            continue;
+        }
         if (o.type != "explicitPorositySource")
         {
             o.unsupported = o.type.empty() ? std::string("(no type)") : o.type;

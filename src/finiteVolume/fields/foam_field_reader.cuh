@@ -105,6 +105,11 @@ struct PatchFieldData
     bool           valueUniform = false;
     T              uniformValue{};
     std::vector<T> values;
+    // uniformFixedValue's `uniformValue` PatchFunction1, kept in its OWN slot. It shares the `value`
+    // slot above only in the sense that OF writes both and they agree; brae must write it back because
+    // OF's PatchFunction1::New REQUIRES it -- an output missing it cannot be read by OpenFOAM at all.
+    bool           hasUniformFn1 = false;
+    T              uniformFn1Value{};
     // inletOutlet (and similar mixed BCs): the inflow value. Used as the device refValue.
     bool           hasInletValue   = false;
     bool           inletUniform    = false;
@@ -193,6 +198,26 @@ inline bool isFoamNumber(const std::string& t)
     if (t.empty()) return false;
     const char c = t[0];
     return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
+}
+
+// OF v2412 writes atmBoundaryLayer's Uref/Zref/z0/d as Function1 and flowDir/zDir as PatchFunction1,
+// so a field WRITTEN by OpenFOAM reads `flowDir constant (1 0 0);` where the tutorial's own
+// include/ABLConditions has the bare `flowDir (1 0 0);`. Both are the same entry: OF's Function1 parser
+// accepts a bare value as shorthand for `constant <v>`. Consume the keyword so the caller sees the value.
+// Anything else (table / polynomial / sine / coded) IS time-varying: name it so dispatch can refuse,
+// because reading past it would leave the caller's scalar/vector at its default and look like a run.
+inline bool takeConstantFunction1(TokenStream& ts, std::string& unsupported, const std::string& key)
+{
+    const std::string m = ts.peek();
+    if (m == "constant" || m == "uniform")
+    {
+        ts.next();
+        return true;
+    }
+    if (m == "(" || isFoamNumber(m)) return true;      // bare value: OF's own shorthand
+    unsupported = key + " " + m;
+    skipToSemicolon(ts, 0);
+    return false;
 }
 // OF Function1 accepts a BARE value as shorthand for `constant <v>`: `uniformValue (0 0 0);` and
 // `uniformValue 5;` are constants, not tables. brae required the keyword, so a bare vector was
@@ -358,6 +383,8 @@ inline FieldData<scalar> symmTensorComponent(const FieldData<symmTensor>& fd, in
         q.hasValue     = p.hasValue;
         q.valueUniform = p.valueUniform;
         q.uniformValue = comp(p.uniformValue, k);
+        q.hasUniformFn1   = p.hasUniformFn1;
+        q.uniformFn1Value = comp(p.uniformFn1Value, k);
         q.values.reserve(p.values.size());
         for (const symmTensor& t : p.values) q.values.push_back(comp(t, k));
         out.boundary.push_back(std::move(q));
@@ -412,19 +439,27 @@ inline FieldData<T> readField(const std::string& path)
                     // keys parse always; the generic-named ones (d/kappa/Cmu) only when this is an ABL entry.
                     else if (key == "Uref")
                     {
-                        p.ablUref = ts.nextScalar();
-                        ts.expect(";");
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            p.ablUref = ts.nextScalar();
+                            ts.expect(";");
+                        }
                     }
                     else if (key == "Zref")
                     {
-                        p.ablZref = ts.nextScalar();
-                        ts.expect(";");
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            p.ablZref = ts.nextScalar();
+                            ts.expect(";");
+                        }
                     }
                     else if (key == "z0")
                     {
-                        if (ts.peek() == "uniform" || ts.peek() == "constant") ts.next();
-                        p.ablZ0 = ts.nextScalar();
-                        ts.expect(";");
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            p.ablZ0 = ts.nextScalar();
+                            ts.expect(";");
+                        }
                     }
                     else if (key == "boundNut")   // atmNutkWallFunction: clamp nut>=0 (true/false)
                     {
@@ -434,18 +469,23 @@ inline FieldData<T> readField(const std::string& path)
                     }
                     else if (key == "flowDir" || key == "zDir")
                     {
-                        ts.expect("(");
-                        const vector v{ts.nextScalar(), ts.nextScalar(), ts.nextScalar()};
-                        ts.expect(")");
-                        ts.expect(";");
-                        if (key == "flowDir") p.ablFlowDir = v;
-                        else p.ablZDir = v;
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            ts.expect("(");
+                            const vector v{ts.nextScalar(), ts.nextScalar(), ts.nextScalar()};
+                            ts.expect(")");
+                            ts.expect(";");
+                            if (key == "flowDir") p.ablFlowDir = v;
+                            else p.ablZDir = v;
+                        }
                     }
                     else if (key == "d" && p.hasABL)
                     {
-                        if (ts.peek() == "uniform" || ts.peek() == "constant") ts.next();
-                        p.ablD = ts.nextScalar();
-                        ts.expect(";");
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            p.ablD = ts.nextScalar();
+                            ts.expect(";");
+                        }
                     }
                     else if ((key == "kappa" || key == "Cmu") && p.hasABL)
                     {
@@ -563,6 +603,8 @@ inline FieldData<T> readField(const std::string& path)
                             p.uniformValue = readFoamValue<T>(ts);
                             p.valueUniform = true;
                             p.hasValue = true;
+                            p.hasUniformFn1 = true;
+                            p.uniformFn1Value = p.uniformValue;
                         }
                         else if (m == "(" || isFoamNumber(m))
                         {
@@ -570,6 +612,8 @@ inline FieldData<T> readField(const std::string& path)
                             p.uniformValue = readBareFoamValue<T>(ts, m);
                             p.valueUniform = true;
                             p.hasValue = true;
+                            p.hasUniformFn1 = true;
+                            p.uniformFn1Value = p.uniformValue;
                         }
                         else   // table / polynomial / coded / expression: skip the entry, then REFUSE.
                         {

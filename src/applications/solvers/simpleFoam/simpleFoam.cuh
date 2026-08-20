@@ -36,6 +36,7 @@
 #include "device_boundary.cuh"
 #include "device_amg.cuh"
 #include "UEqn.cuh"
+#include "actuation_disk.cuh"
 #include "device_MRF.cuh"
 #include "pEqn.cuh"
 #include <functional>
@@ -103,6 +104,7 @@ struct StepInput
     scalar         schemeCoeff = 1.0;                 // the `k` of `limitedLinear k`
     const DevicePorosity* porosity = nullptr;         // explicitPorositySource/DarcyForchheimer
     const DeviceRotorDisk* rotor = nullptr;           // rotorDiskSource (Froude blade-element momentum)
+    const DeviceActuationDisk* actuationDisk = nullptr;   // actuationDiskSource (Froude actuator disk)
     // MRF zones, already resolved against the mesh and uploaded. Null with hasMRF set is a REFUSAL:
     // a case that declares MRF and gets none of it converges to a confidently wrong answer.
     const std::vector<DeviceMRFZone>* mrf = nullptr;

@@ -91,6 +91,42 @@ inline void writePatchEntry(
     // writing phi and a brae->brae restart was attempted at all. Same class as the `gradient` entry
     // above: an INPUT the solve does not change, so echo what was read. OF's own output writes the
     // Function1 in its "constant <v>" form.
+    // uniformFixedValue's `uniformValue` is a PatchFunction1 that OF's reader REQUIRES, exactly like the
+    // gradient above: without it PatchFunction1::New aborts with "Missing or invalid PatchFunction1
+    // entry: uniformValue", so brae's own output could be read back by neither OpenFOAM nor brae. It is
+    // an INPUT the solve does not change, so echo what was read, in the `constant <v>` form OF writes.
+    if (d.hasUniformFn1)
+    {
+        os << "        uniformValue    constant ";
+        formatFoamValue(os, d.uniformFn1Value);
+        os << ";\n";
+    }
+    // atmBoundaryLayerInlet{Velocity,K,Epsilon,Omega}: OF builds flowDir, zDir, Uref, Zref, z0 and d as
+    // Function1/PatchFunction1 and REQUIRES every one of them -- reading a field back without them aborts
+    // with "Missing or invalid Function1 entry: flowDir". The tutorial keeps them in an #include that the
+    // written field cannot refer to, so they are echoed inline, in the `constant <v>` form OF writes.
+    if (d.hasABL)
+    {
+        os << "        flowDir         constant ";
+        formatFoamValue(os, d.ablFlowDir);
+        os << ";\n        zDir            constant ";
+        formatFoamValue(os, d.ablZDir);
+        os << ";\n"
+           << "        Uref            constant " << d.ablUref << ";\n"
+           << "        Zref            constant " << d.ablZref << ";\n"
+           << "        z0              constant " << d.ablZ0   << ";\n"
+           << "        d               constant " << d.ablD    << ";\n"
+           << "        kappa           " << d.ablKappa << ";\n"
+           << "        Cmu             " << d.ablCmu   << ";\n";
+    }
+    // atmNutkWallFunction takes its roughness length as a PatchFunction1 that OF REQUIRES, and z0 IS the
+    // terrain: a field written without it cannot be read back, and a z0 quietly lost would turn a rough
+    // wall into a smooth one. `boundNut` is echoed because its default (true) is not what every case asks.
+    if (d.type == "atmNutkWallFunction")
+    {
+        os << "        z0              constant " << d.ablZ0 << ";\n"
+           << "        boundNut        " << (d.atmBoundNut ? "true" : "false") << ";\n";
+    }
     if (d.hasFlowRate)
     {
         os << "        " << (d.flowRateIsMass ? "massFlowRate" : "volumetricFlowRate")

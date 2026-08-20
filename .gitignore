@@ -13,6 +13,7 @@ validation/*
 !validation/cyclicWedge/
 !validation/airFoil2D/
 !validation/rotorDisk/
+!validation/turbineSiting/
 !validation/windAroundBuildingsBox/
 !validation/kEpsCase/
 !validation/mixerVessel2D/

@@ -905,6 +905,15 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "so the prescribed time variation would be lost. Replace p0 with a constant, or drive the "
             "case at fixed total pressure.");
     }
+    if (d.hasABL && !d.unsupportedFunction1.empty())
+    {
+        // A time-varying atmBoundaryLayer entry (a wind rose, a ramped Uref). Reading past it would leave
+        // brae on the DEFAULT for that parameter -- a silently different inlet profile, not a failure.
+        throw std::runtime_error(
+            "brae: patch " + p.name + " has " + d.type + " with a non-constant Function1 entry ('"
+            + d.unsupportedFunction1 + "'). brae evaluates only `constant`/`uniform` Function1 entries, "
+            "so the prescribed variation would be lost. Replace it with a constant.");
+    }
     if (d.type == "uniformFixedValue" && !d.unsupportedFunction1.empty())
     {
         // A non-constant uniformValue. Refusing rather than falling back to whatever `value` happens to
@@ -1135,11 +1144,17 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
                 fh.z /= fm;
             }
             const vector zh = d.ablZDir;
+            // OF measures the profile from the PATCH's own lowest point, not from z = 0:
+            //   Un = (Ustar/kappa)*log(((zDir & Cf) - groundMin - d + z0)/z0),  groundMin = zDir & ppMin
+            // (atmBoundaryLayer.C:218-224). turbineSiting's terrain sits near z = 1000 m, so leaving
+            // groundMin out replaces the boundary layer with the logarithm of the altitude -- a ~40%
+            // error in the inlet velocity that still converges to a plausible-looking wind field.
+            const scalar groundMin = p.ppMin.x*zh.x + p.ppMin.y*zh.y + p.ppMin.z*zh.z;
             std::vector<vector> vals(p.size);
             for (label i = 0; i < p.size; ++i)
             {
                 const vector& c = p.Cf[i];
-                scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - d.ablD;
+                scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - groundMin - d.ablD;
                 if (zr < 0) zr = 0;
                 const scalar Um = (Ustar / kap) * std::log((zr + z0) / z0);
                 vals[i] = vector{fh.x*Um, fh.y*Um, fh.z*Um};
@@ -1156,11 +1171,13 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             const scalar Ustar = kap * std::fabs(d.ablUref) / std::log((d.ablZref + z0) / z0);
             const vector zh = d.ablZDir;
             const bool isK = (d.type == "atmBoundaryLayerInletK"), isEps = (d.type == "atmBoundaryLayerInletEpsilon");
+            // Same origin as the velocity above: zDir & boundBox(patch points).min().
+            const scalar groundMin = p.ppMin.x*zh.x + p.ppMin.y*zh.y + p.ppMin.z*zh.z;
             std::vector<scalar> vals(p.size);
             for (label i = 0; i < p.size; ++i)
             {
                 const vector& c = p.Cf[i];
-                scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - d.ablD;
+                scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - groundMin - d.ablD;
                 if (zr < 0) zr = 0;
                 vals[i] = isK   ? Ustar*Ustar / std::sqrt(Cmu)
                         : isEps ? Ustar*Ustar*Ustar / (kap * (zr + z0))

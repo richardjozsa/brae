@@ -71,6 +71,7 @@ Residuals simpleStep(
     mi.gradULimitK  = in.gradULimitK;
     mi.snGradLimitCoeff = in.snGradLimitCoeff;
     mi.rotor        = in.rotor;
+    mi.actuationDisk = in.actuationDisk;
     mi.nuLaminar    = in.nuLaminar;
     mi.correctedLaplacian = in.correctedLaplacian;
     mi.hasMRF = in.hasMRF;          mi.hasFvOptions = in.hasFvOptions;
