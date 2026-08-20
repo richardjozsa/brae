@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 
 namespace brae {
 namespace cpu {
@@ -155,6 +156,31 @@ void correct(
         for (label i = 0; i < patches[pi].size; ++i)
         {
             Df.boundary[pi][i] = (ntB[pi][i] + nu) / co.sigmaNut;
+        }
+    }
+
+    // Cell-level term dump, same columns as the device's BRAE_DUMP_SA, so the two paths can be diffed
+    // term by term rather than argued about.
+    if (const char* dp = std::getenv("BRAE_DUMP_SA_CPP"))
+    {
+        static bool dumped = false;
+        if (!dumped)
+        {
+            dumped = true;
+            std::FILE* fp = std::fopen(dp, "w");
+            std::fprintf(fp, "cell,nuTilda,y,Omega,Stilda,fw,gradNt2,P,D,nut\n");
+            for (label c = 0; c < nC; ++c)
+            {
+                const scalar Om = omegaOf(gradU[c]);
+                const scalar y2 = (y[c] * y[c] > 1e-300) ? y[c] * y[c] : 1e-300;
+                const scalar g2 = magSqr(gradNuTilda[c]);
+                const scalar P = co.Cb1 * Stilda[c] * nuTilda.internal[c] + (co.Cb2 / co.sigmaNut) * g2;
+                const scalar D = Cw1 * fw[c] * nuTilda.internal[c] / y2;
+                std::fprintf(fp, "%d,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e,%.10e\n",
+                             static_cast<int>(c), nuTilda.internal[c], y[c], Om, Stilda[c], fw[c],
+                             g2, P, D, nuTilda.internal[c] * fv1[c]);
+            }
+            std::fclose(fp);
         }
     }
 

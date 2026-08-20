@@ -18,6 +18,8 @@
 #include "device_komega_sst.cuh"    // deviceKOmegaSSTCorrect building blocks + KOmegaSSTCoeffs
 #include "komega_sst_coeffs.cuh"
 #include "realizableKE_cpp.cuh"   // RealizableKECoeffs + readRealizableKECoeffs
+#include "SpalartAllmaras_cpp.cuh"
+#include "spalart_coeffs.cuh"
 #include "MRF_cpp.cuh"
 #include "device_MRF.cuh"
 #include "mrf_read.cuh"          // readCellZones
@@ -440,10 +442,11 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE")
+            if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE"
+                && model != "SpalartAllmaras")
                 r.blockers.push_back("RASModel is `" + model + "`; the rebuilt path wires kEpsilon, "
-                                     "realizableKE and kOmegaSST only. OpenFOAM registers 26 "
-                                     "incompressible turbulence models (ofscan: impls "
+                                     "realizableKE, kOmegaSST and SpalartAllmaras only. OpenFOAM "
+                                     "registers 26 incompressible turbulence models (ofscan: impls "
                                      "incompressible::turbulenceModel).");
         }
         else if (simType != "laminar")
@@ -456,19 +459,31 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         {
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-            const std::string second = (model == "kOmegaSST") ? "omega" : "epsilon";
-            for (const std::string& key : {std::string("div(phi,k)"), "div(phi," + second + ")"})
+            // SpalartAllmaras transports nuTilda and names no k or epsilon entry at all.
+            std::vector<std::string> keys;
+            if (model == "SpalartAllmaras")
+            {
+                keys.push_back("div(phi,nuTilda)");
+            }
+            else
+            {
+                const std::string second = (model == "kOmegaSST") ? "omega" : "epsilon";
+                keys.push_back("div(phi,k)");
+                keys.push_back("div(phi," + second + ")");
+            }
+            for (const std::string& key : keys)
             {
                 const TurbDivScheme ts = divTurbScheme(caseDir, key);
                 // An EMPTY scheme word means the case has no such entry and none was inherited -- a
                 // SpalartAllmaras case transports nuTilda and never names div(phi,k). Refusing on that
                 // would be refusing a field the model does not solve.
                 if (ts.found && !ts.scheme.empty()
-                    && ts.scheme != "upwind" && ts.scheme != "limitedLinear")
+                    && ts.scheme != "upwind" && ts.scheme != "limitedLinear"
+                    && ts.scheme != "linearUpwind")
                     r.blockers.push_back("`" + key + "` is `" + ts.scheme + "`; the rebuilt turbulence "
-                                         "transport implements `upwind` and `limitedLinear` only. "
-                                         "Running a different scheme's matrix under this name would be "
-                                         "wrong, not merely slower.");
+                                         "transport implements `upwind`, `limitedLinear` and "
+                                         "`linearUpwind` only. Running a different scheme's matrix under "
+                                         "this name would be wrong, not merely slower.");
             }
         }
     }
@@ -617,8 +632,16 @@ int runSimpleFoamV2(const std::string& caseDir)
 
     // ---- device state ------------------------------------------------------------------------
     const DeviceMesh dm = buildDeviceMesh(m, g, fvp);
-    const DeviceVectorBoundary dbU = buildDeviceVectorBoundary(f.U, fvp, g);
-    const DeviceBoundary dbP = buildDeviceBoundary(f.p, fvp, g);
+    // NOT const: the freestream family's per-face valueFraction is recomputed every iteration from the
+    // flow angle, which writes into these (deviceUpdateMixedFreestream).
+    DeviceVectorBoundary dbU = buildDeviceVectorBoundary(f.U, fvp, g);
+    DeviceBoundary dbP = buildDeviceBoundary(f.p, fvp, g);
+    // Does any patch actually carry a mixed BC? Only then is the per-step update worth running.
+    bool hasMixedBC = false;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (f.U.boundary[pi]->bcCategory() == 5 || f.p.boundary[pi]->bcCategory() == 5) hasMixedBC = true;
+    }
 
     SolverFields gf;
     {
@@ -683,8 +706,19 @@ int runSimpleFoamV2(const std::string& caseDir)
     // div(phi,k) / div(phi,<second>): scheme, its coefficient as the device's twoByk, and `bounded`.
     bool   limitedK = false, limitedEps = false;
     bool   boundedK = false, boundedEps = false;
+    // `Gauss linearUpwind grad(<var>)` on the turbulence scalar: upwind's MATRIX plus a deferred gradient
+    // correction. Module 2 reads it; declared here with the rest of the scheme state.
+    bool   linearUpwindK = false, linearUpwindEps = false;
     scalar twoBykK = 2.0, twoBykEps = 2.0;
     bool   sstModel = false;
+    // SpalartAllmaras transports ONE scalar, nuTilda, and rides the k slot; the epsilon slot is unused.
+    bool   saModel = false;
+    cpu::SA::Coeffs saCoeffs;
+    // nutUSpaldingWallFunction faces, and their wall distance. See where they are built for why the mask
+    // is keyed off nut's BC rather than the patch type.
+    bool   hasSpaldingWall = false;
+    DeviceBuffer<label>  spaldingIsWall;
+    DeviceBuffer<scalar> spaldingY;
     std::string secondField = "epsilon";
     KOmegaSSTCoeffs sstCoeffs;
     KEpsilonCoeffs  keCoeffs;
@@ -714,6 +748,20 @@ int runSimpleFoamV2(const std::string& caseDir)
                           keNut ? &nutCalcMask : nullptr,
                           keNut ? &nutKb : nullptr,
                           keNut ? &nutEb : nullptr);
+
+        // SpalartAllmaras: correctNut writes nut_ = nuTilda*fv1 as a FIELD ASSIGNMENT, and nuTilda is
+        // fixedValue ZERO at a wall -- so the assignment leaves the wall with NO eddy viscosity. OF then
+        // runs correctBoundaryConditions(), and nutUSpaldingWallFunction overwrites that from Spalding's
+        // law (~4.5e-03 on airFoil2D). Measured on the host reference, taking the assignment instead cost
+        // 268x on U, 598x on p and 35x on nuTilda end to end.
+        if (saModel && hasSpaldingWall)
+        {
+            SpalartAllmarasCoeffs dsaW;
+            dsaW.kappa = saCoeffs.nutKappa;
+            dsaW.E     = saCoeffs.E;
+            deviceBoundaryNutSpalding(dbU, spaldingIsWall, spaldingY, gf.Ux, gf.Uy, gf.Uz,
+                                      dNut, nu, dsaW, nb);
+        }
 
         // kOmegaSST's `calculated` patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
         // expression from kEpsilon's Cmu*k_b^2/eps_b, and one that needs the BOUNDARY F2 and S2 (hence
@@ -752,16 +800,30 @@ int runSimpleFoamV2(const std::string& caseDir)
             keCoeffs.sigmaK = rc.sigmak;  keCoeffs.sigmaEps = rc.sigmaEps;
             keCoeffs.kappa = rc.kappa;  keCoeffs.E = rc.E;
         }
-        secondField = sstModel ? "omega" : "epsilon";
-        kF   = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/k"), fvp, nC);
-        epsF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + secondField), fvp, nC);
-        nutF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/nut"), fvp, nC);
-        kF.evaluateBoundary(); epsF.evaluateBoundary(); nutF.evaluateBoundary();
+        saModel = rasDict && rasDict->wordOr("RASModel", "") == "SpalartAllmaras";
+        if (saModel) cpu::SA::readCoeffs(rasDict, saCoeffs);
 
-        dK.copyFrom(kF.internal); dEps.copyFrom(epsF.internal); dNut.copyFrom(nutF.internal);
+        // SpalartAllmaras has no k and no epsilon: nuTilda is the whole model, and it rides the k slot
+        // exactly as it does in the _cpp reference. Reading a `k` that the case does not ship would fail
+        // before the model ever ran.
+        secondField = sstModel ? "omega" : "epsilon";
+        const std::string firstField = saModel ? "nuTilda" : "k";
+        kF   = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + firstField), fvp, nC);
+        if (!saModel)
+            epsF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + secondField), fvp, nC);
+        nutF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/nut"), fvp, nC);
+        kF.evaluateBoundary();
+        if (!saModel) epsF.evaluateBoundary();
+        nutF.evaluateBoundary();
+
+        dK.copyFrom(kF.internal); dNut.copyFrom(nutF.internal);
         dbK   = buildDeviceBoundary(kF,   fvp, g);
-        dbEps = buildDeviceBoundary(epsF, fvp, g);
         dbNut = buildDeviceBoundary(nutF, fvp, g);
+        if (!saModel)
+        {
+            dEps.copyFrom(epsF.internal);
+            dbEps = buildDeviceBoundary(epsF, fvp, g);
+        }
 
         // OF fills nut by FIELD ASSIGNMENT (nut_ = Cmu*sqr(k_)/epsilon_), which writes the BOUNDARY from
         // the boundary k and epsilon; correctBoundaryConditions() then leaves a `calculated` patch alone.
@@ -803,6 +865,8 @@ int runSimpleFoamV2(const std::string& caseDir)
             dY.copyFrom(cellWallDist(m, g, fvp));
             readKOmegaSSTCoeffs(turbProps.subDict("RAS"), sstCoeffs);
         }
+        // SA needs the same CELL wall distance: dTilda is y everywhere, not only near the wall.
+        if (saModel) dY.copyFrom(cellWallDist(m, g, fvp));
 
         {
             const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
@@ -822,7 +886,10 @@ int runSimpleFoamV2(const std::string& caseDir)
                 // That was a real defect, but it is NOT the whole of the 50% simpleCar disagreement: with
                 // it fixed that case's epsilon residual is still 127x OpenFOAM's, and 76% of what remains
                 // now sits in the INTERIOR, so the rest of the cause is not a boundary treatment at all.
-                const bool isWall = epsF.boundary[pi]->isTurbulenceWallFunction();
+                // SpalartAllmaras has no epsilon field and no epsilon wall function: the wall treatment
+                // it needs is on nut (nutUSpaldingWallFunction), not on the transported scalar, so the
+                // epsilon-wall mask is simply empty here.
+                const bool isWall = !saModel && epsF.boundary[pi]->isTurbulenceWallFunction();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     isW.push_back(isWall ? 1 : 0);
@@ -830,6 +897,31 @@ int runSimpleFoamV2(const std::string& caseDir)
                 }
             }
             bndIsWall.copyFrom(isW);
+
+            // SpalartAllmaras puts its wall treatment on NUT, not on the transported scalar: a wall
+            // carrying nutUSpaldingWallFunction recomputes nut from Spalding's law every correctNut.
+            // Keyed off nut's own BC, exactly as the host reference is.
+            if (saModel)
+            {
+                std::vector<label> spW;
+                std::vector<scalar> spY;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    const bool sp = nutF.boundary[pi]->isNutUSpalding();
+                    if (sp) hasSpaldingWall = true;
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                    {
+                        spW.push_back(sp ? 1 : 0);
+                        spY.push_back(sp ? yW[pi][i] : 0.0);
+                    }
+                }
+                if (hasSpaldingWall)
+                {
+                    spaldingIsWall.copyFrom(spW);
+                    spaldingY.copyFrom(spY);
+                }
+            }
             bndY.copyFrom(yv);
         }
 
@@ -844,18 +936,29 @@ int runSimpleFoamV2(const std::string& caseDir)
         // refused anything but upwind and limitedLinear. limitedLinear's device form takes
         // twoByk = 2/coeff, and reduces to upwind at limiter 0, so upwind stays bit-identical.
         {
-            const TurbDivScheme tk = divTurbScheme(caseDir, "div(phi,k)");
-            const TurbDivScheme te = divTurbScheme(caseDir, "div(phi," + secondField + ")");
+            const TurbDivScheme tk =
+                divTurbScheme(caseDir, saModel ? "div(phi,nuTilda)" : "div(phi,k)");
+            const TurbDivScheme te = saModel ? TurbDivScheme{}
+                                             : divTurbScheme(caseDir, "div(phi," + secondField + ")");
             limitedK    = (tk.scheme == "limitedLinear");
             limitedEps  = (te.scheme == "limitedLinear");
+            // linearUpwind keeps upwind's matrix and adds a deferred gradient correction, so it is a
+            // separate flag rather than another value of the same one.
+            linearUpwindK   = (tk.scheme == "linearUpwind");
+            linearUpwindEps = (te.scheme == "linearUpwind");
             twoBykK     = 2.0 / std::max(tk.coeff, static_cast<scalar>(1e-15));
             twoBykEps   = 2.0 / std::max(te.coeff, static_cast<scalar>(1e-15));
             boundedK    = tk.bounded;
             boundedEps  = te.bounded;
-            std::printf("  div(phi,k): %s%s   div(phi,%s): %s%s\n",
-                        tk.bounded ? "bounded " : "", tk.scheme.empty() ? "upwind" : tk.scheme.c_str(),
-                        secondField.c_str(),
-                        te.bounded ? "bounded " : "", te.scheme.empty() ? "upwind" : te.scheme.c_str());
+            if (saModel)
+                std::printf("  div(phi,nuTilda): %s%s\n",
+                            tk.bounded ? "bounded " : "",
+                            tk.scheme.empty() ? "upwind" : tk.scheme.c_str());
+            else
+                std::printf("  div(phi,k): %s%s   div(phi,%s): %s%s\n",
+                            tk.bounded ? "bounded " : "", tk.scheme.empty() ? "upwind" : tk.scheme.c_str(),
+                            secondField.c_str(),
+                            te.bounded ? "bounded " : "", te.scheme.empty() ? "upwind" : te.scheme.c_str());
         }
 
         // Seed nuEff from the nut just read, so iteration 1 already uses it.
@@ -890,7 +993,29 @@ int runSimpleFoamV2(const std::string& caseDir)
             // outer iteration while the case asks for 1e-05 / relTol 0.1 / symGaussSeidel. Measured: the
             // turbulence hook was 168 ms of a ~300 ms outer iteration on 440k cells -- 56% of the run --
             // and almost none of that was the nuEff host copy (6 ms); it was over-solving these two.
-            if (sstModel)
+            if (saModel)
+            {
+                // SpalartAllmarasBase::correct(): chi/fv1/fv2/ft2 -> Stilda -> the nuTilda transport
+                // (div - laplacian(DnuTildaEff) - Cb2/sigmaNut*magSqr(grad) == Cb1*Stilda*nuTilda
+                // - Sp(Cw1*fw*nuTilda/d^2)) -> bound(nuTilda, 0) -> correctNut. nuTilda rides dK.
+                SpalartAllmarasCoeffs dsa;
+                dsa.sigmaNut = saCoeffs.sigmaNut;
+                dsa.kappa    = saCoeffs.kappa;
+                dsa.Cb1      = saCoeffs.Cb1;
+                dsa.Cb2      = saCoeffs.Cb2;
+                dsa.Cw2      = saCoeffs.Cw2;
+                dsa.Cw3      = saCoeffs.Cw3;
+                dsa.Cv1      = saCoeffs.Cv1;
+                dsa.Cs       = saCoeffs.Cs;
+                dsa.E        = saCoeffs.E;
+                deviceSpalartAllmarasCorrect(dm, dbU, dbK, gf.Ux, gf.Uy, gf.Uz,
+                                             dK, dNut, dY, gf.phiInt, gf.phiBnd,
+                                             nu, relaxK, tolKE,
+                                             boundedK, limitedK, twoBykK,
+                                             dsa, relTolKE, /*checkEvery*/1,
+                                             linearUpwindK, /*nonOrth*/false, gsKE);
+            }
+            else if (sstModel)
                 // Mirrors kOmegaSSTBase::correct(): GbyNu0 -> F1/F2/CDkOmega/S2 -> omega eqn (loose solve,
                 // omega-wall setValues) -> bound -> k eqn -> bound -> correctNut (Bradshaw limiter).
                 deviceKOmegaSSTCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
@@ -1110,6 +1235,28 @@ int runSimpleFoamV2(const std::string& caseDir)
     while (ctl.loop(iter + 1, endTime, residuals))
     {
         ++iter;
+        // inletOutlet: resolve each face to fixedValue|zeroGradient from the PREVIOUS iteration's
+        // boundary flux, as OF's updateCoeffs does. The rebuilt driver did NONE of this -- the mask was
+        // built once and never consulted -- so an inletOutlet outlet stayed pinned at its inletValue with
+        // full convection and laplacian coupling where OF switches to zeroGradient on outflow. On
+        // airFoil2D that is nuTilda's whole far field (`freestream` derives from inletOutlet), and the
+        // run diverged to nuTilda ~1e+36 while residualControl still reported convergence.
+        deviceUpdateInletOutlet(dbU, gf.phiBnd);
+        deviceUpdateInletOutlet(dbP, gf.phiBnd);
+        if (ras)
+        {
+            deviceUpdateInletOutlet(dbK, gf.phiBnd);
+            if (!saModel) deviceUpdateInletOutlet(dbEps, gf.phiBnd);
+        }
+
+        // OF freestreamVelocity/freestreamPressure updateCoeffs: valueFraction = 0.5 -/+ 0.5*(U.n)/|U|,
+        // rebuilt from the (lagged) flow angle every iteration. Leaving it at the 0.5 seed makes every
+        // far-field face a half-and-half blend whether it is inflow or outflow; on airFoil2D, whose whole
+        // far field is freestream, that and the mixed evaluate() blend were worth 372x -> 47x on the
+        // momentum residual and 3551x -> 136x on pressure.
+        if (hasMixedBC)
+            deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr);
+
         residuals = simpleStep(gf, ws, dm, dbU, dbP, in);
         std::printf("Time = %d   U initial residual = %.6e   p initial residual = %.6e\n",
                     static_cast<int>(iter),
@@ -1140,13 +1287,17 @@ int runSimpleFoamV2(const std::string& caseDir)
         writeVolField<vector>(src + "/U", outDir + "/U", UOut, fvp);
         if (ras)
         {
-            writeVolField<scalar>(src + "/k",       outDir + "/k",       dK.host(),   fvp);
-            writeVolField<scalar>(src + "/" + secondField, outDir + "/" + secondField, dEps.host(), fvp);
+            // SpalartAllmaras transports nuTilda in the k slot and has no second field.
+            const std::string first = saModel ? "nuTilda" : "k";
+            writeVolField<scalar>(src + "/" + first, outDir + "/" + first, dK.host(), fvp);
+            if (!saModel)
+                writeVolField<scalar>(src + "/" + secondField, outDir + "/" + secondField, dEps.host(), fvp);
             writeVolField<scalar>(src + "/nut",     outDir + "/nut",     dNut.host(), fvp);
         }
         // The second field is `omega` under kOmegaSST; the file was always written under its right name,
         // but this line claimed `epsilon` for every model.
-        const std::string turbFields = ras ? (",k," + secondField + ",nut") : std::string();
+        const std::string turbFields =
+            ras ? (saModel ? std::string(",nuTilda,nut") : ",k," + secondField + ",nut") : std::string();
         std::printf("written %s/{U,p%s}\n", outDir.c_str(), turbFields.c_str());
     }
     return static_cast<int>(iter);

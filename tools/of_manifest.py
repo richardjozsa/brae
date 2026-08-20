@@ -323,7 +323,19 @@ COMPONENTS = {
                   "each by measurement: the coefficients (OpenFOAM prints them, all match, ft2 inactive); "
                   "Omega = sqrt(2)*mag(skew(gradU)) on a unit shear; the wall distance (meshWave against "
                   "brute force, 1.0e-04 mean over 10720 cells); and the linearUpwind correction's sign "
-                  "(upwind 0.162, brae 0.250, flipped 1.72, OpenFOAM 0.380)."),
+                  "(upwind 0.162, brae 0.250, flipped 1.72, OpenFOAM 0.380). "
+                  "CUDA: PORTED but NOT YET MATCHING the _cpp. Five modules, each measured on airFoil2D "
+                  "at OpenFOAM's converged 500 (OF: U 5.36e-06, p 7.51e-05, nuTilda 1.23e-03): (1) the "
+                  "model on the k slot -- U 4.56e-03, p 1.00e-01, nuTilda 1.85e-02; (2) linearUpwind on "
+                  "div(phi,nuTilda) -- nuTilda 7.67e-03; (3) the freestream valueFraction "
+                  "(deviceUpdateMixedFreestream) -- U 2.11e-03, p 1.35e-02; (4) the Spalding wall nut -- "
+                  "U 1.34e-04, p 1.88e-03; (5) inletOutlet resolved per iteration. END TO END it reaches "
+                  "U 1.2e-02, p 3.3e-02, nuTilda 3.4e-01 against the _cpp's 6.2e-05 / 7.5e-05 / 1.3e-02, "
+                  "so it is NOT gated yet. The SA terms themselves are NOT the cause: dumped cell by cell "
+                  "(BRAE_DUMP_SA vs BRAE_DUMP_SA_CPP), gradNt2 is identical to 2.4e-11 and every formula "
+                  "matches; the divergence enters through Omega/Stilda (median per-cell 1.1e-03 but max "
+                  "8.4), which fw amplifies wherever Stilda is small -- the far field -- because "
+                  "r = nuTilda/(Stilda*(kappa*y)^2) is unbounded below in Stilda."),
         dict(name="kEpsilon", of_symbol="Foam::RASModels::kEpsilon",
              of_file="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.C",
              classification="MODEL", status="REVALIDATE_EXISTING",
