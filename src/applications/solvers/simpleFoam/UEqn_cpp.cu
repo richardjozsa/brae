@@ -4,6 +4,7 @@
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"
 #include "limitedSchemes_cpp.cuh"
+#include "cellLimitedGrad_cpp.cuh"
 #include <stdexcept>
 
 namespace brae {
@@ -122,7 +123,10 @@ FvVectorMatrix momentumCore(
     // linearUpwindV carries a DIFFERENT correction, not a scaled one, so it branches before the factor.
     if (in.scheme == DivScheme::linearUpwindV)
     {
-        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`:
+        // the correction uses the LIMITED gradient. k = 0 leaves the plain Gauss one.
+        cellLimitGrad(gradU, U, in.gradULimitK, m, g, patches);
         const std::vector<vector> corr =
             limitedSchemes::linearUpwindVCorrection(*in.phi, U, gradU, m, g);
         for (std::size_t c = 0; c < corr.size(); ++c)
@@ -135,7 +139,10 @@ FvVectorMatrix momentumCore(
     const scalar corrFac = correctionFactor(in);
     if (corrFac != 0.0)
     {
-        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`:
+        // the correction uses the LIMITED gradient. k = 0 leaves the plain Gauss one.
+        cellLimitGrad(gradU, U, in.gradULimitK, m, g, patches);
         const std::vector<vector> corr =
             fvm::linearUpwindCorrection<vector, tensor>(*in.phi, gradU, m, g);
         for (std::size_t c = 0; c < corr.size(); ++c)
@@ -173,7 +180,10 @@ FvVectorMatrix assembleUEqn(
     // linearUpwindV carries a DIFFERENT correction, not a scaled one, so it branches before the factor.
     if (in.scheme == DivScheme::linearUpwindV)
     {
-        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`:
+        // the correction uses the LIMITED gradient. k = 0 leaves the plain Gauss one.
+        cellLimitGrad(gradU, U, in.gradULimitK, m, g, patches);
         const std::vector<vector> corr =
             limitedSchemes::linearUpwindVCorrection(*in.phi, U, gradU, m, g);
         for (std::size_t c = 0; c < corr.size(); ++c)
@@ -186,7 +196,10 @@ FvVectorMatrix assembleUEqn(
     const scalar corrFac = correctionFactor(in);
     if (corrFac != 0.0)
     {
-        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`:
+        // the correction uses the LIMITED gradient. k = 0 leaves the plain Gauss one.
+        cellLimitGrad(gradU, U, in.gradULimitK, m, g, patches);
         const std::vector<vector> corr =
             fvm::linearUpwindCorrection<vector, tensor>(*in.phi, gradU, m, g);
         for (std::size_t c = 0; c < corr.size(); ++c)

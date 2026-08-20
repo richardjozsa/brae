@@ -195,6 +195,8 @@ void assembleUEqn(
         {
             deviceBCValue(dbU.comp[k], *Usrc[k], ub);
             deviceGaussGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k]);
+            if (in.gradULimitK > 0.0)
+                deviceCellLimitGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k], in.gradULimitK);
         }
         deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
         const DeviceBuffer<scalar>* cc[3] = {&cx, &cy, &cz};
@@ -212,6 +214,9 @@ void assembleUEqn(
             DeviceBuffer<scalar> ub, gx, gy, gz, lu;
             deviceBCValue(dbU.comp[k], *U[k], ub);
             deviceGaussGrad(dm, *U[k], ub, gx, gy, gz);
+            // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
+            if (in.gradULimitK > 0.0)
+                deviceCellLimitGrad(dm, *U[k], ub, gx, gy, gz, in.gradULimitK);
             deviceLinearUpwindCorr(dm, *in.phiInt, gx, gy, gz, lu);
             deviceAxpy(-corrFac, lu, M.source[k]);
         }

@@ -94,6 +94,7 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
+    src/finiteVolume/finiteVolume/gradSchemes/limitedGradSchemes/cellLimitedGrad_cpp.cu
     src/applications/solvers/simpleFoam/UEqn_cpp.cu
     src/applications/solvers/simpleFoam/UEqn.cu
     src/applications/solvers/simpleFoam/pEqn.cu
@@ -680,6 +681,14 @@ add_test(NAME sa_cuda_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
 set_tests_properties(sa_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# cellLimited Gauss linear <k> vs real OpenFOAM, on BOTH paths, with an unlimited control that must be
+# markedly worse. This is what windAroundBuildings was refused for: linearUpwind's correction is built
+# from the gradient the scheme NAMES, and it does not vanish at convergence.
+add_test(NAME celllimited_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/celllimited_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
+set_tests_properties(celllimited_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
@@ -779,6 +788,12 @@ target_link_libraries(gradu_probe PRIVATE brae_core)
 add_executable(ueqn_localize tests/ueqn_localize.cu)
 target_include_directories(ueqn_localize PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(ueqn_localize PRIVATE brae_core)
+
+add_executable(test_celllimited_cpp tests/test_celllimited_cpp.cu)
+target_include_directories(test_celllimited_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_celllimited_cpp PRIVATE brae_core)
+add_test(NAME celllimited_cpp
+         COMMAND test_celllimited_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 
 add_executable(test_simple_mrf_cpp tests/test_simple_mrf_cpp.cu)
 target_include_directories(test_simple_mrf_cpp PRIVATE ${BRAE_HEADER_DIRS})

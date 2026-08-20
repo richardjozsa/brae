@@ -190,11 +190,19 @@ try_refusal divscheme \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss vanLeer;',s); open(d+'/system/fvSchemes','w').write(s)" \
   "vanLeer"
 
-# ...and so is a linearUpwind whose NAMED gradient is not the one brae computes. The scheme is supported;
-# `cellLimited Gauss linear 1` under it is not, and the correction does not vanish at convergence.
-try_refusal lugradscheme \
+# linearUpwind's NAMED gradient. `cellLimited Gauss linear 1` is IMPLEMENTED now (both paths -- see
+# tests/celllimited_vs_openfoam.sh), so it must be accepted AND announced: the correction is built
+# from that gradient and does not vanish at convergence, so silently running the plain Gauss one
+# under a limited name would be a different equation. Announcing it is what makes that checkable.
+try_notice lugradcelllimited \
   "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss linearUpwind grad(U);',s); s=re.sub(r'gradSchemes\s*\{[^}]*\}','gradSchemes\n{\n    default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;\n}',s); open(d+'/system/fvSchemes','w').write(s)" \
-  "cellLimited"
+  "cellLimited Gauss linear 1"
+
+# ...while a named gradient brae genuinely does NOT compute is still refused BY NAME. leastSquares is
+# a different stencil altogether, not a limiter on the Gauss one.
+try_refusal lugradscheme \
+  "s=open(d+'/system/fvSchemes').read(); s=re.sub(r'div\(phi,U\)[^;]*;','div(phi,U)      bounded Gauss linearUpwind grad(U);',s); s=re.sub(r'gradSchemes\s*\{[^}]*\}','gradSchemes\n{\n    default         Gauss linear;\n    grad(U)         leastSquares;\n}',s); open(d+'/system/fvSchemes','w').write(s)" \
+  "leastSquares"
 
 # ddtSchemes is NOT a refusal, because it is not one for OpenFOAM either: simpleFoam's UEqn carries no
 # fvm::ddt term, so the entry is never consulted. OpenFOAM's OWN squareBend tutorial ships

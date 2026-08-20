@@ -12,6 +12,7 @@ validation/*
 !validation/cyclicChannelAMI/
 !validation/cyclicWedge/
 !validation/airFoil2D/
+!validation/windAroundBuildingsBox/
 !validation/kEpsCase/
 !validation/mixerVessel2D/
 !validation/kEpsCorrect/

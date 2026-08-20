@@ -24,6 +24,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -151,8 +152,13 @@ int main(int argc, char** argv)
     if (const FoamDict* rf = fvSolution.subDict("relaxationFactors"))
         if (const FoamDict* eq = rf->subDict("equations")) relaxU = eq->scalarOr("U", relaxU);
 
-    std::printf("ueqn_localize: %s/%s   %d cells   relaxU %.2f\n",
-                caseDir.c_str(), t.c_str(), static_cast<int>(nC), relaxU);
+    // `grad(U) cellLimited Gauss linear <k>`: the gradient linearUpwind's correction is built from.
+    // 0 (the default) is the plain Gauss gradient, i.e. the scheme off.
+    const char* lk = std::getenv("UEQN_GRADU_LIMIT_K");
+    const scalar gradULimitK = lk ? std::atof(lk) : 0.0;
+
+    std::printf("ueqn_localize: %s/%s   %d cells   relaxU %.2f   gradU cellLimited k=%.3g\n",
+                caseDir.c_str(), t.c_str(), static_cast<int>(nC), relaxU, gradULimitK);
 
     std::vector<scalar> psi(nC);
     for (label c = 0; c < nC; ++c) psi[c] = f.U.internal[c].x;
@@ -169,6 +175,7 @@ int main(int argc, char** argv)
         mi.bounded = true;
         mi.linearUpwind = true;
         mi.scheme = cpu::DivScheme::linearUpwind;
+        mi.gradULimitK = gradULimitK;
         FvVectorMatrix M = cpu::assembleUEqn(f.U, mi, m, g, fvp);
         cpu::addPressureGradient(M, f.p, m, g, fvp);
 
@@ -219,6 +226,7 @@ int main(int argc, char** argv)
         mi.bounded = true;
         mi.linearUpwind = true;
         mi.scheme = cpu::DivScheme::linearUpwind;
+        mi.gradULimitK = gradULimitK;
 
         gpu::MomentumMatrix M;
         gpu::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, mi);

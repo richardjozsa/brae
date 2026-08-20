@@ -102,6 +102,11 @@ struct MomentumInput
     // unchanged -- the entire scheme is a deferred source correction (linearUpwind.C;
     // gaussConvectionScheme.C:112-115). It does NOT vanish at convergence, unlike `bounded`.
     bool   linearUpwind = false;                                 // kept: DivScheme::linearUpwind
+    // The `k` of `grad(U) cellLimited Gauss linear <k>` -- the gradient linearUpwind NAMES. 0 leaves
+    // the plain Gauss gradient, which is what every unlimited case gets and is bit-identical to before.
+    // This is NOT a convergence detail: the limiter changes the deferred correction, which does not
+    // vanish at convergence, so an unlimited gradient under a limited name solves a different equation.
+    scalar gradULimitK = 0.0;
     DivScheme scheme = DivScheme::upwind;
     scalar    schemeCoeff = 1.0;                                 // the `k` of `limitedLinear k`
     // `corrected`/`limited` laplacianSchemes: use nonOrthDeltaCoeffs implicitly AND add the explicit

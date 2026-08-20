@@ -104,6 +104,7 @@ struct StepInput
     bool   correctedLaplacian = false;           // `corrected` laplacianSchemes
     bool   bounded = false;                      // div(phi,U) `bounded`
     bool   linearUpwind = false;                 // div(phi,U) `linearUpwind`
+    scalar gradULimitK = 0.0;                    // `grad(U) cellLimited Gauss linear <k>` (0 = off)
     DivScheme scheme = DivScheme::upwind;
     scalar    schemeCoeff = 1.0;
     // MRF zones, already resolved against the mesh. hasMRF WITHOUT these is still a refusal.

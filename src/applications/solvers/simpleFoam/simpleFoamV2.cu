@@ -158,9 +158,12 @@ TurbDivScheme divTurbScheme(const std::string& caseDir, const std::string& key)
 // up with mesh.gradScheme(name), which falls back to gradSchemes `default`. brae computes a plain Gauss
 // linear gradient; a case naming cellLimited or leastSquares there would get a DIFFERENT correction,
 // silently, and this correction does NOT vanish at convergence -- so the answer would simply be wrong.
-// Returns the offending scheme word, or empty when the resolved scheme is Gauss linear.
-std::string linearUpwindGradUnsupported(const std::string& caseDir)
+// Returns the offending scheme word, or empty when the resolved scheme is one brae computes: `Gauss
+// linear`, or `cellLimited Gauss linear <k>` -- the limited form is now implemented on both paths
+// (cellLimitedGrad_cpp.cu, deviceCellLimitGrad), and `limitK` receives its k when it is.
+std::string linearUpwindGradUnsupported(const std::string& caseDir, scalar* limitK)
 {
+    if (limitK) *limitK = 0.0;
     std::string text;
     try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return ""; }
 
@@ -207,14 +210,30 @@ std::string linearUpwindGradUnsupported(const std::string& caseDir)
     }
     if (entry.empty()) return "";
 
-    // 3. accept only `Gauss linear`.
+    // 3. accept `Gauss linear` and `cellLimited Gauss linear <k>`; anything else is named and refused.
     static const std::regex tok(R"([^\s]+)");
+    static const std::regex num(R"([-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)");
+    bool limited = false;
     for (std::sregex_iterator it(entry.begin(), entry.end(), tok), e; it != e; ++it)
     {
         const std::string w = it->str();
         if (w == "Gauss" || w == "linear") continue;
+        if (w == "cellLimited")
+        {
+            limited = true;
+            continue;
+        }
+        // The coefficient, and ONLY when a limiter claimed it -- a bare number after `Gauss linear`
+        // would belong to some other scheme this does not implement.
+        if (limited && std::regex_match(w, num))
+        {
+            if (limitK) *limitK = std::atof(w.c_str());
+            continue;
+        }
         return w;
     }
+    // `cellLimited Gauss linear` with no number is k = 1 in OpenFOAM's stream reading.
+    if (limited && limitK && *limitK == 0.0) *limitK = 1.0;
     return "";
 }
 
@@ -426,7 +445,7 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
                                  "anyway would solve a different discretisation than the case specifies.");
         if (sc == "linearUpwind" || sc == "linearUpwindV")
         {
-            const std::string bad = linearUpwindGradUnsupported(caseDir);
+            const std::string bad = linearUpwindGradUnsupported(caseDir, nullptr);
             if (!bad.empty())
                 r.blockers.push_back("div(phi,U) is `linearUpwind`, whose named gradient resolves to `" +
                                      bad + "` in gradSchemes; brae computes a plain Gauss linear gradient. "
@@ -1287,6 +1306,13 @@ int runSimpleFoamV2(const std::string& caseDir)
                                            : cpu::DivScheme::upwind;
         in.linearUpwind = (in.scheme == cpu::DivScheme::linearUpwind);
         in.schemeCoeff = divUSchemeCoeff(caseDir, 1.0);
+        // The gradient linearUpwind NAMES: `cellLimited Gauss linear <k>` limits it, and the envelope
+        // above has already refused any other resolution. Measured on windAroundBuildings, running the
+        // plain Gauss gradient where the case names cellLimited leaves the momentum residual 272x
+        // OpenFOAM's own instead of 1.4x -- the correction does not vanish at convergence.
+        linearUpwindGradUnsupported(caseDir, &in.gradULimitK);
+        if (in.gradULimitK > 0.0)
+            std::printf("  grad(U): cellLimited Gauss linear %g\n", in.gradULimitK);
         std::printf("  div(phi,U) scheme: %s", sc.empty() ? "upwind" : sc.c_str());
         if (in.scheme == cpu::DivScheme::limitedLinear || in.scheme == cpu::DivScheme::limitedLinearV)
             std::printf(" %g", in.schemeCoeff);

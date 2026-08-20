@@ -75,6 +75,11 @@ struct MomentumInput
     // `Gauss linearUpwind grad(U)`: the matrix stays pure upwind and the whole scheme is a deferred
     // source correction -- see UEqn_cpp.cuh. Unlike `bounded` it does NOT vanish at convergence.
     bool   linearUpwind = false;                 // kept: equivalent to scheme == linearUpwind
+    // The `k` of `grad(U) cellLimited Gauss linear <k>` -- the gradient linearUpwind NAMES. 0 leaves
+    // the plain Gauss gradient. The correction does not vanish at convergence, so an unlimited
+    // gradient under a limited name is a different equation: measured on windAroundBuildings, it puts
+    // the momentum residual 272x OpenFOAM's instead of 1.4x.
+    scalar gradULimitK = 0.0;
     // The div(phi,U) scheme, shared with the reference (cpu::DivScheme). Each scheme is weights only, a
     // deferred correction only, or both; the assembly branches on that, not on a name.
     cpu::DivScheme scheme = cpu::DivScheme::upwind;

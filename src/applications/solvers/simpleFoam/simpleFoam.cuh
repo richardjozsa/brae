@@ -98,6 +98,7 @@ struct StepInput
     bool   momentumPredictor = true;
     bool   bounded = false;              // div(phi,U) `bounded`
     bool   linearUpwind = false;         // div(phi,U) `linearUpwind`: deferred correction, upwind matrix
+    scalar gradULimitK = 0.0;            // `grad(U) cellLimited Gauss linear <k>` (0 = plain Gauss)
     cpu::DivScheme scheme = cpu::DivScheme::upwind;   // the div(phi,U) scheme, shared with the reference
     scalar         schemeCoeff = 1.0;                 // the `k` of `limitedLinear k`
     const DevicePorosity* porosity = nullptr;         // explicitPorositySource/DarcyForchheimer

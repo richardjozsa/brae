@@ -406,6 +406,18 @@ components:
           read_by: getOrAddToDict
           at: "SpalartAllmarasBase.C:208"
 
+  cellLimitedGrad:
+    openfoam:
+      symbol: "Foam::fv::cellLimitedGrad"
+      file: src/finiteVolume/finiteVolume/gradSchemes/limitedGradSchemes/cellLimitedGrad/cellLimitedGrad.C
+    classification: SHARED_NUMERICAL
+    brae_status: PORTED
+    brae_existing: src/cuda/device_mesh.cu (deviceCellLimitGrad)
+    brae_reference: src/finiteVolume/finiteVolume/gradSchemes/limitedGradSchemes/cellLimitedGrad_cpp.cu
+    brae_target: src/finiteVolume/finiteVolume/gradSchemes/limitedGradSchemes/
+    validation: "tests/test_celllimited_cpp.cu -- the new host port against the already OpenFOAM-validated device one, 3.2e-15 (scalar grad(p)) and 3.7e-16 (vector grad(U)) on validation/pitzDailyTurb, with a check that the limiter actually bites (5.8e+03) and a TRANSPOSED control that disagrees by 1.005. tests/celllimited_vs_openfoam.sh then measures it on the case it unblocks: assembling the momentum equation at OpenFOAM's own t=400 on validation/windAroundBuildingsBox gives Ux 1.53e-04 (host) and 1.50e-04 (device) against OpenFOAM's 1.09e-04 -- 1.40x and 1.37x -- where the SAME assembly with the limiter off gives 2.98e-02, i.e. 272x. On the real 185237-cell snappyHexMesh the same measurement is 1.33x limited against 6.25x unlimited."
+    note: "`cellLimited Gauss linear <k>` scales the base Gauss gradient per cell and PER COMPONENT so extrapolating to any of the cell's own face centres cannot overshoot its neighbours' range. Three places it is easy to get wrong. (1) limitFaceCmpt RETURNS when |extrapolate| <= SMALL -- no constraint at all, which is NOT the same as r = 1. (2) The boundary faces contribute the patch VALUE to the range (a coupled patch its neighbour field); omitting them lets the gradient overshoot exactly where the field is driven from outside. (3) For a vector the limiter is itself a VECTOR and scales COLUMN j of grad(U), because OpenFOAM's grad(U)_ij is d(U_j)/d(x_i) -- reading it as a row is the transposed control the unit test carries. k < SMALL disables the scheme; k < 1 widens the band by (1/k - 1)*(maxDelta - minDelta). WHY IT MATTERS: linearUpwind's deferred correction is built from the gradient the scheme NAMES, and that correction does not vanish at convergence -- so running the plain Gauss gradient under a limited name is a different equation, not a slower one. That is what windAroundBuildings was refused for."
+
   kEpsilon:
     openfoam:
       symbol: "Foam::RASModels::kEpsilon"

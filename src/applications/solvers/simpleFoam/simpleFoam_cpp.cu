@@ -78,6 +78,7 @@ Residuals simpleStep(
     mi.correctedLaplacian = in.correctedLaplacian;
     mi.bounded = in.bounded;
     mi.linearUpwind = in.linearUpwind;
+    mi.gradULimitK  = in.gradULimitK;
     mi.scheme       = in.scheme;
     mi.schemeCoeff  = in.schemeCoeff;
     mi.hasMRF = in.hasMRF;     mi.hasFvOptions = in.hasFvOptions;
