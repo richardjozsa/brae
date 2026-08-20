@@ -88,6 +88,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
     src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
@@ -758,6 +759,10 @@ target_link_libraries(v2_envelope PRIVATE brae_core)
 add_executable(test_simple_mrf_cpp tests/test_simple_mrf_cpp.cu)
 target_include_directories(test_simple_mrf_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_mrf_cpp PRIVATE brae_core)
+
+add_executable(test_simple_sa_cpp tests/test_simple_sa_cpp.cu)
+target_include_directories(test_simple_sa_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_sa_cpp PRIVATE brae_core)
 
 add_executable(mrf_probe tests/mrf_probe.cu)
 target_include_directories(mrf_probe PRIVATE ${BRAE_HEADER_DIRS})

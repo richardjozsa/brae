@@ -6,6 +6,7 @@
 #include "gamg.cuh"
 #include "k_epsilon.cuh"
 #include "kOmegaSST_cpp.cuh"
+#include "SpalartAllmaras_cpp.cuh"
 
 namespace brae {
 namespace cpu {
@@ -47,6 +48,19 @@ Residuals simpleStep(
     // so p.relax() below relaxes against the value p had before this iteration touched it.
     const std::vector<scalar> pPrev = f.p.internal;
 
+    // OF's updateCoeffs is lazy: a patch recomputes its coefficients the first time the matrix asks for
+    // them, which for the freestream family means recomputing the valueFraction from the CURRENT flow
+    // angle. Doing it here, once at the top, is the same lag -- Up is still the previous iteration's
+    // patch velocity either way. Non-mixed patches are untouched, so nothing else moves.
+    {
+        std::vector<std::vector<vector>> Ub(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            Ub[pi] = f.U.boundary[pi]->value();
+        }
+        updateMixedFreestream(f.U.boundary, Ub, patches);
+    }
+
     // ---- UEqn.H ----------------------------------------------------------------------------
     // MRF.correctBoundaryVelocity(U) -- UEqn.H:3, the FIRST thing the momentum block does. The included
     // patch faces take the frame velocity, so the convection and the wall shear both see it.
@@ -85,6 +99,19 @@ Residuals simpleStep(
     pi.hasMRF = in.hasMRF;     pi.hasFvOptions = in.hasFvOptions;
     pi.mrf = in.mrf;
 
+    // p's turn. OF's updateCoeffs is called when the PRESSURE matrix asks for the coefficients, which is
+    // after the momentum predictor -- so freestreamPressure sees the POST-predictor velocity, not the one
+    // U's own valueFraction was built from at the top of the iteration.
+    {
+        std::vector<std::vector<vector>> Ub(patches.size());
+        for (std::size_t pi2 = 0; pi2 < patches.size(); ++pi2)
+        {
+            Ub[pi2] = f.U.boundary[pi2]->value();
+        }
+        updateMixedFreestream(f.p.boundary, Ub, patches);
+        f.p.evaluateBoundary();
+    }
+
     const PressureStages st = pressurePredictor(UEqn, f.U, f.p, pi, m, g, patches);
 
     // Non-orthogonal corrector loop. Each pass re-assembles from the SAME phiHbyA and solves again; only
@@ -116,7 +143,18 @@ Residuals simpleStep(
     // non-Newtonian one is a separate manifest component and is not covered.
     if (in.turb)
     {
-        if (in.turb->sst)
+        if (in.turb->sa)
+        {
+            SA::DivScheme sch;
+            sch.bounded       = in.turb->boundedTurb;
+            sch.linearUpwind  = in.turb->linearUpwindTurb;
+            sch.limitedLinear = in.turb->limitedLinearTurb;
+            sch.coeff         = in.turb->turbLimiterCoeff;
+            SA::correct(f.U, *in.turb->k, *in.turb->nut, f.phi, in.turb->y, in.nu,
+                        m, g, patches, in.turb->relaxK, in.turb->tol, in.turb->relTol,
+                        in.turb->maxIter, in.turb->saCoeffs, sch, in.turb->saRes);
+        }
+        else if (in.turb->sst)
         {
             kOmegaSST::correct(f.U, *in.turb->k, *in.turb->epsilon, *in.turb->nut, f.phi, in.turb->y,
                                in.nu, m, g, patches, in.turb->relaxEpsilon, in.turb->relaxK,

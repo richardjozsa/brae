@@ -590,9 +590,12 @@ public:
 // matrix coeffs (gradientInternalCoeffs = -vf*dc, valueInternalCoeffs = 1-vf, etc.). freestreamVelocity /
 // freestreamPressure are mixed with vf = 0.5 -/+ 0.5*(U.n)/|U| (continuous flow-angle blend, NOT the binary
 // inletOutlet switch). OF mixedFvPatchField::fixesValue() == true -> references the pressure (needReference false).
-// The DEVICE recomputes vf each step from the boundary flux (deviceUpdateMixedFreestream); the host evaluate()
-// keeps the seed vf (=0.5) -> host CPU path is approximate for mixed (the device-resident solver is the target),
-// matching the InletOutlet host-path scope.
+// The valueFraction is NOT a constant for the freestream family: OF recomputes it every updateCoeffs from
+// the flow angle, and updateMixedFreestream below is the host form of that (the device has
+// deviceUpdateMixedFreestream). Leaving it at the seed 0.5 makes every far-field face a half-and-half
+// blend regardless of whether it is inflow or outflow, which on a case whose whole far field is
+// freestream -- airFoil2D -- measured 665x on the momentum residual and 3551x on pressure against
+// OpenFOAM's own converged state.
 template <typename T>
 class MixedPatchField : public ExtrapolatedValuePatchField<T>     // value() = refValue (freestreamValue); base evaluate() sets it
 {
@@ -608,6 +611,26 @@ public:
           velocitySign_(velocitySign), vf_(p.size, 0.5) {}
     bool fixesValue() const override { return true; }               // OF mixedFvPatchField::fixesValue() == true
     int  bcCategory() const override { return 5; }                  // device: mixed (per-face valueFraction blend)
+
+    // OF mixedFvPatchField::evaluate is a BLEND, not the refValue:
+    //     value = lerp(patchInternalField + refGrad/deltaCoeffs, refValue, valueFraction)
+    // brae does NOT do that, and this is a LOCATED, UNFIXED defect rather than an oversight. Measured on
+    // airFoil2D, taking refValue outright puts the whole far field at freestreamValue (0) instead of the
+    // field OpenFOAM converges to -- its inlet p runs 0.74 to -1.77 across the patch -- and implementing
+    // the blend cut the pressure residual at OpenFOAM's own converged state by 17x, from 2.57e-01 to
+    // 1.49e-02 against OpenFOAM's 7.51e-05.
+    //
+    // It is not applied because two other gated comparisons get WORSE, and both for the same reason: the
+    // blend is only as good as the valueFraction it blends with.
+    //   * mx_vs_openfoam -- this class also serves the `mixed` T patch basicThermo maps onto mixedEnergy,
+    //     which in OF overrides updateCoeffs() to rebuild refValue/refGrad/valueFraction in ENERGY space
+    //     from the thermo. brae has no such conversion, so the seeded vf is not the one OF blends with
+    //     (hotWall: OF 467.8 against a blended 367.9).
+    //   * restart_vs_openfoam -- at READ time no iteration has run, so vf is still the 0.5 seed while the
+    //     file's `value` already holds OpenFOAM's converged blend. Blending on the seed discards it
+    //     (p L2rel 4.8e-03 against a 1e-03 bound).
+    // Doing this properly means carrying the read `value` through construction AND giving mixedEnergy its
+    // updateCoeffs, which is its own piece of work. See tests/sa_cpp_vs_openfoam.sh for what it costs.
     const std::vector<scalar>* valueFractionPtr() const override { return &vf_; }
     // mixedEnergy / an external-convection wall carries refGradient beside refValue. Stored per face and
     // handed to DeviceBoundary::refGrad through the same hook fixedGradient uses (B5); the kernels apply
@@ -1106,6 +1129,40 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<FixedValuePatchField<T>>(p, v.uniform, v.uniformValue, v.values);
     }
     throw std::runtime_error("brae: unsupported BC type '" + d.type + "' on patch " + p.name);
+}
+
+// OF freestreamVelocity::updateCoeffs / freestreamPressure::updateCoeffs -- the host form.
+//
+//   velocity: valueFraction = 0.5 - 0.5*(Up & nf)/mag(Up)
+//   pressure: valueFraction = 0.5 + 0.5*(Up & nf)/mag(Up)
+//
+// `Up` is the patch's CURRENT velocity, i.e. whatever the previous evaluate left there, so calling this
+// before the field is re-evaluated reproduces OpenFOAM's own one-iteration lag. A face with no flow
+// (mag(Up) == 0) has no flow angle to blend on and keeps 0.5, which is what the seed already is.
+//
+// Only patches that ARE mixed are touched; everything else is left alone.
+template <typename T>
+void updateMixedFreestream(
+    std::vector<std::unique_ptr<fvPatchField<T>>>& boundary,
+    const std::vector<std::vector<vector>>&        Ubnd,
+    const std::vector<FvPatch>&                    patches)
+{
+    for (std::size_t pi = 0; pi < patches.size() && pi < boundary.size(); ++pi)
+    {
+        MixedPatchField<T>* mp = dynamic_cast<MixedPatchField<T>*>(boundary[pi].get());
+        if (!mp) continue;
+        if (pi >= Ubnd.size() || Ubnd[pi].size() != static_cast<std::size_t>(patches[pi].size)) continue;
+
+        const scalar sign = mp->mixedVelocitySign() ? -1.0 : 1.0;
+        std::vector<scalar> vf(patches[pi].size, 0.5);
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const vector& Up = Ubnd[pi][i];
+            const scalar mu = mag(Up);
+            if (mu > 0.0) vf[i] = 0.5 + sign * 0.5 * dot(Up, patches[pi].nf[i]) / mu;
+        }
+        mp->setValueFraction(std::move(vf));
+    }
 }
 
 } // namespace brae

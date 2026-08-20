@@ -338,8 +338,10 @@ components:
     classification: MODEL
     brae_status: REVALIDATE_EXISTING
     brae_existing: src/cuda/device_spalart.cu
+    brae_reference: src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
     brae_target: src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/
-    note: "All 12 coefficients are read via dimensioned<scalar>::getOrAddToDict -- see the derived schema below. nut = nuTilda*fv1 on `calculated` patches was a past defect."
+    validation: "PARTIAL -- the MODEL is right, the CASE does not yet match. On airFoil2D, assembled at OpenFOAM's own converged 500, the nuTilda initial residual is 1.393e-03 against OpenFOAM's 1.230e-03 (13%, and 5.7% with the mixed-evaluate blend applied), so the transport equation itself is essentially correct. Run END TO END from 0/ it is not: nuTilda lands 43% low (max 0.251 against 0.380) and, started FROM OpenFOAM's converged fields, brae DRIFTS to its own different fixed point within 200 iterations. NOT GATED, and no CUDA port, until that closes."
+    note: "All 12 coefficients are read via dimensioned<scalar>::getOrAddToDict -- see the derived schema below. nut = nuTilda*fv1 on `calculated` patches was a past defect. WHAT IS ALREADY RULED OUT for the end-to-end gap: the coefficients (OpenFOAM prints them with printCoeffs and every one matches brae's defaults, ft2 inactive); Omega = sqrt(2)*mag(skew(gradU)), verified analytically on a unit shear; the wall distance (brae's meshWave agrees with a brute-force Euclidean distance to 1.0e-04 mean over 10720 cells); and the linearUpwind deferred correction's SIGN (upwind alone gives max nuTilda 0.162, brae's sign gives 0.250, the opposite sign 1.72, against OpenFOAM's 0.380 -- so the sign is right and the magnitude is short). The residual error grows monotonically with wall distance (12% at y~1e-2, 28% at y~1e-1, 45% beyond y=1), i.e. it lives where convection dominates. The MOMENTUM residual on the same case is still 200x OpenFOAM's, so the turbulence comparison is downstream of a momentum problem that is specific to this case's freestream far field -- 22% of it sits on the inlet patch."
     derived_dictionary_schema:
       class: SpalartAllmarasBase
       keys:

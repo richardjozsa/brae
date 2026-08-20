@@ -38,6 +38,7 @@
 #include "UEqn_cpp.cuh"        // DivScheme: the div(phi,U) scheme, shared with the CUDA driver
 #include "kepsilon_coeffs.cuh"
 #include "komega_sst_coeffs.cuh"
+#include "SpalartAllmaras_cpp.cuh"
 #include "geometric_field.cuh"
 #include <map>
 #include <string>
@@ -72,7 +73,14 @@ struct TurbulenceState
     // `Gauss upwind` in pitzDaily's kEpsilon -- a different matrix, not a different tolerance.
     bool   boundedTurb = false;
     bool   limitedLinearTurb = false;
+    bool   linearUpwindTurb = false;   // `Gauss linearUpwind grad(<var>)` on the turbulence scalar
     scalar turbLimiterCoeff = 1.0;
+
+    // SpalartAllmaras transports ONE scalar, nuTilda, and holds it in the `k` slot; `epsilon` is unused.
+    // Its own coefficients, and the same cell wall distance the SST needs.
+    bool     sa = false;
+    SA::Coeffs saCoeffs{};
+    SA::Residuals* saRes = nullptr;   // optional: the nuTilda INITIAL residual, OF normalisation
 
     scalar relaxK = 0.7, relaxEpsilon = 0.7;
     scalar tol = 1e-10, relTol = 0.0;
