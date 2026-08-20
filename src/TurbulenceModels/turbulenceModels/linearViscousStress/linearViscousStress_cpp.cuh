@@ -102,7 +102,9 @@ void addDivDevReff(
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
-    bool                          correctedLaplacian = false);
+    bool                          correctedLaplacian = false,
+    // `limited <k> corrected` -- caps the non-orth correction against the orthogonal part. 0 = uncapped.
+    scalar                        snGradLimitCoeff = 0.0);
 
 } // namespace cpu
 } // namespace brae

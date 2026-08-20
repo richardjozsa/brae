@@ -302,6 +302,9 @@ bool divUBounded(const std::string& caseDir)
 struct LaplacianScheme
 {
     bool        corrected = true;   // OpenFOAM's default when the word is absent
+    // `limited <k> corrected`: limitedSnGrad's coefficient. 0 means no limiter (plain `corrected`),
+    // which is also what k >= 1 reduces to.
+    scalar      limitCoeff = 0.0;
     std::string unsupported;
 };
 
@@ -309,9 +312,12 @@ struct LaplacianScheme
 // the scheme instead of refusing it. OpenFOAM's default when the word is absent IS corrected, so an absent
 // block returns true.
 //
-// `limited <coeff>` is NOT the same scheme: limitedSnGrad caps the correction against the orthogonal part,
-// and `limited 1` alone is equivalent to `corrected`. Anything else is reported through `unsupported` so
-// the envelope can refuse it rather than quietly running the uncapped correction.
+// `limited <k>` is limitedSnGrad: it caps the correction against the ORTHOGONAL part of the same snGrad,
+//     limiter = min( k*|orth| / ((1 - k)*|corr| + SMALL), 1 )
+// so `limited 1` is exactly `corrected` and `limited 0` is `uncorrected`. Implemented in
+// fvm::laplacianCorrFlux and gated by tests/limitedsngrad_vs_openfoam.sh; the coefficient is read out
+// here rather than refused, because running the UNCAPPED correction under a capped name applies a larger
+// correction than the case asked for and does not vanish at convergence.
 LaplacianScheme laplacianScheme(const std::string& caseDir)
 {
     LaplacianScheme r;
@@ -326,12 +332,37 @@ LaplacianScheme laplacianScheme(const std::string& caseDir)
 
     if (b.find("limited") != std::string::npos)
     {
-        // `limited 1` is exactly `corrected`; any other coefficient is limitedSnGrad, which is not ported.
+        // OpenFOAM writes it BOTH ways: `limited <k>` and `limited <scheme> <k>` -- turbineSiting has
+        // `Gauss linear limited corrected 0.33`, where the coefficient follows the scheme word. Reading
+        // only the token straight after `limited` finds "corrected" there and refuses a case brae can run.
         const std::size_t k = b.find("limited");
         std::istringstream ls(b.substr(k + 7));
         scalar coeff = -1.0;
-        if (!(ls >> coeff) || std::fabs(coeff - 1.0) > 1e-12)
+        std::string tok;
+        bool got = false;
+        while (ls >> tok)
+        {
+            if (tok.empty()) continue;
+            if (tok.back() == ';') tok.pop_back();
+            try
+            {
+                std::size_t used = 0;
+                const scalar v = std::stod(tok, &used);
+                if (used == tok.size())
+                {
+                    coeff = v;
+                    got = true;
+                    break;
+                }
+            }
+            catch (...) { /* a scheme word, e.g. `corrected` -- keep looking */ }
+            if (tok == "corrected" || tok == "uncorrected" || tok == "orthogonal") continue;
+            break;   // anything else is a scheme this does not implement
+        }
+        if (!got || coeff < 0.0 || coeff > 1.0)
             r.unsupported = "limited";
+        else if (std::fabs(coeff - 1.0) > 1e-12)
+            r.limitCoeff = coeff;   // `limited 1` needs no limiter at all
         return r;
     }
     if (b.find("uncorrected") != std::string::npos) { r.corrected = false; return r; }
@@ -1351,7 +1382,14 @@ int runSimpleFoamV2(const std::string& caseDir)
     // deferred correction in the source, in the momentum equation and the pressure equation alike. Matched
     // to the reference to 5e-16 (tests/test_ueqn_cuda.cu, tests/test_peqn_cuda.cu) and gated against real
     // OpenFOAM on a non-orthogonal mesh (tests/nonorth_vs_openfoam.sh), so it is READ rather than refused.
-    in.correctedLaplacian = laplacianScheme(caseDir).corrected;
+    {
+        const LaplacianScheme lapS = laplacianScheme(caseDir);
+        in.correctedLaplacian = lapS.corrected;
+        in.snGradLimitCoeff   = lapS.limitCoeff;
+        if (lapS.limitCoeff > 0.0)
+            std::printf("  laplacianSchemes: `limited %g corrected` -- the non-orthogonal correction is "
+                        "capped against the orthogonal part\n", lapS.limitCoeff);
+    }
     std::printf("  laplacianSchemes: non-orthogonal correction %s\n",
                 in.correctedLaplacian ? "ON (`corrected`)" : "OFF (`uncorrected`/`orthogonal`)");
 

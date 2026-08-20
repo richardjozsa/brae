@@ -69,6 +69,7 @@ Residuals simpleStep(
     mi.porosity     = in.porosity;
     mi.mrf          = in.mrf;
     mi.gradULimitK  = in.gradULimitK;
+    mi.snGradLimitCoeff = in.snGradLimitCoeff;
     mi.rotor        = in.rotor;
     mi.nuLaminar    = in.nuLaminar;
     mi.correctedLaplacian = in.correctedLaplacian;
@@ -128,6 +129,7 @@ Residuals simpleStep(
     pin.pRefCell = in.pRefCell;   pin.pRefValue = in.pRefValue;
     pin.consistent = in.consistent;
     pin.correctedLaplacian = in.correctedLaplacian;
+    pin.snGradLimitCoeff   = in.snGradLimitCoeff;
     pin.hasMRF = in.hasMRF;       pin.hasFvOptions = in.hasFvOptions;
     pin.mrf = in.mrf;
     pin.adjustable = in.adjustable;

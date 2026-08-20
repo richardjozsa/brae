@@ -84,6 +84,7 @@ struct PressureInput
     // is NOT ported, so it must be refused rather than left with a stale gradient.
     bool   hasFixedFluxPressure = false;
     bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
+    scalar snGradLimitCoeff = 0.0;       // `limited <k> corrected` (OF limitedSnGrad)
     bool   hasMRF = false;      // refused
     bool   hasFvOptions = false;// refused
 };

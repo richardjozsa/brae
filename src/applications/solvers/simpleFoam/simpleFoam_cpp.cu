@@ -76,6 +76,7 @@ Residuals simpleStep(
     mi.nuEff = nuEffPtr;       mi.nuEffBnd = nuEffBndPtr;
     mi.relaxU = in.relaxU;
     mi.correctedLaplacian = in.correctedLaplacian;
+    mi.snGradLimitCoeff   = in.snGradLimitCoeff;
     mi.bounded = in.bounded;
     mi.linearUpwind = in.linearUpwind;
     mi.gradULimitK  = in.gradULimitK;
@@ -102,6 +103,7 @@ Residuals simpleStep(
     pi.pRefCell = f.pRefCell;  pi.pRefValue = f.pRefValue;
     pi.consistent = ctl.consistent();
     pi.correctedLaplacian = in.correctedLaplacian;
+    pi.snGradLimitCoeff   = in.snGradLimitCoeff;
     pi.hasMRF = in.hasMRF;     pi.hasFvOptions = in.hasFvOptions;
     pi.mrf = in.mrf;
 

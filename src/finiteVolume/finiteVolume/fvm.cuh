@@ -116,12 +116,24 @@ FvMatrix<T> laplacian(
 // so the two cannot drift apart: fvm::laplacian puts ffc in the matrix's faceFluxCorrection and its
 // divergence in the source, and fvMatrix::flux() adds ffc back. If those two were derived independently,
 // `phi = phiHbyA - pEqn.flux()` would stop being conservative the moment one of them changed.
+// |T| for the limiter, for both field types: `mag` is only declared for vector.
+inline scalar magOf(scalar a) { return std::fabs(a); }
+inline scalar magOf(const vector& a) { return mag(a); }
+
 template <typename T, typename G>
 std::vector<T> laplacianCorrFlux(
     const SurfaceScalarField& gammaf,
     const std::vector<G>& gradVf,
     const PrimitiveMesh& m,
-    const FvGeometry& g)
+    const FvGeometry& g,
+    // `limited <k> corrected` (OF limitedSnGrad): cap the non-orthogonal correction against the
+    // ORTHOGONAL part of the same snGrad, per face,
+    //     limiter = min( k*|orth| / ((1 - k)*|corr| + SMALL), 1 )
+    // so a face whose correction dwarfs its orthogonal term cannot run away. k >= 1 is `corrected`
+    // (the limiter is 1 everywhere, since the denominator collapses to SMALL) and k = 0 is
+    // `uncorrected`; 0 here means "no limiter", which is the same thing as k >= 1.
+    scalar limitCoeff = 0.0,
+    const GeometricField<T>* vf = nullptr)
 {
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -129,12 +141,25 @@ std::vector<T> laplacianCorrFlux(
     const std::vector<scalar>& w  = g.weights();
     const std::vector<scalar>& magSf = g.magSf();
     const std::vector<vector>& cv = g.nonOrthCorrectionVectors();
+    const std::vector<scalar>& nodc = g.nonOrthDeltaCoeffs();
+    const bool limited = (limitCoeff > 0.0 && limitCoeff < 1.0 && vf != nullptr);
 
     std::vector<T> ffc(nIf);
     for (label f = 0; f < nIf; ++f)
     {
         const G gf = w[f] * gradVf[own[f]] + (1.0 - w[f]) * gradVf[nei[f]];
-        ffc[f] = (gammaf.internal[f] * magSf[f]) * dotCorr(cv[f], gf);
+        T corr = dotCorr(cv[f], gf);
+        if (limited)
+        {
+            // The comparison is at SNGRAD level -- before gamma*magSf -- exactly as OpenFOAM forms it.
+            const T orth = nodc[f] * (vf->internal[nei[f]] - vf->internal[own[f]]);
+            const scalar lim =
+                std::fmin(limitCoeff * magOf(orth)
+                              / ((1.0 - limitCoeff) * magOf(corr) + 1e-15),
+                          1.0);
+            corr = lim * corr;
+        }
+        ffc[f] = (gammaf.internal[f] * magSf[f]) * corr;
     }
     return ffc;
 }
@@ -158,9 +183,10 @@ std::vector<T> laplacianNonOrthSource(
     const std::vector<G>& gradVf,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    scalar limitCoeff = 0.0)   // `limited <k> corrected`; 0 = unlimited. See laplacianCorrFlux.
 {
-    (void)vf; (void)patches;
+    (void)patches;
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -170,7 +196,7 @@ std::vector<T> laplacianNonOrthSource(
     const std::vector<vector>& cv = g.nonOrthCorrectionVectors();
 
     std::vector<T> src(nC, T{});
-    const std::vector<T> ffc = laplacianCorrFlux<T, G>(gammaf, gradVf, m, g);
+    const std::vector<T> ffc = laplacianCorrFlux<T, G>(gammaf, gradVf, m, g, limitCoeff, &vf);
     for (label f = 0; f < nIf; ++f)
     {
         src[own[f]] += ffc[f];

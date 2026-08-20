@@ -224,7 +224,8 @@ FvVectorMatrix assembleUEqn(
 
     // turbulence->divDevReff(U): implicit -laplacian(nuEff,U) into the matrix AND the explicit
     // -div(nuEff*dev2(T(grad U))) into the source. Both halves, one call, so they cannot drift apart.
-    addDivDevReff(M, U, *in.nuEff, *in.nuEffBnd, m, g, patches, in.correctedLaplacian);
+    addDivDevReff(M, U, *in.nuEff, *in.nuEffBnd, m, g, patches, in.correctedLaplacian,
+                  in.snGradLimitCoeff);
 
     // == fvOptions(U). BEFORE relax, as UEqn.H has it: the source is part of the matrix relaxation then
     // acts on. The double negation (`eqn -= porosityEqn` inside, `UEqn == fvOptions(U)` outside) cancels,

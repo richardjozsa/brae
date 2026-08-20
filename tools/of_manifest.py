@@ -353,6 +353,30 @@ COMPONENTS = {
                   "answer bit-identical), the wall distance (nearWallDist and 1/deltaCoeffs coincide here "
                   "at 9.027330e-02), and the linearUpwind correction (forcing upwind moves the momentum "
                   "residual 1.34e-04 -> 7.99e-03, so it is applied)."),
+        dict(name="limitedSnGrad", of_symbol="Foam::fv::limitedSnGrad",
+             of_file="src/finiteVolume/finiteVolume/snGradSchemes/limitedSnGrad/limitedSnGrad.C",
+             classification="SHARED_NUMERICAL", status="PORTED",
+             brae_existing="src/cuda/device_fvm.cu (deviceLaplacianCorrFluxLimited)",
+             brae_reference="src/finiteVolume/finiteVolume/fvm.cuh (laplacianCorrFlux, limitCoeff)",
+             brae_target="src/finiteVolume/finiteVolume/",
+             validation="tests/limitedsngrad_vs_openfoam.sh, on validation/airFoil2D (a genuinely "
+                        "non-orthogonal C-grid, so the correction is not a rounding term). Three "
+                        "assertions: `limited 1` reproduces `corrected` BIT-FOR-BIT on both paths "
+                        "(6.904985e-05), `limited 0.33` changes the answer (7.753060e-05) so the scheme "
+                        "is not inert, and host and device agree bit-for-bit at 0.33.",
+             note="limiter = min( k*|orth| / ((1 - k)*|corr| + SMALL), 1 ) applied to the non-orthogonal "
+                  "correction, with |orth| the ORTHOGONAL part of the same snGrad "
+                  "(nonOrthDeltaCoeffs*(vf[nei] - vf[own])) and both magnitudes taken BEFORE gamma*magSf. "
+                  "`limited 1` is exactly `corrected` and `limited 0` is `uncorrected`. THE VECTOR CASE is "
+                  "where this is easy to get wrong and where brae's pre-existing device implementation "
+                  "did: OF's limitedSnGrad<Type> takes mag() of the WHOLE snGrad and of the WHOLE "
+                  "correction, so all three velocity components share ONE per-face limiter. The device "
+                  "limited each component independently -- a different scheme, 0.6% out on airFoil2D -- "
+                  "and only writing the host reference and comparing the two exposed it "
+                  "(deviceLaplacianCorrFluxLimitedVec is the fix). Needed by turbineSiting "
+                  "(`Gauss linear limited corrected 0.33`), which remains blocked on "
+                  "actuationDiskSource alone."),
+
         dict(name="rotorDiskSource", of_symbol="Foam::fv::rotorDiskSource",
              of_file="src/fvOptions/sources/derived/rotorDiskSource/rotorDiskSource.C",
              classification="MODEL", status="REVALIDATE_EXISTING",

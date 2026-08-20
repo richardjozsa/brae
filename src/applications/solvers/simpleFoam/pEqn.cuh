@@ -34,7 +34,8 @@ struct PressureInput
     scalar pRefValue = 0.0;
     bool   consistent = false;           // SIMPLEC -- implemented (pEqn.H:8-16)
     bool   hasFixedFluxPressure = false; // refused: needs constrainPressure (pEqn.H:21)
-    bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
+    bool   correctedLaplacian = false;
+    scalar snGradLimitCoeff = 0.0;   // `limited <k> corrected` (OF limitedSnGrad)   // `corrected` laplacianSchemes
     bool   hasMRF = false;       // refused
     bool   hasFvOptions = false; // refused
     // adjustPhi's per-boundary-face mask: 1 where the U patch does NOT fix a value, i.e. where the flux

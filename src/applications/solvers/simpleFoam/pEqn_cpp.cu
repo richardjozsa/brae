@@ -198,12 +198,14 @@ FvScalarMatrix assemblePEqn(
     {
         const std::vector<vector> gradP = fvc::gaussGrad(p, m, g, patches);
         const std::vector<scalar> corr =
-            fvm::laplacianNonOrthSource<scalar, vector>(rAUf, p, gradP, m, g, patches);
+            fvm::laplacianNonOrthSource<scalar, vector>(rAUf, p, gradP, m, g, patches,
+                                                        in.snGradLimitCoeff);
         for (std::size_t c = 0; c < corr.size(); ++c) pEqn.source[c] -= corr[c];
         // ...and STORE the face flux, which fvMatrix::flux() adds back (fvMatrix.C:1688). Without it
         // `phi = phiHbyA - pEqn.flux()` drops the correction that the source above put in, and phi stops
         // being conservative on a non-orthogonal mesh.
-        pEqn.faceFluxCorrection = fvm::laplacianCorrFlux<scalar, vector>(rAUf, gradP, m, g);
+        pEqn.faceFluxCorrection =
+            fvm::laplacianCorrFlux<scalar, vector>(rAUf, gradP, m, g, in.snGradLimitCoeff, &p);
     }
 
     // == fvc::div(phiHbyA). brae's FvMatrix solves M.psi = source, and fvc::div returns a per-volume

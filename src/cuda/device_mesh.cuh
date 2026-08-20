@@ -294,6 +294,15 @@ void deviceLaplacianCorrFlux(const DeviceMesh& dm, const DeviceBuffer<scalar>& g
 void deviceLaplacianCorrFluxLimited(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammafInt, const DeviceBuffer<scalar>& phi,
                                     const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
                                     scalar psi, DeviceBuffer<scalar>& ffc);
+// The VECTOR form of the above: ONE limiter per face from mag(snGrad) and mag(corr) over all three
+// components, as OF's limitedSnGrad<Type> forms it. Limiting each component on its own is a different
+// scheme -- see the kernel comment. phi/gxc/gyc/gzc/ffc are arrays of 3.
+void deviceLaplacianCorrFluxLimitedVec(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammafInt,
+                                       const DeviceBuffer<scalar>& p0, const DeviceBuffer<scalar>& p1,
+                                       const DeviceBuffer<scalar>& p2,
+                                       const DeviceBuffer<scalar>* gxc, const DeviceBuffer<scalar>* gyc,
+                                       const DeviceBuffer<scalar>* gzc,
+                                       scalar psi, DeviceBuffer<scalar>* ffc);
 void deviceFaceDivSource(const DeviceMesh& dm, const DeviceBuffer<scalar>& ffc, DeviceBuffer<scalar>& src);
 void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
                            DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);

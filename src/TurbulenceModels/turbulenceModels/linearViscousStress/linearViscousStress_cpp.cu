@@ -78,7 +78,8 @@ void addDivDevReff(
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
-    bool                          correctedLaplacian)
+    bool                          correctedLaplacian,
+    scalar                        snGradLimitCoeff)
 {
     // Implicit half: OpenFOAM writes `- fvm::laplacian(nuEff, U)` inside divDevReff, and UEqn.H adds
     // divDevReff to the equation -- so the laplacian enters with coefficient -1.
@@ -96,7 +97,8 @@ void addDivDevReff(
     {
         const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
         const std::vector<vector> corr =
-            fvm::laplacianNonOrthSource<vector, tensor>(gammaf, U, gradU, m, g, patches);
+            fvm::laplacianNonOrthSource<vector, tensor>(gammaf, U, gradU, m, g, patches,
+                                                        snGradLimitCoeff);
         for (std::size_t c = 0; c < corr.size(); ++c)
         {
             UEqn.source[c].x += corr[c].x;

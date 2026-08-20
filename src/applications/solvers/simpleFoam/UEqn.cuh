@@ -88,6 +88,8 @@ struct MomentumInput
     // `corrected` laplacianSchemes: switches the implicit coefficient to nonOrthDeltaCoeffs AND adds the
     // explicit deferred correction. Both halves, as in the reference -- see UEqn_cpp.cuh.
     bool   correctedLaplacian = false;
+    // `limited <k> corrected` (OF limitedSnGrad). 0 = uncapped, which is what `corrected` means.
+    scalar snGradLimitCoeff = 0.0;
     bool   hasMRF = false;
     bool   hasFvOptions = false;   // an UNIMPLEMENTED option -> refuse
     // explicitPorositySource/DarcyForchheimer, evaluated on the device each iteration from the current U.

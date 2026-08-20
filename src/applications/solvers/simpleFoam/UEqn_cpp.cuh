@@ -113,6 +113,7 @@ struct MomentumInput
     // deferred correction to the source (gaussLaplacianScheme.C). OpenFOAM's default when the word is
     // absent, so most real cases set it.
     bool   correctedLaplacian = false;
+    scalar snGradLimitCoeff = 0.0;               // `limited <k> corrected` (OF limitedSnGrad)
     bool   hasMRF = false;                                       // present in the case -> must refuse
     bool   hasFvOptions = false;                                 // an UNIMPLEMENTED option -> must refuse
     // The parsed fvOptions. UEqn.H applies it three times; only `== fvOptions(U)` is implemented, and an

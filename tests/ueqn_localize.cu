@@ -156,6 +156,9 @@ int main(int argc, char** argv)
     // 0 (the default) is the plain Gauss gradient, i.e. the scheme off.
     const char* lk = std::getenv("UEQN_GRADU_LIMIT_K");
     const scalar gradULimitK = lk ? std::atof(lk) : 0.0;
+    // `limited <k> corrected` on the laplacian (OF limitedSnGrad); 0 = uncapped.
+    const char* sk = std::getenv("UEQN_SNGRAD_LIMIT_K");
+    const scalar snGradLimitCoeff = sk ? std::atof(sk) : 0.0;
 
     std::printf("ueqn_localize: %s/%s   %d cells   relaxU %.2f   gradU cellLimited k=%.3g\n",
                 caseDir.c_str(), t.c_str(), static_cast<int>(nC), relaxU, gradULimitK);
@@ -176,6 +179,7 @@ int main(int argc, char** argv)
         mi.linearUpwind = true;
         mi.scheme = cpu::DivScheme::linearUpwind;
         mi.gradULimitK = gradULimitK;
+        mi.snGradLimitCoeff = snGradLimitCoeff;
         FvVectorMatrix M = cpu::assembleUEqn(f.U, mi, m, g, fvp);
         cpu::addPressureGradient(M, f.p, m, g, fvp);
 
@@ -227,6 +231,7 @@ int main(int argc, char** argv)
         mi.linearUpwind = true;
         mi.scheme = cpu::DivScheme::linearUpwind;
         mi.gradULimitK = gradULimitK;
+        mi.snGradLimitCoeff = snGradLimitCoeff;
 
         gpu::MomentumMatrix M;
         gpu::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, mi);

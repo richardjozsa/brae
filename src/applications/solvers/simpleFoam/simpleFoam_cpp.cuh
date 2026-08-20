@@ -102,6 +102,7 @@ struct StepInput
     scalar tolP = 1e-10, relTolP = 0.0;
     int    maxIter = 2000;
     bool   correctedLaplacian = false;           // `corrected` laplacianSchemes
+    scalar snGradLimitCoeff = 0.0;               // `limited <k> corrected` (OF limitedSnGrad)
     bool   bounded = false;                      // div(phi,U) `bounded`
     bool   linearUpwind = false;                 // div(phi,U) `linearUpwind`
     scalar gradULimitK = 0.0;                    // `grad(U) cellLimited Gauss linear <k>` (0 = off)

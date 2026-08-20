@@ -697,6 +697,14 @@ add_test(NAME rotordisk_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/rotorDisk)
 set_tests_properties(rotordisk_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
+# that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
+# each velocity component independently where OpenFOAM shares one limiter across the vector.
+add_test(NAME limitedsngrad_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/limitedsngrad_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(limitedsngrad_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.

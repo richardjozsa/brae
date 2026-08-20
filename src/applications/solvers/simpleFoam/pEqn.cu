@@ -281,10 +281,21 @@ void assemblePEqn(
         DeviceBuffer<scalar> pb, gx, gy, gz, lc;
         deviceBCValue(dbP, *p, pb);
         deviceGaussGrad(dm, *p, pb, gx, gy, gz);
+        if (in.snGradLimitCoeff > 0.0)
+        {
+            DeviceBuffer<scalar> ffcL;
+            deviceLaplacianCorrFluxLimited(dm, rAUface, *p, gx, gy, gz, in.snGradLimitCoeff, ffcL);
+            deviceFaceDivSource(dm, ffcL, lc);
+        }
+        else
         deviceLaplacianCorr(dm, rAUface, gx, gy, gz, lc);
         deviceAxpy(1.0, lc, P.source);
         // ...and the matching FACE FLUX, which correctFlux adds back -- see PressureMatrix.
-        deviceLaplacianCorrFlux(dm, rAUface, gx, gy, gz, P.faceFluxCorr);
+        if (in.snGradLimitCoeff > 0.0)
+            deviceLaplacianCorrFluxLimited(dm, rAUface, *p, gx, gy, gz, in.snGradLimitCoeff,
+                                           P.faceFluxCorr);
+        else
+            deviceLaplacianCorrFlux(dm, rAUface, gx, gy, gz, P.faceFluxCorr);
     }
     else P.faceFluxCorr.resize(0);
 

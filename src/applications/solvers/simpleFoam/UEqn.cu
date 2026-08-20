@@ -162,13 +162,36 @@ void assembleUEqn(
     if (in.correctedLaplacian)
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+        DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3];
         for (int k = 0; k < 3; ++k)
         {
-            DeviceBuffer<scalar> ub, gx, gy, gz, lc;
+            DeviceBuffer<scalar> ub;
             deviceBCValue(dbU.comp[k], *U[k], ub);
-            deviceGaussGrad(dm, *U[k], ub, gx, gy, gz);
-            deviceLaplacianCorr(dm, *in.nuEffFace, gx, gy, gz, lc);
-            deviceAxpy(-1.0, lc, M.source[k]);
+            deviceGaussGrad(dm, *U[k], ub, gxc[k], gyc[k], gzc[k]);
+        }
+        if (in.snGradLimitCoeff > 0.0)
+        {
+            // `limited <k> corrected`. OF's limitedSnGrad takes mag() of the WHOLE snGrad and of the
+            // WHOLE correction, so all three components share one per-face limiter -- which is why this
+            // cannot be done inside the per-component loop above.
+            DeviceBuffer<scalar> ffc[3];
+            deviceLaplacianCorrFluxLimitedVec(dm, *in.nuEffFace, *U[0], *U[1], *U[2],
+                                              gxc, gyc, gzc, in.snGradLimitCoeff, ffc);
+            for (int k = 0; k < 3; ++k)
+            {
+                DeviceBuffer<scalar> lc;
+                deviceFaceDivSource(dm, ffc[k], lc);
+                deviceAxpy(-1.0, lc, M.source[k]);
+            }
+        }
+        else
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                DeviceBuffer<scalar> lc;
+                deviceLaplacianCorr(dm, *in.nuEffFace, gxc[k], gyc[k], gzc[k], lc);
+                deviceAxpy(-1.0, lc, M.source[k]);
+            }
         }
     }
 

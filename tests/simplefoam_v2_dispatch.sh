@@ -177,10 +177,22 @@ if [ $brc -eq 0 ]; then ok "bounded: exit 0"; else bad "bounded: exit $brc"; sed
 grep -q "is bounded" "$W/bnd/log" && ok "bounded: the solver states it is applying the term" \
                                   || bad "bounded: applied silently or not at all"
 
-# `limited <coeff>` is limitedSnGrad, which caps the correction -- a DIFFERENT scheme from `corrected`,
-# and the one place where accepting the whole `corrected`/`limited` family would silently over-correct.
-try_refusal limitedlaplacian \
+# `limited <coeff>` is limitedSnGrad -- IMPLEMENTED now on both paths (tests/limitedsngrad_vs_openfoam.sh),
+# so it must be accepted AND announced with its coefficient: running the uncapped correction under a
+# capped name applies a larger correction than the case asked for, and it does not vanish at
+# convergence. OpenFOAM writes the coefficient both ways -- `limited <k>` and `limited <scheme> <k>` --
+# and both must resolve to the same k, so both forms are exercised.
+try_notice limitedlaplacian \
     "import re,sys;p=sys.argv[1]+'/system/fvSchemes';s=open(p).read();open(p,'w').write(re.sub(r'laplacianSchemes\s*\{[^}]*\}','laplacianSchemes\n{\n    default         Gauss linear limited 0.33;\n}',s))" \
+    "limited 0.33"
+
+try_notice limitedlaplacian2 \
+    "import re,sys;p=sys.argv[1]+'/system/fvSchemes';s=open(p).read();open(p,'w').write(re.sub(r'laplacianSchemes\s*\{[^}]*\}','laplacianSchemes\n{\n    default         Gauss linear limited corrected 0.33;\n}',s))" \
+    "limited 0.33"
+
+# ...while a coefficient OUTSIDE [0, 1] is not a limiter at all and is still refused by name.
+try_refusal limitedlaplacianbad \
+    "import re,sys;p=sys.argv[1]+'/system/fvSchemes';s=open(p).read();open(p,'w').write(re.sub(r'laplacianSchemes\s*\{[^}]*\}','laplacianSchemes\n{\n    default         Gauss linear limited 7;\n}',s))" \
     "limited"
 
 # Five div(phi,U) schemes are implemented now (upwind, linearUpwind, limitedLinear, limitedLinearV,
