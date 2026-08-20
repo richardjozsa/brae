@@ -11,6 +11,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
+#include "scheme_parse.cuh"   // readFvSchemesText: fusedGauss -> Gauss
 #include "fvc.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
@@ -64,7 +65,7 @@ bool divUBounded(const std::string& caseDir);
 std::string divUScheme(const std::string& caseDir)
 {
     std::string text;
-    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return ""; }
+    try { text = readFvSchemesText(caseDir); } catch (...) { return ""; }
     const std::size_t blk = text.find("divSchemes");
     if (blk == std::string::npos) return "";
     const std::size_t open = text.find('{', blk);
@@ -112,7 +113,7 @@ TurbDivScheme divTurbScheme(const std::string& caseDir, const std::string& key)
 {
     TurbDivScheme out;
     std::string text;
-    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return out; }
+    try { text = readFvSchemesText(caseDir); } catch (...) { return out; }
     const std::size_t blk = text.find("divSchemes");
     if (blk == std::string::npos) return out;
     const std::size_t open = text.find('{', blk);
@@ -167,7 +168,7 @@ std::string linearUpwindGradUnsupported(const std::string& caseDir, scalar* limi
 {
     if (limitK) *limitK = 0.0;
     std::string text;
-    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return ""; }
+    try { text = readFvSchemesText(caseDir); } catch (...) { return ""; }
 
     // 1. the name linearUpwind gives -- the word immediately after it in the div(phi,U) entry.
     std::string gradName = "default";
@@ -245,7 +246,7 @@ std::string linearUpwindGradUnsupported(const std::string& caseDir, scalar* limi
 scalar divUSchemeCoeff(const std::string& caseDir, scalar def)
 {
     std::string text;
-    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return def; }
+    try { text = readFvSchemesText(caseDir); } catch (...) { return def; }
     const std::size_t blk = text.find("divSchemes");
     if (blk == std::string::npos) return def;
     const std::size_t open = text.find('{', blk);
@@ -270,7 +271,7 @@ scalar divUSchemeCoeff(const std::string& caseDir, scalar def)
 bool divUBounded(const std::string& caseDir)
 {
     std::string text;
-    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { return false; }
+    try { text = readFvSchemesText(caseDir); } catch (...) { return false; }
     const std::size_t blk = text.find("divSchemes");
     if (blk == std::string::npos) return false;
     const std::size_t open = text.find('{', blk);
@@ -322,7 +323,7 @@ LaplacianScheme laplacianScheme(const std::string& caseDir)
 {
     LaplacianScheme r;
     std::string text;
-    try { text = readFileExpanded(caseDir + "/system/fvSchemes"); } catch (...) { r.corrected = false; return r; }
+    try { text = readFvSchemesText(caseDir); } catch (...) { r.corrected = false; return r; }
     const std::size_t blk = text.find("laplacianSchemes");
     if (blk == std::string::npos) return r;                 // absent -> OpenFOAM default is `corrected`
     const std::size_t open = text.find('{', blk);

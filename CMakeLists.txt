@@ -715,6 +715,15 @@ add_test(NAME turbinesiting_cuda_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/turbineSiting)
 set_tests_properties(turbinesiting_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
 
+# OpenFOAM's fusedGauss scheme family (pitzDaily_fused). It is Gauss written without field temporaries,
+# so brae reads it AS Gauss and announces that; this gate measures the equivalence from OpenFOAM ITSELF
+# (its own two spellings of the same case), asserts brae's rewrite is bit-for-bit a rename, and runs the
+# case end to end. Its control forces div(phi,U) to upwind.
+add_test(NAME fusedgauss_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/fusedgauss_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(fusedgauss_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.

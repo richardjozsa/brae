@@ -453,6 +453,17 @@ components:
     validation: "tests/turbinesiting_cuda_vs_openfoam.sh -- turbineSiting is the only case in validation/ with an ABL inlet, and it now converges to OpenFOAM's fixed point."
     note: "PROFILE ORIGIN, fixed 2026-08-20: OF measures the log profile from the PATCH's own lowest point, `groundMin = zDir & boundBox(patch.localPoints()).min()` (atmBoundaryLayer.C:45,218), not from z = 0. brae used the raw height. turbineSiting sits at a real elevation near z = 1000 m, so the inlet was the logarithm of the ALTITUDE rather than a boundary layer -- ~40% fast at the inlet, and the case never converged in either brae path (p stuck at ~3e-3 against OpenFOAM's 8e-5, in a limit cycle). It is the patch POINTS, not the face centres: FvPatch gained ppMin for this. Also: OF v2412 WRITES flowDir/zDir/Uref/Zref/z0/d as Function1/PatchFunction1 (`flowDir constant (1 0 0)`), which brae's reader could not read back and its writer did not emit at all -- so no OpenFOAM-written ABL field could be read, and no brae-written one could be restarted from."
 
+  fusedGauss:
+    openfoam:
+      symbol: "Foam::fv::fusedGaussConvectionScheme, fusedGaussDivScheme, fusedGaussGrad, fusedGaussLaplacianScheme"
+      file: src/fused/finiteVolume/fusedGaussConvectionScheme.C
+    classification: SHARED_NUMERICAL
+    brae_status: EQUIVALENT
+    brae_existing: src/applications/solvers/common/scheme_parse.cuh (readFvSchemesText)
+    brae_target: src/applications/solvers/common/
+    validation: "tests/fusedgauss_vs_openfoam.sh, on validation/pitzDaily with OpenFOAM's OWN pitzDaily and pitzDaily_fused scheme files. Four assertions: (1) the equivalence measured from OpenFOAM ITSELF -- real OpenFOAM runs the same case under both spellings and lands within 3.4e-05 (U) to 4.5e-04 (nut), the gap being fused summation ORDER, not a different scheme; (2) brae is BIT-IDENTICAL on the two spellings (Linf 0.000e+00 on U, p, k, epsilon, nut), which is the assertion that the rewrite is a rename and nothing else; (3) end to end against OpenFOAM on the fused case -- U 1.02e-04, p 3.55e-04, k 7.78e-04, epsilon 9.57e-04, nut 1.29e-03, TIGHTER than OpenFOAM's own two spellings differ because brae runs identical code for both; (4) control: div(phi,U) forced to upwind is 119x worse."
+    note: "fusedGauss is NOT a different discretisation. Every member of the family is the plain Gauss scheme with the field-expression temporaries replaced by fused loops, and OpenFOAM leaves the original lines in as comments directly above the fused calls (`//fvm.lower() = -weights.primitiveField()*faceFlux.primitiveField();` above `multiplySubtract(...)`); fusedGaussLaplacianScheme::fvmLaplacian is line-for-line identical to gaussLaplacianScheme::fvmLaplacian, and fusedGaussGrad::calcGrad computes `area*(lambda*(own - nei) + nei)` summed and divided by V, which is gaussGrad. pitzDaily_fused is stock pitzDaily with `libs (fusedFiniteVolume)` and the scheme words renamed -- diff the two system/ directories. brae rewrites the WHOLE TOKEN `fusedGauss` to `Gauss` once, in readFvSchemesText, so every downstream parser (V2's and the shipped path's) is unchanged and `fusedGauss <scheme brae cannot do>` is still refused by name. It is ANNOUNCED with a new notice kind, `equivalent` -- reporting an exact equivalence as `approximated` would teach the reader to discount the approximated lines that really do differ."
+
   cellLimitedGrad:
     openfoam:
       symbol: "Foam::fv::cellLimitedGrad"
