@@ -29,6 +29,7 @@
 //     original UEqn for A() and H(). Adding grad(p) to UEqn itself changes rAU and HbyA.
 //   * p is relaxed AFTER the flux correction and BEFORE the velocity correction, so phi is built from the
 //     unrelaxed pressure and U from the relaxed one.
+#include "kOmegaSSTLM_cpp.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -75,6 +76,16 @@ struct TurbulenceState
     bool   limitedLinearTurb = false;
     bool   linearUpwindTurb = false;   // `Gauss linearUpwind grad(<var>)` on the turbulence scalar
     scalar turbLimiterCoeff = 1.0;
+
+    // kOmegaSSTLM is kOmegaSST plus two transported scalars and three overrides of it. gammaIntEff is
+    // NOT read from a file: OpenFOAM constructs it as zero and the first outer iteration runs with no
+    // turbulent production at all, so seeding it here would change where transition lands.
+    bool lm = false;
+    GeometricField<scalar>* ReThetat = nullptr;
+    GeometricField<scalar>* gammaInt = nullptr;
+    std::vector<scalar>     gammaIntEff;
+    kOmegaSSTLM::Coeffs     lmCoeffs{};
+    kOmegaSSTLM::Residuals* lmRes = nullptr;
 
     // SpalartAllmaras transports ONE scalar, nuTilda, and holds it in the `k` slot; `epsilon` is unused.
     // Its own coefficients, and the same cell wall distance the SST needs.

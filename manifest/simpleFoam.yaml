@@ -464,6 +464,29 @@ components:
     validation: "tests/fusedgauss_vs_openfoam.sh, on validation/pitzDaily with OpenFOAM's OWN pitzDaily and pitzDaily_fused scheme files. Four assertions: (1) the equivalence measured from OpenFOAM ITSELF -- real OpenFOAM runs the same case under both spellings and lands within 3.4e-05 (U) to 4.5e-04 (nut), the gap being fused summation ORDER, not a different scheme; (2) brae is BIT-IDENTICAL on the two spellings (Linf 0.000e+00 on U, p, k, epsilon, nut), which is the assertion that the rewrite is a rename and nothing else; (3) end to end against OpenFOAM on the fused case -- U 1.02e-04, p 3.55e-04, k 7.78e-04, epsilon 9.57e-04, nut 1.29e-03, TIGHTER than OpenFOAM's own two spellings differ because brae runs identical code for both; (4) control: div(phi,U) forced to upwind is 119x worse."
     note: "fusedGauss is NOT a different discretisation. Every member of the family is the plain Gauss scheme with the field-expression temporaries replaced by fused loops, and OpenFOAM leaves the original lines in as comments directly above the fused calls (`//fvm.lower() = -weights.primitiveField()*faceFlux.primitiveField();` above `multiplySubtract(...)`); fusedGaussLaplacianScheme::fvmLaplacian is line-for-line identical to gaussLaplacianScheme::fvmLaplacian, and fusedGaussGrad::calcGrad computes `area*(lambda*(own - nei) + nei)` summed and divided by V, which is gaussGrad. pitzDaily_fused is stock pitzDaily with `libs (fusedFiniteVolume)` and the scheme words renamed -- diff the two system/ directories. brae rewrites the WHOLE TOKEN `fusedGauss` to `Gauss` once, in readFvSchemesText, so every downstream parser (V2's and the shipped path's) is unchanged and `fusedGauss <scheme brae cannot do>` is still refused by name. It is ANNOUNCED with a new notice kind, `equivalent` -- reporting an exact equivalence as `approximated` would teach the reader to discount the approximated lines that really do differ."
 
+  kOmegaSSTLM:
+    openfoam:
+      symbol: "Foam::RASModels::kOmegaSSTLM"
+      file: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM.C
+    classification: MODEL
+    brae_status: CPP_REFERENCE
+    brae_existing: src/cuda/device_komega_sst.cu (the shipped device path; NOT yet gated end to end)
+    brae_reference: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
+    brae_target: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/
+    validation: "tests/lm_cpp_vs_openfoam.sh, on validation/T3A -- the ERCOFTAC T3A flat-plate transition tutorial on its own 26820-cell blockMesh, run by OpenFOAM v2412 to the case's own residualControl at t=269. END TO END from 0/, 500 iterations, no CUDA: U 2.04e-04, p 1.26e-03, k 1.39e-03, omega 5.02e-05, nut 1.57e-03, settled at U 9.7e-09. CONTROL: the same case with the transition model removed (plain kOmegaSST, identical solver and schemes) against the same reference is 167x worse on U, 437x on k and 114x on nut -- the transition model is doing the work, not the bounds."
+    note: "kOmegaSSTLM IS kOmegaSST plus two transport equations (ReThetat, gammaInt) and three overrides of the base model, so the overrides live in kOmegaSST_cpp as LMHooks rather than as a branch: F1 = max(kOmegaSST::F1, exp(-(Ry/120)^8)) with Ry = y*sqrt(k)/nu, Pk *= gammaIntEff, epsilonByk *= clamp(gammaIntEff, 0.1, 1). That F3 is NOT kOmegaSSTBase's F3 near-wall switch, which brae refuses -- two different functions with the same name in a base and its derived class. THE ORDER IS THE MODEL: correct() runs kOmegaSST::correct() FIRST, so k and omega advance on the PREVIOUS iteration's transition state, and gammaIntEff is constructed ZERO, so the first outer iteration has no turbulent production at all. Within correctReThetatGammaInt, Fthetat is formed ONCE from the OLD ReThetat and OLD gammaInt and reused in gammaSep at the end, while ReThetac/Rev/RT see the NEW ReThetat and gammaSep sees the NEW gammaInt. ReThetat0 is a per-cell fixed-point iteration on lambda with NO iteration cap (OpenFOAM warns past maxLambdaIter and carries on); transcribed as written. DgammaIntEff is nut + nu -- there is no sigmaGamma in this model. REFUSED: MRF and fvOptions on the two transition equations."
+
+  linearUpwindTurbulence:
+    openfoam:
+      symbol: "Foam::fv::gaussConvectionScheme with linearUpwind, on k/omega"
+      file: src/finiteVolume/interpolation/surfaceInterpolation/schemes/linearUpwind/linearUpwind.C
+    classification: SHARED_NUMERICAL
+    brae_status: PORTED
+    brae_reference: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
+    brae_target: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/
+    validation: "tests/lm_cpp_vs_openfoam.sh -- T3A asks for `bounded Gauss linearUpwind grad` on k, omega, gammaInt and ReThetat. Honouring it moved the end-to-end U error from 2.43e-03 to 2.04e-04, a factor of 12."
+    note: "The _cpp kOmegaSST had no linearUpwind parameter AT ALL, so a case asking for it silently got UPWIND -- a different matrix under the case's own scheme name, which is the substitution class this port exists to eliminate. SpalartAllmaras already had it (SA::DivScheme::linearUpwind); kOmegaSST did not. linearUpwind's matrix IS upwind's; the scheme is the deferred gradient correction subtracted from the source."
+
   cellLimitedGrad:
     openfoam:
       symbol: "Foam::fv::cellLimitedGrad"

@@ -207,7 +207,9 @@ void correct(
     SSTResiduals*                  res,
     bool                           bounded,
     bool                           limitedLinear,
-    scalar                         limiterCoeff)
+    scalar                         limiterCoeff,
+    bool                           linearUpwind,
+    const LMHooks*                 lm)
 {
     if (co.F3)
         throw std::runtime_error(
@@ -232,7 +234,20 @@ void correct(
     const std::vector<vector> gradK  = fvc::gaussGrad(k, m, g, patches);
     const std::vector<vector> gradOm = fvc::gaussGrad(omega, m, g, patches);
     const std::vector<scalar> CD  = CDkOmega(gradK, gradOm, omega.internal, co);
-    const std::vector<scalar> f1  = F1(k.internal, omega.internal, y, CD, nu, co);
+    std::vector<scalar> f1 = F1(k.internal, omega.internal, y, CD, nu, co);
+    if (lm)
+    {
+        // kOmegaSSTLM::F1 = max(kOmegaSST::F1, F3), F3 = exp(-(Ry/120)^8), Ry = y*sqrt(k)/nu
+        // (kOmegaSSTLM.C:43-52). Raising F1 toward 1 near the wall keeps the k-omega branch of the blend
+        // through the laminar region, which is the point of a transition model.
+        for (label c = 0; c < nC; ++c)
+        {
+            const scalar Ry = y[c] * std::sqrt(std::fmax(k.internal[c], 0.0)) / nu;
+            const scalar r  = Ry / 120.0;
+            const scalar r2 = r * r, r4 = r2 * r2;
+            f1[c] = std::fmax(f1[c], std::exp(-(r4 * r4)));
+        }
+    }
     const std::vector<scalar> f23 = F2(k.internal, omega.internal, y, nu, co);
 
     // ---- the production limiter: omega uses the LIMITED GbyNu, k uses the raw G ------------------
@@ -314,6 +329,42 @@ void correct(
             // move a converged answer -- it is there to keep the transported scalar bounded on the way.
             if (bounded) M.diag[c] -= divU[c] * V;
         }
+        if (linearUpwind)
+        {
+            // linearUpwind's deferred correction. The caller SUBTRACTS what linearUpwindCorrection
+            // returns -- see the sign note in fvm.cuh.
+            std::vector<std::vector<scalar>> ob(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi) ob[pi] = omega.boundary[pi]->value();
+            const std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, ob, m, g, patches);
+            const std::vector<scalar> corr =
+                fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
+            for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
+        }
+
+        // Per-cell term trace. A single residual over the whole field cannot say WHICH term of the
+        // omega equation disagrees, and on a resolved mesh the terms span eight orders of magnitude.
+        if (const char* cs = std::getenv("BRAE_SST_CELL"))
+        {
+            const label c = std::atoi(cs);
+            if (c >= 0 && c < nC)
+            {
+                const scalar gam  = blend(f1[c], co.gamma1, co.gamma2);
+                const scalar beta = blend(f1[c], co.beta1,  co.beta2);
+                const scalar V    = g.V()[c];
+                std::printf("  [omega cell %d]  V %.4e  y %.4e  omega %.6e  k %.6e  nut %.6e\n",
+                            (int)c, V, y[c], omega.internal[c], k.internal[c], nutF[c]);
+                std::printf("    F1 %.6f  F23 %.6f  gamma %.6f  beta %.6f  S %.6e\n",
+                            f1[c], f23[c], gam, beta, std::sqrt(s2[c]));
+                std::printf("    GbyNu0 %.6e  GbyNu(limited) %.6e  %s\n",
+                            gb0[c], gbLim[c], gbLim[c] < gb0[c] ? "LIMITER ACTIVE" : "unlimited");
+                std::printf("    production gamma*GbyNu*V %.6e   destruction beta*omega^2*V %.6e\n",
+                            gam*gbLim[c]*V, beta*omega.internal[c]*omega.internal[c]*V);
+                std::printf("    CDkOmega %.6e   cross-diff SuSp (F1-1)*CD/omega %.6e\n",
+                            CD[c], (f1[c] - 1.0)*CD[c]/omega.internal[c]);
+                std::printf("    divU %.6e   matrix: diag %.6e  source %.6e\n",
+                            divU[c], M.diag[c], M.source[c]);
+            }
+        }
         relaxMatrix(M, omega, m, patches, relaxOmega);
         setValues(M, omega.internal, m, patches, wallCells, omVals);
         const SolverPerformance po = pbicgstab(M, omega.internal, m, patches, tol, relTol, maxIter);
@@ -354,13 +405,35 @@ void correct(
         for (label c = 0; c < nC; ++c)
         {
             const scalar V = g.V()[c];
-            // == Pk(G) = min(G, (c1*betaStar)*k*omega)
-            M.source[c] += std::fmin(G[c], (co.c1*co.betaStar)*k.internal[c]*omega.internal[c]) * V;
+            // == Pk(G) = min(G, (c1*betaStar)*k*omega), and for kOmegaSSTLM that whole thing scaled by
+            // gammaIntEff (kOmegaSSTLM.C:55-62) -- the intermittency IS the switch that turns turbulent
+            // production on as the boundary layer transitions.
+            scalar pk = std::fmin(G[c], (co.c1*co.betaStar)*k.internal[c]*omega.internal[c]);
+            if (lm) pk *= (*lm->gammaIntEff)[c];
+            M.source[c] += pk * V;
             const scalar sp = (2.0/3.0) * divU[c];                   // - SuSp((2/3)*divU, k)
             M.diag[c]   += V * std::fmax(sp, 0.0);
             M.source[c] -= V * std::fmin(sp, 0.0) * k.internal[c];
-            M.diag[c]   += co.betaStar * omega.internal[c] * V;      // - Sp(epsilonByk, k)
+            // - Sp(epsilonByk, k). kOmegaSSTLM scales epsilonByk by gammaIntEff CLAMPED to [0.1, 1]
+            // (kOmegaSSTLM.C:65-76) -- a different clamp from the production above, so the destruction
+            // never falls below a tenth even where the intermittency does.
+            scalar ebk = co.betaStar * omega.internal[c];
+            if (lm)
+            {
+                const scalar ge = (*lm->gammaIntEff)[c];
+                ebk *= (ge < 0.1 ? 0.1 : (ge > 1.0 ? 1.0 : ge));
+            }
+            M.diag[c]   += ebk * V;
             if (bounded) M.diag[c] -= divU[c] * V;                   // - Sp(fvc::div(phi), k)
+        }
+        if (linearUpwind)
+        {
+            std::vector<std::vector<scalar>> kb(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi) kb[pi] = k.boundary[pi]->value();
+            const std::vector<vector> gradVf = fvc::gaussGrad(k.internal, kb, m, g, patches);
+            const std::vector<scalar> corr =
+                fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
+            for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
         }
         relaxMatrix(M, k, m, patches, relaxK);
         const SolverPerformance pk = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter);

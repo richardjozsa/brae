@@ -86,6 +86,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
@@ -724,6 +725,14 @@ add_test(NAME fusedgauss_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 set_tests_properties(fusedgauss_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# kOmegaSSTLM (Langtry-Menter transition) on the _cpp REFERENCE, run END TO END on the real T3A tutorial
+# against real OpenFOAM. Its control is the same case with the transition model removed -- 167x on U and
+# 437x on k -- which is what makes the bounds above mean something.
+add_test(NAME lm_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/lm_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A 269 500)
+set_tests_properties(lm_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.
@@ -819,6 +828,14 @@ target_link_libraries(test_simple_turbulent_cpp PRIVATE brae_core)
 add_executable(test_simple_sst_cpp tests/test_simple_sst_cpp.cu)
 target_include_directories(test_simple_sst_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_sst_cpp PRIVATE brae_core)
+
+add_executable(test_simple_lm_cpp tests/test_simple_lm_cpp.cu)
+target_include_directories(test_simple_lm_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_lm_cpp PRIVATE brae_core)
+
+add_executable(lm_probe tests/lm_probe.cu)
+target_include_directories(lm_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(lm_probe PRIVATE brae_core)
 
 add_executable(v2_envelope tests/v2_envelope.cu)
 target_include_directories(v2_envelope PRIVATE ${BRAE_HEADER_DIRS})

@@ -162,13 +162,25 @@ Residuals simpleStep(
                         m, g, patches, in.turb->relaxK, in.turb->tol, in.turb->relTol,
                         in.turb->maxIter, in.turb->saCoeffs, sch, in.turb->saRes);
         }
+        else if (in.turb->lm)
+        {
+            kOmegaSSTLM::correct(f.U, *in.turb->k, *in.turb->epsilon, *in.turb->nut,
+                                 *in.turb->ReThetat, *in.turb->gammaInt, in.turb->gammaIntEff,
+                                 f.phi, in.turb->y, in.nu, m, g, patches,
+                                 in.turb->relaxEpsilon, in.turb->relaxK,
+                                 in.turb->tol, in.turb->relTol, in.turb->maxIter,
+                                 in.turb->sstCoeffs, in.turb->lmCoeffs,
+                                 /*sstRes*/nullptr, in.turb->lmRes,
+                                 in.turb->boundedTurb, in.turb->limitedLinearTurb,
+                                 in.turb->linearUpwindTurb, in.turb->turbLimiterCoeff);
+        }
         else if (in.turb->sst)
         {
             kOmegaSST::correct(f.U, *in.turb->k, *in.turb->epsilon, *in.turb->nut, f.phi, in.turb->y,
                                in.nu, m, g, patches, in.turb->relaxEpsilon, in.turb->relaxK,
                                in.turb->tol, in.turb->relTol, in.turb->maxIter, in.turb->sstCoeffs,
                                /*res*/nullptr, in.turb->boundedTurb, in.turb->limitedLinearTurb,
-                               in.turb->turbLimiterCoeff);
+                               in.turb->turbLimiterCoeff, in.turb->linearUpwindTurb);
         }
         else
         {

@@ -90,6 +90,23 @@ std::vector<scalar> correctNut(const std::vector<scalar>& k, const std::vector<s
 // fixed point, so solving from its state to 1e-12 moves the field by however much that plateau is worth.)
 struct SSTResiduals { scalar omega = 0, k = 0; };
 
+// kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than
+// branched on here -- OpenFOAM's kOmegaSSTLM overrides F1, Pk and epsilonByk and inherits everything
+// else (kOmegaSSTLM.C:43-76):
+//
+//   F1         = max(kOmegaSST::F1, F3),  F3 = exp(-(Ry/120)^8),  Ry = y*sqrt(k)/nu
+//   Pk(G)      = gammaIntEff*kOmegaSST::Pk(G)
+//   epsilonByk = clamp(gammaIntEff, 0.1, 1)*kOmegaSST::epsilonByk
+//
+// That F3 is NOT the base model's F3 near-wall switch, which this reference refuses: kOmegaSSTBase::F3
+// is `1 - tanh(pow4(min(150*nu/(omega*y^2), 10)))` and multiplies F23. Two different functions, both
+// called F3, in a base and its derived class.
+struct LMHooks
+{
+    // Per cell. Null leaves this model exactly as it was: plain kOmegaSST.
+    const std::vector<scalar>* gammaIntEff = nullptr;
+};
+
 // One kOmegaSST::correct(): the whole model, updating k, omega and nut in place.
 //
 // Refuses (throws) rather than silently approximating: F3, decayControl, and a case with no wall.
@@ -117,7 +134,13 @@ void correct(
     // so the defaults keep that and every existing call site is unchanged.
     bool                           bounded = false,
     bool                           limitedLinear = false,
-    scalar                         limiterCoeff = 1.0);
+    scalar                         limiterCoeff = 1.0,
+    // `Gauss linearUpwind grad(<var>)` on k and omega. T3A asks for it on every turbulence scalar, and
+    // it is a different matrix from both upwind and limitedLinear: upwind's, plus a deferred gradient
+    // correction on the source. Ignoring it ran a scheme the case did not name.
+    bool                           linearUpwind = false,
+    // kOmegaSSTLM. Null (the default) is plain kOmegaSST and nothing below changes.
+    const LMHooks*                 lm = nullptr);
 
 } // namespace kOmegaSST
 } // namespace cpu
