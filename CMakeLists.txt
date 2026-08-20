@@ -672,6 +672,14 @@ add_test(NAME sa_cpp_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
 set_tests_properties(sa_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
 
+# The SAME case through the CUDA V2 driver, ported onto the _cpp path one module at a time. Its cold start
+# is what the fixed-point comparison could not see: the two momentum assemblies are bit-identical, and the
+# whole gap was the Spalding wall Newton being cold-started instead of seeded from nut_ -- see the header.
+add_test(NAME sa_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(sa_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
@@ -767,6 +775,10 @@ target_link_libraries(v2_envelope PRIVATE brae_core)
 add_executable(gradu_probe tests/gradu_probe.cu)
 target_include_directories(gradu_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(gradu_probe PRIVATE brae_core)
+
+add_executable(ueqn_localize tests/ueqn_localize.cu)
+target_include_directories(ueqn_localize PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(ueqn_localize PRIVATE brae_core)
 
 add_executable(test_simple_mrf_cpp tests/test_simple_mrf_cpp.cu)
 target_include_directories(test_simple_mrf_cpp PRIVATE ${BRAE_HEADER_DIRS})

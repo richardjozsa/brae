@@ -735,6 +735,9 @@ int runSimpleFoamV2(const std::string& caseDir)
     bool keNut = false;
     DeviceBuffer<label>  nutCalcMask;
     DeviceBuffer<scalar> nb, nutKb, nutEb, sstGradU;
+    // SA's nut = nuTilda*fv1 field assignment, kept apart from nb so nb can carry the previous wall nut
+    // into the Spalding warm start.
+    DeviceBuffer<scalar> saNutAssigned;
     auto refreshBoundaryNut = [&]()
     {
         if (keNut)
@@ -742,6 +745,12 @@ int runSimpleFoamV2(const std::string& caseDir)
             deviceBCValue(dbK, dK, nutKb);
             deviceBCValue(dbEps, dEps, nutEb);
         }
+        // SpalartAllmaras does NOT go through the k-based wall nut: its wall treatment is
+        // nutUSpaldingWallFunction, and its non-wall faces take the nut = nuTilda*fv1 field assignment.
+        // Running deviceBoundaryNut first would overwrite nb with cell values, destroying the previous
+        // WALL nut that Spalding's Newton warm-starts from -- OpenFOAM seeds it from nut_ itself, and
+        // seeding from the adjacent cell instead leaves the wall 14% out at convergence.
+        if (!saModel)
         deviceBoundaryNut(dbNut, bndIsWall, bndY, dK, dNut, nu, nb,
                           keCoeffs, /*atmZ0*/0.0, /*atmBoundNut*/true,
                           /*nuFace*/nullptr,
@@ -749,7 +758,37 @@ int runSimpleFoamV2(const std::string& caseDir)
                           keNut ? &nutKb : nullptr,
                           keNut ? &nutEb : nullptr);
 
-        // SpalartAllmaras: correctNut writes nut_ = nuTilda*fv1 as a FIELD ASSIGNMENT, and nuTilda is
+        // SpalartAllmaras: nut_ = nuTilda*fv1 is a FIELD ASSIGNMENT, so EVERY boundary face takes
+        // nuTilda's own patch value -- not the adjacent cell's, which is what deviceBoundaryNut leaves
+        // there for a non-wall patch. Measured on airFoil2D: the outlet's nuEff was 2.88e-01 away from
+        // what the nut field itself carried, on a nut of order 1e-03. Same defect class as kEpsilon's
+        // DkEff(patchi) and the SST's; SA just reaches it through a different expression.
+        // Into its OWN buffer, not into nb: nb still holds the previous iteration's wall nut, and the
+        // Spalding Newton below warm-starts from it exactly as OpenFOAM does. Overwriting nb here cold-
+        // started that iteration at ~0 (nuTilda is fixedValue ZERO at a wall) and its 10 iterations with a
+        // 1% early-out then landed on 4.86e-06 where OpenFOAM has 4.55e-03 -- a thousandfold.
+        if (saModel)
+        {
+            // nb carries the previous iteration's boundary nut -- the Spalding seed. Seeded once from
+            // the nut field the case shipped, exactly what OpenFOAM starts from.
+            if (nb.size() != static_cast<std::size_t>(dm.nBndFaces))
+            {
+                std::vector<scalar> nb0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    const std::vector<scalar>& fb = nutF.boundary[pi]->value();
+                    nb0.insert(nb0.end(), fb.begin(), fb.end());
+                }
+                nb0.resize(dm.nBndFaces, 0.0);
+                nb.copyFrom(nb0);
+            }
+            DeviceBuffer<scalar> ntB;
+            deviceBCValue(dbK, dK, ntB);
+            deviceNutSABoundary(ntB, nullptr, nu, saCoeffs.Cv1, saNutAssigned);
+        }
+
+        // ...and THEN correctBoundaryConditions(): correctNut writes nut_ = nuTilda*fv1, and nuTilda is
         // fixedValue ZERO at a wall -- so the assignment leaves the wall with NO eddy viscosity. OF then
         // runs correctBoundaryConditions(), and nutUSpaldingWallFunction overwrites that from Spalding's
         // law (~4.5e-03 on airFoil2D). Measured on the host reference, taking the assignment instead cost
@@ -759,8 +798,11 @@ int runSimpleFoamV2(const std::string& caseDir)
             SpalartAllmarasCoeffs dsaW;
             dsaW.kappa = saCoeffs.nutKappa;
             dsaW.E     = saCoeffs.E;
+            // The kernel rewrites EVERY face: wall faces from Spalding's law seeded by whatever nb
+            // already holds, and every other face from `nutFile` -- or, without it, from the adjacent
+            // CELL, which would discard the field assignment.
             deviceBoundaryNutSpalding(dbU, spaldingIsWall, spaldingY, gf.Ux, gf.Uy, gf.Uz,
-                                      dNut, nu, dsaW, nb);
+                                      dNut, nu, dsaW, nb, nullptr, &saNutAssigned);
         }
 
         // kOmegaSST's `calculated` patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
@@ -914,6 +956,9 @@ int runSimpleFoamV2(const std::string& caseDir)
                     {
                         spW.push_back(sp ? 1 : 0);
                         spY.push_back(sp ? yW[pi][i] : 0.0);
+                        if (sp && i == 0 && std::getenv("BRAE_DUMP_NUEFF"))
+                            std::printf("  [wallY] patch %s face0: nearWallDist %.6e   1/deltaCoeffs %.6e\n",
+                                        fvp[pi].name.c_str(), yW[pi][i], 1.0 / fvp[pi].deltaCoeffs[i]);
                     }
                 }
                 if (hasSpaldingWall)
@@ -980,6 +1025,36 @@ int runSimpleFoamV2(const std::string& caseDir)
             for (const auto& v : nuEffB) for (scalar x : v) flat.push_back(x);
             flat.resize(dm.nBndFaces, nu);
             dNuBnd.copyFrom(flat);
+
+            // What the driver seeds nuEff's BOUNDARY with, against what the field itself carries. They
+            // are the same quantity by two routes -- the wall-function recomputation here, and whatever
+            // the previous correctNut left on nut -- and any gap is an input difference, not an assembly
+            // one (the two momentum assemblies are bit-identical; see tests/ueqn_localize.cu).
+            if (std::getenv("BRAE_DUMP_NUEFF"))
+            {
+                const std::vector<label> hm = spaldingIsWall.host();
+                label nW = 0;
+                for (label v : hm) nW += v;
+                std::printf("  [nuEff] saModel %d  hasSpaldingWall %d  spalding faces %d of %zu\n",
+                            (int)saModel, (int)hasSpaldingWall, (int)nW, hm.size());
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    const std::vector<scalar>& fb = nutF.boundary[pi]->value();
+                    scalar mx = 0;
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                        mx = std::fmax(mx, std::fabs(nuEffB[pi][i] - (nu + fb[i])));
+                    scalar dmx = 0, fmx = 0;
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                    {
+                        dmx = std::fmax(dmx, nuEffB[pi][i] - nu);
+                        fmx = std::fmax(fmx, fb[i]);
+                    }
+                    std::printf("  [nuEff] patch %-14s (%-7s) driver nut max %.6e  field nut max %.6e"
+                                "  max|diff| %.6e\n",
+                                fvp[pi].name.c_str(), fvp[pi].type.c_str(), dmx, fmx, mx);
+                }
+            }
         }
 
         in.correct = [&]()

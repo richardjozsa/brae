@@ -56,7 +56,10 @@ inline DeviceBoundary buildDeviceBoundary(
         // overridden on ProcessorFvPatchField, so it would otherwise report 0 (= zeroGradient) whose
         // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
         const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
-        const std::vector<scalar>& val = f.boundary[pi]->value();   // inletOutlet/outletInlet/mixed: value() = refValue; totalPressure: p0
+        // The REFERENCE value, not the current one: the mixed/inletOutlet evaluators blend towards it, and
+        // a restarted field carries the value OpenFOAM wrote in value() -- which is a blend, not a
+        // reference. refValues() is value() for every BC that does not distinguish them.
+        const std::vector<scalar> val = f.boundary[pi]->refValues();   // totalPressure: p0
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         const std::vector<scalar>* rgp = f.boundary[pi]->refGradPtr();         // fixedGradient: per-face g
         for (label i = 0; i < fvp[pi].size; ++i)
@@ -246,7 +249,8 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         const scalar wdgVf[3] = { wedge ? scalar(0.5)*(scalar(1) - wcT->xx) : scalar(0),
                                   wedge ? scalar(0.5)*(scalar(1) - wcT->yy) : scalar(0),
                                   wedge ? scalar(0.5)*(scalar(1) - wcT->zz) : scalar(0) };
-        const std::vector<vector>& val = f.boundary[pi]->value();   // inletOutlet/mixed: value() = freestreamValue (= refValue)
+        // The REFERENCE value, not the current one -- see the scalar builder above.
+        const std::vector<vector> val = f.boundary[pi]->refValues();
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         // fixedGradient on a VECTOR field: the gradient is a vector, so it splits per component -- each
         // DeviceBoundary in comp[] carries its own refGrad, exactly as each carries its own refValue.

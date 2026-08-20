@@ -62,6 +62,12 @@ public:
     // from Spalding's law, and for SpalartAllmaras (nuTilda fixedValue 0 at a wall) the assignment would
     // otherwise leave the wall with NO eddy viscosity at all.
     virtual bool isNutUSpalding() const { return false; }
+    // The patch's REFERENCE value -- inletValue / outletValue / freestreamValue / refValue -- as opposed
+    // to its current value(). For most BCs the two are the same object and this returns value(); the
+    // read-and-hold family below overrides it. The device boundary builder needs the reference, because
+    // that is what its mixed/inletOutlet evaluators blend TOWARDS; handing it value() only worked while
+    // the two were kept identical, and stops working the moment a field carries the value OF wrote.
+    virtual std::vector<T> refValues() const { return value_; }
     // wedge (axisymmetric constraint): the HALF-angle and FULL-angle rotation tensors, or null on every
     // other patch type. The device builder reads them to set the per-component valueFraction and to
     // recompute the rotated value each step.
@@ -532,6 +538,12 @@ public:
         for (label i = 0; i < this->patch_.size; ++i)
             this->value_[i] = refValue(i);
     }
+    std::vector<T> refValues() const override
+    {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i) r[i] = refValue(i);
+        return r;
+    }
     bool fixesValue() const override { return false; }
 protected:
     T refValue(label i) const { return uniform_ ? uniformValue_ : (values_.empty() ? T{} : values_[i]); }
@@ -626,9 +638,18 @@ public:
         bool velocitySign,
         // The freestream family (freestreamVelocity/freestreamPressure) is the one whose valueFraction
         // brae actually maintains -- see evaluate() for why that gates the blend.
-        bool freestream = false)
+        bool freestream = false,
+        // The file's own `value` entry, per face, when it had one. OF's mixed constructor READS it and
+        // does not re-evaluate, so a restart resumes with the field OpenFOAM wrote rather than with a
+        // blend of a valueFraction no iteration has computed yet. refValue stays freestreamValue; only
+        // value() carries this, which is why the device builder had to be taught to ask for the
+        // reference explicitly (refValues()) instead of reading value().
+        std::vector<T> readValue = {})
         : ExtrapolatedValuePatchField<T>(p, uniform, uval, std::move(vals)),
-          velocitySign_(velocitySign), freestream_(freestream), vf_(p.size, 0.5) {}
+          velocitySign_(velocitySign), freestream_(freestream), vf_(p.size, 0.5)
+    {
+        if (readValue.size() == static_cast<std::size_t>(p.size)) this->value_ = std::move(readValue);
+    }
     bool fixesValue() const override { return true; }               // OF mixedFvPatchField::fixesValue() == true
     int  bcCategory() const override { return 5; }                  // device: mixed (per-face valueFraction blend)
 
@@ -990,16 +1011,20 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<InletOutletPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues);
     // freestreamVelocity / freestreamPressure derive from mixedFvPatchField in OF -> CONTINUOUS Robin blend
     // vf = 0.5 -/+ 0.5*(U.n)/|U| (flow-angle, not the binary switch). The device recomputes vf each step.
-    // NOT seeded from the file's `value`, though OF's mixed constructor does keep it: doing that moved
-    // naca0012's compressible restart (restart_vs_openfoam, p 1e-03 -> 2.8e-03). The device path builds
-    // its boundary from this object and does not go through setValueFraction, so the two disagree about
-    // what value_ means there; that is its own piece of work, separate from the blend below.
+    // The file's own `value`, expanded per face. OF's mixed constructor keeps it verbatim on read.
+    auto readValueOf = [&]() -> std::vector<T>
+    {
+        if (!d.hasValue) return {};
+        if (d.valueUniform) return std::vector<T>(p.size, d.uniformValue);
+        if (d.values.size() == static_cast<std::size_t>(p.size)) return d.values;
+        return {};
+    };
     if (d.type == "freestreamVelocity")   // mixed, velocity sign (0.5 - 0.5 U.n/|U|)
         return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
-                                                    true, /*freestream*/true);
+                                                    true, /*freestream*/true, readValueOf());
     if (d.type == "freestreamPressure")   // mixed, pressure sign (0.5 + 0.5 U.n/|U|)
         return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
-                                                    false, /*freestream*/true);
+                                                    false, /*freestream*/true, readValueOf());
     // Plain `mixed` (Robin): refValue + refGradient + valueFraction, all given by the case. Unlike
     // freestream*/inletOutlet the valueFraction is FIXED, not recomputed from the flux, so the device does
     // not need a per-step update -- the seeded vf is the answer. This is the shape basicThermo maps a
