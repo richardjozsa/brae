@@ -109,6 +109,16 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
             continue;
         }
 
+        // rotorDiskSource is implemented (rotorDiskSource_cpp.cu, gated by
+        // tests/rotordisk_vs_openfoam.sh against OpenFOAM's own reported drag/lift/AOA). Its parameters
+        // are read by readFvOptions into RotorDiskParams, not here -- this list only decides whether the
+        // envelope refuses the case, and the geometry needs a mesh this reader does not take.
+        if (o.type == "rotorDisk" || o.type == "rotorDiskSource")
+        {
+            o.rotorDisk = true;
+            list.options.push_back(o);
+            continue;
+        }
         if (o.type != "explicitPorositySource")
         {
             o.unsupported = o.type.empty() ? std::string("(no type)") : o.type;

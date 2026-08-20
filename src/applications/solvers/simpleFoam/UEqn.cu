@@ -237,6 +237,16 @@ void assembleUEqn(
         }
     }
 
+    // == fvOptions(U): rotorDiskSource. OF's addSup divides the force by V and then `eqn -= force`
+    // ADDS V*force to the source, so the extensive source gains the raw blade-element force.
+    if (in.rotor && in.rotor->active)
+    {
+        DeviceBuffer<scalar> fx, fy, fz;
+        deviceRotorForce(*in.rotor, dm.nCells, Ux, Uy, Uz, fx, fy, fz);
+        DeviceBuffer<scalar>* fc[3] = {&fx, &fy, &fz};
+        for (int k = 0; k < 3; ++k) deviceAxpy(1.0, *fc[k], M.source[k]);
+    }
+
     if (in.porosity && in.porosity->active)
     {
         deviceFvoPorosityDiag(*in.porosity, in.nuLaminar, dm.V, Ux, Uy, Uz, M.diag);

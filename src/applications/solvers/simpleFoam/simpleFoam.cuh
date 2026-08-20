@@ -102,6 +102,7 @@ struct StepInput
     cpu::DivScheme scheme = cpu::DivScheme::upwind;   // the div(phi,U) scheme, shared with the reference
     scalar         schemeCoeff = 1.0;                 // the `k` of `limitedLinear k`
     const DevicePorosity* porosity = nullptr;         // explicitPorositySource/DarcyForchheimer
+    const DeviceRotorDisk* rotor = nullptr;           // rotorDiskSource (Froude blade-element momentum)
     // MRF zones, already resolved against the mesh and uploaded. Null with hasMRF set is a REFUSAL:
     // a case that declares MRF and gets none of it converges to a confidently wrong answer.
     const std::vector<DeviceMRFZone>* mrf = nullptr;

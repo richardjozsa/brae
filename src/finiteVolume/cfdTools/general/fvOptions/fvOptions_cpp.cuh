@@ -51,6 +51,10 @@ namespace fvOptions {
 // type name of anything else so the caller can refuse it by name.
 struct Option
 {
+    // A rotorDiskSource: implemented, but its parameters and geometry come from readFvOptions
+    // and the mesh rather than from this list. Recorded so the driver knows one is present.
+    bool rotorDisk = false;
+
     std::string        name;
     std::string        type;
     bool               active = true;

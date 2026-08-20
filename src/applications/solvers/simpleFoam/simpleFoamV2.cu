@@ -23,6 +23,8 @@
 #include "MRF_cpp.cuh"
 #include "device_MRF.cuh"
 #include "mrf_read.cuh"          // readCellZones
+#include "fv_options.cuh"        // readFvOptions -> RotorDiskParams
+#include "rotor_disk.cuh"
 #include "fvOptions_cpp.cuh"       // the fvOptions framework + explicitPorositySource    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
 #include "cell_wall_dist.cuh"       // cellWallDist: kOmegaSST's F1/F2 need y at every CELL, not just walls
 #include "near_wall_dist.cuh"
@@ -1260,6 +1262,7 @@ int runSimpleFoamV2(const std::string& caseDir)
         for (const auto& o : ol.options)
         {
             if (!o.active || !o.unsupported.empty()) continue;
+            if (o.rotorDisk) continue;   // built below, from readFvOptions + the mesh
             const scalar offD = std::fabs(o.D.xy) + std::fabs(o.D.xz) + std::fabs(o.D.yz)
                               + std::fabs(o.D.yx) + std::fabs(o.D.zx) + std::fabs(o.D.zy);
             const scalar offF = std::fabs(o.F.xy) + std::fabs(o.F.xz) + std::fabs(o.F.yz)
@@ -1282,6 +1285,29 @@ int runSimpleFoamV2(const std::string& caseDir)
         }
     }
     in.porosity  = porosity.active ? &porosity : nullptr;
+
+    // rotorDiskSource. The parameters come from readFvOptions (the same reader the shipped solver uses)
+    // and the per-cell geometry from the mesh. The force itself is the blade-element calculation gated
+    // against OpenFOAM's own reported drag/lift/AOA in tests/rotordisk_vs_openfoam.sh.
+    DeviceRotorDisk rotor;
+    {
+        std::map<std::string, std::vector<label>> rzones;
+        {
+            std::ifstream a(caseDir + "/constant/polyMesh/cellZones");
+            std::ifstream b(caseDir + "/constant/polyMesh/cellZones.gz");
+            if (a.good() || b.good()) rzones = readCellZones(caseDir + "/constant/polyMesh");
+        }
+        const FvOptionsData fvo = readFvOptions(caseDir, rzones, g.V(), nC, g.C());
+        if (fvo.rotor.active)
+        {
+            rotor = buildDeviceRotorDisk(fvo.rotor, g.C(), g.Sf(), m.owner(), m.neighbour(),
+                                         m.nInternalFaces());
+            std::printf("  fvOptions rotorDisk: %d cells, rMax %.4g, omega %.4g rad/s, %d blades\n",
+                        rotor.n, rotor.rMax, rotor.omega, (int)rotor.nBlades);
+        }
+    }
+    in.rotor = rotor.active ? &rotor : nullptr;
+
     in.nuLaminar = nu;
 
     std::printf("  U solver: %s\n",

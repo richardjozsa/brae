@@ -32,6 +32,7 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_MRF.cuh"
+#include "rotor_disk.cuh"
 #include "device_ldu.cuh"
 #include "device_fvoptions.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
 #include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
@@ -92,6 +93,9 @@ struct MomentumInput
     // explicitPorositySource/DarcyForchheimer, evaluated on the device each iteration from the current U.
     // nuLaminar, not nuEff: DarcyForchheimer.C looks up the field NAMED "nu".
     const DevicePorosity* porosity = nullptr;
+    // rotorDiskSource. OF addSup is `eqn -= force` with force PER VOLUME, and operator-= is
+    // source += V*su, so the extensive source GAINS the raw force. See rotorDiskSource_cpp.cuh.
+    const DeviceRotorDisk* rotor = nullptr;
     // MRF.DDt(U), UEqn.H:8 -- the zones already resolved against the mesh and uploaded.
     const std::vector<DeviceMRFZone>* mrf = nullptr;
     scalar nuLaminar = 0.0;

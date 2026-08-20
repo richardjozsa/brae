@@ -353,6 +353,34 @@ COMPONENTS = {
                   "answer bit-identical), the wall distance (nearWallDist and 1/deltaCoeffs coincide here "
                   "at 9.027330e-02), and the linearUpwind correction (forcing upwind moves the momentum "
                   "residual 1.34e-04 -> 7.99e-03, so it is applied)."),
+        dict(name="rotorDiskSource", of_symbol="Foam::fv::rotorDiskSource",
+             of_file="src/fvOptions/sources/derived/rotorDiskSource/rotorDiskSource.C",
+             classification="MODEL", status="REVALIDATE_EXISTING",
+             brae_existing="src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu",
+             brae_reference="src/finiteVolume/cfdTools/general/fvOptions/rotorDiskSource_cpp.cu",
+             brae_target="src/finiteVolume/cfdTools/general/fvOptions/",
+             validation="tests/rotordisk_vs_openfoam.sh, on validation/rotorDisk -- the tutorial on its "
+                        "REAL 71734-cell snappyHexMesh, run to its own convergence at t=224. OpenFOAM's "
+                        "rotorDiskSource PRINTS its own answer, so the oracle is unusually direct: "
+                        "min/max(AOA) -61.412/-7.44884 against -61.413193/-7.4489333, Effective drag "
+                        "-130.396343 against -130.399890, Effective lift 1230.695836 against 1230.716500 "
+                        "-- all within 2.7e-05, which is the one-iteration offset between OpenFOAM's "
+                        "printed value (start of iteration 224) and the written t=224 field. The gate "
+                        "also compares the DEVICE force against the host one (5.6e-16) and asserts the "
+                        "lift has OpenFOAM's sign.",
+             note="Froude blade-element momentum. Scoped, and refused rather than approximated outside "
+                  "it: geometryMode `specified`, fixedTrim, no coning (Rcone = I), one lookup profile, "
+                  "inletFlowType local|fixed. THE SIGN is the thing worth stating: OF's addSup is "
+                  "`eqn -= force` with force carrying eqn's dimensions PER VOLUME (calculate divides by "
+                  "V), and fvMatrix::operator-= is source() += V*su -- so the extensive source GAINS the "
+                  "raw force. A body force that pushes the wrong way still converges, it just converges "
+                  "to the wrong answer, so nothing about a residual would have caught it. brae's device "
+                  "rotorDisk existed with NO test at all and a header comment describing the opposite "
+                  "(`relaxSrc -= force`); the host port plus this gate established that the device FORCE "
+                  "is right to 5.6e-16 and that the comment refers to the solver's application, not the "
+                  "force. Unblocks the rotorDisk tutorial (its other two blockers, linearUpwind on "
+                  "div(phi,k) and div(phi,omega), were cleared by the turbulence-scheme work)."),
+
         dict(name="cellLimitedGrad", of_symbol="Foam::fv::cellLimitedGrad",
              of_file="src/finiteVolume/finiteVolume/gradSchemes/limitedGradSchemes/cellLimitedGrad/"
                      "cellLimitedGrad.C",

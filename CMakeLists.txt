@@ -90,6 +90,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
+    src/finiteVolume/cfdTools/general/fvOptions/rotorDiskSource_cpp.cu
     src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
@@ -689,6 +690,13 @@ add_test(NAME celllimited_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
 set_tests_properties(celllimited_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# rotorDiskSource vs OpenFOAM's OWN reported drag/lift/AOA on the real 71734-cell tutorial mesh, plus a
+# device-vs-_cpp check. The device implementation predated any test; this is the first thing to check it.
+add_test(NAME rotordisk_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rotordisk_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/rotorDisk)
+set_tests_properties(rotordisk_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 # fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
 # topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
 # with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
@@ -792,6 +800,10 @@ target_link_libraries(ueqn_localize PRIVATE brae_core)
 add_executable(test_celllimited_cpp tests/test_celllimited_cpp.cu)
 target_include_directories(test_celllimited_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_celllimited_cpp PRIVATE brae_core)
+
+add_executable(rotordisk_probe tests/rotordisk_probe.cu)
+target_include_directories(rotordisk_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(rotordisk_probe PRIVATE brae_core)
 add_test(NAME celllimited_cpp
          COMMAND test_celllimited_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 
