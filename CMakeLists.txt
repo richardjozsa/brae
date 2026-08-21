@@ -764,6 +764,16 @@ add_test(NAME coupledinterfacescheme_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclic)
 set_tests_properties(coupledinterfacescheme_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# The SAME gate on the other blend, `bounded Gauss linear`, which at a coupled face is the patch's own
+# interpolation weight -- w ~ 0.5, the furthest a weight can get from upwind's 0 or 1, so this is the widest
+# of the three gaps and the one a wrong interface assembly distorts most. OpenFOAM's implicitAMI is the only
+# tutorial anywhere that pairs a coupled patch with `Gauss linear` on div(phi,U); it is laminar, so its
+# bounds name only U and p and the gate checks the fields the case actually wrote.
+add_test(NAME linearinterfacescheme_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/coupledinterfacescheme_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/implicitAMI U=4e-02,p=8e-02)
+set_tests_properties(linearinterfacescheme_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # SIMPLEC (`consistent true`) across a coupled interface, on OpenFOAM's basic/simpleFoam/implicitAMI.
 # fvMatrix::H1() sums boundaryCoeffs over every coupled patch and the SIMPLEC flux term is evaluated on
 # coupled boundary faces like any other; brae did neither, so on a mesh coupled only by a cyclicAMI the

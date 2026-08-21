@@ -1316,10 +1316,9 @@ void amgFineCoeffKernel(
         // off-diagonal never changed sign where OpenFOAM's did: L2 6.86e-01 against OF's own
         // boundaryCoeffs, with the gap equal to phi*(1-w) face by face.
         //
-        // Only the limited schemes are wired here. `Gauss linear` and LUST are also blends at a coupled
-        // face (w = cd, and 0.75*cd + 0.25*pos0) and are still assembled upwind there -- see the manifest
-        // entry; each needs its own control before it is switched on, and switching them on silently
-        // alongside this would move every cyclic case at once with one gate covering them all.
+        // LUST is the one blend still assembled upwind at a coupled face (w = 0.75*cd + 0.25*pos0). No
+        // simpleFoam tutorial names it -- the fourteen that do are fireFoam and pimpleFoam LES -- so it
+        // has no case to be gated on here; see the manifest entry.
         DeviceBuffer<scalar> cycWsch, amiWsch;
         if (ctl_.divULimitedV)
         {
@@ -1327,6 +1326,19 @@ void amgFineCoeffKernel(
                 deviceCyclicLimitedVWeights(cyc_, Uk_[0], Uk_[1], Uk_[2], gradUlv, nC_, ctl_.divUTwoBykV, cycWsch);
             if (hasAMI_)
                 deviceAmiLimitedVWeights(ami_, Uk_[0], Uk_[1], Uk_[2], gradUlv, nC_, ctl_.divUTwoBykV, amiWsch);
+        }
+        // `Gauss linear` -- CENTRAL differencing, and at a coupled face there is nothing to compute: OF's
+        // linear scheme returns mesh.surfaceInterpolation::weights() (linear.H:106), whose boundary field
+        // on a coupled patch IS the patch's own interpolation weight, which both interface structs already
+        // carry and already use for every face value they form. So the weight is a pointer, not a kernel.
+        //
+        // This is the widest of the three gaps in absolute terms: w = wCD is ~0.5, the furthest a weight
+        // can get from upwind's 0 or 1, so a case that asks for `Gauss linear` and is given upwind at its
+        // interface is not slightly off there, it is running a different scheme at half strength.
+        else if (ctl_.divULinear)
+        {
+            if (hasCyclic_) deviceCopy(cycWsch, cyc_.weights);
+            if (hasAMI_)    deviceCopy(amiWsch, ami_.weights);
         }
         DeviceBuffer<scalar> cycSumOff;
         if (hasCyclic_)
