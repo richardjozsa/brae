@@ -13,6 +13,45 @@
 
 namespace brae {
 
+namespace {
+// The level-0 fine coefficients over the EXTENDED edge list the AMG hierarchy was built from:
+// [internal faces | cyclic entries | AMI stencil entries].
+//
+// THE SIGN, and it is the whole subtlety. brae's lduMatrix edge means
+//     Ax[nei] += lower*x[own] ;  Ax[own] += upper*x[nei]
+// while an interface entry means only  Apsi[own] += ifCoeff*psi[nbr]  -- ONE direction. The reverse
+// direction is a SEPARATE appended edge, contributed by the matching entry on the other patch. So each
+// edge carries upper = ifCoeff and lower = ZERO; writing ifCoeff into both would count every periodic
+// connection twice.
+//
+// It still comes out symmetric on the coarse grid, which is what the V-cycle needs: the two edges (A,B)
+// and (B,A) agglomerate to the same coarse face with opposite orientation, and agglomerate()'s faceFlip
+// sends the reversed one's upper into cLower. Where both cells land in the same aggregate the pair goes
+// into the coarse diagonal instead, which is equally right.
+__global__
+void amgFineCoeffKernel(
+    int nIf, int nCyc, int nAmi,
+    const scalar* __restrict__ pU,
+    const scalar* __restrict__ pL,
+    const scalar* __restrict__ cycIf,
+    const scalar* __restrict__ amiIf,
+    const label*  __restrict__ amiSrc,
+    const scalar* __restrict__ amiW,
+    scalar* __restrict__ up,
+    scalar* __restrict__ lo)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nIf + nCyc + nAmi) return;
+    if (i < nIf)              { up[i] = pU[i];  lo[i] = pL[i]; return; }
+    if (i < nIf + nCyc)       { up[i] = cycIf[i - nIf];                    lo[i] = 0; return; }
+    const int j = i - nIf - nCyc;
+    up[i] = amiIf[amiSrc[j]] * amiW[j];
+    lo[i] = 0;
+}
+}   // namespace
+
+
+
     // BRAE_SETUP_TIMING: same milestone trace as the driver, inside the constructor. The ctor is the
     // longest silent stretch of set-up (mesh upload, AMG hierarchy, wall distance, validate) and a hang
     // in it looks identical to a hang in the driver from the outside.
@@ -331,13 +370,30 @@ namespace brae {
             ddtCorrBndMask_.copyFrom(mask);
         }
         nuBndConst_.copyFrom(std::vector<scalar>(dbExtrap_.n, ctl.nu));
-        // AMG hierarchy for the pressure Laplacian (static: faceWeights = |Sf|), built from the mesh internal faces.
-        // The cyclic interface is NOT in the AMG: a Galerkin coarse operator built from the internal-face restriction
-        // cannot represent the long-range periodic edges (the V-cycle diverges, OF handles this with a dedicated
-        // cyclicGAMGInterface agglomerated at every level). Instead, when cyclic is present the pressure is solved with
-        // Jacobi-PCG over the interface-coupled fine operator (deviceLduViewCyclic), the device analog of the validated
-        // host cyclicPCG. cyclicGAMGInterface is the deferred perf path; for now AMG is only used on non-cyclic cases.
-        const std::vector<label> ownerInt(m.owner().begin(), m.owner().begin() + nIf_), neiInt(m.neighbour());
+        // AMG hierarchy for the pressure Laplacian (static: faceWeights = |Sf|), built from the mesh internal faces
+        // PLUS the coupled-interface edges.
+        //
+        // The interface edges used to be left out, and the whole AMG with them: a cyclic or AMI mesh fell back to
+        // Jacobi-PCG over the interface-coupled fine operator. That is a diagonal preconditioner on a Poisson
+        // problem, and it costs what one costs -- measured on pipeCyclic, 1250 cells with a periodic pair, brae
+        // took 153/118/130 pressure iterations where OpenFOAM's GAMG took 5/5/2, while brae on the 10x LARGER
+        // interface-free pitzDaily took 18. A mesh ten times smaller needing eight times the iterations is the
+        // O(sqrt(N)) signature of losing the multigrid, not a property of the mesh.
+        //
+        // Nothing about a periodic edge actually resists agglomeration: buildAMG takes a plain edge list, and an
+        // interface entry IS an edge -- (ownCell, nbrCell) for a conformal 1:1 pair, and (ownCell[i], nbrCell[k])
+        // per stencil entry with the AMI weight folded into the face weight for a non-conformal one. The
+        // agglomeration is symmetric in owner/nei and carries a faceFlip per fine face, so an edge whose coarse
+        // orientation comes out reversed scatters into cLower instead of cUpper by itself.
+        //
+        // Each physical periodic connection appears TWICE, once from each side's own patch entry, and that is
+        // exactly right: the two carry the two directions of one lduMatrix edge. Coarsening sees the pair as one
+        // strong connection, which is what it is.
+        //
+        // OpenFOAM does the same thing by a different route -- a dedicated cyclicGAMGInterface agglomerated at
+        // every level -- and the point of both is the same: the coarse grid has to be able to move the periodic
+        // mode, or the outer Krylov has to do it one iteration at a time.
+        std::vector<label> ownerInt(m.owner().begin(), m.owner().begin() + nIf_), neiInt(m.neighbour());
         std::vector<scalar> fwAMG(g.magSf().begin(), g.magSf().begin() + nIf_);   // default: geometric face area (bit-identical)
         if (std::getenv("BRAE_AMG_SOC"))   // SoC ON: weight = LAPLACIAN coupling magSf*deltaCoeffs (the real matrix strength,
         {
@@ -345,8 +401,58 @@ namespace brae {
             for (label f = 0; f < nIf_; ++f)
                 fwAMG[f] *= dcg[f];                  // strong-face filter sees the true anisotropy
         }
+        // The interface edges, appended after the internal faces so a fine coefficient array is simply
+        // [internal faces | interface entries] and level-0 Galerkin reads them with no extra addressing.
+        // nAmgIfEdges_ records how many were added; zero on a mesh without interfaces, which leaves the
+        // hierarchy and every existing case bit-identical.
+        nAmgIfEdges_ = 0;
+        amgIfOwn_.clear();
+        amgIfNbr_.clear();
+        if (hasCyclic_ || hasAMI_)
+        {
+            const std::vector<AMIInterface> amis = buildAMIInterfaces(m, g, fvp);
+            for (const CyclicInterface& c : cyclics)
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                {
+                    amgIfOwn_.push_back(c.faceCells[i]);
+                    amgIfNbr_.push_back(c.nbrFaceCells[i]);
+                    // |Sf| of this patch face, the same geometric weight the internal faces carry.
+                    fwAMG.push_back(fvp[c.patch].magSf[i]);
+                }
+            for (const AMIInterface& a : amis)
+                for (std::size_t i = 0; i < a.ownCell.size(); ++i)
+                    for (label k = a.srcOffset[i]; k < a.srcOffset[i+1]; ++k)
+                    {
+                        amgIfOwn_.push_back(a.ownCell[i]);
+                        amgIfNbr_.push_back(a.nbrCell[k]);
+                        fwAMG.push_back(a.magSf[i] * a.weight[k]);   // the AMI weight IS the edge's share
+                    }
+            {
+                std::vector<label>  aSrc;
+                std::vector<scalar> aW;
+                for (const AMIInterface& a : amis)
+                    for (std::size_t i = 0; i < a.ownCell.size(); ++i)
+                        for (label k = a.srcOffset[i]; k < a.srcOffset[i+1]; ++k)
+                        {
+                            aSrc.push_back(static_cast<label>(i));
+                            aW.push_back(a.weight[k]);
+                        }
+                nAmgAmiEdges_ = static_cast<label>(aSrc.size());
+                if (nAmgAmiEdges_) { amgIfAmiSrc_.copyFrom(aSrc); amgIfAmiW_.copyFrom(aW); }
+            }
+            ownerInt.insert(ownerInt.end(), amgIfOwn_.begin(), amgIfOwn_.end());
+            neiInt.insert(neiInt.end(), amgIfNbr_.begin(), amgIfNbr_.end());
+            nAmgIfEdges_  = static_cast<label>(amgIfOwn_.size());
+            nAmgCycEdges_ = nAmgIfEdges_ - nAmgAmiEdges_;
+            std::printf("  AMG: %d interface edge(s) agglomerated alongside %d internal faces\n",
+                        (int)nAmgIfEdges_, (int)nIf_);
+        }
         ctorMark("pre-AMG");
-        amg_ = buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
+        // The hierarchy CACHE keys on the mesh only, so a run that adds interface edges must not reload a
+        // hierarchy built without them (or vice versa). Interface meshes therefore build fresh.
+        amg_ = nAmgIfEdges_
+             ? buildAMG(ownerInt, neiInt, fwAMG, nC_)
+             : buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
 
         // initial device state.
         {
@@ -1166,6 +1272,11 @@ namespace brae {
             cycSumOff.copyFrom(std::vector<scalar>(nC_, 0.0));
             interfaceOffDiagSum(cyc_, cycSumOff);
             if (cyc_.rotational) interfaceScaleImplicit(cyc_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
+            // The cyclic MOMENTUM off-diagonal, dumped so a conformal cyclicAMI run can be diffed
+            // against a cyclic run of the same mesh face for face -- at weight 1 and a 1:1 stencil the
+            // two must agree exactly, so any difference localises which path is wrong.
+            if (stageDumpActive() && stageDumpFirstOnly("cycIfCoeffMom"))
+                stageDump("stage_cyc_ifCoeffMom", cyc_.ifCoeff);
         }
         DeviceBuffer<scalar> amiSumOff;                              // cyclicAMI momentum coupling (translational)
         if (hasAMI_)
@@ -1665,9 +1776,14 @@ namespace brae {
         if (hasAMI_) interfaceFlux(ami_, HbyA[0], HbyA[1], HbyA[2]);   // AMI-face phiHbyA = (w*HbyA[own]+(1-w)*interp(HbyA[nbr])).Sf
         // Stage harness: phiHbyA ON the interface. This is the one quantity neither code writes per face, and
         // it is where a coupling defect shows up as a number rather than as a downstream symptom.
-        if (hasAMI_ && stageDumpActive() && stageDumpFirstOnly("amiPhiHbyA"))
+        if ((hasAMI_ || hasCyclic_) && stageDumpActive() && stageDumpFirstOnly("amiPhiHbyA"))
         {
-            stageDump("stage_ami_phiHbyA", ami_.phi);
+            if (hasAMI_)
+            {
+                stageDump("stage_ami_phiHbyA", ami_.phi);
+                stageDump("stage_ami_ifCoeffP", ami_.ifCoeff);   // the PRESSURE (laplacian) off-diagonal
+            }
+            if (hasCyclic_) stageDump("stage_cyc_ifCoeffP", cyc_.ifCoeff);
             // ...and the CYCLIC faces. These live outside both the internal-face array and the
             // DeviceBoundary, so neither existing dump sees them -- which is exactly why a stage
             // comparison showed div(phiHbyA) wrong on the interface cells while every dumped input
@@ -1676,6 +1792,7 @@ namespace brae {
             stageDump("stage_ami_HbyAx", HbyA[0]);
             stageDump("stage_ami_HbyAy", HbyA[1]);
             stageDump("stage_ami_rAU", rAU);
+            if (hasCyclic_) stageDump("stage_cyc_phi", cyc_.phi);
         }
         // OF's U.correctBoundaryConditions() -- which solve() runs at the end of the momentum predictor
         // and pEqn.H runs again after the velocity correction. It matters for a WEDGE because its value
@@ -2220,9 +2337,36 @@ namespace brae {
                 // requires symmetry. Conforming interfaces -- every plain cyclic, and an AMI whose two
                 // sides happen to match 1:1 -- stay on PCG, which is both faster and the path all the
                 // existing cyclic cases are validated on.
+                // The interface edges are now IN the agglomeration, so the coarse grids can move the
+                // periodic mode and the V-cycle is a valid preconditioner here. Galerkin needs the fine
+                // coefficients over the SAME extended edge list the hierarchy was built from:
+                // [internal faces | interface entries], the second half gathered from the interface
+                // off-diagonals. The pressure matrix is symmetric, so upper and lower agree.
+                // A NON-CONFORMING AMI keeps BiCGStab (the operator is not self-adjoint), so it does not
+                // use the V-cycle -- and must not pay for a Galerkin re-coarsening it will never read.
+                const bool amgHere = nAmgIfEdges_ && !amiNonConforming_;
+                if (amgHere)
+                {
+                    const int nE = static_cast<int>(nIf_ + nAmgIfEdges_);
+                    amgFineUpper_.resize(nE);
+                    amgFineLower_.resize(nE);
+                    amgFineCoeffKernel<<<nBlocks(nE), TPB>>>(
+                        (int)nIf_, (int)nAmgCycEdges_, (int)nAmgAmiEdges_,
+                        pU_.data(), pL_.data(),
+                        hasCyclic_ ? cyc_.ifCoeff.data() : nullptr,
+                        hasAMI_    ? ami_.ifCoeff.data() : nullptr,
+                        nAmgAmiEdges_ ? amgIfAmiSrc_.data() : nullptr,
+                        nAmgAmiEdges_ ? amgIfAmiW_.data()   : nullptr,
+                        amgFineUpper_.data(), amgFineLower_.data());
+                    cudaCheck(cudaGetLastError(), "amgFineCoeff");
+                    amgGalerkin(amg_, diagCp_, amgFineUpper_, amgFineLower_);
+                }
                 pp = amiNonConforming_
                    ? deviceJacobiBiCGStab(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(),
                                           ctl_.pcgCheckEvery, ctl_.pMinIter())
+                   : amgHere
+                   ? deviceAMGPCG(pvc, amg_, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(),
+                                  /*captureVcycle*/false, ctl_.pcgCheckEvery, /*corrScaling*/false, ctl_.pMinIter())
                    : deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.pMinIter());
             }
             else if (compressible_ && ctl_.transonic)

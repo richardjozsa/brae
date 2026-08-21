@@ -510,6 +510,17 @@ components:
     validation: "tests/lm_cpp_vs_openfoam.sh -- T3A asks for `bounded Gauss linearUpwind grad` on k, omega, gammaInt and ReThetat. Honouring it moved the end-to-end U error from 2.43e-03 to 2.04e-04, a factor of 12."
     note: "The _cpp kOmegaSST had no linearUpwind parameter AT ALL, so a case asking for it silently got UPWIND -- a different matrix under the case's own scheme name, which is the substitution class this port exists to eliminate. SpalartAllmaras already had it (SA::DivScheme::linearUpwind); kOmegaSST did not. linearUpwind's matrix IS upwind's; the scheme is the deferred gradient correction subtracted from the source."
 
+  amgInterfaceAgglomeration:
+    openfoam:
+      symbol: "Foam::cyclicGAMGInterface / cyclicAMIGAMGInterface"
+      file: src/finiteVolume/fvMatrices/solvers/GAMGSymSolver/GAMGAgglomerations
+    classification: SHARED_NUMERICAL
+    brae_status: PORTED
+    brae_existing: src/applications/solvers/simpleFoam/device_simple_foam.cu (amgFineCoeffKernel + the extended edge list)
+    brae_target: src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/
+    validation: "Measured on the conformal pipeCyclic (1250 cells, one periodic pair): pressure iterations 153/118/8/130/129 before, 129/37/14/37/36 after -- ~3.5x on every iteration past the first. Same for a conforming cyclicAMI (133/36/13/38/40). The converged answer is UNCHANGED to every digit printed (U 6.060e-02, p 2.479e-01 against OpenFOAM before and after), which is what a pure preconditioner change must do. 60 gates re-run green, including every AMG/PCG/SpMV/determinism test."
+    note: "brae used to switch the pressure solve OFF AMG entirely on any mesh carrying a cyclic or cyclicAMI patch and fall back to Jacobi-PCG -- a diagonal preconditioner on a Poisson problem. The cost was visible against mesh size: 1250 cells with a periodic pair needed 153 iterations while the interface-free 12225-cell pitzDaily needed 18, the O(sqrt(N)) signature of losing the multigrid. Nothing about a periodic edge actually resists agglomeration: buildAMG takes a plain edge list, and an interface entry IS an edge -- (ownCell, nbrCell) for a conformal pair, (ownCell[i], nbrCell[k]) per stencil entry with the AMI weight folded into the face weight otherwise. THE SIGN is the subtlety: an interface entry is ONE direction (Apsi[own] += ifCoeff*psi[nbr]), so each appended edge carries upper = ifCoeff and lower = ZERO, the reverse direction being the matching entry on the other patch; writing ifCoeff into both would count every periodic connection twice. It still comes out symmetric on the coarse grid because the two edges agglomerate to the same coarse face with opposite orientation and agglomerate()'s faceFlip sends the reversed one's upper into cLower. STILL OPEN: a NON-CONFORMING AMI keeps BiCGStab (the operator is not self-adjoint, so CG is invalid) and so still runs unpreconditioned by AMG; and brae's AMG remains ~7x OpenFOAM's GAMG in iteration count here (37 against 5), which is the general brae-AMG gap rather than an interface one. The hierarchy CACHE is bypassed on interface meshes, since it keys on the mesh alone and must not serve a hierarchy built without the interface edges."
+
   cellLimitedGrad:
     openfoam:
       symbol: "Foam::fv::cellLimitedGrad"

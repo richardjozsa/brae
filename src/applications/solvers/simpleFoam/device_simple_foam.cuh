@@ -872,6 +872,14 @@ private:
     bool   ufActive_ = false;            // set once the mesh-motion path has run: OF's mesh.dynamic()
     bool   meshPhiValid_ = false;
     DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
+    // Coupled-interface edges added to the AMG agglomeration, in the order they were appended to the
+    // fine edge list (internal faces first). The level-0 Galerkin needs a fine coefficient array of the
+    // same extended length, so the interface coefficients are gathered into these positions each step.
+    label                nAmgIfEdges_ = 0, nAmgCycEdges_ = 0, nAmgAmiEdges_ = 0;
+    DeviceBuffer<label>  amgIfAmiSrc_;   // per appended AMI edge: its source face (index into ami_.ifCoeff)
+    DeviceBuffer<scalar> amgIfAmiW_;     // per appended AMI edge: its stencil weight
+    std::vector<label>   amgIfOwn_, amgIfNbr_;
+    DeviceBuffer<scalar> amgFineUpper_, amgFineLower_;   // [internal faces | interface entries]
     std::vector<std::pair<label, label>> cycRuns_, amiRuns_;
     // DILU for the momentum solves (OF's `preconditioner DILU`). The level schedule depends only on the
     // mesh addressing, so it is built once; rD is refactorised inside every solve.
