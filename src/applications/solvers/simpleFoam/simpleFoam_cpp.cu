@@ -172,7 +172,8 @@ Residuals simpleStep(
                                  in.turb->sstCoeffs, in.turb->lmCoeffs,
                                  /*sstRes*/nullptr, in.turb->lmRes,
                                  in.turb->boundedTurb, in.turb->limitedLinearTurb,
-                                 in.turb->linearUpwindTurb, in.turb->turbLimiterCoeff);
+                                 in.turb->linearUpwindTurb, in.turb->turbLimiterCoeff,
+                                 in.correctedLaplacian, in.snGradLimitCoeff);
         }
         else if (in.turb->sst)
         {
@@ -180,7 +181,8 @@ Residuals simpleStep(
                                in.nu, m, g, patches, in.turb->relaxEpsilon, in.turb->relaxK,
                                in.turb->tol, in.turb->relTol, in.turb->maxIter, in.turb->sstCoeffs,
                                /*res*/nullptr, in.turb->boundedTurb, in.turb->limitedLinearTurb,
-                               in.turb->turbLimiterCoeff, in.turb->linearUpwindTurb);
+                               in.turb->turbLimiterCoeff, in.turb->linearUpwindTurb,
+                               in.correctedLaplacian, in.snGradLimitCoeff);
         }
         else
         {

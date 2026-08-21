@@ -1110,7 +1110,18 @@ void deviceKOmegaSSTCorrect(
 
 // kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition)
 // LM coeffs (OF defaults): ca1=2, ca2=0.06, ce1=1, ce2=50, cThetat=0.03, sigmaThetat=2; lambdaErr=1e-6, maxIter=10.
-namespace { struct LMCoeffs { scalar ca1=2.0, ca2=0.06, ce1=1.0, ce2=50.0, cThetat=0.03, sigmaThetat=2.0, lambdaErr=1e-6; int maxIter=10; }; }
+namespace {
+// OpenFOAM's SMALL (doubleScalar.H: 1.0e-15), which is what kOmegaSSTLM's deltaU_ and deltaMin are built
+// from -- NOT VSMALL (1e-300) and not an arbitrary tiny number. Us appears SQUARED in a denominator and
+// delta sits under y in y/delta, so the value of the floor is part of the model where the flow stagnates.
+constexpr scalar LM_SMALL = 1.0e-15;
+// A hang guard, not the model: OpenFOAM iterates lambda without a cap.
+constexpr int LM_LAMBDA_HARD_CAP = 1000;
+}
+
+// kOmegaSSTLM's coeffDict, OpenFOAM's defaults. maxLambdaIter is a WARNING threshold, not a cap -- see
+// lmLaunchReThetatPrep.
+namespace { struct LMCoeffs { scalar ca1=2.0, ca2=0.06, ce1=1.0, ce2=50.0, cThetat=0.03, sigmaThetat=2.0, lambdaErr=1e-6; int maxLambdaIter=10; }; }
 
 
 // DReThetatEff = sigmaThetat*(nut + nu)  (NOT nut/sigma + nu, depsKernel can't express this).
@@ -1170,7 +1181,7 @@ __device__ __forceinline__
 scalar lmFthetat(scalar S, scalar Omega, scalar Us, scalar nu, scalar y, scalar om,
                  scalar ReThetat, scalar gammaInt, scalar ce2)
 {
-    const scalar delta = fmax(375.0*Omega*nu*ReThetat*y/(Us*Us), 1e-37);
+    const scalar delta = fmax(375.0*Omega*nu*ReThetat*y/(Us*Us), LM_SMALL);
     const scalar ReOmega = y*y*om/nu;
     const scalar Fwake = exp(-(ReOmega/1e5)*(ReOmega/1e5));
     scalar ywd = y/delta; ywd *= ywd; ywd *= ywd;   // (y/delta)^4
@@ -1220,10 +1231,10 @@ void lmReThetatPrepKernel(
     scalar ce2,
     scalar deltaU,
     scalar lambdaErr,
-    int maxIter,
     scalar* __restrict__ Fth,
     scalar* __restrict__ sp,
-    scalar* __restrict__ su)
+    scalar* __restrict__ su,
+    int* __restrict__ maxIterOut)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -1254,8 +1265,15 @@ void lmReThetatPrepKernel(
             thetat = 331.50*pow(Tu - 0.5658, -0.671)*Fl*nuc/Us;
         }
         lambda = fmin(fmax(thetat*thetat/nuc*dUsds, -0.1), 0.1);
-        if (fabs(lambda - lam0) <= lambdaErr || ++iter >= maxIter) break;
+        ++iter;
+        // OpenFOAM's loop is `do { ... } while (lambdaErr > lambdaErr_)` with NO cap -- maxLambdaIter is
+        // only the threshold past which it WARNS. Stopping at maxLambdaIter would return a lambda that
+        // has not met the case's own lambdaErr, which is a different correlation, silently. So the cap
+        // here is a hang guard set far above any converging cell, and the count is reported so the host
+        // can warn exactly where OpenFOAM warns and refuse where OpenFOAM would spin.
+        if (fabs(lambda - lam0) <= lambdaErr || iter >= LM_LAMBDA_HARD_CAP) break;
     }
+    if (maxIterOut) atomicMax(maxIterOut, iter);
     const scalar ReThetat0 = fmax(thetat*Us/nuc, 20.0);
     const scalar Fthetat = lmFthetat(S, Omega, Us, nuc, yc, omc, ret, gi, ce2);
     Fth[c] = Fthetat;
@@ -1344,6 +1362,45 @@ void lmGammaEffKernel(
 }
 
 
+
+// The lambda fixed point is the one part of this model that ITERATES per cell, and OpenFOAM neither caps
+// it nor stops on it -- it warns past maxLambdaIter and carries on. Reproducing that on a GPU needs a
+// hang guard, so the kernel caps at LM_LAMBDA_HARD_CAP and reports the worst count: past maxLambdaIter
+// brae warns exactly where OpenFOAM warns, and at the hard cap it REFUSES, because a lambda that never
+// met the case's own lambdaErr is a different correlation and silently returning it is the substitution
+// this port exists to eliminate.
+void lmLaunchReThetatPrep(
+    int nC, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& y,
+    const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, scalar nu,
+    const LMCoeffs& lm,
+    DeviceBuffer<scalar>& Fth, DeviceBuffer<scalar>& spR, DeviceBuffer<scalar>& suR)
+{
+    Fth.resize(nC); spR.resize(nC); suR.resize(nC);
+    DeviceBuffer<label> worst;
+    worst.copyFrom(std::vector<label>(1, 0));
+    lmReThetatPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(),
+        k.data(), omega.data(), y.data(), ReThetat.data(), gammaInt.data(), nu,
+        lm.cThetat, lm.ce2, LM_SMALL, lm.lambdaErr,
+        Fth.data(), spR.data(), suR.data(), worst.data());
+    cudaCheck(cudaGetLastError(), "lmReThetatPrep");
+    const label used = worst.host()[0];
+    if (used >= LM_LAMBDA_HARD_CAP)
+        throw std::runtime_error(
+            "brae: kOmegaSSTLM's lambda iteration did not reach lambdaErr in "
+            + std::to_string(LM_LAMBDA_HARD_CAP) + " iterations. OpenFOAM iterates this loop without a "
+            "cap, so returning the partly-converged lambda would run a different ReThetat0 correlation "
+            "than the case asks for. Refusing rather than substituting it.");
+    if (used > lm.maxLambdaIter)
+    {
+        static int warned = 0;
+        if (!warned++)
+            std::fprintf(stderr, "brae WARNING: kOmegaSSTLM lambda iterations (%d) exceed maxLambdaIter "
+                                 "(%d)\n", (int)used, lm.maxLambdaIter);
+    }
+}
+
 void deviceKOmegaSSTLMCorrect(
     const DeviceMesh& dm,
     const DeviceVectorBoundary& dbU,
@@ -1372,7 +1429,13 @@ void deviceKOmegaSSTLMCorrect(
     DeviceAMI* ami,
     DeviceCyclic* cyc,
     const ScalarDdt& reDdt,
-    const ScalarDdt& giDdt)
+    const ScalarDdt& giDdt,
+    // div(phi,ReThetat) and div(phi,gammaInt). T3A asks for `bounded Gauss linearUpwind grad` on both,
+    // which is a DIFFERENT matrix from upwind -- upwind's, plus a deferred gradient correction on the
+    // source. Running upwind under the case's own scheme name was worth a factor of 12 on the _cpp
+    // reference's end-to-end error, so it is threaded through rather than assumed.
+    bool limitedLinear,
+    bool linearUpwind)
 {
     const int nC = dm.nCells;
     const LMCoeffs lm;
@@ -1384,14 +1447,11 @@ void deviceKOmegaSSTLMCorrect(
     if (cyc && cyc->n) interfaceAddDiv(*cyc, dm.V, divU);
 
     // ReThetat: DReThetatEff = sigmaThetat*(nut+nu); reaction = Pthetat*ReThetat0 - Sp(Pthetat). Fthetat stored for gammaSep.
-    DeviceBuffer<scalar> Fth(nC), spR(nC), suR(nC);
-    lmReThetatPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.cThetat, lm.ce2, 1e-37, lm.lambdaErr, lm.maxIter,
-        Fth.data(), spR.data(), suR.data());
-    cudaCheck(cudaGetLastError(), "lmReThetatPrep");
+    DeviceBuffer<scalar> Fth, spR, suR;
+    lmLaunchReThetatPrep(nC, gradU, Ux, Uy, Uz, k, omega, y, ReThetat, gammaInt, nu, lm, Fth, spR, suR);
     DeviceBuffer<scalar> DRe(nC);
     lmReDiffKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), lm.sigmaThetat, nu, DRe.data());   // sigmaThetat*(nut+nu)
-    deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
+    deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, limitedLinear, linearUpwind, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spR.data(), suR.data(), diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, reDdt);
@@ -1400,18 +1460,18 @@ void deviceKOmegaSSTLMCorrect(
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
     DeviceBuffer<scalar> spG(nC), suG(nC);
     lmGammaPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, 1e-37, spG.data(), suG.data());
+        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, LM_SMALL, spG.data(), suG.data());
     cudaCheck(cudaGetLastError(), "lmGammaPrep");
     DeviceBuffer<scalar> DgI(nC);
     depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), 1.0, nu, DgI.data());   // nut/1 + nu
-    deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
+    deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, limitedLinear, linearUpwind, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spG.data(), suG.data(), diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, giDdt);
     deviceBoundField(dm, gammaInt, 0.0);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, 1e-37, gammaIntEff.data());
+        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, LM_SMALL, gammaIntEff.data());
     cudaCheck(cudaGetLastError(), "lmGammaEff");
 }
 
@@ -1431,11 +1491,8 @@ void deviceLMReThetatPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& grad
     const DeviceBuffer<scalar>& ReThetat, const DeviceBuffer<scalar>& gammaInt, scalar nu,
     DeviceBuffer<scalar>& Fth, DeviceBuffer<scalar>& spR, DeviceBuffer<scalar>& suR)
 {
-    const int nC = dm.nCells; const LMCoeffs lm; Fth.resize(nC); spR.resize(nC); suR.resize(nC);
-    lmReThetatPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.cThetat, lm.ce2, 1e-37, lm.lambdaErr, lm.maxIter,
-        Fth.data(), spR.data(), suR.data());
-    cudaCheck(cudaGetLastError(), "deviceLMReThetatPrep");
+    const int nC = dm.nCells; const LMCoeffs lm;
+    lmLaunchReThetatPrep(nC, gradU, Ux, Uy, Uz, k, omega, y, ReThetat, gammaInt, nu, lm, Fth, spR, suR);
 }
 void deviceLMGammaPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
     const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
@@ -1445,7 +1502,7 @@ void deviceLMGammaPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
 {
     const int nC = dm.nCells; const LMCoeffs lm; spG.resize(nC); suG.resize(nC);
     lmGammaPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, 1e-37, spG.data(), suG.data());
+        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, LM_SMALL, spG.data(), suG.data());
     cudaCheck(cudaGetLastError(), "deviceLMGammaPrep");
 }
 void deviceLMGammaEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
@@ -1456,7 +1513,7 @@ void deviceLMGammaEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
 {
     const int nC = dm.nCells; gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, 1e-37, gammaIntEff.data());
+        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, LM_SMALL, gammaIntEff.data());
     cudaCheck(cudaGetLastError(), "deviceLMGammaEff");
 }
 void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, const DeviceBuffer<scalar>& su,

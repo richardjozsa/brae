@@ -469,12 +469,35 @@ components:
       symbol: "Foam::RASModels::kOmegaSSTLM"
       file: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM.C
     classification: MODEL
-    brae_status: CPP_REFERENCE
-    brae_existing: src/cuda/device_komega_sst.cu (the shipped device path; NOT yet gated end to end)
+    brae_status: PORTED
+    brae_existing: src/cuda/device_komega_sst.cu (lmReThetatPrepKernel / lmGammaPrepKernel / lmGammaEffKernel / deviceKOmegaSSTLMCorrect)
     brae_reference: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
     brae_target: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/
-    validation: "tests/lm_cpp_vs_openfoam.sh, on validation/T3A -- the ERCOFTAC T3A flat-plate transition tutorial on its own 26820-cell blockMesh, run by OpenFOAM v2412 to the case's own residualControl at t=269. END TO END from 0/, 500 iterations, no CUDA: U 2.04e-04, p 1.26e-03, k 1.39e-03, omega 5.02e-05, nut 1.57e-03, settled at U 9.7e-09. CONTROL: the same case with the transition model removed (plain kOmegaSST, identical solver and schemes) against the same reference is 167x worse on U, 437x on k and 114x on nut -- the transition model is doing the work, not the bounds."
+    validation: "TWO gates. (1) tests/lm_cuda_vs_openfoam.sh -- the CUDA V2 driver end to end on T3A: U 7.89e-05, p 8.88e-05, k 1.41e-03, omega 2.55e-06, nut 1.48e-03, TIGHTER than the _cpp reference it was ported from because the driver reads the case's linear-solver settings. It runs the MODULE comparison first (tests/lm_cuda_probe.cu): Fthetat 1.3e-13, both reaction preps 5.5e-14, gammaIntEff 6.2e-16, the two solved transports 9.8e-08 -- so an end-to-end agreement reached by cancellation cannot pass. Control: plain kOmegaSST through the same driver is 430x worse on U and 431x on k. (2) tests/lm_cpp_vs_openfoam.sh, on validation/T3A -- the ERCOFTAC T3A flat-plate transition tutorial on its own 26820-cell blockMesh, run by OpenFOAM v2412 to the case's own residualControl at t=269. END TO END from 0/, 500 iterations, no CUDA: U 2.04e-04, p 1.26e-03, k 1.39e-03, omega 5.02e-05, nut 1.57e-03, settled at U 9.7e-09. CONTROL: the same case with the transition model removed (plain kOmegaSST, identical solver and schemes) against the same reference is 167x worse on U, 437x on k and 114x on nut -- the transition model is doing the work, not the bounds."
     note: "kOmegaSSTLM IS kOmegaSST plus two transport equations (ReThetat, gammaInt) and three overrides of the base model, so the overrides live in kOmegaSST_cpp as LMHooks rather than as a branch: F1 = max(kOmegaSST::F1, exp(-(Ry/120)^8)) with Ry = y*sqrt(k)/nu, Pk *= gammaIntEff, epsilonByk *= clamp(gammaIntEff, 0.1, 1). That F3 is NOT kOmegaSSTBase's F3 near-wall switch, which brae refuses -- two different functions with the same name in a base and its derived class. THE ORDER IS THE MODEL: correct() runs kOmegaSST::correct() FIRST, so k and omega advance on the PREVIOUS iteration's transition state, and gammaIntEff is constructed ZERO, so the first outer iteration has no turbulent production at all. Within correctReThetatGammaInt, Fthetat is formed ONCE from the OLD ReThetat and OLD gammaInt and reused in gammaSep at the end, while ReThetac/Rev/RT see the NEW ReThetat and gammaSep sees the NEW gammaInt. ReThetat0 is a per-cell fixed-point iteration on lambda with NO iteration cap (OpenFOAM warns past maxLambdaIter and carries on); transcribed as written. DgammaIntEff is nut + nu -- there is no sigmaGamma in this model. REFUSED: MRF and fvOptions on the two transition equations."
+
+  turbulenceSchemesInV2:
+    openfoam:
+      symbol: "fvSchemes divSchemes/laplacianSchemes, applied to the turbulence equations"
+      file: src/finiteVolume/finiteVolume/laplacianSchemes/gaussLaplacianScheme/gaussLaplacianScheme.C
+    classification: SHARED_NUMERICAL
+    brae_status: PORTED
+    brae_existing: src/applications/solvers/simpleFoam/simpleFoamV2.cu
+    brae_target: src/applications/solvers/simpleFoam/
+    validation: "tests/lm_cuda_vs_openfoam.sh asserts the driver REPORTS reading `div(phi,k): bounded linearUpwind` and `non-orthogonal correction ON`, and then measures the answer end to end; every other V2 gate (stock pitzDaily, SST, SA, MRF, turbineSiting, fusedGauss) was re-run against the change and is unmoved."
+    note: "The V2 driver passed linearUpwindK, linearUpwindOmega and the laplacian nonOrth flag as literal FALSE to the turbulence hook, while its own setup line printed what the case had asked for. A case naming `bounded Gauss linearUpwind grad` and `Gauss linear corrected` therefore ran upwind and orthogonal on every turbulence scalar -- printed one thing and did another, which is worse than not reading the entry at all. The same gap existed in the _cpp kOmegaSST reference (no linearUpwind parameter, orthogonal laplacian); on T3A honouring linearUpwind was worth a factor of 12 on the end-to-end error and the corrected laplacian was worth 5.2e-04 on ReThetat, whose mesh reaches 43.8 degrees non-orthogonality. OpenFOAM applies the case's laplacianScheme to EVERY laplacian, the turbulence equations included."
+
+  lmLambdaIteration:
+    openfoam:
+      symbol: "Foam::RASModels::kOmegaSSTLM::ReThetat0"
+      file: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM.C
+    classification: MODEL
+    brae_status: PORTED
+    brae_existing: src/cuda/device_komega_sst.cu (lmReThetatPrepKernel + lmLaunchReThetatPrep)
+    brae_reference: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
+    brae_target: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/
+    validation: "tests/lm_cuda_probe.cu -- the ReThetat reaction (which ReThetat0 feeds) matches the _cpp reference to 5.5e-14 on T3A."
+    note: "OpenFOAM's lambda loop is `do { ... } while (lambdaErr > lambdaErr_)` with NO cap at all -- maxLambdaIter is only the threshold past which it WARNS and carries on. The device kernel stopped at maxLambdaIter (10), returning a lambda that had not met the case's own lambdaErr, which is a different ReThetat0 correlation, silently. It now iterates to lambdaErr with a hang guard far above any converging cell, reports the worst count with an atomicMax, warns exactly where OpenFOAM warns, and REFUSES at the guard. Also fixed: the kernel used 1e-37 for deltaU and deltaMin where OpenFOAM uses SMALL (1e-15) -- Us appears squared in a denominator and delta sits under y in y/delta, so the value of the floor is part of the model where the flow stagnates. And LMCoeffs were hardcoded to OpenFOAM's defaults, so a case overriding ca1 or cThetat ran the defaults; they are now read from the RAS dict."
 
   linearUpwindTurbulence:
     openfoam:

@@ -209,6 +209,8 @@ void correct(
     bool                           limitedLinear,
     scalar                         limiterCoeff,
     bool                           linearUpwind,
+    bool                           correctedLaplacian,
+    scalar                         snGradLimitCoeff,
     const LMHooks*                 lm)
 {
     if (co.F3)
@@ -308,7 +310,22 @@ void correct(
                                  nu, m, g, patches);
 
         FvScalarMatrix M = divWithScheme(phi, omega, limitedLinear, limiterCoeff, m, g, patches);
-        addEqual(M, fvm::laplacian(Df, omega, m, g, patches), -1.0);
+        {
+            // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
+            // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
+            // it into the transport equation with the right sign.
+            FvScalarMatrix L = fvm::laplacian(Df, omega, m, g, patches, correctedLaplacian);
+            if (correctedLaplacian)
+            {
+                std::vector<std::vector<scalar>> vb(patches.size());
+                for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = omega.boundary[pi]->value();
+                const std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, vb, m, g, patches);
+                const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+                    Df, omega, gradVf, m, g, patches, snGradLimitCoeff);
+                for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
+            }
+            addEqual(M, L, -1.0);
+        }
         for (label c = 0; c < nC; ++c)
         {
             const scalar gam  = blend(f1[c], co.gamma1, co.gamma2);
@@ -401,7 +418,22 @@ void correct(
                                  nu, m, g, patches);
 
         FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, m, g, patches);
-        addEqual(M, fvm::laplacian(Df, k, m, g, patches), -1.0);
+        {
+            // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
+            // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
+            // it into the transport equation with the right sign.
+            FvScalarMatrix L = fvm::laplacian(Df, k, m, g, patches, correctedLaplacian);
+            if (correctedLaplacian)
+            {
+                std::vector<std::vector<scalar>> vb(patches.size());
+                for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = k.boundary[pi]->value();
+                const std::vector<vector> gradVf = fvc::gaussGrad(k.internal, vb, m, g, patches);
+                const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+                    Df, k, gradVf, m, g, patches, snGradLimitCoeff);
+                for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
+            }
+            addEqual(M, L, -1.0);
+        }
         for (label c = 0; c < nC; ++c)
         {
             const scalar V = g.V()[c];

@@ -733,6 +733,14 @@ add_test(NAME lm_cpp_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A 269 500)
 set_tests_properties(lm_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# The SAME case through the CUDA V2 driver, ported onto the _cpp path one module at a time. The module
+# comparison (lm_cuda_probe: Fthetat, both reaction preps and gammaIntEff to 1e-12) runs FIRST inside the
+# gate, so an end-to-end agreement that came from cancellation cannot pass it. Control: plain kOmegaSST.
+add_test(NAME lm_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/lm_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A 269)
+set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.
@@ -836,6 +844,10 @@ target_link_libraries(test_simple_lm_cpp PRIVATE brae_core)
 add_executable(lm_probe tests/lm_probe.cu)
 target_include_directories(lm_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(lm_probe PRIVATE brae_core)
+
+add_executable(lm_cuda_probe tests/lm_cuda_probe.cu)
+target_include_directories(lm_cuda_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(lm_cuda_probe PRIVATE brae_core)
 
 add_executable(v2_envelope tests/v2_envelope.cu)
 target_include_directories(v2_envelope PRIVATE ${BRAE_HEADER_DIRS})

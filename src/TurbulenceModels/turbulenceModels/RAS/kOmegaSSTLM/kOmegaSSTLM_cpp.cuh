@@ -18,7 +18,9 @@
 //
 //   Omega  = sqrt(2*magSqr(skew(gradU)))            vorticity magnitude
 //   S      = sqrt(2*magSqr(symm(gradU)))            strain magnitude
-//   Us     = max(mag(U), deltaU),  deltaU = SMALL
+//   Us     = max(mag(U), deltaU),  deltaU = SMALL = 1e-15 (OpenFOAM doubleScalarSMALL,
+//                                  NOT VSMALL 1e-300 -- the two differ by 285 orders and
+//                                  Us appears squared in a denominator)
 //   dUsds  = (U & (U & gradU))/sqr(Us)              streamwise acceleration
 //
 //   Fthetat = min(max(Fwake*exp(-(y/delta)^4),
@@ -137,6 +139,57 @@ std::vector<scalar> Fthetat(const std::vector<scalar>& Us,
                             scalar                     nu,
                             const Coeffs&              co);
 
+// The three CELL-LOCAL stages, exposed at exactly the boundaries the device kernels use
+// (lmReThetatPrepKernel / lmGammaPrepKernel / lmGammaEffKernel) so the CUDA port can be compared one
+// module at a time rather than as a single fused answer. Each takes the same inputs its kernel does and
+// returns the same outputs, so a disagreement names the stage instead of the model.
+//
+// The reaction convention matches the device's lmAddReactionKernel and OpenFOAM's own:
+//     diag += V*sp     source += V*su      i.e. the RHS is  su - Sp(sp, psi)
+struct StrainState
+{
+    std::vector<scalar> S, Omega, Us, dUsds;
+};
+StrainState strain(const std::vector<tensor>& gradU,
+                   const std::vector<vector>& U,
+                   scalar                     deltaU);
+
+struct ReThetatPrep
+{
+    std::vector<scalar> Fthetat, sp, su;
+};
+ReThetatPrep reThetatPrep(const StrainState&         st,
+                          const std::vector<scalar>& k,
+                          const std::vector<scalar>& omega,
+                          const std::vector<scalar>& y,
+                          const std::vector<scalar>& ReThetat,
+                          const std::vector<scalar>& gammaInt,
+                          scalar                     nu,
+                          const Coeffs&              co);
+
+struct GammaPrep
+{
+    std::vector<scalar> sp, su;
+};
+GammaPrep gammaPrep(const StrainState&         st,
+                    const std::vector<scalar>& k,
+                    const std::vector<scalar>& omega,
+                    const std::vector<scalar>& y,
+                    const std::vector<scalar>& ReThetat,   // the NEW ReThetat, post-solve
+                    const std::vector<scalar>& gammaInt,
+                    scalar                     nu,
+                    const Coeffs&              co);
+
+// gammaIntEff = max(gammaInt, gammaSep), from the NEW ReThetat and NEW gammaInt but the LAGGED Fthetat.
+std::vector<scalar> gammaEff(const StrainState&         st,
+                             const std::vector<scalar>& k,
+                             const std::vector<scalar>& omega,
+                             const std::vector<scalar>& y,
+                             const std::vector<scalar>& ReThetat,
+                             const std::vector<scalar>& gammaInt,
+                             const std::vector<scalar>& Fthetat,
+                             scalar                     nu);
+
 // OF correctReThetatGammaInt(): the two transport equations and gammaIntEff. Updates ReThetat, gammaInt
 // and gammaIntEff in place.
 void correctReThetatGammaInt(
@@ -163,7 +216,11 @@ void correctReThetatGammaInt(
     bool                           bounded = false,
     bool                           limitedLinear = false,
     bool                           linearUpwind = false,
-    scalar                         limiterCoeff = 1.0);
+    scalar                         limiterCoeff = 1.0,
+    // The case's laplacianScheme, applied to the two transition equations as OpenFOAM applies it to
+    // every laplacian in the case.
+    bool                           correctedLaplacian = false,
+    scalar                         snGradLimitCoeff = 0.0);
 
 // One kOmegaSSTLM::correct(): kOmegaSST::correct with the LM overrides, then correctReThetatGammaInt.
 void correct(
@@ -192,7 +249,9 @@ void correct(
     bool                           bounded = false,
     bool                           limitedLinear = false,
     bool                           linearUpwind = false,
-    scalar                         limiterCoeff = 1.0);
+    scalar                         limiterCoeff = 1.0,
+    bool                           correctedLaplacian = false,
+    scalar                         snGradLimitCoeff = 0.0);
 
 } // namespace kOmegaSSTLM
 } // namespace cpu

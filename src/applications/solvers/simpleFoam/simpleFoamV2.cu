@@ -18,6 +18,7 @@
 #include "device_kepsilon.cuh"
 #include "device_komega_sst.cuh"    // deviceKOmegaSSTCorrect building blocks + KOmegaSSTCoeffs
 #include "komega_sst_coeffs.cuh"
+#include "kOmegaSSTLM_cpp.cuh"   // the LM coefficient reader; the reference this port was gated against
 #include "realizableKE_cpp.cuh"   // RealizableKECoeffs + readRealizableKECoeffs
 #include "SpalartAllmaras_cpp.cuh"
 #include "spalart_coeffs.cuh"
@@ -497,9 +498,10 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
             const FoamDict* ras = turbProps.subDict("RAS");
             const std::string model = ras ? ras->wordOr("RASModel", "") : "";
             if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE"
-                && model != "SpalartAllmaras")
+                && model != "SpalartAllmaras" && model != "kOmegaSSTLM")
                 r.blockers.push_back("RASModel is `" + model + "`; the rebuilt path wires kEpsilon, "
-                                     "realizableKE, kOmegaSST and SpalartAllmaras only. OpenFOAM "
+                                     "realizableKE, kOmegaSST, kOmegaSSTLM and SpalartAllmaras only. "
+                                     "OpenFOAM "
                                      "registers 26 incompressible turbulence models (ofscan: impls "
                                      "incompressible::turbulenceModel).");
         }
@@ -763,10 +765,26 @@ int runSimpleFoamV2(const std::string& caseDir)
     // `Gauss linearUpwind grad(<var>)` on the turbulence scalar: upwind's MATRIX plus a deferred gradient
     // correction. Module 2 reads it; declared here with the rest of the scheme state.
     bool   linearUpwindK = false, linearUpwindEps = false;
+    // The case's laplacianScheme, read ONCE here because both the turbulence hook and the momentum /
+    // pressure equations need it. OpenFOAM applies it to every laplacian in the case, the turbulence
+    // ones included; this driver applied it only to momentum and pressure.
+    bool   nonOrthLaplacian = false;
+    scalar snGradLimitK = 0.0;
+    {
+        const LaplacianScheme lapS = laplacianScheme(caseDir);
+        nonOrthLaplacian = lapS.corrected;
+        snGradLimitK     = lapS.limitCoeff;
+    }
     scalar twoBykK = 2.0, twoBykEps = 2.0;
     bool   sstModel = false;
     // SpalartAllmaras transports ONE scalar, nuTilda, and rides the k slot; the epsilon slot is unused.
     bool   saModel = false;
+    // kOmegaSSTLM rides the kOmegaSST slots (omega in the `epsilon` slot) and adds two transported
+    // scalars of its own plus gammaIntEff, which is NOT read from a file: OpenFOAM constructs it zero.
+    bool   lmModel = false;
+    DeviceBuffer<scalar> dReThetat, dGammaInt, dGammaIntEff;
+    DeviceBoundary       dbReThetat, dbGammaInt;
+    cpu::kOmegaSSTLM::Coeffs lmCoeffs{};
     cpu::SA::Coeffs saCoeffs;
     // nutUSpaldingWallFunction faces, and their wall distance. See where they are built for why the mask
     // is keyed off nut's BC rather than the patch type.
@@ -888,7 +906,10 @@ int runSimpleFoamV2(const std::string& caseDir)
         // uses -- the fused device correct() for each model takes that slot and knows what it means.
         // `ras` here is the simulationType switch, not the dict -- the RAS sub-dictionary is re-fetched.
         const FoamDict* rasDict = turbProps.subDict("RAS");
-        sstModel = rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSST";
+        lmModel  = rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSSTLM";
+        // The LM model IS kOmegaSST plus the transition transport, so every kOmegaSST path below is
+        // taken as well -- the two flags are deliberately not exclusive.
+        sstModel = lmModel || (rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSST");
         // realizableKE rides the SAME fused device kEpsilon through KEpsilonCoeffs::realizable: variable
         // Cmu, the strain-based epsilon production and the C2*eps^2/(k + sqrt(nu*eps)) destruction are
         // all selected by that flag, so this is a coefficient change and not a second model path.
@@ -938,6 +959,27 @@ int runSimpleFoamV2(const std::string& caseDir)
         if (!saModel) epsF.evaluateBoundary();
         nutF.evaluateBoundary();
 
+        // MUST_READ in OpenFOAM: kOmegaSSTLM refuses to construct without them, and there is no default.
+        if (lmModel)
+        {
+            GeometricField<scalar> reF =
+                buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/ReThetat"), fvp, nC);
+            GeometricField<scalar> giF =
+                buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/gammaInt"), fvp, nC);
+            reF.evaluateBoundary();
+            giF.evaluateBoundary();
+            dReThetat.copyFrom(reF.internal);
+            dGammaInt.copyFrom(giF.internal);
+            dbReThetat = buildDeviceBoundary(reF, fvp, g);
+            dbGammaInt = buildDeviceBoundary(giF, fvp, g);
+            // gammaIntEff starts at ZERO, as OpenFOAM constructs it -- so the first outer iteration has
+            // no turbulent production at all. Seeding it to 1 would make the first iteration fully
+            // turbulent and move where transition lands.
+            dGammaIntEff.copyFrom(std::vector<scalar>(nC, 0.0));
+            std::printf("  kOmegaSSTLM (Langtry-Menter transition): + ReThetat + gammaInt transport, "
+                        "gammaIntEff seeded at 0 as OpenFOAM constructs it\n");
+        }
+
         dK.copyFrom(kF.internal); dNut.copyFrom(nutF.internal);
         dbK   = buildDeviceBoundary(kF,   fvp, g);
         dbNut = buildDeviceBoundary(nutF, fvp, g);
@@ -986,6 +1028,9 @@ int runSimpleFoamV2(const std::string& caseDir)
             // distance the wall functions use. Two different quantities with the same symbol in OpenFOAM.
             dY.copyFrom(cellWallDist(m, g, fvp));
             readKOmegaSSTCoeffs(turbProps.subDict("RAS"), sstCoeffs);
+            // kOmegaSSTLM's own coeffDict. The device carried OpenFOAM's DEFAULTS hardcoded, so a case
+            // that overrode ca1 or cThetat ran the defaults silently.
+            if (lmModel) cpu::kOmegaSSTLM::readCoeffs(turbProps.subDict("RAS"), lmCoeffs);
         }
         // SA needs the same CELL wall distance: dTilda is y everywhere, not only near the wall.
         if (saModel) dY.copyFrom(cellWallDist(m, g, fvp));
@@ -1171,6 +1216,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                              linearUpwindK, /*nonOrth*/false, gsKE);
             }
             else if (sstModel)
+            {
                 // Mirrors kOmegaSSTBase::correct(): GbyNu0 -> F1/F2/CDkOmega/S2 -> omega eqn (loose solve,
                 // omega-wall setValues) -> bound -> k eqn -> bound -> correctNut (Bradshaw limiter).
                 deviceKOmegaSSTCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
@@ -1179,9 +1225,17 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        boundedK, boundedEps,
                                        limitedK, limitedEps, twoBykK, twoBykEps,
                                        sstCoeffs, relTolKE, /*keCheckEvery*/1,
-                                       /*linearUpwindK*/false, /*linearUpwindOmega*/false,
-                                       /*nonOrth*/false, /*gradULimitK*/0.0, gsKE, gsKE,
-                                       /*ami*/nullptr, /*cyc*/nullptr, /*gammaIntEff*/nullptr,
+                                       // The case's OWN turbulence div and laplacian schemes. These were
+                                       // hardcoded off while the setup line above printed what the case
+                                       // asked for -- so a case naming `linearUpwind` or `corrected` got
+                                       // upwind and orthogonal. On the _cpp reference honouring
+                                       // linearUpwind was worth a factor of 12 on T3A's end-to-end error.
+                                       linearUpwindK, linearUpwindEps,
+                                       nonOrthLaplacian, /*gradULimitK*/0.0, gsKE, gsKE,
+                                       /*ami*/nullptr, /*cyc*/nullptr,
+                                       // kOmegaSSTLM: F1 = max(F1, F3), Pk *= gammaIntEff and
+                                       // epsilonByk *= clamp(gammaIntEff, 0.1, 1). Null on plain SST.
+                                       lmModel ? dGammaIntEff.data() : nullptr,
                                        /*nutWall*/0, atmZ0, atmBoundNut,
                                        /*kDdt*/{}, /*sDdt*/{},
                                        /*des*/false, /*iddes*/false, /*hmax*/nullptr, /*hwn*/nullptr,
@@ -1190,6 +1244,18 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        // DkEff(patchi)/DomegaEff(patchi) = alphaK(F1)*nut_b + nu, from
                                        // nut's OWN boundary rather than the interpolated cell value.
                                        &nb);
+
+            // OF kOmegaSSTLM::correct() runs kOmegaSST::correct() FIRST and the transition transport
+            // SECOND, so k and omega always advance on the PREVIOUS iteration's gammaIntEff. Reversing
+            // these two lines is a different (more implicit) scheme.
+            if (lmModel)
+                deviceKOmegaSSTLMCorrect(dm, dbU, dbReThetat, dbGammaInt, gf.Ux, gf.Uy, gf.Uz,
+                                         dK, dEps, dNut, dY, dReThetat, dGammaInt, dGammaIntEff,
+                                         gf.phiInt, gf.phiBnd, nu, relaxEps, tolKE, relTolKE,
+                                         /*keCheckEvery*/1, boundedEps, nonOrthLaplacian, gsKE,
+                                         /*ami*/nullptr, /*cyc*/nullptr, /*reDdt*/{}, /*giDdt*/{},
+                                         limitedEps, linearUpwindEps);
+            }
             else
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                   dK, dEps, dNut, gf.phiInt, gf.phiBnd,
@@ -1431,12 +1497,11 @@ int runSimpleFoamV2(const std::string& caseDir)
     // to the reference to 5e-16 (tests/test_ueqn_cuda.cu, tests/test_peqn_cuda.cu) and gated against real
     // OpenFOAM on a non-orthogonal mesh (tests/nonorth_vs_openfoam.sh), so it is READ rather than refused.
     {
-        const LaplacianScheme lapS = laplacianScheme(caseDir);
-        in.correctedLaplacian = lapS.corrected;
-        in.snGradLimitCoeff   = lapS.limitCoeff;
-        if (lapS.limitCoeff > 0.0)
+        in.correctedLaplacian = nonOrthLaplacian;
+        in.snGradLimitCoeff   = snGradLimitK;
+        if (snGradLimitK > 0.0)
             std::printf("  laplacianSchemes: `limited %g corrected` -- the non-orthogonal correction is "
-                        "capped against the orthogonal part\n", lapS.limitCoeff);
+                        "capped against the orthogonal part\n", snGradLimitK);
     }
     std::printf("  laplacianSchemes: non-orthogonal correction %s\n",
                 in.correctedLaplacian ? "ON (`corrected`)" : "OFF (`uncorrected`/`orthogonal`)");

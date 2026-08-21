@@ -139,6 +139,13 @@ void correct(
     // it is a different matrix from both upwind and limitedLinear: upwind's, plus a deferred gradient
     // correction on the source. Ignoring it ran a scheme the case did not name.
     bool                           linearUpwind = false,
+    // OpenFOAM applies the case's laplacianScheme to EVERY laplacian, the turbulence equations included.
+    // `Gauss linear corrected` changes two things: the implicit face coefficient becomes
+    // nonOrthDeltaCoeffs, AND an explicit deferred source is subtracted. Running the orthogonal form on
+    // k and omega where the case says corrected is a different discretisation under the case's own
+    // scheme name -- worth 5.2e-04 on T3A's ReThetat, whose mesh reaches 43.8 degrees.
+    bool                           correctedLaplacian = false,
+    scalar                         snGradLimitCoeff = 0.0,
     // kOmegaSSTLM. Null (the default) is plain kOmegaSST and nothing below changes.
     const LMHooks*                 lm = nullptr);
 

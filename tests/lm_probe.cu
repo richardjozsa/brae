@@ -93,7 +93,8 @@ int main(int argc, char** argv)
     cpu::kOmegaSST::SSTResiduals res;
     cpu::kOmegaSST::correct(U, k, omega, nut, phi, y, nu, m, g, patches,
                             0.9, 0.9, 1e-10, 0.0, 2000, co, &res,
-                            /*bounded*/true, /*limitedLinear*/false, 1.0, /*linearUpwind*/true, nullptr);
+                            /*bounded*/true, /*limitedLinear*/false, 1.0, /*linearUpwind*/true,
+                            /*correctedLaplacian*/true, /*snGradLimitCoeff*/0.0, nullptr);
 
     std::printf("lm_probe: %s/%s  %d cells\n", caseDir.c_str(), t.c_str(), (int)nC);
     for (const FvPatch& p : patches)
