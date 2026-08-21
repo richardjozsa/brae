@@ -764,6 +764,19 @@ add_test(NAME coupledinterfacescheme_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclic)
 set_tests_properties(coupledinterfacescheme_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# SIMPLEC (`consistent true`) across a coupled interface, on OpenFOAM's basic/simpleFoam/implicitAMI.
+# fvMatrix::H1() sums boundaryCoeffs over every coupled patch and the SIMPLEC flux term is evaluated on
+# coupled boundary faces like any other; brae did neither, so on a mesh coupled only by a cyclicAMI the
+# whole SIMPLEC correction stopped at the interface. Nothing in validation/ combined SIMPLEC with a
+# coupled interface before this case, which is why the path was unreachable. The sharp check seeds brae
+# with OpenFOAM's own converged U, p and phi: at that state the true divergence is zero, so brae's
+# continuity error measures its own inconsistency directly -- 1.3e-01 before, 1.7e-03 after, with the
+# momentum residual at 2.8e-07 throughout to show the UEqn was never the term at fault.
+add_test(NAME simplec_interface_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simplec_interface_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/implicitAMI)
+set_tests_properties(simplec_interface_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.

@@ -1768,6 +1768,26 @@ void amgFineCoeffKernel(
             deviceAmul(hasCyclic_
                 ? deviceLduViewCyclic(dm, diagA, mUp, mLo, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
                 : deviceLduView(dm, diagA, mUp, mLo), ones_, rowSum);
+            // ...AND THE cyclicAMI INTERFACE. OF fvMatrix::H1() adds boundaryCoeffs for EVERY coupled patch:
+            //     H1_ = lduMatrix::H1();  forAll(psi_.boundaryField(), patchi)
+            //         if (ptf.coupled() && ptf.size()) addToInternalField(..., boundaryCoeffs_[patchi].component(0), H1_);
+            // so an AMI face belongs in the row sum exactly as a cyclic face does. The line above took the
+            // cyclic interface and stopped there, so on a mesh coupled ONLY by an AMI the row sum was the
+            // internal faces alone and rAtU = V/max(A*1, 0.1*diagA) came out too large at every interface
+            // cell -- and rAtU sets both the pressure Laplacian coefficient and the SIMPLEC flux correction,
+            // so the error lands on the pressure equation, not the momentum one.
+            //
+            // MEASURED on the basic/simpleFoam/implicitAMI tutorial, brae seeded with OpenFOAM's own
+            // converged fields: the momentum residual was 2.8e-07 -- brae's UEqn agrees, and its interface
+            // off-diagonal matches OpenFOAM's boundaryCoeffs to every digit -- while the pressure residual
+            // was 3.4e-02 with a continuity error of 0.128. Converged, U was 8.3e-02 from OpenFOAM with
+            // SIMPLEC on and 1.8e-03 with it off, which is what named the term.
+            //
+            // ifCoeff, not ifCoeffC: OF takes boundaryCoeffs.component(0), and a rotational interface
+            // carries its transform in updateInterfaceMatrix rather than in the coefficient, so the scalar
+            // coefficient is the one H1 sums. deviceAmiAmul contributes ifCoeff[i]*sum_k w_k -- the
+            // coverage-weighted row sum, which is the AMI's `1` -- matching the cyclic view's ifCoeff*1.
+            if (hasAMI_) deviceAmiAmul(ami_, ones_, rowSum);
             deviceSimplecRAtU(dm, rowSum, diagA, rAtU);
             deviceCopy(drAtU, rAtU);
             deviceAxpy(-1.0, rAU, drAtU);
@@ -2103,6 +2123,61 @@ void amgFineCoeffKernel(
             DeviceBuffer<scalar> fBnd;
             deviceMatrixFluxBoundary(dbP_, dIC, dBC, dp_, fBnd);
             deviceAxpy(1.0, fBnd, phiHb);
+            // ...AND ON THE COUPLED INTERFACE FACES, which neither call above reaches:
+            // deviceMatrixFluxInternal walks the internal faces and deviceMatrixFluxBoundary the
+            // NON-coupled patches, and a cyclic or cyclicAMI face is in neither list. OpenFOAM has no such
+            // gap -- `fvc::interpolate(rAtU - rAU)*fvc::snGrad(p)*mesh.magSf()` is a surfaceScalarField
+            // whose COUPLED boundary values are evaluated like every other patch's, so the SIMPLEC
+            // correction reaches the interface flux there.
+            //
+            // Without it the interface flux is inconsistent with the pressure equation about to be
+            // assembled from the same rAtU, and it shows up as a continuity error on exactly the interface
+            // cells. Measured on the basic/simpleFoam/implicitAMI tutorial with brae seeded at OpenFOAM's
+            // own converged fields -- where the true divergence is zero -- the continuity error was 0.128
+            // while the momentum residual was 2.8e-07, which is what pointed at the pressure side.
+            //
+            // THE DIFFUSIVITY IS NEGATED because the primitive reused here subtracts: interfaceCorrectFlux
+            // is `phi -= ifCoeff*(interp(p) - p[own])`, the POST-solve pressure correction, whereas OF's
+            // SIMPLEC term ADDS that same laplacian flux. Passing -drAtU turns the one into the other
+            // exactly, and reuses a coefficient path that is already gated instead of adding a second one.
+            if (hasCyclic_ || hasAMI_)
+            {
+                DeviceBuffer<scalar> negDrAtU;
+                deviceCopy(negDrAtU, drAtUFlux_);
+                deviceScale(negDrAtU, -1.0);
+                DeviceBuffer<scalar> scratch;
+                scratch.copyFrom(std::vector<scalar>(nC_, 0.0));
+                // ifCoeff is ONE buffer shared by the momentum and pressure assemblies (see the note where
+                // cycIfCoeffMom_/amiIfCoeffMom_ are taken), so borrow it and put it back.
+                if (hasCyclic_)
+                {
+                    DeviceBuffer<scalar> keep;
+                    deviceCopy(keep, cyc_.ifCoeff);
+                    interfaceAssembleLaplacian(cyc_, negDrAtU, scratch, false);
+                    interfaceCorrectFlux(cyc_, dp_);
+                    if (ctl_.nonOrth)   // snGrad(p) is the CORRECTED snGrad; add its non-orth half too
+                    {
+                        DeviceBuffer<scalar> ffcS;
+                        interfaceLapCorrP(cyc_, negDrAtU, gx, gy, gz, scratch, ffcS);
+                        deviceAxpy(-1.0, ffcS, cyc_.phi);
+                    }
+                    deviceCopy(cyc_.ifCoeff, keep);
+                }
+                if (hasAMI_)
+                {
+                    DeviceBuffer<scalar> keep;
+                    deviceCopy(keep, ami_.ifCoeff);
+                    interfaceAssembleLaplacian(ami_, negDrAtU, scratch, false);
+                    interfaceCorrectFlux(ami_, dp_);
+                    if (ctl_.nonOrth)
+                    {
+                        DeviceBuffer<scalar> ffcS;
+                        interfaceLapCorrP(ami_, negDrAtU, gx, gy, gz, scratch, ffcS);
+                        deviceAxpy(-1.0, ffcS, ami_.phi);
+                    }
+                    deviceCopy(ami_.ifCoeff, keep);
+                }
+            }
             // HbyA adjustment AFTER the flux (feeds the velocity corrector only): HbyA -= (rAU-rAtU)*grad(p)
             for (int kk = 0; kk < 3; ++kk)
             {
