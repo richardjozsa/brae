@@ -787,6 +787,23 @@ add_test(NAME simplec_interface_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/implicitAMI)
 set_tests_properties(simplec_interface_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# Two stock simpleFoam tutorials that had no gate at all: they were run once, agreed, and nothing kept
+# them agreeing. Both are read straight from the OpenFOAM installation, so neither needs a committed case.
+# backwardFacingStep2D is the ONLY simpleFoam tutorial that names LUST, so it is the one thing standing
+# behind brae's internal LUST weights. Each asserts that both codes reached a steady state before
+# comparing -- squareBend reads U 2.759e-02 at its tutorial endTime and 1.773e-03 once both codes are on
+# the same residual plateau, a factor of 16 from nothing but where the comparison was taken -- and each
+# carries a control requiring the INITIAL field to fail the same bounds.
+add_test(NAME tutorial_rotatingcylinders
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 rotatingCylinders U=2e-03,p=3e-03)
+set_tests_properties(tutorial_rotatingcylinders PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+add_test(NAME tutorial_backwardfacingstep2d
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 backwardFacingStep2D U=1e-02,p=2e-02,k=3e-02,omega=5e-03,nut=2e-02)
+set_tests_properties(tutorial_backwardfacingstep2d PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.
