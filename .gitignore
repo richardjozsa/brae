@@ -15,6 +15,7 @@ validation/*
 !validation/rotorDisk/
 !validation/turbineSiting/
 !validation/T3A/
+!validation/pipeCyclicAMI/
 !validation/windAroundBuildingsBox/
 !validation/kEpsCase/
 !validation/mixerVessel2D/

@@ -130,6 +130,7 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
     src/finiteVolume/cfdTools/fvOptions/actuation_disk.cu
+    src/finiteVolume/fvMatrices/cyclicAMI/cyclicAMI_cpp.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_cache.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_coarse.cu
@@ -741,6 +742,15 @@ add_test(NAME lm_cuda_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A 269)
 set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# The cyclicAMI CUDA path against the _cpp REFERENCE, stage by stage: interpolation (scalar and rotated
+# vector), face value, both matrix assemblies with their diagonals, the matrix action, the interface
+# flux, UEqn.H()'s interface term and the interface's share of div(phi). Twelve checks at 1e-12; they
+# pass bit-identically. It caught the reference's own assembleLaplacian sign on its first run.
+add_test(NAME ami_cpp_vs_device
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_cpp_vs_device.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclicAMI 100)
+set_tests_properties(ami_cpp_vs_device PROPERTIES SKIP_RETURN_CODE 77)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.
@@ -852,6 +862,10 @@ target_link_libraries(lm_cuda_probe PRIVATE brae_core)
 add_executable(ami_probe tests/ami_probe.cu)
 target_include_directories(ami_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(ami_probe PRIVATE brae_core)
+
+add_executable(ami_cpp_vs_device tests/ami_cpp_vs_device.cu)
+target_include_directories(ami_cpp_vs_device PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(ami_cpp_vs_device PRIVATE brae_core)
 
 add_executable(ke_localize_probe tests/ke_localize_probe.cu)
 target_include_directories(ke_localize_probe PRIVATE ${BRAE_HEADER_DIRS})
