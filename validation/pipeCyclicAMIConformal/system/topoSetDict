@@ -10,43 +10,51 @@ FoamFile
     version     2.0;
     format      ascii;
     class       dictionary;
-    object      controlDict;
+    object      topoSetDict;
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-application     simpleFoam;
+actions
+(
+    {
+        name    f0;
+        type    faceSet;
+        action  new;
+        source  patchToFace;
+        patch   side1;
+    }
+    {
+        name    f0;
+        type    faceSet;
+        action  subset;
+        source  boxToFace;
+        box     (0 -100 -100)(100 -0.2 100);
+    }
+    {
+        name    c0;
+        type    cellSet;
+        action  new;
+        source  faceToCell;
+        set     f0;
+        option  any;
+    }
 
-startFrom       startTime;
-
-startTime       0;
-
-stopAt          endTime;
-
-endTime         100;
-
-deltaT          1;
-
-writeControl    timeStep;
-
-writeInterval   100;
-
-purgeWrite      0;
-
-writeFormat     ascii;
-
-writePrecision  6;
-
-writeCompression off;
-
-timeFormat      general;
-
-timePrecision   6;
-
-runTimeModifiable true;
-
-functions
-{
-}
+    {
+        name    walls;
+        type    faceSet;
+        action  new;
+        source  patchToFace;
+        patch   walls;
+    }
+    {
+        name    c0;
+        type    cellSet;
+        action  subtract;
+        source  faceToCell;
+        set     walls;
+        option  any;
+    }
+);
 
 
 // ************************************************************************* //

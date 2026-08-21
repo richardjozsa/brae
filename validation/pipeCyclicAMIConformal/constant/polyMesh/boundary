@@ -21,21 +21,21 @@ FoamFile
     inlet
     {
         type            patch;
-        nFaces          28;
-        startFace       4422;
+        nFaces          25;
+        startFace       3225;
     }
     outlet
     {
         type            patch;
-        nFaces          28;
-        startFace       4450;
+        nFaces          25;
+        startFace       3250;
     }
     side1
     {
         type            cyclicAMI;
         inGroups        1(cyclicAMI);
-        nFaces          400;
-        startFace       4478;
+        nFaces          250;
+        startFace       3275;
         matchTolerance  0.0001;
         transform       rotational;
         neighbourPatch  side2;
@@ -49,7 +49,7 @@ FoamFile
         type            cyclicAMI;
         inGroups        1(cyclicAMI);
         nFaces          250;
-        startFace       4878;
+        startFace       3525;
         matchTolerance  0.0001;
         transform       rotational;
         neighbourPatch  side1;
@@ -63,7 +63,7 @@ FoamFile
         type            wall;
         inGroups        1(wall);
         nFaces          250;
-        startFace       5128;
+        startFace       3775;
     }
 )
 

@@ -748,7 +748,8 @@ set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS s
 # pass bit-identically. It caught the reference's own assembleLaplacian sign on its first run.
 add_test(NAME ami_cpp_vs_device
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_cpp_vs_device.sh
-                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclicAMI 100)
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclicAMI 100
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclicAMIConformal)
 set_tests_properties(ami_cpp_vs_device PROPERTIES SKIP_RETURN_CODE 77)
 
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,

@@ -35,4 +35,26 @@ SRC="$(cd "$SRC" && pwd)"
 OUT=$("$BIN" "$SRC" "$REF" 2>&1); rc=$?
 echo "$OUT" | sed 's/^/  /'
 [ $rc -eq 77 ] && exit 77
+
+# THE GEOMETRY CROSS-CHECK, when a conformal case is supplied as $3. Every stage above is a function of
+# (weights, deltaCoeffs, Sf), and proving the device reproduces those says nothing about whether they are
+# RIGHT -- both sides read the same buildAMIInterfaces. On a CONFORMAL interface an AMI *is* a cyclic, so
+# the same mesh with the patches declared cyclic must give the same numbers, and the cyclic geometry is
+# covered independently by cyclic_geometry/cyclic_rotational. The cyclic twin is made here by changing
+# one word in constant/polyMesh/boundary: the mesh, the points and the faces are untouched.
+#
+# It runs as a SECOND invocation because the two checks want opposite meshes -- the stencil test above
+# needs a non-conforming interface, and only a conforming one has a cyclic twin at all.
+CONF="${3:-}"
+if [ -n "$CONF" ] && [ -d "$CONF" ]; then
+    CONF="$(cd "$CONF" && pwd)"
+    W2=$(mktemp -d); trap 'rm -rf "$W2"' EXIT
+    cp -r "$CONF" "$W2/cyc"
+    sed -i 's/type            cyclicAMI;/type            cyclic;/' "$W2/cyc/constant/polyMesh/boundary"
+    grep -q 'type            cyclic;' "$W2/cyc/constant/polyMesh/boundary" \
+        || { echo "  FAIL: could not derive a cyclic twin from $CONF"; exit 1; }
+    OUT2=$("$BIN" "$CONF" 0 "$W2/cyc" 2>&1); rc2=$?
+    echo "$OUT2" | grep -E 'cross-check|AMI vs cyclic' | sed 's/^/  /'
+    [ $rc2 -ne 0 ] && [ $rc2 -ne 77 ] && rc=$rc2
+fi
 exit $rc

@@ -1,7 +1,7 @@
 /*--------------------------------*- C++ -*----------------------------------*\
 | =========                 |                                                 |
 | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
-|  \\    /   O peration     | Version:  v2412                                 |
+|  \\    /   O peration     | Version:  2412                                  |
 |   \\  /    A nd           | Website:  www.openfoam.com                      |
 |    \\/     M anipulation  |                                                 |
 \*---------------------------------------------------------------------------*/
@@ -9,7 +9,9 @@ FoamFile
 {
     version     2.0;
     format      ascii;
+    arch        "LSB;label=32;scalar=64";
     class       volScalarField;
+    location    "0";
     object      k;
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
@@ -20,21 +22,28 @@ internalField   uniform 1;
 
 boundaryField
 {
-    #includeEtc "caseDicts/setConstraintTypes"
-
     inlet
     {
         type            turbulentIntensityKineticEnergyInlet;
-        intensity       0.05;       // 5% turbulent intensity
-        value           $internalField;
+        intensity       0.05;
+        value           uniform 1;
     }
-
     outlet
     {
         type            inletOutlet;
-        inletValue      $internalField;
+        inletValue      uniform 1;
+        value           uniform 1;
     }
-
+    side1
+    {
+        type            cyclicAMI;
+        value           uniform 1;
+    }
+    side2
+    {
+        type            cyclicAMI;
+        value           uniform 1;
+    }
     walls
     {
         type            kqRWallFunction;

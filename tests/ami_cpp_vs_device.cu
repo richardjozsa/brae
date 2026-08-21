@@ -14,6 +14,7 @@
 #include "geometric_field.cuh"
 #include "foam_field_reader.cuh"
 #include "ami_interface.cuh"
+#include "cyclic_interface.cuh"
 #include "cyclicAMI_cpp.cuh"
 #include "device_mesh.cuh"
 #include "device_ami.cuh"
@@ -80,6 +81,33 @@ int main(int argc, char** argv)
     std::vector<scalar> nuEff(nC);
     for (label c = 0; c < nC; ++c) nuEff[c] = nut.internal[c] + 1e-6;
 
+    // The gate must run on a NON-CONFORMING interface. A conformal AMI has one stencil entry per source
+    // face with weight exactly 1, so the weighted sum is a copy and the multi-entry path -- the thing
+    // that makes an AMI an AMI rather than a cyclic -- is never executed. The first version of this gate
+    // shipped a conformal case and passed twelve stages without touching it.
+    // ...unless this run is the CROSS-CHECK, which needs the opposite. The two requirements are in
+    // tension on purpose: the stencil test needs a non-conforming interface, and an AMI only has a
+    // cyclic twin to be checked against when it IS conforming. So the two run as separate invocations.
+    if (argc < 4)
+    {
+        label multi = 0, maxLen = 0;
+        for (const AMIInterface& a : amis)
+            for (std::size_t i = 0; i < a.ownCell.size(); ++i)
+            {
+                const label len = a.srcOffset[i+1] - a.srcOffset[i];
+                maxLen = std::max(maxLen, len);
+                if (len > 1) ++multi;
+            }
+        std::printf("  stencil: %d source face(s) with more than one entry, longest %d\n",
+                    (int)multi, (int)maxLen);
+        if (!multi)
+        {
+            std::printf("  FAIL: every stencil is 1:1, so this case exercises no AMI interpolation at "
+                        "all -- use a non-conforming interface\n");
+            return 1;
+        }
+    }
+
     const DeviceMesh dm = buildDeviceMesh(m, g, fvp);
     DeviceAMI ami = buildDeviceAMI(amis);
     std::printf("ami_cpp_vs_device: %s/%s   %d interface(s), %d source faces\n",
@@ -98,6 +126,39 @@ int main(int argc, char** argv)
     // the gate would pass on arithmetic it never ran. These ranges are printed so a degenerate input
     // cannot masquerade as agreement, and the flux check below refuses one outright.
     int rc = 0;
+
+    // ---- STAGE 0: the AMI GEOMETRY itself, against the separately-gated cyclic geometry -----------
+    // Every stage below is a function of (weights, deltaCoeffs, Sf). Those come from
+    // buildAMIInterfaces and had no independent check: proving the device reproduces them says nothing
+    // about whether they are RIGHT. On a CONFORMAL interface an AMI is a cyclic, so the same mesh
+    // declared cyclic must give the same numbers face for face -- and the cyclic geometry is covered by
+    // cyclic_geometry/cyclic_rotational. Pass a second case dir (same mesh, patches declared cyclic) to
+    // run the cross-check; it is skipped otherwise, since a non-conforming AMI has no cyclic twin.
+    if (argc >= 4)
+    {
+        PrimitiveMesh mc;
+        mc.read(std::string(argv[3]) + "/constant/polyMesh");
+        FvGeometry gc;
+        gc.build(mc);
+        const std::vector<FvPatch> fvpc = buildPatches(mc, gc);
+        const std::vector<CyclicInterface> cycs = buildCyclicInterfaces(mc, gc, fvpc);
+        std::vector<scalar> cDc, cW, aDc, aW;
+        for (const CyclicInterface& c : cycs)
+        {
+            cDc.insert(cDc.end(), c.deltaCoeffs.begin(), c.deltaCoeffs.end());
+            cW.insert(cW.end(), c.weights.begin(), c.weights.end());
+        }
+        for (const AMIInterface& a : amis)
+        {
+            aDc.insert(aDc.end(), a.deltaCoeffs.begin(), a.deltaCoeffs.end());
+            aW.insert(aW.end(), a.weights.begin(), a.weights.end());
+        }
+        std::printf("  cross-check against the same mesh declared cyclic (%d interfaces):\n",
+                    (int)cycs.size());
+        rc |= report("  deltaCoeffs AMI vs cyclic", cDc, aDc, 1e-12);
+        rc |= report("  weights     AMI vs cyclic", cW,  aW,  1e-12);
+    }
+
     std::vector<scalar> ux(nC), uy(nC), uz(nC);
     for (label c = 0; c < nC; ++c) { ux[c] = U.internal[c].x; uy[c] = U.internal[c].y; uz[c] = U.internal[c].z; }
     DeviceBuffer<scalar> dUx, dUy, dUz, dP, dNuEff, dV;
@@ -245,6 +306,10 @@ int main(int argc, char** argv)
         rc |= report("addDiv(phi)", divH, divD.host(), 1e-12);
     }
 
+    // The cross-check invocation exists to compare GEOMETRY and is handed a conformal case at its
+    // initial state, where the azimuthal interface legitimately carries no flux. Demanding a developed
+    // field there would only force a second stored state for a check that does not read one.
+    if (argc < 4)
     {
         scalar mx = 0;
         for (scalar v : phiIf) mx = std::fmax(mx, std::fabs(v));
