@@ -1487,6 +1487,25 @@ namespace brae {
             // the case asked for.
             if (!ctl_.momentumPredictor) continue;
             const scalar nf = deviceNormFactor(mv, Uk_[kk], b, ones_);          // OF residualControl normalisation
+            // The PER-CELL momentum residual, r = b - A*psi, before the solve moves anything.
+            //
+            // The global initial residual is one number for the whole field, so it can say that brae's
+            // momentum equation disagrees with OpenFOAM's converged state but never WHERE. Every defect
+            // found in this port was found by splitting a residual by region -- the pitzDaily inlet, the
+            // Spalding wall, turbineSiting's ground -- and on pipeCyclic the disagreement is 777x on Uy
+            // against 17x on Ux, which is a shape worth being able to look at rather than infer.
+            {
+                const char* mrTag = (kk == 0) ? "mResid0" : (kk == 1) ? "mResid1" : "mResid2";
+                if (stageDumpActive() && stageDumpFirstOnly(mrTag))
+                {
+                    DeviceBuffer<scalar> Apsi, r;
+                    deviceAmul(mv, Uk_[kk], Apsi);
+                    deviceCopy(r, b);
+                    deviceAxpy(-1.0, Apsi, r);
+                    stageDump(std::string("stage_") + mrTag, r);
+                    stageDump(std::string("stage_") + mrTag + "_normFactor", std::vector<scalar>(1, nf));
+                }
+            }
             // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver (smoothSolver
             // /GaussSeidel for motorBike). Route through deviceSymGaussSeidel when fvSolution asks for it (robust on
             // anisotropic snappy cells where Jacobi-BiCGStab under-solves the loose relTol); interface LDUs keep BiCGStab.
