@@ -849,6 +849,10 @@ add_executable(lm_cuda_probe tests/lm_cuda_probe.cu)
 target_include_directories(lm_cuda_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(lm_cuda_probe PRIVATE brae_core)
 
+add_executable(ami_probe tests/ami_probe.cu)
+target_include_directories(ami_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(ami_probe PRIVATE brae_core)
+
 add_executable(v2_envelope tests/v2_envelope.cu)
 target_include_directories(v2_envelope PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(v2_envelope PRIVATE brae_core)
