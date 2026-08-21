@@ -48,6 +48,37 @@ int main(int argc, char** argv)
                     a.forwardT.xx, a.forwardT.xy, a.forwardT.xz,
                     a.forwardT.yx, a.forwardT.yy, a.forwardT.yz,
                     a.forwardT.zx, a.forwardT.zy, a.forwardT.zz);
+        // deltaCoeffs against RADIUS. In a pipe SECTOR the two cyclicAMI patches meet along the axis,
+        // so the faces nearest r = 0 are the ones whose owner and neighbour cells are closest together
+        // and most nearly coincident -- exactly where 1/(n & delta) is most delicate. A conformal mesh
+        // makes every one of these faces identical in area and interpolation weight, so any spread here
+        // is geometric and worth seeing binned rather than as a min/max pair.
+        {
+            const FvPatch& pp = fvp[a.patch];
+            std::printf("    deltaCoeffs by radius (r = sqrt(y^2+z^2) of the face centre):\n");
+            const int NB = 6;
+            scalar rmn = 1e300, rmx = -1e300;
+            for (label i = 0; i < pp.size; ++i)
+            {
+                const scalar r = std::sqrt(pp.Cf[i].y*pp.Cf[i].y + pp.Cf[i].z*pp.Cf[i].z);
+                rmn = std::fmin(rmn, r); rmx = std::fmax(rmx, r);
+            }
+            for (int b = 0; b < NB; ++b)
+            {
+                const scalar lo = rmn + (rmx-rmn)*b/NB, hi = rmn + (rmx-rmn)*(b+1)/NB;
+                scalar dmn = 1e300, dmx = -1e300;
+                int n = 0;
+                for (label i = 0; i < pp.size && i < (label)a.deltaCoeffs.size(); ++i)
+                {
+                    const scalar r = std::sqrt(pp.Cf[i].y*pp.Cf[i].y + pp.Cf[i].z*pp.Cf[i].z);
+                    if (r < lo || (b+1 < NB ? r >= hi : r > hi)) continue;
+                    dmn = std::fmin(dmn, a.deltaCoeffs[i]); dmx = std::fmax(dmx, a.deltaCoeffs[i]);
+                    ++n;
+                }
+                if (n) std::printf("      r %7.4f..%7.4f  %4d faces   deltaCoeffs %10.4f .. %10.4f\n",
+                                   lo, hi, n, dmn, dmx);
+            }
+        }
         // A face centre and where the transform sends it: the check that the rotation goes the way the
         // geometry does, which the tensor alone does not show.
         if (!a.ownCell.empty())
