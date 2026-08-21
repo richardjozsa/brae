@@ -76,7 +76,8 @@ void amgFineCoeffKernel(
         const GeometricField<scalar>* eps,
         const GeometricField<scalar>* nut,
         const GeometricField<scalar>* ReThetat,
-        const GeometricField<scalar>* gammaInt)
+        const GeometricField<scalar>* gammaInt,
+    bool                          phiWasRead)
         : fvp_(fvp), ctl_(ctl), nC_(m.nCells()), nIf_(m.nInternalFaces())
     {
         // cyclic (periodic) interfaces: a SEPARATE lduInterface (OF cyclicFvPatchField::updateInterfaceMatrix),
@@ -479,11 +480,50 @@ void amgFineCoeffKernel(
             if (cyc_.rotational) deviceCyclicFluxRot(cyc_, Uk_[0], Uk_[1], Uk_[2]);
             else                 interfaceFlux(cyc_, Uk_[0], Uk_[1], Uk_[2]);
         }
-        if (hasAMI_) interfaceFlux(ami_, Uk_[0], Uk_[1], Uk_[2]);   // conservative initial AMI flux from U_init
+        // The AMI interface flux. Rebuilding it from U is right for a COLD start -- the host phi carries a
+        // zeroGradient placeholder on a coupled patch, so its boundary value is neither coupled nor
+        // rotated -- but it is wrong on a RESTART, and wrong in a way that hides.
+        //
+        // A written phi DOES carry the interface flux: OpenFOAM writes it per patch (pipeCyclic's
+        // side1/side2 hold 400 and 250 values), and createFields copies those straight into
+        // phi.boundary, past the patch-field layer that would otherwise have replaced them. That flux is
+        // the CONSERVATIVE one the previous run ended with; fvc::flux(U) is not, because U alone does not
+        // know what the pressure correction did. Measured on pipeCyclic restarted from OpenFOAM's own
+        // converged state, the two differ by 4.98e-03 relative on side1.
+        //
+        // It matters most for the residual ORACLE this port leans on. Restart brae at OpenFOAM's
+        // converged fields and every internal face gets OpenFOAM's phi (read from file) while every
+        // interface face got a rebuilt one -- so the momentum residual came out exactly zero in the
+        // interior and enormous on the interface cells, which reads exactly like an interface
+        // discretisation defect and is not one.
+        if (hasAMI_)
+        {
+            bool loaded = false;
+            if (phiWasRead)
+            {
+                std::vector<scalar> ifPhi;
+                ifPhi.reserve(ami_.n);
+                for (const auto& r : amiRuns_)
+                {
+                    const label pi = r.first;
+                    if (pi < 0 || (std::size_t)pi >= phi.boundary.size()
+                        || (label)phi.boundary[pi].size() != r.second) { ifPhi.clear(); break; }
+                    ifPhi.insert(ifPhi.end(), phi.boundary[pi].begin(), phi.boundary[pi].end());
+                }
+                if ((label)ifPhi.size() == ami_.n)
+                {
+                    ami_.phi.copyFrom(ifPhi);
+                    loaded = true;
+                    std::printf("  AMI: interface flux restored from the written phi (%d faces); "
+                                "fvc::flux(U) would not be the conservative one\n", (int)ami_.n);
+                }
+            }
+            if (!loaded) interfaceFlux(ami_, Uk_[0], Uk_[1], Uk_[2]);   // cold start: rebuild from U_init
         // Stage harness: fvc::flux(U) ON the interface, from the U just read off disk. The one interface
         // quantity that can be compared against OpenFOAM with NO circularity -- restart both codes from
         // the same time directory and this is the same function of the same input on both sides, before
         // either has taken a step. Everything downstream (HbyA, p) is contaminated by the other's answer.
+        }
         if (hasAMI_ && stageDumpActive()) stageDump("stage_ami_fluxU_init", ami_.phi);
         {
             std::vector<scalar> o;
@@ -1203,10 +1243,13 @@ void amgFineCoeffKernel(
         // fvc::grad(lPhi) inside calcLimiter -- hence the same cellLimited treatment the other
         // grad(U) consumers get. Uk_ still holds the old velocity here (nothing is solved until the kk
         // loop below), which is what OF interpolates too.
+        // Hoisted out of the branch below: the interface assembly further down needs the SAME gradient
+        // to build its own limiter, because a coupled face is limited by OF exactly as an internal one is
+        // (LimitedScheme::calcLimiter has a coupled() branch; only an UNCOUPLED patch gets limiter 1).
+        DeviceBuffer<scalar> gradUlv;
         if (ctl_.divULinear) deviceDivCentralCoeffs(dm, phiInt_, mDiag, mUp, mLo);
         else if (ctl_.divULimitedV)
         {
-            DeviceBuffer<scalar> gradUlv;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUlv, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
             if (ctl_.gradULimitK > 0.0)
                 deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUlv, ctl_.gradULimitK,
@@ -1265,10 +1308,30 @@ void amgFineCoeffKernel(
         }
         // cyclic (periodic) momentum coupling M = div(phi,U) - laplacian(nuEff,U): folds the interface diagonal into
         // mDiag + builds cyc_.ifCoeff (off-diag) from the current cyclic flux; cycSumOff feeds the relax dominance.
+        //
+        // THE INTERFACE'S OWN DIV-SCHEME WEIGHT. Both assemblies below used to split the convective term
+        // upwind -- ifCoeff = -lap + min(phi,0), diag += lap + max(phi,0) -- for EVERY case, because
+        // that is what w = pos0(phi) is. OpenFOAM instead builds a coupled patch with the weights of the
+        // scheme the case NAMED, so on pipeCyclic (`bounded Gauss limitedLinearV 1`) brae's interface
+        // off-diagonal never changed sign where OpenFOAM's did: L2 6.86e-01 against OF's own
+        // boundaryCoeffs, with the gap equal to phi*(1-w) face by face.
+        //
+        // Only the limited schemes are wired here. `Gauss linear` and LUST are also blends at a coupled
+        // face (w = cd, and 0.75*cd + 0.25*pos0) and are still assembled upwind there -- see the manifest
+        // entry; each needs its own control before it is switched on, and switching them on silently
+        // alongside this would move every cyclic case at once with one gate covering them all.
+        DeviceBuffer<scalar> cycWsch, amiWsch;
+        if (ctl_.divULimitedV)
+        {
+            if (hasCyclic_)
+                deviceCyclicLimitedVWeights(cyc_, Uk_[0], Uk_[1], Uk_[2], gradUlv, nC_, ctl_.divUTwoBykV, cycWsch);
+            if (hasAMI_)
+                deviceAmiLimitedVWeights(ami_, Uk_[0], Uk_[1], Uk_[2], gradUlv, nC_, ctl_.divUTwoBykV, amiWsch);
+        }
         DeviceBuffer<scalar> cycSumOff;
         if (hasCyclic_)
         {
-            interfaceAssembleMomentum(cyc_, nuEff, mDiag);
+            interfaceAssembleMomentum(cyc_, nuEff, mDiag, cycWsch.size() ? &cycWsch : nullptr);
             cycSumOff.copyFrom(std::vector<scalar>(nC_, 0.0));
             interfaceOffDiagSum(cyc_, cycSumOff);
             if (cyc_.rotational) interfaceScaleImplicit(cyc_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
@@ -1281,7 +1344,7 @@ void amgFineCoeffKernel(
         DeviceBuffer<scalar> amiSumOff;                              // cyclicAMI momentum coupling (translational)
         if (hasAMI_)
         {
-            interfaceAssembleMomentum(ami_, nuEff, mDiag);
+            interfaceAssembleMomentum(ami_, nuEff, mDiag, amiWsch.size() ? &amiWsch : nullptr);
             if (stageDumpActive() && stageDumpFirstOnly("amiNuEff"))
             {   // the interface diffusivity the momentum laplacian uses: fvc::interpolate(nuEff) there
                 DeviceBuffer<scalar> tmpF, tmpN;

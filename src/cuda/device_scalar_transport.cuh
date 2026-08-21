@@ -270,9 +270,9 @@ void deviceSolveScalarTransport(
             deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK, ifs, nIfs);
         }
     }
+    const bool sharedLim = limField && limGradX && limGradY && limGradZ;
     if (limited)
     {
-        const bool sharedLim = limField && limGradX && limGradY && limGradZ;
         deviceDivLimitedCoeffs(dm, phiInt,
                                sharedLim ? *limField  : field,
                                sharedLim ? *limGradX  : gx,
@@ -350,10 +350,28 @@ void deviceSolveScalarTransport(
     // interface (cyclic/cyclicAMI) coupling: fold div(phi,f) - laplacian(D,f) at the interface into the diagonal and
     // set the off-diagonal ifCoeff. A scalar is invariant under the cyclic transform (no rotation of the value), so the
     // translational momentum assembly + a plain weighted off-diagonal apply even for a ROTATIONAL interface.
+    //
+    // ...WITH THE SCHEME'S OWN FACE WEIGHT, not upwind's. `limited` means the case named a TVD scheme for
+    // div(phi,f) -- the SST and pipeCyclic tutorials all say `bounded Gauss limitedLinear 1` on k,
+    // epsilon, omega and nuTilda -- and OpenFOAM limits a coupled face exactly as it limits an internal
+    // one. Assembling the interface upwind regardless is the same defect the momentum predictor carried,
+    // reaching every turbulence scalar through this one call. Null for upwind and linearUpwind, whose
+    // matrix IS upwind's.
+    DeviceBuffer<scalar> ifWsch;
+    if (limited)
+    {
+        const DeviceBuffer<scalar>& lf = sharedLim ? *limField : field;
+        const DeviceBuffer<scalar>& lx = sharedLim ? *limGradX : gx;
+        const DeviceBuffer<scalar>& ly = sharedLim ? *limGradY : gy;
+        const DeviceBuffer<scalar>& lz = sharedLim ? *limGradZ : gz;
+        if (ami && ami->n)      deviceAmiLimitedWeights(*ami, lf, lx, ly, lz, twoByk, ifWsch);
+        else if (cyc && cyc->n) deviceCyclicLimitedWeights(*cyc, lf, lx, ly, lz, twoByk, ifWsch);
+    }
+    const DeviceBuffer<scalar>* ifW = ifWsch.size() ? &ifWsch : nullptr;
     DeviceBuffer<scalar> ifSumOff;
-    if (ami && ami->n) { interfaceAssembleMomentum(*ami, D, aD);
+    if (ami && ami->n) { interfaceAssembleMomentum(*ami, D, aD, ifW);
         ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); interfaceOffDiagSum(*ami, ifSumOff); }
-    else if (cyc && cyc->n) { interfaceAssembleMomentum(*cyc, D, aD);
+    else if (cyc && cyc->n) { interfaceAssembleMomentum(*cyc, D, aD, ifW);
         ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); interfaceOffDiagSum(*cyc, ifSumOff); }
     // implicit fvm::ddt(f) (URANS transient turbulence): the diagonal into the assembled aD (BEFORE relax = OF assembles
     // ddt into the eqn then relaxes), the source (old-time) into src. steady (ddt.c.active==false) -> exact no-op, so this

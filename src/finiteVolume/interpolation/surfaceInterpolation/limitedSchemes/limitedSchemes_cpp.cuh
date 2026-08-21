@@ -42,11 +42,113 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
+#include <cmath>
 #include <vector>
 
 namespace brae {
 namespace cpu {
 namespace limitedSchemes {
+
+// THE LIMITER MATH ITSELF, exposed rather than kept private to the .cu, because it is needed in TWO
+// places that must not drift: the internal faces below, and the COUPLED (cyclic / cyclicAMI) faces,
+// which OpenFOAM limits with the same functions in LimitedScheme::calcLimiter's coupled branch. A
+// second transcription for the interface would be a second chance to get NVDTVD's 1000x guard, its
+// >= vs >, or OpenFOAM's sign() convention wrong -- so there is one.
+namespace detail {
+
+inline scalar sign0(scalar x) { return (x >= 0) ? 1.0 : -1.0; }   // OpenFOAM sign(): >= 0 -> +1
+
+inline scalar clamp01(scalar x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
+
+// NVDTVD::r -- the scalar TVD ratio. `gradf` is the face difference, `gradcf` the projection of the
+// UPWIND cell's gradient onto d. The 1000x guard is OpenFOAM's, not a regularisation of our own.
+inline scalar rScalar(scalar faceFlux, scalar phiP, scalar phiN,
+                      const vector& gradcP, const vector& gradcN, const vector& d)
+{
+    const scalar gradf = phiN - phiP;
+    const vector& gc = (faceFlux > 0) ? gradcP : gradcN;
+    const scalar gradcf = d.x*gc.x + d.y*gc.y + d.z*gc.z;
+    if (std::fabs(gradcf) >= 1000.0*std::fabs(gradf))
+        return 2.0*1000.0*sign0(gradcf)*sign0(gradf) - 1.0;
+    return 2.0*(gradcf/gradf) - 1.0;
+}
+
+// NVDVTVDV::r -- the V form. gradf is the SQUARED magnitude of the vector difference and gradcf is that
+// difference dotted with (d & gradc), so one limiter serves all three components. That coupling is the
+// whole difference between `limitedLinear` and `limitedLinearV`.
+//
+// gradcP/gradcN are in OPENFOAM's tensor packing, gradc_ij = d(U_j)/d(x_i), so the projection (d & gradc)
+// is a COLUMN dot. brae's device packs its velocity gradient the other way round (row = component), and
+// the two are transposes of each other -- a caller holding the device packing must transpose, not just
+// pass it through. See cyclicAMI_cpp::limitedLinearVWeights, which does exactly that and says so.
+inline scalar rVector(scalar faceFlux, const vector& phiP, const vector& phiN,
+                      const tensor& gradcP, const tensor& gradcN, const vector& d)
+{
+    const vector gradfV { phiN.x - phiP.x, phiN.y - phiP.y, phiN.z - phiP.z };
+    const scalar gradf = gradfV.x*gradfV.x + gradfV.y*gradfV.y + gradfV.z*gradfV.z;
+    const tensor& gc = (faceFlux > 0) ? gradcP : gradcN;
+    // (d & gradc)_j = d_i * gradc_ij
+    const vector dg { d.x*gc.xx + d.y*gc.yx + d.z*gc.zx,
+                      d.x*gc.xy + d.y*gc.yy + d.z*gc.zy,
+                      d.x*gc.xz + d.y*gc.yz + d.z*gc.zz };
+    const scalar gradcf = gradfV.x*dg.x + gradfV.y*dg.y + gradfV.z*dg.z;
+    if (std::fabs(gradcf) >= 1000.0*std::fabs(gradf))
+        return 2.0*1000.0*sign0(gradcf)*sign0(gradf) - 1.0;
+    return 2.0*(gradcf/gradf) - 1.0;
+}
+
+// limitedLinear.H's limiter, and the blend limitedSurfaceInterpolationScheme::weights applies to it.
+inline scalar limitedLinearLimiter(scalar r, scalar twoByk) { return clamp01(twoByk * r); }
+
+inline scalar blend(scalar limiter, scalar cdWeight, scalar faceFlux)
+{
+    return limiter*cdWeight + (1.0 - limiter)*((faceFlux >= 0.0) ? 1.0 : 0.0);   // pos0
+}
+
+} // namespace detail
+
+
+// THE SAME SCHEMES AT A COUPLED PATCH FACE (cyclic, cyclicAMI).
+//
+// OpenFOAM limits a coupled patch exactly as it limits an internal face -- LimitedScheme::calcLimiter
+// has a `coupled()` branch that calls the SAME Limiter::limiter with patch-side arguments, and only an
+// UNCOUPLED patch gets the constant limiter of 1.0. The four substitutions are:
+//
+//     CDweights[face]  ->  the patch's own interpolation weight  (fvPatch::weights)
+//     C[nei] - C[own]  ->  fvPatch::delta(), which for a transformed patch is
+//                          dOwn - transform(forwardT, interpolated dNbr) -- NOT a cell-centre difference
+//     lPhi[own/nei]    ->  patchInternalField / patchNeighbourField
+//     gradc[own/nei]   ->  the gradient's patchInternalField / patchNeighbourField
+//
+// and patchNeighbourField is where the transform lives: a scalar is never transformed, a vector is
+// rotated, a tensor is rotated on BOTH indices. The caller supplies both sides already prepared, so
+// these functions are pure per-face arithmetic and carry no interface addressing.
+//
+// WHY THIS MATTERS ENOUGH TO PORT. Without it brae assembles every coupled face upwind whatever the case
+// asked for, because w = pos0(phi) is what upwind's max/min split IS. pipeCyclic asks for
+// `bounded Gauss limitedLinearV 1`, and against OpenFOAM's own boundaryCoeffs the interface off-diagonal
+// came out at L2 6.86e-01 -- brae's coefficient never changing sign where OpenFOAM's does.
+std::vector<scalar> limitedLinearWeightsCoupled(
+    const std::vector<scalar>& phi,   // the interface face flux
+    const std::vector<scalar>& cd,    // the patch's interpolation weights
+    const std::vector<vector>& d,     // fvPatch::delta()
+    const std::vector<scalar>& vfP,   // patchInternalField
+    const std::vector<scalar>& vfN,   // patchNeighbourField
+    const std::vector<vector>& gP,    // grad's patchInternalField
+    const std::vector<vector>& gN,    // grad's patchNeighbourField (rotated when the patch transforms)
+    scalar                     k);
+
+// The V form. gP/gN use OPENFOAM's packing, gradc_ij = d(U_j)/d(x_i) -- see detail::rVector.
+std::vector<scalar> limitedLinearVWeightsCoupled(
+    const std::vector<scalar>& phi,
+    const std::vector<scalar>& cd,
+    const std::vector<vector>& d,
+    const std::vector<vector>& vfP,
+    const std::vector<vector>& vfN,
+    const std::vector<tensor>& gP,
+    const std::vector<tensor>& gN,
+    scalar                     k);
+
 
 // pos0(phi): the upwind weights. 1 where the flux leaves the owner, 0 where it enters.
 std::vector<scalar> upwindWeights(const std::vector<scalar>& phi);

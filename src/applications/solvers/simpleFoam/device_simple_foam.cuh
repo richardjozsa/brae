@@ -74,7 +74,10 @@ public:
         const GeometricField<scalar>* eps = nullptr,
         const GeometricField<scalar>* nut = nullptr,
         const GeometricField<scalar>* ReThetat = nullptr,
-        const GeometricField<scalar>* gammaInt = nullptr);
+        const GeometricField<scalar>* gammaInt = nullptr,
+        // Whether `phi` came off disk. On a coupled patch that decides whether its boundary values are
+        // the previous run's CONSERVATIVE interface flux or an un-coupled placeholder.
+        bool                          phiWasRead = false);
 
     // OF turbulence-model load sequence, ported byte-for-byte (do NOT skip, this is why OF never blows up on a
     // case cf does): (1) the model ctor bounds the read fields  [kEpsilon.C:105-106 bound(k_,kMin_); bound(epsilon_,...);

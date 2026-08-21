@@ -426,8 +426,9 @@ int main(int argc, char** argv)
         //
         // Identical to the defect already fixed for the compressible driver; this driver simply never
         // received it, which is what carrying three copies of the same behaviour costs.
+        bool phiWasRead = false;
         SurfaceScalarField phi = readPhiIfPresent(fieldDir, fvp, m.nInternalFaces(),
-                                                  fvc::flux(U, m, g, fvp));
+                                                  fvc::flux(U, m, g, fvp), &phiWasRead);
 
         const std::string secondName = ctl.sst ? "omega" : "epsilon";   // the 2nd turbulence scalar
         TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
@@ -476,7 +477,8 @@ int main(int argc, char** argv)
         _tsLap("fields + patches");
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                                   ctl.turbulent ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa) ? &tf.eps : nullptr, ctl.turbulent ? &tf.nut : nullptr,
-                                  ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+                                  ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr,
+                                  phiWasRead);
         // uniformTotalPressure p0(t). OF samples p0_->value(t) at construction with the CURRENT
         // time and again in every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:73,149),
         // so the tables are handed over before the first step and re-evaluated per step inside the

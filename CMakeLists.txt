@@ -752,6 +752,18 @@ add_test(NAME ami_cpp_vs_device
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclicAMIConformal)
 set_tests_properties(ami_cpp_vs_device PROPERTIES SKIP_RETURN_CODE 77)
 
+# The DIV SCHEME's face weight at a coupled interface, on the real pipeCyclic tutorial against real
+# OpenFOAM. brae assembled every cyclic and cyclicAMI face UPWIND whatever the case named -- a defect
+# invisible to ami_cpp_vs_device above, because brae's device and its reference implemented the same wrong
+# scheme and agreed to 1e-16 on it. Four runs, not one: brae and OpenFOAM under BOTH the limited and the
+# upwind scheme, so matching OpenFOAM is checked against a case proven to discriminate the two. Plus a
+# symmetry check that needs no reference at all -- the sector's transverse pressure force must vanish, and
+# the upwind interface put it at 2.2e-02 of the axial force against 2.1e-06 now.
+add_test(NAME coupledinterfacescheme_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/coupledinterfacescheme_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclic)
+set_tests_properties(coupledinterfacescheme_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.

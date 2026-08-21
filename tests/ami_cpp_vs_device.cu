@@ -18,6 +18,7 @@
 #include "cyclicAMI_cpp.cuh"
 #include "device_mesh.cuh"
 #include "device_ami.cuh"
+#include "fvc.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -42,7 +43,10 @@ static int report(const char* name, const std::vector<scalar>& host, const std::
         const scalar r = std::fabs(dev[i] - host[i]) / std::fmax(std::fabs(host[i]), 1e-30);
         if (r > linf) { linf = r; worst = (int)i; }
     }
-    const bool ok = linf < bound;
+    // A bound of exactly zero means EXACT equality is required, so it has to compare <= rather than <.
+    // Used where the two sides are the same kernel on the same data and any difference at all is a bug,
+    // not a tolerance question -- e.g. an explicitly-supplied default reproducing the implicit one.
+    const bool ok = (bound > 0.0) ? (linf < bound) : (linf <= 0.0);
     std::printf("  %-26s L_inf rel %.3e   bound %.1e   %s\n", name, linf, bound, ok ? "ok" : "FAIL");
     if (!ok && worst >= 0)
         std::printf("      worst entry %d:  _cpp %.12e   device %.12e\n", worst, host[worst], dev[worst]);
@@ -265,6 +269,36 @@ int main(int argc, char** argv)
         }
         rc |= report("assembleMomentum ifCoeff", ifH,   ami.ifCoeff.host(), 1e-12);
         rc |= report("assembleMomentum diag",    diagH, diagD.host(),       1e-12);
+
+        // The scheme weight is now an INPUT rather than baked in. Upwind is the special case
+        // w = pos0(phi), so passing it explicitly must reproduce the default byte for byte -- that is
+        // what makes the new parameter provably inert on every case that does not set it, and it is the
+        // only way to tell a correctly-plumbed default from one that is silently ignored.
+        {
+            std::vector<scalar> wUp(phiIf.size());
+            for (std::size_t i = 0; i < phiIf.size(); ++i) wUp[i] = phiIf[i] > 0.0 ? 1.0 : 0.0;
+            DeviceBuffer<scalar> wD;
+            wD.copyFrom(wUp);
+            DeviceBuffer<scalar> diagE;
+            diagE.copyFrom(std::vector<scalar>(nC, 0.0));
+            const std::vector<scalar> ifDefault = ami.ifCoeff.host();
+            deviceAmiAssembleMomentum(ami, dNuEff, diagE, &wD);
+            rc |= report("  explicit pos0(phi) == default", ifDefault, ami.ifCoeff.host(), 0.0);
+            rc |= report("  ...and its diagonal",           diagD.host(), diagE.host(),     0.0);
+
+            std::vector<scalar> diagG(nC, 0.0), ifG;
+            std::size_t off2 = 0;
+            for (const AMIInterface& a : amis)
+            {
+                const std::vector<scalar> ph(phiIf.begin() + off2, phiIf.begin() + off2 + a.ownCell.size());
+                const std::vector<scalar> wa(wUp.begin() + off2, wUp.begin() + off2 + a.ownCell.size());
+                off2 += a.ownCell.size();
+                cpu::cyclicAMI::State st;
+                cpu::cyclicAMI::assembleMomentum(a, nuEff, ph, st, diagG, &wa);
+                ifG.insert(ifG.end(), st.ifCoeff.begin(), st.ifCoeff.end());
+            }
+            rc |= report("  reference, same weight",        ifG,   ami.ifCoeff.host(), 1e-12);
+        }
     }
 
     // ---- STAGE 8: UEqn.H() ------------------------------------------------------------------------
@@ -320,6 +354,177 @@ int main(int argc, char** argv)
             std::printf("  FAIL: the interface flux is zero on this state, so assembleMomentum's "
                         "convective split was never exercised -- use a developed field, not a uniform one\n");
             rc = 1;
+        }
+    }
+
+    // ---- STAGE 10 and 11: the gradient contribution and the non-orthogonal correction ------------
+    // Both sides are handed the SAME per-component gradient, computed once on the host, so these test
+    // the two stages and not the gradient build (which has its own gates). The packing matters and is
+    // easy to get backwards: the device holds gUx[l]/gUy[l]/gUz[l] = d(U_l)/d(x,y,z), i.e. row = the
+    // velocity COMPONENT and column = the derivative direction -- the TRANSPOSE of what fvc::gaussGrad
+    // returns, where gradU_ij = d(U_j)/d(x_i). The tensor handed to lapCorr below is in the device's
+    // packing, built component by component so there is nothing to mistake.
+    {
+        std::vector<std::vector<vector>> gc(3);
+        for (int l = 0; l < 3; ++l)
+        {
+            std::vector<scalar> comp(nC);
+            for (label c = 0; c < nC; ++c)
+                comp[c] = l == 0 ? U.internal[c].x : l == 1 ? U.internal[c].y : U.internal[c].z;
+            std::vector<std::vector<scalar>> bnd(fvp.size());
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                const std::vector<vector>& bv = U.boundary[pi]->value();
+                bnd[pi].resize(fvp[pi].size);
+                for (label i = 0; i < fvp[pi].size; ++i)
+                    bnd[pi][i] = l == 0 ? bv[i].x : l == 1 ? bv[i].y : bv[i].z;
+            }
+            gc[l] = fvc::gaussGrad(comp, bnd, m, g, fvp);
+        }
+        DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
+        for (int l = 0; l < 3; ++l)
+        {
+            std::vector<scalar> xs(nC), ys(nC), zs(nC);
+            for (label c = 0; c < nC; ++c) { xs[c] = gc[l][c].x; ys[c] = gc[l][c].y; zs[c] = gc[l][c].z; }
+            gUx[l].copyFrom(xs); gUy[l].copyFrom(ys); gUz[l].copyFrom(zs);
+        }
+        // gradU[c] in the DEVICE packing: (row, col) = (component, derivative direction).
+        std::vector<tensor> gradU(nC);
+        for (label c = 0; c < nC; ++c)
+            gradU[c] = tensor{gc[0][c].x, gc[0][c].y, gc[0][c].z,
+                              gc[1][c].x, gc[1][c].y, gc[1][c].z,
+                              gc[2][c].x, gc[2][c].y, gc[2][c].z};
+
+        // STAGE 10: the gradient's interface contribution, component 0.
+        {
+            DeviceBuffer<scalar> oX, oY, oZ, gxD, gyD, gzD;
+            deviceAmiInterpolateVec(ami, dUx, dUy, dUz, oX, oY, oZ);
+            gxD.copyFrom(std::vector<scalar>(nC, 0.0));
+            gyD.copyFrom(std::vector<scalar>(nC, 0.0));
+            gzD.copyFrom(std::vector<scalar>(nC, 0.0));
+            deviceAmiAddGradRot(ami, dUx, oX, dV, gxD, gyD, gzD);
+            const std::vector<scalar> UNx = oX.host();
+            std::vector<vector> gh(nC, vector{0, 0, 0});
+            std::size_t off = 0;
+            std::vector<scalar> uown(nC);
+            for (label c = 0; c < nC; ++c) uown[c] = U.internal[c].x;
+            for (const AMIInterface& a : amis)
+            {
+                const std::vector<scalar> un(UNx.begin() + off, UNx.begin() + off + a.ownCell.size());
+                off += a.ownCell.size();
+                cpu::cyclicAMI::addGrad(a, uown, un, g.V(), gh);
+            }
+            std::vector<scalar> hx(nC);
+            for (label c = 0; c < nC; ++c) hx[c] = gh[c].x;
+            rc |= report("addGrad(U.x).x", hx, gxD.host(), 1e-12);
+        }
+
+        // STAGE 11: the non-orthogonal correction, per component.
+        for (int comp = 0; comp < 3; ++comp)
+        {
+            DeviceBuffer<scalar> corrD;
+            corrD.copyFrom(std::vector<scalar>(nC, 0.0));
+            deviceAmiAddLapCorr(ami, comp, dNuEff, gUx, gUy, gUz, corrD);
+            std::vector<scalar> corrH(nC, 0.0);
+            for (const AMIInterface& a : amis)
+                cpu::cyclicAMI::lapCorr(a, comp, nuEff, gradU, corrH);
+            rc |= report(comp == 0 ? "lapCorr(U.x)" : comp == 1 ? "lapCorr(U.y)" : "lapCorr(U.z)",
+                         corrH, corrD.host(), 1e-12);
+        }
+
+        // ---- STAGE 12: the DIV SCHEME's face weight at the interface -----------------------------
+        // What the case's div(phi,U) actually asks for. Every stage above agreed while the interface was
+        // assembled UPWIND on a case naming `bounded Gauss limitedLinearV 1` -- agreement between brae's
+        // two implementations of the same wrong scheme -- so this stage is the one the earlier sixteen
+        // could not have caught, and it needs a control that upwind itself would fail.
+        {
+            // The PACKED gradient the device kernel reads: g[q*nC + c], q = 3i + j = d(U_j)/d(x_i).
+            // That is OpenFOAM's packing and the TRANSPOSE of the `gradU` tensor built above for
+            // lapCorr, and both are filled from the same gc[l] so neither can drift from the other.
+            std::vector<scalar> packed(9 * (std::size_t)nC);
+            for (int di = 0; di < 3; ++di)
+                for (int cj = 0; cj < 3; ++cj)
+                    for (label c = 0; c < nC; ++c)
+                        packed[(3*di + cj)*(std::size_t)nC + c] =
+                            di == 0 ? gc[cj][c].x : di == 1 ? gc[cj][c].y : gc[cj][c].z;
+            DeviceBuffer<scalar> gPack;
+            gPack.copyFrom(packed);
+            const scalar twoByk = 2.0 / 1.0;         // `limitedLinearV 1`
+
+            DeviceBuffer<scalar> wD;
+            deviceAmiLimitedVWeights(ami, dUx, dUy, dUz, gPack, nC, twoByk, wD);
+            std::vector<scalar> wH;
+            for (const AMIInterface& a : amis)
+            {
+                std::size_t off = wH.size();
+                const std::vector<scalar> ph(phiIf.begin() + off, phiIf.begin() + off + a.ownCell.size());
+                const std::vector<scalar> wa =
+                    cpu::cyclicAMI::limitedLinearVWeights(a, ph, U.internal, gradU, 1.0);
+                wH.insert(wH.end(), wa.begin(), wa.end());
+            }
+            const std::vector<scalar> wDh = wD.host();
+            rc |= report("limitedLinearV weight", wH, wDh, 1e-12);
+
+            // THE CONTROL. A weight that happened to equal pos0(phi) everywhere would pass the line
+            // above while changing nothing -- which is exactly the state this stage exists to end. So
+            // demand that it actually differs from upwind on a real share of the interface, and that
+            // the difference reaches the assembled matrix.
+            int nDiff = 0;
+            scalar wMax = 0;
+            for (std::size_t i = 0; i < wDh.size(); ++i)
+            {
+                const scalar up = phiIf[i] >= 0.0 ? 1.0 : 0.0;
+                const scalar dd = std::fabs(wDh[i] - up);
+                if (dd > 1e-10) ++nDiff;
+                wMax = std::fmax(wMax, dd);
+            }
+            std::printf("  limitedLinearV differs from upwind on %d of %zu faces, max |dw| %.4e\n",
+                        nDiff, wDh.size(), wMax);
+            if (nDiff == 0)
+            {
+                std::printf("  FAIL: the limited weight equals pos0(phi) on EVERY interface face, so this "
+                            "stage cannot tell the new scheme from the upwind one it replaces\n");
+                rc = 1;
+            }
+
+            DeviceBuffer<scalar> diagL, diagU;
+            diagL.copyFrom(std::vector<scalar>(nC, 0.0));
+            diagU.copyFrom(std::vector<scalar>(nC, 0.0));
+            deviceAmiAssembleMomentum(ami, dNuEff, diagL, &wD);
+            const std::vector<scalar> ifLim = ami.ifCoeff.host();
+            deviceAmiAssembleMomentum(ami, dNuEff, diagU);
+            const std::vector<scalar> ifUpw = ami.ifCoeff.host();
+            scalar mx = 0;
+            for (std::size_t i = 0; i < ifLim.size(); ++i)
+                mx = std::fmax(mx, std::fabs(ifLim[i] - ifUpw[i]));
+            std::printf("  ...and moves the interface off-diagonal by up to %.4e\n", mx);
+            if (!(mx > 0.0))
+            {
+                std::printf("  FAIL: the limited weight reached the assembly and changed nothing\n");
+                rc = 1;
+            }
+
+            // The SCALAR form, on U.x standing in for a turbulence transport: same limiter, NVDTVD's r,
+            // and the value is not rotated across the interface while its gradient is.
+            {
+                std::vector<scalar> fx(nC);
+                for (label c = 0; c < nC; ++c) fx[c] = U.internal[c].x;
+                DeviceBuffer<scalar> fD, sxD, syD, szD, wsD;
+                std::vector<scalar> sx(nC), sy(nC), sz(nC);
+                for (label c = 0; c < nC; ++c) { sx[c] = gc[0][c].x; sy[c] = gc[0][c].y; sz[c] = gc[0][c].z; }
+                fD.copyFrom(fx); sxD.copyFrom(sx); syD.copyFrom(sy); szD.copyFrom(sz);
+                deviceAmiLimitedWeights(ami, fD, sxD, syD, szD, twoByk, wsD);
+                std::vector<scalar> wsH;
+                for (const AMIInterface& a : amis)
+                {
+                    std::size_t off = wsH.size();
+                    const std::vector<scalar> ph(phiIf.begin() + off, phiIf.begin() + off + a.ownCell.size());
+                    const std::vector<scalar> wa =
+                        cpu::cyclicAMI::limitedLinearWeights(a, ph, fx, gc[0], 1.0);
+                    wsH.insert(wsH.end(), wa.begin(), wa.end());
+                }
+                rc |= report("limitedLinear weight (scalar)", wsH, wsD.host(), 1e-12);
+            }
         }
     }
 

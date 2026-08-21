@@ -6,43 +6,15 @@ namespace brae {
 namespace cpu {
 namespace limitedSchemes {
 
+// The limiter math -- NVDTVD::r, NVDVTVDV::r, the clamp and the blend -- now lives in the header, because
+// the COUPLED-face weights below need the identical functions and a second copy is a second chance to
+// get OpenFOAM's 1000x guard or its sign() convention wrong. These aliases keep the call sites reading
+// the way they did.
 namespace {
 
-inline scalar sign0(scalar x) { return (x >= 0) ? 1.0 : -1.0; }   // OpenFOAM sign(): >= 0 -> +1
-
-// NVDTVD::r -- the scalar TVD ratio. `gradf` is the face difference, `gradcf` the projection of the
-// UPWIND cell's gradient onto d. The 1000x guard is OpenFOAM's, not a regularisation of our own.
-inline scalar rScalar(scalar faceFlux, scalar phiP, scalar phiN,
-                      const vector& gradcP, const vector& gradcN, const vector& d)
-{
-    const scalar gradf = phiN - phiP;
-    const vector& gc = (faceFlux > 0) ? gradcP : gradcN;
-    const scalar gradcf = d.x*gc.x + d.y*gc.y + d.z*gc.z;
-    if (std::fabs(gradcf) >= 1000.0*std::fabs(gradf))
-        return 2.0*1000.0*sign0(gradcf)*sign0(gradf) - 1.0;
-    return 2.0*(gradcf/gradf) - 1.0;
-}
-
-// NVDVTVDV::r -- the V form. gradf is the SQUARED magnitude of the vector difference and gradcf is that
-// difference dotted with (d & gradc), so one limiter serves all three components. That coupling is the
-// whole difference between `limitedLinear` and `limitedLinearV`.
-inline scalar rVector(scalar faceFlux, const vector& phiP, const vector& phiN,
-                      const tensor& gradcP, const tensor& gradcN, const vector& d)
-{
-    const vector gradfV { phiN.x - phiP.x, phiN.y - phiP.y, phiN.z - phiP.z };
-    const scalar gradf = gradfV.x*gradfV.x + gradfV.y*gradfV.y + gradfV.z*gradfV.z;
-    const tensor& gc = (faceFlux > 0) ? gradcP : gradcN;
-    // (d & gradc)_j = d_i * gradc_ij   -- OpenFOAM's grad(U)_ij = d(U_j)/d(x_i)
-    const vector dg { d.x*gc.xx + d.y*gc.yx + d.z*gc.zx,
-                      d.x*gc.xy + d.y*gc.yy + d.z*gc.zy,
-                      d.x*gc.xz + d.y*gc.yz + d.z*gc.zz };
-    const scalar gradcf = gradfV.x*dg.x + gradfV.y*dg.y + gradfV.z*dg.z;
-    if (std::fabs(gradcf) >= 1000.0*std::fabs(gradf))
-        return 2.0*1000.0*sign0(gradcf)*sign0(gradf) - 1.0;
-    return 2.0*(gradcf/gradf) - 1.0;
-}
-
-inline scalar clamp01(scalar x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
+using detail::rScalar;
+using detail::rVector;
+using detail::clamp01;
 
 } // namespace
 
@@ -119,6 +91,58 @@ std::vector<scalar> limitedLinearVWeights(
     }
     return w;
 }
+
+// -- the same two schemes at a COUPLED patch face (OF LimitedScheme::calcLimiter, coupled branch) ------
+//
+// No mesh, no addressing: every argument is already the patch-side field OpenFOAM would have built
+// (patchInternalField, patchNeighbourField, fvPatch::delta, fvPatch::weights), so the only thing here is
+// the per-face limiter. That is deliberate -- cyclic and cyclicAMI prepare those fields very differently
+// (a 1:1 pair against a weighted stencil, and a rotational patch transforms both the value and the
+// gradient), and folding either one's addressing in here would make this reusable by neither.
+
+std::vector<scalar> limitedLinearWeightsCoupled(
+    const std::vector<scalar>& phi,
+    const std::vector<scalar>& cd,
+    const std::vector<vector>& d,
+    const std::vector<scalar>& vfP,
+    const std::vector<scalar>& vfN,
+    const std::vector<vector>& gP,
+    const std::vector<vector>& gN,
+    const scalar               k)
+{
+    const scalar twoByk = 2.0 / std::fmax(k, 1e-15);          // limitedLinear.H:82
+    std::vector<scalar> w(phi.size());
+    for (std::size_t i = 0; i < phi.size(); ++i)
+    {
+        const scalar r   = detail::rScalar(phi[i], vfP[i], vfN[i], gP[i], gN[i], d[i]);
+        const scalar lim = detail::limitedLinearLimiter(r, twoByk);
+        w[i] = detail::blend(lim, cd[i], phi[i]);
+    }
+    return w;
+}
+
+
+std::vector<scalar> limitedLinearVWeightsCoupled(
+    const std::vector<scalar>& phi,
+    const std::vector<scalar>& cd,
+    const std::vector<vector>& d,
+    const std::vector<vector>& vfP,
+    const std::vector<vector>& vfN,
+    const std::vector<tensor>& gP,
+    const std::vector<tensor>& gN,
+    const scalar               k)
+{
+    const scalar twoByk = 2.0 / std::fmax(k, 1e-15);
+    std::vector<scalar> w(phi.size());
+    for (std::size_t i = 0; i < phi.size(); ++i)
+    {
+        const scalar r   = detail::rVector(phi[i], vfP[i], vfN[i], gP[i], gN[i], d[i]);
+        const scalar lim = detail::limitedLinearLimiter(r, twoByk);
+        w[i] = detail::blend(lim, cd[i], phi[i]);
+    }
+    return w;
+}
+
 
 std::vector<vector> linearUpwindVFaceCorrection(
     const std::vector<scalar>&    phi,
