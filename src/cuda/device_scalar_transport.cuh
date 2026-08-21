@@ -439,6 +439,20 @@ void deviceSolveScalarTransport(
         return nf + scalar(1e-20);                      // solverPerformance::small_
     }();
     DeviceSolverPerf perf;                                        // OF-style report: init/final/nIter for this scalar
+    // The PER-CELL residual of this transport equation, r = B - A*psi, before the solve moves anything.
+    // Same instrument as the momentum one: a global initial residual says a scalar equation disagrees
+    // with OpenFOAM's converged state but never WHERE, and every defect found in this port was found by
+    // splitting a residual by region. Named by field so k, epsilon, omega, nuTilda, ReThetat and
+    // gammaInt each get their own.
+    if (stageDumpActive() && stageDumpFirstOnly((std::string("resid_") + fieldName).c_str()))
+    {
+        DeviceBuffer<scalar> Apsi, r;
+        deviceAmul(sv, field, Apsi);
+        deviceCopy(r, B);
+        deviceAxpy(-1.0, Apsi, r);
+        stageDump(std::string("stage_resid_") + fieldName, r);
+        stageDump(std::string("stage_resid_") + fieldName + "_normFactor", std::vector<scalar>(1, normF));
+    }
     if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf);
     else    perf = deviceJacobiBiCGStab(sv, B, field, normF, tol, relTolKE, 3000, keCheckEvery);  // loose (relTol); interface in the Amul
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
