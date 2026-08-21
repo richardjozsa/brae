@@ -360,10 +360,17 @@ public:
     void setTurbulentInlets(const std::vector<label>& tiMask, const std::vector<scalar>& tiIntensity,
                             const std::vector<label>& mlMask, const std::vector<scalar>& mlLength)
     {
-        bool any = false;
-        for (label m : tiMask) if (m) { any = true; break; }
-        if (!any) for (label m : mlMask) if (m) { any = true; break; }
-        if (!any) return;
+        label nTi = 0, nMl = 0;
+        for (label m : tiMask) if (m) ++nTi;
+        for (label m : mlMask) if (m) ++nMl;
+        // Positive confirmation, because the failure mode here is SILENT and expensive: a
+        // turbulentIntensityKineticEnergyInlet that is never refreshed sits at whatever the file's
+        // `value` entry says, and OpenFOAM tutorials routinely write `value $internalField` there. On
+        // pipeCyclic that is k = 1, against the 0.0038-0.0067 the intensity actually implies -- a 200x
+        // inlet that feeds the whole entrance region and decays only by the pipe exit.
+        std::printf("  turbulent inlets: %d face(s) intensity-based k, %d face(s) mixing-length "
+                    "epsilon/omega, refreshed every iteration\n", (int)nTi, (int)nMl);
+        if (!nTi && !nMl) return;
         tiMask_.copyFrom(tiMask); tiIntensity_.copyFrom(tiIntensity);
         mlMask_.copyFrom(mlMask); mlLength_.copyFrom(mlLength);
         hasTurbInlet_ = true;

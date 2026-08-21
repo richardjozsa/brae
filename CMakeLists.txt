@@ -853,6 +853,10 @@ add_executable(ami_probe tests/ami_probe.cu)
 target_include_directories(ami_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(ami_probe PRIVATE brae_core)
 
+add_executable(ke_localize_probe tests/ke_localize_probe.cu)
+target_include_directories(ke_localize_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(ke_localize_probe PRIVATE brae_core)
+
 add_executable(v2_envelope tests/v2_envelope.cu)
 target_include_directories(v2_envelope PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(v2_envelope PRIVATE brae_core)

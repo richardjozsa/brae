@@ -518,12 +518,19 @@ int main(int argc, char** argv)
                    " actuationDiskSource[Froude], rotorDisk, velocityDampingConstraint; selectionMode all|cellZone.";
             throw std::runtime_error(msg);
         }
+        // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face masks
+        // so it refreshes them each iteration instead of freezing the set-up value.
+        //
+        // THIS IS NOT AN fvOptions CONCERN, and sitting inside the `if (!fvo.empty())` below meant a case
+        // with no fvOptions never got it -- the intensity-based k inlet and the mixing-length
+        // epsilon/omega inlet stayed at whatever the file's `value` entry said for the whole run. The
+        // OpenFOAM tutorials write `value $internalField` there, so on pipeCyclic that was k = 1 against
+        // the 0.0038-0.0067 the 5% intensity implies: a 200x inlet that fed the entrance region and
+        // decayed only by the pipe exit (wall-cell k 31x OpenFOAM's at x<1.3, 1.02x at x>8.7).
+        solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
+                                  tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
         if (!fvo.empty())
         {
-            // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face
-            // masks so it refreshes them each iteration instead of freezing the set-up value.
-            solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
-                                      tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
             solver.setFvOptions(fvo);
             if (fvo.rotor.active)   // build the BEM rotor geometry from the mesh (cell centres + face areas) and hand it over
                 solver.setRotorDisk(buildDeviceRotorDisk(fvo.rotor, g.C(), g.Sf(), m.owner(), m.neighbour(), m.nInternalFaces()));
