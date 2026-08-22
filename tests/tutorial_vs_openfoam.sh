@@ -23,8 +23,22 @@
 # 2.5e-05 residual plateau -- it reads 1.773e-03. Same code, same case, a factor of 16 from nothing but
 # where the comparison was taken. So this refuses to report a number unless both runs finished at a
 # residual worth comparing, or stopped because their own residualControl said to.
+#
+# MULTI-SETUP TUTORIALS. bump2D and turbulentFlatPlate are not single cases: each ships a
+# `setups.orig/` tree holding one `common/` skeleton plus a per-turbulence-model overlay, and its Allrun
+# composes and runs every combination. Name one as `<tutorial>:<setup>` and this composes it the way
+# OpenFOAM's own Allrun does -- common first, then the setup's 0.orig, constant and system copied over
+# it -- so the case under test is byte-for-byte the one OpenFOAM builds, not a hand-assembled lookalike.
+# The composition is the ONLY thing borrowed: the tutorial's own Allrun runs the setups in PARALLEL and
+# then post-processes with foamDictionary into benchmark profiles, neither of which this needs.
 set -u
-CASE="${1:?tutorial name under incompressible/simpleFoam}"
+SPEC="${1:?tutorial name, tutorial:setup, or tutorial:setup:grading}"
+CASE="${SPEC%%:*}"
+REST="${SPEC#*:}"
+[ "$REST" = "$CASE" ] && REST=""
+SETUP="${REST%%:*}"
+GRADING="${REST#*:}"
+[ "$GRADING" = "$SETUP" ] && GRADING=""
 BOUNDS="${2:?field bounds, e.g. U=2e-03,p=5e-03}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -40,7 +54,31 @@ set +u
 source /usr/lib/openfoam/openfoam2412/etc/bashrc > /dev/null 2>&1 || true
 set -u
 
-cp -r "$TUT/$CASE" "$W/of" || exit 1
+if [ -n "$SETUP" ]
+then
+    [ -d "$TUT/$CASE/setups.orig/$SETUP" ] \
+        || { echo "SKIP: $CASE has no setup '$SETUP' in this OpenFOAM"; exit 77; }
+    mkdir -p "$W/of"
+    cp -aRfL "$TUT/$CASE/setups.orig/common/." "$W/of" || exit 1
+    for sub in 0.orig constant system; do
+        [ -d "$TUT/$CASE/setups.orig/$SETUP/$sub" ] \
+            && { mkdir -p "$W/of/$sub"; cp -aRfL "$TUT/$CASE/setups.orig/$SETUP/$sub/." "$W/of/$sub"; }
+    done
+    # A TEMPLATED MESH. turbulentFlatPlate is not just a set of turbulence models -- it is a matrix of
+    # (model x near-wall grading), and its Allrun expands system/blockMeshDict.template with
+    # `sed s/GRADING/<g>/g` once per target y+ before composing anything. Without that expansion there is
+    # no blockMeshDict at all and blockMesh dies, which is what "Cannot find file points" was really about.
+    # The grading is part of the case identity, so it is named in the spec rather than defaulted silently.
+    if [ -f "$W/of/system/blockMeshDict.template" ] && [ ! -f "$W/of/system/blockMeshDict" ]
+    then
+        [ -n "$GRADING" ] \
+            || { echo "FAIL: $CASE builds its mesh from blockMeshDict.template; name a grading as"\
+                      " $CASE:$SETUP:<grading> (its Allrun lists grading_vs_yp, e.g. 2200 for y+ 1)"; exit 1; }
+        sed "s/GRADING/$GRADING/g" "$W/of/system/blockMeshDict.template" > "$W/of/system/blockMeshDict"
+    fi
+else
+    cp -r "$TUT/$CASE" "$W/of" || exit 1
+fi
 python3 - "$W/of" <<'PY'
 import re, sys, os
 c = os.path.join(sys.argv[1], 'system/controlDict')
@@ -53,7 +91,19 @@ PY
 # Allrun's EXIT STATUS is not the test -- rotatingCylinders ends with a `./plot` step that fails when
 # gnuplot is absent, long after simpleFoam has run and written its result. What matters is whether
 # OpenFOAM produced a solution, which is checked below by looking for one.
-( cd "$W/of" && timeout 2400 ./Allrun > allrun.log 2>&1 ) || true
+#
+# A composed setup is meshed by its own Allrun.pre and then run directly, skipping the Allrun that would
+# decompose it across processors and post-process the result into benchmark profiles.
+if [ -n "$SETUP" ]
+then
+    # Allrun.pre and the solver are run SEPARATELY, not chained on &&: Allrun.pre ends with checkMesh,
+    # which returns nonzero on a mesh it merely has warnings about, and turbulentFlatPlate's does. Chained,
+    # that silently skipped simpleFoam and the gate reported "OpenFOAM never ran".
+    ( cd "$W/of" && timeout 2400 ./Allrun.pre > allrun.log 2>&1 ) || true
+    ( cd "$W/of" && timeout 2400 simpleFoam > log.simpleFoam 2>&1 ) || true
+else
+    ( cd "$W/of" && timeout 2400 ./Allrun > allrun.log 2>&1 ) || true
+fi
 [ -f "$W/of/log.simpleFoam" ] \
     || { echo "FAIL: OpenFOAM never ran simpleFoam for $CASE"; tail -5 "$W/of/allrun.log"; exit 1; }
 grep -q '^End' "$W/of/log.simpleFoam" \
@@ -62,10 +112,31 @@ grep -q '^End' "$W/of/log.simpleFoam" \
 # brae runs the SAME mesh and the same dictionaries -- only the solver differs.
 cp -r "$W/of" "$W/brae"
 rm -rf "$W"/brae/[1-9]* "$W"/brae/0.[0-9]* "$W"/brae/log.* "$W"/brae/postProcessing "$W"/brae/allrun.log
+# BOUNDS of the form `REFUSE:<token>` invert the test: the case uses something brae does not implement,
+# and the requirement is that brae REFUSES BY NAME rather than substituting something plausible. bump2D's
+# third setup is kEpsilonPhitF, which brae has no model for; silently running it as kEpsilon would be a
+# wrong answer wearing the right label.
+case "$BOUNDS" in
+    REFUSE:*)
+        TOKEN="${BOUNDS#REFUSE:}"
+        if ( cd "$W/brae" && timeout 2400 "$BRAE" . > run.log 2>&1 ); then
+            echo "  FAIL: brae RAN a case using '$TOKEN', which it does not implement -- it must refuse"
+            exit 1
+        fi
+        if grep -qiE "ERROR.*$TOKEN" "$W/brae/run.log"; then
+            echo "  refusal names it: $(grep -iE 'ERROR' "$W/brae/run.log" | head -1)"
+            echo "  ok:   brae refuses $SPEC by name instead of substituting a model it does have"
+            exit 0
+        fi
+        echo "  FAIL: brae exited nonzero but never named '$TOKEN' -- a refusal has to say what is missing"
+        grep -viE 'NOTICE' "$W/brae/run.log" | tail -5
+        exit 1
+        ;;
+esac
 ( cd "$W/brae" && timeout 2400 "$BRAE" . > run.log 2>&1 ) \
-    || { echo "FAIL: brae refused or crashed on $CASE"; tail -15 "$W/brae/run.log"; exit 1; }
+    || { echo "FAIL: brae refused or crashed on $CASE"; grep -viE 'NOTICE' "$W/brae/run.log" | tail -8; exit 1; }
 
-GATE_BOUNDS="$BOUNDS" GATE_CASE="$CASE" python3 - "$W" <<'PY'
+GATE_BOUNDS="$BOUNDS" GATE_CASE="$SPEC" python3 - "$W" <<'PY'
 import os, re, sys
 import numpy as np
 W = sys.argv[1]
@@ -147,5 +218,5 @@ if worst <= 1.0:
 sys.exit(rc)
 PY
 rc=$?
-[ $rc -eq 0 ] && echo "  ok:   brae reproduces the $CASE tutorial"
+[ $rc -eq 0 ] && echo "  ok:   brae reproduces the $SPEC tutorial"
 exit $rc

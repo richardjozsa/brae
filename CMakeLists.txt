@@ -804,6 +804,32 @@ add_test(NAME tutorial_backwardfacingstep2d
                  backwardFacingStep2D U=1e-02,p=2e-02,k=3e-02,omega=5e-03,nut=2e-02)
 set_tests_properties(tutorial_backwardfacingstep2d PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# The MULTI-SETUP tutorials. bump2D and turbulentFlatPlate are not single cases: each ships a
+# `setups.orig/` tree of one common skeleton plus a per-turbulence-model overlay, and turbulentFlatPlate
+# additionally builds its mesh from a blockMeshDict.template expanded with a per-y+ grading -- so it is a
+# matrix of (model x near-wall grading), not a list of cases. tests/tutorial_vs_openfoam.sh composes them
+# exactly as their own Allrun does and names one as tutorial:setup[:grading].
+#
+# turbulentFlatPlate at y+ 1 is the tightest agreement of any tutorial gated here (U 1.9e-05, nut 3.8e-03),
+# which is worth having precisely because bump2D at its own residualControl of 1e-05 is the loosest.
+add_test(NAME tutorial_turbulentflatplate_komegasst
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 turbulentFlatPlate:kOmegaSST:2200 U=2e-04,p=3e-02,k=1e-03,omega=5e-04,nut=2e-02)
+set_tests_properties(tutorial_turbulentflatplate_komegasst PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+
+add_test(NAME tutorial_bump2d_spalartallmaras
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 bump2D:SpalartAllmaras U=5e-03,p=5e-03,nut=1e-01,nuTilda=1e-01)
+set_tests_properties(tutorial_bump2d_spalartallmaras PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+
+# ...and the setup brae must REFUSE. bump2D's third model is kEpsilonPhitF, which brae does not implement;
+# running it as the kEpsilon it does have would be a wrong answer wearing the right label. The gate asserts
+# brae exits nonzero AND names the model, so a refusal that says nothing useful fails too.
+add_test(NAME tutorial_bump2d_kepsilonphitf_refused
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 bump2D:kEpsilonPhitF REFUSE:kEpsilonPhitF)
+set_tests_properties(tutorial_bump2d_kepsilonphitf_refused PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.
