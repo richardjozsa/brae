@@ -142,7 +142,7 @@ void amgFineCoeffKernel(
             pc.evaluateBoundary();
             dbPcorr_ = buildDeviceBoundary(pc, fvp, g);
         }
-        wall_ = buildDeviceWallData(m, g, fvp, U);
+        wall_ = buildDeviceWallData(m, g, fvp, U, ctl_.turbWallPatch);
         {   // DeviceBoundary face offset of each patch, for setPatchVelocity
             label st = 0;
             patchStart_.assign(fvp.size(), 0);
@@ -192,16 +192,18 @@ void amgFineCoeffKernel(
             nutBndFile_.copyFrom(nb);
         }
         {
-            // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping type=="wall" patches;
-            // DeviceBoundary walks the same fvp skipping cyclic/cyclicAMI (a wall is neither), so the wall
-            // faces are a subsequence of the boundary faces and this map is just the running count.
+            // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping the TURBULENCE WALL
+            // patches (isTurbWallPatch: type=="wall" AND named by the epsilon/omega BC); DeviceBoundary
+            // walks the same fvp skipping cyclic/cyclicAMI (a wall is neither), so the wall faces are a
+            // subsequence of the boundary faces and this map is just the running count. The two MUST use
+            // the same predicate or the map silently points at the wrong faces.
             std::vector<label> wfb;
             label bi = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
                 if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i, ++bi)
-                    if (fvp[pi].type == "wall") wfb.push_back(bi);
+                    if (isTurbWallPatch(fvp, pi, ctl_.turbWallPatch)) wfb.push_back(bi);
             }
             if (!wfb.empty()) wfBndIdx_.copyFrom(wfb);
         }
@@ -3124,7 +3126,7 @@ void amgFineCoeffKernel(
                 if (f < rvx.size()) wallU[pi][i] = vector{rvx[f], rvy[f], rvz[f]};
             }
         }
-        wall_ = buildDeviceWallData(m, g, fvp, wallU);
+        wall_ = buildDeviceWallData(m, g, fvp, wallU, ctl_.turbWallPatch);
     }
 
     void DeviceSimpleSolver::advanceTime(scalar deltaT)

@@ -170,6 +170,7 @@ void wallFnKernel(
     scalar atmZ0,
     bool   atmBoundNut,
     int nutWall,
+    bool   lowReCorrection,
     scalar* __restrict__ eps0,
     scalar* __restrict__ G0,
     const scalar* __restrict__ nuFace)   // compressible: per-wall-face nu, null -> the scalar nu
@@ -190,9 +191,17 @@ void wallFnKernel(
         // OF epsilonWallFunction reads turbulenceModel::nu(patchi) = mu_b/rho_b, a per-FACE field. The
         // scalar fallback is only right for constant-property incompressible flow.
         const scalar nuw = nuFace ? nuFace[wf] : nu;
-        g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
-                               yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
-        e0 += iN * Cmu75 * pow(kc, 1.5) / (kappa * y);   // kEpsilon: distinct eps wall value
+        // epsilonWallFunction, STEPWISE blender (its default). `lowReCorrection` switches a face whose
+        // y+ is below yPlusLam to the VISCOUS epsilon and drops its wall production ENTIRELY --
+        // epsilonWallFunctionFvPatchScalarField.C:242 and :338, where the G guard is
+        // `if (!lowReCorrection_ || (yPlus > yPlusLam))`. Mirrors kEpsilon_cpp's reference branch.
+        const scalar yPlus = Cmu25 * y * sqrt(kc) / nuw;
+        const bool   resolved = lowReCorrection && (yPlus < yplLam);
+        if (!resolved)
+            g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
+                                   yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
+        e0 += resolved ? iN * 2.0 * kc * nuw / (y * y)                 // epsilonVis
+                       : iN * Cmu75 * pow(kc, 1.5) / (kappa * y);      // epsilonLog
     }
     G0[c]   = g0;
     eps0[c] = e0;
@@ -529,7 +538,7 @@ void deviceWallEpsG0(
         wallFnKernel<<<nBlocks(w.nWC), TPB>>>(w.nWC, w.wcCell.data(), w.wcStart.data(), w.wcFace.data(),
                                               w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
                                               w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(), Uy.data(),
-                                              Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, eps0.data(), G0.data(),
+                                              Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, co.epsLowRe, eps0.data(), G0.data(),
                                               (nuFace && nuFace->size()) ? nuFace->data() : nullptr);
     cudaCheck(cudaGetLastError(), "wallFn");
 }

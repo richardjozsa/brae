@@ -5,6 +5,7 @@
 // guards wall-function-on-non-wall patches, and applies the turbulent-inlet BCs. Bodies extracted verbatim from
 // gpuSimpleFoam so both drivers stay identical. Call readTurbulenceModel BEFORE readTurbulenceFields (needs ctl.sst).
 #include "solver_controls.cuh"
+#include "patch_entry_lookup.cuh"
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"
 #include "foam_field_reader.cuh"
@@ -422,6 +423,55 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             guardWallFn(nutFD, "nut");
             guardWallFn(sFD, secondName);
             setNutWall(nutFD);   // honour the BC-specified velocity-based nut wall function (nutUSpalding/nutUBlended)
+            // WHICH PATCHES THE TURBULENCE WALL FUNCTION ACTUALLY APPLIES TO. OpenFOAM's
+            // epsilonWallFunction/omegaWallFunction are BC objects on this field: only a patch whose BC
+            // is one of them gets an epsilon0/G0 override. brae built its wall set from the patch TYPE,
+            // so a `wall`-typed patch carrying a plain BC was overridden too.
+            //
+            // turbulentFlatPlate's `topWall` is exactly that -- typed `wall`, but U slip, k and epsilon
+            // zeroGradient, nut calculated, i.e. a slip far-field. brae pinned epsilon in its 545
+            // adjacent cells to the wall-function value 1.556e-03 where OpenFOAM transports it to
+            // 3.055e-02, so nut came out 1028x high, the freestream k never decayed from its 1.08e-03
+            // inlet value (OpenFOAM's decays to 1.55e-04) and the run diverged at iteration 395.
+            // findPatchEntry, NOT a name comparison: a boundaryField key may be an exact name, a GROUP or
+            // a REGEX, and OpenFOAM resolves it in that order with the last match winning.
+            // backwardFacingStep2D writes its wall BC as "(upperWall|lowerWall)", so comparing names
+            // matched nothing, left this mask all zeros, and removed the wall function from the whole
+            // case -- U went to 1.400e-01 against OpenFOAM and omega to 9.905e-01 before the suite
+            // caught it.
+            ctl.turbWallPatch.assign(fvp.size(), 0);
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                const auto* pb = findPatchEntry(sFD.boundary, fvp[pi]);
+                if (pb && (pb->type == "epsilonWallFunction" || pb->type == "omegaWallFunction"))
+                    ctl.turbWallPatch[pi] = 1;
+            }
+            {
+                std::size_t nWF = 0, nWall = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (fvp[pi].type != "wall") continue;
+                    ++nWall;
+                    if (ctl.turbWallPatch[pi]) ++nWF;
+                }
+                if (nWF != nWall)
+                    std::printf("  turbulence wall function on %zu of %zu wall patch(es) -- the rest carry a "
+                                "plain %s BC and are NOT overridden, as in OpenFOAM\n", nWF, nWall, secondName.c_str());
+            }
+            // epsilonWallFunction `lowReCorrection`, off the epsilon BC that names it. It was read by
+            // NOTHING before: the entry sits inside a boundaryField patch dictionary, which the dict audit
+            // does not track per key, so a case asking for it got the high-Re log-law epsilon and no
+            // warning. turbulentFlatPlate:kEpsilon at y+ ~ 1 diverged at iteration 10 on that.
+            for (const auto& pb : sFD.boundary)
+            {
+                if (pb.type == "epsilonWallFunction" && pb.epsLowRe)
+                {
+                    ctl.keCoeffs.epsLowRe = true;
+                    std::printf("  epsilonWallFunction: lowReCorrection ON (resolved faces take "
+                                "eps = 2*k*nu/y^2 and contribute no wall production)\n");
+                    break;
+                }
+            }
             nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
             if (ctl.lm)   // kOmegaSSTLM transition fields

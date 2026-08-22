@@ -134,6 +134,13 @@ struct DeviceSimpleControls
     // turbulence is corrected -- so it is not a cost-only control.
     struct OuterResidualControl { std::string field; scalar absTol = 0; scalar relTol = 0; };
     std::vector<OuterResidualControl> outerResidualControl;
+    // WHICH PATCHES CARRY THE TURBULENCE WALL FUNCTION, one entry per fvPatch, 1 = yes. OpenFOAM applies
+    // epsilonWallFunction/omegaWallFunction per BOUNDARY CONDITION -- they are BC objects on the
+    // epsilon/omega field, so only a patch whose BC is one gets a cornerWeights_ entry and an
+    // epsilon0/G0 override. brae selected those cells by PATCH TYPE instead, which is a different set
+    // whenever a `wall`-typed patch carries a plain BC. EMPTY means "fall back to the patch type",
+    // which is what the SA and LES paths use -- they have no epsilon/omega field to read.
+    std::vector<char> turbWallPatch;
     // OF createDyMControls.H, default FALSE: the mesh moves once per time step, on the first outer
     // iteration. When true it moves before EVERY outer corrector, so the outer loop converges the mesh
     // position alongside the pressure-velocity coupling.

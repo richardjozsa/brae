@@ -75,6 +75,10 @@ BRAE_HD inline scalar spaldingNutValue(scalar magUp, scalar magGradU, scalar y, 
 //     nutw   = (yPlus > yPlusLam ? nutLog : nutVis) - nutVis
 // The trailing subtraction is OF's `nutw -= nutVis`, so the viscous branch returns exactly 0 and the log
 // branch returns the TURBULENT part only.
+// yPlusLam: the fixed point of yPlusLam = log(E*yPlusLam)/kappa (OF wallFunctionCoefficients). One
+// definition, shared by the nut wall functions and epsilonWallFunction's lowReCorrection branch.
+scalar yPlusLam(scalar kappa, scalar E);
+
 BRAE_HD inline scalar nutUWallValue(scalar magUp, scalar y, scalar nu, scalar kappa, scalar E, scalar yPlusLam)
 {
     if (!(magUp > scalar(0)) || !(y > scalar(0)) || !(nu > scalar(0))) return scalar(0);

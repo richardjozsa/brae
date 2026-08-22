@@ -102,6 +102,7 @@ void correct(
     int  dropTerm = 0);      // DIAGNOSTIC: epsilon eqn 1 production, 2 divU SuSp, 3 destruction,
                              // 4 diffusion; k eqn 5 production G, 6 divU SuSp, 7 destruction eps/k,
                              // 8 diffusion nut/sigmak
+                             // (epsilonWallFunction's lowReCorrection rides on KEpsilonCoeffs::epsLowRe)
 
 } // namespace kEpsilonRef
 } // namespace cpu

@@ -83,21 +83,35 @@ struct DeviceWallData
     DeviceBuffer<scalar> wallW;
     DeviceBuffer<scalar> wfY, wfDc, wfUwx, wfUwy, wfUwz, invNw;
 };
+// The predicate the wall set is built on, in one place so the DeviceWallData faces and the wall-face ->
+// boundary-face map below cannot drift apart.
+inline bool isTurbWallPatch(const std::vector<FvPatch>& fvp, std::size_t pi, const std::vector<char>& wfPatch)
+{
+    if (fvp[pi].type != "wall") return false;
+    return wfPatch.empty() || (pi < wfPatch.size() && wfPatch[pi]);
+}
+
 // The wall velocity comes in per patch rather than from a GeometricField, because on a MOVING mesh the
 // two can disagree: `movingWallVelocity` is assigned into the solver's device boundary after the move
 // (setPatchVelocity), and the host field is not what the solver imposes. See refreshWallData.
+// `wfPatch`, when non-empty, says which patches carry the turbulence wall function -- see
+// DeviceSimpleControls::turbWallPatch and wallFunctionPatchMask below. A patch has to be BOTH a `wall`
+// and named by its epsilon/omega BC, because that is the set OpenFOAM overrides: the wall function is a
+// BC object on that field, so a `wall`-typed patch whose epsilon BC is plain zeroGradient gets nothing.
+// Empty = fall back to the patch type alone, which is what the SA and LES paths want.
 inline DeviceWallData buildDeviceWallData(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp,
-    const std::vector<std::vector<vector>>& wallU)
+    const std::vector<std::vector<vector>>& wallU,
+    const std::vector<char>& wfPatch = {})
 {
     const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
     std::vector<label> wfCell;
     std::vector<scalar> wfY, wfDc, wux, wuy, wuz;
     std::vector<label> nw(m.nCells(), 0);
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-        if (fvp[pi].type == "wall")
+        if (isTurbWallPatch(fvp, pi, wfPatch))
         {
             const std::vector<vector>& uv = wallU[pi];
             for (label i = 0; i < fvp[pi].size; ++i)
@@ -202,12 +216,13 @@ inline DeviceWallData buildDeviceWallData(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp,
-    const GeometricField<vector>& U)
+    const GeometricField<vector>& U,
+    const std::vector<char>& wfPatch = {})
 {
     std::vector<std::vector<vector>> wallU(fvp.size());
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         if (fvp[pi].type == "wall") wallU[pi] = U.boundary[pi]->value();
-    return buildDeviceWallData(m, g, fvp, wallU);
+    return buildDeviceWallData(m, g, fvp, wallU, wfPatch);
 }
 
 // epsilonWallFunction near-wall values: eps0 = (1/nWall) Cmu^.75 k^1.5/(kappa y); G0 = (1/nWall)(nutw+nu)*
@@ -218,6 +233,8 @@ void deviceWallEpsG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, con
                      scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
                      const DeviceBuffer<scalar>* nuFace = nullptr,
     const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+// (epsilonWallFunction's `lowReCorrection` rides on KEpsilonCoeffs::epsLowRe, so it reaches the kernel
+//  without threading a flag through every caller.)
 
 // add the eps / k reaction (Sp/Su) + SuSp(divU) terms to a matrix's diag/source (in place).
 void deviceEpsReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,

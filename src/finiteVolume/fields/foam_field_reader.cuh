@@ -151,6 +151,10 @@ struct PatchFieldData
     bool   hasABL = false;
     scalar ablUref = 0, ablZref = 0, ablZ0 = 0.1, ablD = 0, ablKappa = 0.41, ablCmu = 0.09;
     bool   atmBoundNut = true;   // atmNutkWallFunction boundNut option (clamp nut>=0); z0 is stored in ablZ0.
+    // epsilonWallFunction `lowReCorrection` (epsilonWallFunctionFvPatchScalarField.C:414,
+    // getOrDefault("lowReCorrection", false)). On a face with y+ < yPlusLam it switches epsilon from the
+    // log form to the VISCOUS one AND drops that face's wall production entirely -- see kEpsilon_cpp.
+    bool   epsLowRe = false;
     vector ablFlowDir{1, 0, 0}, ablZDir{0, 0, 1};
 };
 
@@ -465,6 +469,12 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         const std::string v = ts.next();
                         p.atmBoundNut = (v == "true" || v == "yes" || v == "on" || v == "1");
+                        ts.expect(";");
+                    }
+                    else if (key == "lowReCorrection")   // epsilonWallFunction: resolved-sublayer branch
+                    {
+                        const std::string v = ts.next();
+                        p.epsLowRe = (v == "true" || v == "yes" || v == "on" || v == "1");
                         ts.expect(";");
                     }
                     else if (key == "flowDir" || key == "zDir")

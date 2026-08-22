@@ -26,6 +26,13 @@ struct KEpsilonCoeffs
     bool   rng  = false;
     scalar eta0 = 4.38;
     scalar beta = 0.012;
+    // epsilonWallFunction `lowReCorrection` (epsilonWallFunctionFvPatchScalarField.C:414,
+    // getOrDefault("lowReCorrection", false)) -- a property of the epsilon WALL BC rather than of the
+    // model, carried here because this struct already reaches both the _cpp reference and every device
+    // entry point that needs it. On a wall face with y+ < yPlusLam it takes epsilon = 2*k*nu/y^2 in place
+    // of the log form AND contributes no wall production at all (:242 and :338). Both halves or neither:
+    // the log epsilon under-predicts dissipation on a resolved mesh while the production keeps feeding k.
+    bool   epsLowRe = false;
 };
 
 } // namespace brae

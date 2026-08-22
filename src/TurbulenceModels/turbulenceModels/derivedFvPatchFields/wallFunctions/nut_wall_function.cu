@@ -2,14 +2,16 @@
 #include <cmath>
 
 namespace brae {
-namespace {
 // yPlusLam: fixed-point solution of yPlusLam = log(E*yPlusLam)/kappa (OF wallFunctionCoefficients).
+// EXPORTED rather than file-local: epsilonWallFunction's lowReCorrection branch needs the same
+// threshold, and a second transcription of a fixed-point iteration is a second thing to get wrong.
 scalar yPlusLam(scalar kappa, scalar E)
 {
     scalar ypl = 11.0;
     for (int i = 0; i < 10; ++i) ypl = std::log(std::fmax(E * ypl, 1.0)) / kappa;
     return ypl;
 }
+namespace {
 } // namespace
 
 std::vector<scalar> nutkWallFunction(

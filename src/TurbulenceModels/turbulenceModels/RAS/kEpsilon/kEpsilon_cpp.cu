@@ -175,8 +175,18 @@ void correct(
             const scalar kc = k.internal[c];
             const scalar magGradUw = mag((Uw[i] - U.internal[c]) * wp.deltaCoeffs[i]);
 
-            eps0[c] += w * Cmu75 * std::pow(kc, 1.5) / (co.kappa * yw[i]);
-            G0[c]   += w * (nutw[i] + nu) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
+            // epsilonWallFunction, STEPWISE blender (its default: wallFunctionBlenders(dict,
+            // blenderType::STEPWISE, 2)). Without lowReCorrection the log branch is taken on every face,
+            // which is what this did unconditionally before.
+            const scalar yPlus = Cmu25 * yw[i] * std::sqrt(kc) / nu;
+            const scalar yPlusLam = brae::yPlusLam(co.kappa, co.E);
+            const bool   resolved = co.epsLowRe && (yPlus < yPlusLam);
+            eps0[c] += resolved ? w * 2.0 * kc * nu / (yw[i] * yw[i])                        // epsilonVis
+                                : w * Cmu75 * std::pow(kc, 1.5) / (co.kappa * yw[i]);        // epsilonLog
+            // ...and the production override is SKIPPED ENTIRELY on a resolved face -- OF's guard is
+            // `if (!lowReCorrection_ || (yPlus > yPlusLam))`, not a scaling of the same term.
+            if (!resolved)
+                G0[c] += w * (nutw[i] + nu) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
         }
     }
 
