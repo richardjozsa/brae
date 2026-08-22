@@ -180,6 +180,16 @@ struct DeviceSimpleControls
     // entry brae used to substitute Jacobi for). Only meaningful on the BiCGStab path -- a smoothSolver
     // has no preconditioner in OF either.
     bool   diluU = false;
+    // DILU on the TURBULENCE solve (k, epsilon/omega, nuTilda), when the case asks for it. Separate from
+    // diluU because the two are different fvSolution entries and a case can name one without the other.
+    //
+    // This is not a cost knob. Measured on turbulentFlatPlate:kEpsilon at y+ ~ 1, over 60 consecutive k
+    // solves: OpenFOAM DILU-preconditioned PBiCGStab reduces the residual to a median 0.0064 of initial,
+    // overshooting the case relTol of 0.1 by more than 10x in a single iteration, while brae Jacobi
+    // BiCGStab stops right at the threshold, median 0.0726. In the stiff k-epsilon pair that leaves the
+    // two fields mutually inconsistent every outer iteration and the case DIVERGES; solving them to
+    // 1e-3 instead makes the same code converge to U 1.04e-05 of OpenFOAM.
+    bool   diluKE = false;
     scalar twoBykK = 2.0, twoBykEps = 2.0;         // 2/max(k_,SMALL) from the limitedLinear coefficient (k_=1 -> 2).
     // div(phi,h|e) and div(phi,K|Ekp) -- the ENERGY equation's convection scheme (rhoSimpleFoam). Read from
     // fvSchemes like every other div scheme; brae used to hardcode upwind here and silently ignore what the

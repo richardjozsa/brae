@@ -830,6 +830,15 @@ add_test(NAME tutorial_bump2d_kepsilonphitf_refused
                  bump2D:kEpsilonPhitF REFUSE:kEpsilonPhitF)
 set_tests_properties(tutorial_bump2d_kepsilonphitf_refused PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# turbulentFlatPlate:kEpsilon at y+ ~ 1 -- the case that DIVERGED until the turbulence solve got the DILU
+# preconditioner the case asks for. It is gated tightly on purpose: the failure it guards was not a wrong
+# term but a preconditioner substitution, and the symptom of that returning is the run not finishing at
+# all, so bounds near the measured 1.8e-05 on U cost nothing and say exactly what is expected.
+add_test(NAME tutorial_turbulentflatplate_kepsilon
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 turbulentFlatPlate:kEpsilon:2200 U=2e-04,p=2e-03,k=3e-03,epsilon=2e-02,nut=2e-03)
+set_tests_properties(tutorial_turbulentflatplate_kepsilon PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.

@@ -6,6 +6,7 @@
 // omega/nuTilda today and by energy/species/compressible transport later. Extracted verbatim from device_kepsilon.cu.
 #include "device_kepsilon.cuh"    // deviceBoundField + DeviceMesh/DeviceBoundary/DeviceWallData
 #include "device_ldu.cuh"
+#include "device_dilu.cuh"      // OF DILU preconditioner (null -> Jacobi)
 #include "device_pcg.cuh"         // deviceJacobiBiCGStab
 #include "device_simple.cuh"      // deviceFold/deviceRelaxDiag/deviceDiv*Coeffs/deviceLinearUpwindCorr/...
 #include "device_blas.cuh"
@@ -29,6 +30,15 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // OF-style turbulence residual report store; clearTurbulenceReport/turbulenceReport (device_kepsilon.cu) wrap this.
 inline std::vector<ScalarSolveEntry>& turbStore() { static std::vector<ScalarSolveEntry> s; return s; }
+
+// The DILU preconditioner every turbulence solve uses, or null for Jacobi. Held here, in the same
+// file-scope idiom as turbStore above, rather than threaded through deviceKEpsilonCorrect,
+// deviceKOmegaSSTCorrect, deviceSpalartCorrect and deviceEnergyCorrect: it is one object shared by all of
+// them (the level schedule depends only on the mesh, and diluUpdate recomputes rD from whichever matrix
+// is being solved), so a parameter on four signatures would carry the same pointer four times.
+//
+// The solver sets it once at construction and it stays put; nothing else writes it.
+inline const DeviceDilu*& turbPrecon() { static const DeviceDilu* p = nullptr; return p; }
 
 namespace {
 // setValues (eps wall constraint): zero wall-cell off-diagonals + move the known eps0 to the neighbour RHS.
@@ -219,7 +229,11 @@ void deviceSolveScalarTransport(
     const DeviceBuffer<scalar>* limField = nullptr,
     const DeviceBuffer<scalar>* limGradX = nullptr,
     const DeviceBuffer<scalar>* limGradY = nullptr,
-    const DeviceBuffer<scalar>* limGradZ = nullptr)
+    const DeviceBuffer<scalar>* limGradZ = nullptr,
+    // OF DILU preconditioner for this field's BiCGStab; null keeps Jacobi. LAST in the list so every
+    // existing positional call is untouched. The level schedule depends only on the mesh, so ONE
+    // instance serves every field -- diluUpdate recomputes rD from the current matrix per solve.
+    const DeviceDilu* precon = nullptr)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -472,7 +486,16 @@ void deviceSolveScalarTransport(
         stageDump(std::string("stage_resid_") + fieldName + "_normFactor", std::vector<scalar>(1, normF));
     }
     if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf);
-    else    perf = deviceJacobiBiCGStab(sv, B, field, normF, tol, relTolKE, 3000, keCheckEvery);  // loose (relTol); interface in the Amul
+    // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
+    // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve
+    // lands at a median 0.0064 of the initial residual against brae's Jacobi 0.0726, and that gap leaves
+    // k and epsilon mutually inconsistent enough to diverge. See DeviceSimpleControls::diluKE.
+    else
+    {
+        const DeviceDilu* pc = precon ? precon : turbPrecon();
+        perf = deviceJacobiBiCGStab(sv, B, field, normF, tol, relTolKE, 3000, keCheckEvery, 0,
+                                    (pc && pc->valid) ? pc : nullptr);
+    }
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
     if (boundPositive) deviceBoundField(dm, field, 1e-15);        // OF bound(field): neg -> local avg, not floor
 }

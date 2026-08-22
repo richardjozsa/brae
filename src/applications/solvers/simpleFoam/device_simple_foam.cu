@@ -113,7 +113,12 @@ void amgFineCoeffKernel(
         if (hasCyclic_ || hasAMI_) ctl_.useGraph = false;   // V-cycle graph replay not interface-safe; minor perf only.
         // The DILU level schedule: mesh addressing only, so once per solver. Skipped entirely when the
         // case did not ask for DILU, so no case pays for it unasked.
-        if (ctl_.diluU) diluU_ = buildDeviceDilu(m.owner(), m.neighbour(), nC_);
+        // ONE level schedule for every DILU-preconditioned solve on this mesh -- momentum and the
+        // turbulence pair alike. The schedule is a property of the addressing, not of the matrix, and
+        // diluUpdate recomputes rD from whichever matrix is being solved, so building it twice would
+        // duplicate the DAG for nothing.
+        if (ctl_.diluU || ctl_.diluKE) dilu_ = buildDeviceDilu(m.owner(), m.neighbour(), nC_);
+        turbPrecon() = (ctl_.diluKE && dilu_.valid) ? &dilu_ : nullptr;
         ctorMark("enter");
         dm_   = buildDeviceMesh(m, g, fvp);
         ctorMark("deviceMesh built");
@@ -1708,7 +1713,7 @@ void amgFineCoeffKernel(
                 // diagonal preconditioner leaves the residual error in that direction for the PIMPLE
                 // outer loop to amplify (see device_dilu.cuh).
                 uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), ctl_.uMaxIter(), ctl_.bicgCheckEvery, ctl_.uMinIter(),
-                                             (ctl_.diluU && diluU_.valid) ? &diluU_ : nullptr);
+                                             (ctl_.diluU && dilu_.valid) ? &dilu_ : nullptr);
                 ur = uperf.initialResidual;
             }
             // keep all 3 components + their final residual / nIter (OF prints Solving for Ux/Uy/Uz each iteration)

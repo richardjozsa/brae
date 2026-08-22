@@ -117,11 +117,24 @@ inline void readLinearSolverControls(
         if (!smoo.empty() && !gs)
             noticeIgnored("solvers/" + f + " smoother",
                           "'" + smoo + "' -- brae is not running a smoothSolver on this field");
-        // DILU is now implemented (device_dilu.cuh), so only the preconditioners brae still substitutes
-        // are reported. A smoothSolver has no preconditioner in OF either, so the entry is inert there.
-        if (!prec.empty() && !gs && prec != "diagonal" && prec != "none" && prec != "DILU")
+        // DILU is implemented (device_dilu.cuh) but only WIRED on the momentum and turbulence solves, so
+        // the exemption names those fields instead of the word DILU. A case asking DILU on any other
+        // field still gets Jacobi and must still be told -- before this the blanket exemption meant a
+        // DILU request on k/epsilon was answered with Jacobi and NO notice at all.
+        //
+        // AND THE SUBSTITUTION IS NOT COST-ONLY, which is what the wording used to imply. Both
+        // preconditioners reach the requested relTol; they stop in different places. On
+        // turbulentFlatPlate:kEpsilon, over 60 consecutive k solves, OpenFOAM's DILU lands at a median
+        // 0.0064 of the initial residual -- one iteration overshooting the case's relTol of 0.1 by more
+        // than 10x -- while Jacobi stops at 0.0726. That gap left k and epsilon mutually inconsistent
+        // every outer iteration and the case DIVERGED at iteration 171. A preconditioner substitution
+        // can change whether a case runs at all.
+        const bool diluWired = (prec == "DILU") && (f == "U" || f == "k" || f == secondName || f == "nuTilda");
+        if (!prec.empty() && !gs && prec != "diagonal" && prec != "none" && !diluWired)
             noticeApproximated("solvers/" + f + " preconditioner",
-                               "case asks '" + prec + "', brae preconditions with Jacobi (diagonal)");
+                               "case asks '" + prec + "', brae preconditions with Jacobi (diagonal). Both reach the"
+                               " requested relTol but stop at DIFFERENT residuals, which can change stability, not"
+                               " just cost");
     };
 
     // OF's selection, exactly: solver smoothSolver + a GaussSeidel-family smoother -> brae's symmetric
@@ -202,6 +215,20 @@ inline void readLinearSolverControls(
             ctl.gsEps = useSymGS(secondName);
             noticeSolverChoice("k", "Jacobi-BiCGStab", ctl.gsK);
             noticeSolverChoice(secondName, "Jacobi-BiCGStab", ctl.gsEps);
+            // DILU on whichever of the pair runs BiCGStab. subDict is regex-aware (literal first, then
+            // last wildcard match, OF semantics), so a case writing its solver block as
+            // "(omega|epsilon|k)" -- which is how essentially every tutorial writes it -- resolves here
+            // without a special case. Read AFTER gsK/gsEps, since a smoothSolver field has no
+            // preconditioner to honour.
+            {
+                const FoamDict* sk = solvers ? solvers->subDict("k") : nullptr;
+                const FoamDict* ss = solvers ? solvers->subDict(secondName) : nullptr;
+                const bool kDilu = sk && sk->wordOr("preconditioner", "") == "DILU";
+                const bool sDilu = ss && ss->wordOr("preconditioner", "") == "DILU";
+                ctl.diluKE = (kDilu && !ctl.gsK) || (sDilu && !ctl.gsEps);
+                if (const char* e = std::getenv("BRAE_DILU_KE"))   // attribution escape hatch
+                    ctl.diluKE = (std::atoi(e) != 0) && !(ctl.gsK && ctl.gsEps);
+            }
         }
     }
 
