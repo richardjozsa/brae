@@ -839,6 +839,49 @@ add_test(NAME tutorial_turbulentflatplate_kepsilon
                  turbulentFlatPlate:kEpsilon:2200 U=2e-04,p=2e-03,k=3e-03,epsilon=2e-02,nut=2e-03)
 set_tests_properties(tutorial_turbulentflatplate_kepsilon PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
 
+# The two tutorials that had never been compared to OpenFOAM at all.
+#
+# motorBike is the big one -- 353700 cells from snappyHexMesh, kOmegaSST -- and the only tutorial here
+# whose OpenFOAM side runs IN PARALLEL (decomposePar, snappyHexMesh and simpleFoam on 6 processors, then
+# reconstructPar). Its ~5% on U is the LOOSEST agreement of any gated tutorial, and it is not a
+# convergence artefact: run both codes 5x longer, to 2500, and the comparison is the same (U 5.58e-02
+# against 5.00e-02, nut 9.56e-03 against 1.06e-02) while OpenFOAM's residual falls to 6.0e-05 and brae's
+# to 1.4e-04. That is why the steady-state threshold is passed as 3e-04 here -- the extra iterations move
+# the residual and not the answer -- and why the case is gated AS SHIPPED at its own endTime of 500.
+# OpenFOAM's run is also potentialFoam-initialised and brae's is not, which is in the bounds too.
+add_test(NAME tutorial_motorbike
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 motorBike U=8e-02,p=9e-02,k=1.7e-01,omega=1.0e-01,nut=2e-02 3e-04)
+set_tests_properties(tutorial_motorbike PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 5400)
+
+# pitzDailyExptInlet ships no Allrun at all (blockMesh + simpleFoam) and its residualControl is very loose
+# -- p 1e-2, U 1e-3. That looseness is most of the gap: at the case's own settings brae reads U 2.866e-02
+# and p 1.630e-01 against OpenFOAM, and with both codes driven to ~1e-9 the same comparison reads
+# U 1.155e-02 and p 1.540e-02. Gated as shipped, with the bounds that implies.
+add_test(NAME tutorial_pitzdailyexptinlet
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 pitzDailyExptInlet U=5e-02,p=2.8e-01,k=1.3e-01,epsilon=1.2e-01,nut=2.0e-01)
+set_tests_properties(tutorial_pitzdailyexptinlet PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+
+# squareBend, gated at 8000 rather than its shipped endTime of 500. That is not padding: at 500 the
+# comparison reads U 2.759e-02 and at 8000 -- where both codes sit on the same 2.5e-05 residual plateau --
+# it reads 1.773e-03. Gating the shipped number would record where the run stopped as if it were a
+# property of the solver. 112000 cells, kEpsilon, SIMPLEC, `Gauss limitedLinearV 1`.
+add_test(NAME tutorial_squarebend
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 squareBend U=5e-03,p=5e-03,k=1.2e-02,epsilon=3e-02,nut=5e-03 1e-04 8000)
+set_tests_properties(tutorial_squarebend PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
+
+# bump2D:kOmegaSST. U, p, k and omega agree to 5.3e-04, 5.2e-04, 9.4e-03 and 1.1e-05; nut alone sits at
+# 1.1e-01, and that is the case's own residualControl of 1e-05 rather than the closure -- drive both codes
+# to 1e-08 and the same comparison reads U 1.495e-05 and nut 9.905e-03, a factor of 11 on nut from nothing
+# but the stopping point. Gated as shipped, since 40000 iterations is not a routine gate, with a nut bound
+# that says so.
+add_test(NAME tutorial_bump2d_komegasst
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 bump2D:kOmegaSST U=1.5e-03,p=1.5e-03,k=2.5e-02,omega=4e-05,nut=2.2e-01)
+set_tests_properties(tutorial_bump2d_komegasst PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+
 # `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
 # that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
 # each velocity component independently where OpenFOAM shares one limiter across the vector.

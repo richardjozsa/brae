@@ -40,6 +40,17 @@ SETUP="${REST%%:*}"
 GRADING="${REST#*:}"
 [ "$GRADING" = "$SETUP" ] && GRADING=""
 BOUNDS="${2:?field bounds, e.g. U=2e-03,p=5e-03}"
+# The residual below which check 1 calls a run steady, when it stopped at endTime rather than on its own
+# residualControl. Default 1e-04. A case may need it raised, but ONLY with evidence that the comparison is
+# insensitive to running longer -- motorBike is the example: brae sits at 1.4e-04 after 2500 iterations
+# against OpenFOAM's 6.0e-05, and the field comparison is the same there as at 500 (U 5.58e-02 against
+# 5.00e-02), so the extra iterations change the residual and not the answer.
+STEADY="${3:-1e-04}"
+# Optional endTime override, for a tutorial whose own endTime stops well short of steady. squareBend is
+# the case: at its shipped 500 the comparison reads U 2.759e-02, and at 8000 -- where both codes sit on
+# the same 2.5e-05 residual plateau -- it reads 1.773e-03, a factor of 16 from nothing but where it was
+# taken. Gating the shipped number would record the stopping point as if it were a property of the solver.
+ENDTIME="${4:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 TUT=/usr/lib/openfoam/openfoam2412/tutorials/incompressible/simpleFoam
@@ -79,13 +90,17 @@ then
 else
     cp -r "$TUT/$CASE" "$W/of" || exit 1
 fi
-python3 - "$W/of" <<'PY'
+GATE_ENDTIME="$ENDTIME" python3 - "$W/of" <<'PY'
 import re, sys, os
 c = os.path.join(sys.argv[1], 'system/controlDict')
 s = open(c).read()
 s = re.sub(r'functions\s*\{.*?\n\}', 'functions\n{\n}', s, flags=re.S)
 s = re.sub(r'^writeFormat .*',    'writeFormat     ascii;', s, flags=re.M)
 s = re.sub(r'^writePrecision .*', 'writePrecision  15;', s, flags=re.M)
+et = os.environ.get('GATE_ENDTIME', '')
+if et:
+    s = re.sub(r'^endTime .*',       'endTime         %s;' % et, s, flags=re.M)
+    s = re.sub(r'^writeInterval .*', 'writeInterval   %s;' % et, s, flags=re.M)
 open(c, 'w').write(s)
 PY
 # Allrun's EXIT STATUS is not the test -- rotatingCylinders ends with a `./plot` step that fails when
@@ -102,7 +117,14 @@ then
     ( cd "$W/of" && timeout 2400 ./Allrun.pre > allrun.log 2>&1 ) || true
     ( cd "$W/of" && timeout 2400 simpleFoam > log.simpleFoam 2>&1 ) || true
 else
-    ( cd "$W/of" && timeout 2400 ./Allrun > allrun.log 2>&1 ) || true
+    # A tutorial need not ship an Allrun -- pitzDailyExptInlet is just 0/, constant/ and system/, meshed
+    # by blockMesh and run directly. Falling back keeps the gate usable on those instead of skipping them.
+    if [ -x "$W/of/Allrun" ]; then
+        ( cd "$W/of" && timeout 2400 ./Allrun > allrun.log 2>&1 ) || true
+    else
+        ( cd "$W/of" && timeout 2400 blockMesh > log.blockMesh 2>&1 ) || true
+        ( cd "$W/of" && timeout 3600 simpleFoam > log.simpleFoam 2>&1 ) || true
+    fi
 fi
 [ -f "$W/of/log.simpleFoam" ] \
     || { echo "FAIL: OpenFOAM never ran simpleFoam for $CASE"; tail -5 "$W/of/allrun.log"; exit 1; }
@@ -112,6 +134,12 @@ grep -q '^End' "$W/of/log.simpleFoam" \
 # brae runs the SAME mesh and the same dictionaries -- only the solver differs.
 cp -r "$W/of" "$W/brae"
 rm -rf "$W"/brae/[1-9]* "$W"/brae/0.[0-9]* "$W"/brae/log.* "$W"/brae/postProcessing "$W"/brae/allrun.log
+# A tutorial that meshes and runs IN PARALLEL (motorBike: decomposePar, snappyHexMesh, simpleFoam on 6
+# processors, then reconstructPar) leaves the fields in processor*/ and never writes a serial 0/ -- the
+# reconstructed constant/polyMesh is there, but restore0Dir ran per-processor. Rebuild 0/ from 0.orig and
+# drop the decomposition, which brae does not read and which is large.
+rm -rf "$W"/brae/processor*
+[ -d "$W/brae/0" ] || { [ -d "$W/brae/0.orig" ] && cp -r "$W/brae/0.orig" "$W/brae/0"; }
 # BOUNDS of the form `REFUSE:<token>` invert the test: the case uses something brae does not implement,
 # and the requirement is that brae REFUSES BY NAME rather than substituting something plausible. bump2D's
 # third setup is kEpsilonPhitF, which brae has no model for; silently running it as kEpsilon would be a
@@ -136,7 +164,7 @@ esac
 ( cd "$W/brae" && timeout 2400 "$BRAE" . > run.log 2>&1 ) \
     || { echo "FAIL: brae refused or crashed on $CASE"; grep -viE 'NOTICE' "$W/brae/run.log" | tail -8; exit 1; }
 
-GATE_BOUNDS="$BOUNDS" GATE_CASE="$SPEC" python3 - "$W" <<'PY'
+GATE_BOUNDS="$BOUNDS" GATE_CASE="$SPEC" GATE_STEADY="$STEADY" python3 - "$W" <<'PY'
 import os, re, sys
 import numpy as np
 W = sys.argv[1]
@@ -183,7 +211,7 @@ for k, log in (('OpenFOAM', os.path.join(W, 'of', 'log.simpleFoam')),
     if not res:
         print("     %-9s FAIL: no Ux residual in the log" % k); rc = 1; continue
     v = float(res[-1])
-    ok = stopped or v < 1e-04
+    ok = stopped or v < float(os.environ.get('GATE_STEADY', '1e-04'))
     print("     %-9s Ux %.3e  (%s)   %s" % (k, v, "residualControl" if stopped else "ran to endTime",
                                             "ok" if ok else "FAIL: still moving"))
     if not ok: rc = 1
@@ -202,18 +230,29 @@ for f in fields:
 # 3. THE CONTROL, and it is what makes the bounds above mean anything: the INITIAL field must FAIL them.
 #    Without it a bound loose enough to pass a broken solver also passes a solver that did nothing.
 print("  3. control -- the initial field must NOT pass those bounds")
+# `0` when the case has one; a parallel tutorial (motorBike) restores 0 per-processor and only ships
+# 0.orig. Fields written with #include/$macro are skipped rather than failed -- the control needs one
+# field it can actually read, not all of them.
 z = os.path.join(W, 'of', '0')
-worst = 0.0
+if not os.path.isdir(z):
+    z = os.path.join(W, 'of', '0.orig')
+worst, nRead = 0.0, 0
 for f in fields:
     if not os.path.exists(os.path.join(z, f)):
         continue
     try:
-        e = rel(read(z, f), read(od, f))
+        a = read(z, f); b = read(od, f)
+        if a is not None and a.shape[0] == 1:
+            a = np.repeat(a, b.shape[0], axis=0)
+        e = rel(a, b)
     except Exception:
-        continue
+        continue                       # $macro / #include -- unreadable here, not a failure
+    nRead += 1
     worst = max(worst, e / BOUND[f])
     print("     %-8s L2 rel %.3e  (%.0fx its bound)" % (f, e, e / BOUND[f]))
-if worst <= 1.0:
+if nRead == 0:
+    print("     FAIL: could not read ANY initial field, so the control is not exercised at all"); rc = 1
+elif worst <= 1.0:
     print("     FAIL: the initial field already meets the bounds, so they discriminate nothing"); rc = 1
 sys.exit(rc)
 PY
