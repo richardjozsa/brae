@@ -2,6 +2,16 @@
 
     MRF.correctBoundaryVelocity(U);
 
+    // Stage harness: U EXACTLY as UEqn.H assembles from -- after correctBoundaryVelocity and after the
+    // boundary conditions have been evaluated, before any matrix is built. Without this, a brae-side
+    // comparison of the momentum matrix also measures brae's flowRateInletVelocity (which sbMatched's
+    // inlet uses, and whose value depends on which rho it is fed). Those are separate components and a
+    // single number covering both cannot be attributed to either.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        volVectorField("stage_Uass", U).write();
+    }
+
     tmp<fvVectorMatrix> tUEqn
     (
         fvm::div(phi, U)

@@ -17,6 +17,7 @@
 #include "mrf_read.cuh"
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
+#include "turb_blowup.cuh"
 #include "foam_dict.cuh"
 #include "dict_audit.cuh"
 #include "scheme_parse.cuh"
@@ -549,7 +550,7 @@ int main(int argc, char** argv)
         // OF simpleControl::criteriaSatisfied: an unlisted field is not a criterion, and a run only
         // converges if at least one criterion was ACTUALLY checked (see solvers/common/residual_control.cuh).
         int rcChecked = 0;
-        scalar turbMag0 = 0;   // sum|turb| at iteration 1; baseline for the blow-up tripwire
+        TurbBlowup turbBlowup;   // sum|turb| tripwire; see solvers/common/turb_blowup.cuh
         auto ok = [&](scalar res, scalar ctlv) { if (ctlv < 0) return true; ++rcChecked; return res < ctlv; };
         // OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time)
         const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
@@ -677,20 +678,15 @@ int main(int argc, char** argv)
             // flow just goes near-laminar), every residual stayed finite, and the run marched to endTime and
             // WROTE the fields reporting success. That is worse than a crash -- the output looks plausible.
             //
-            // Trip on growth relative to the first iteration rather than an absolute value, so the bar is
-            // independent of mesh size and of the case's units. 1e12 is a tripwire, not a convergence
-            // criterion: a healthy cold start grows sum|turb| by ~1e2, so this cannot fire on a real solve.
+            // Growth is measured against the first iteration rather than an absolute value, so the bar is
+            // independent of mesh size and of the case's units -- but crossing the bar is NOT on its own
+            // divergence. A violent start-up transient crosses it and recovers, and real OpenFOAM goes
+            // through the same excursion on the case that exposed this. The tripwire therefore requires the
+            // excursion to PERSIST; see solvers/common/turb_blowup.cuh for the measurements behind that.
             if (!std::getenv("BRAE_ALLOW_NONFINITE") && ctl.turbulent)
             {
-                const scalar tm = solver.turbSumMag();
-                if (iter == 1) turbMag0 = tm;
-                if (!std::isfinite(tm) || (turbMag0 > 0 && tm > 1e12 * turbMag0))
-                    throw std::runtime_error(
-                        "solution diverged: turbulence blow-up at iteration " + std::to_string(iter)
-                        + " (sum|k|+sum|eps/omega| grew from " + std::to_string((double)turbMag0) + " to "
-                        + std::to_string((double)tm) + "). The momentum residuals can stay finite while this"
-                        + " happens, so the run would otherwise write a plausible-looking but wrong field."
-                        + " No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+                if (turbBlowup.update(solver.turbSumMag(), (int)iter))
+                    throw std::runtime_error(turbBlowup.message((int)iter));
             }
             // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
             // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon

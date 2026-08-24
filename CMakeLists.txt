@@ -105,6 +105,11 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/createFields_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/UEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/EEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/pEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/pcEqn_cpp.cu
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
     src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
     src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
@@ -1616,6 +1621,90 @@ add_executable(test_thermo_perfect_gas tests/test_thermo_perfect_gas.cu)
 target_include_directories(test_thermo_perfect_gas PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_thermo_perfect_gas PRIVATE brae_core)
 add_test(NAME thermo_perfect_gas COMMAND test_thermo_perfect_gas)
+
+# The turbulence blow-up tripwire's DECISION, tested on the two measured sequences it has to tell apart:
+# a start-up transient that crosses the ratio bar and recovers (a 5.96M-cell car case both brae and real
+# OpenFOAM solve), and a run that genuinely diverges. Carries its own control -- a bar-only detector must
+# stop the transient, otherwise the sequences prove nothing.
+add_executable(test_turb_blowup tests/test_turb_blowup.cu)
+target_include_directories(test_turb_blowup PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_turb_blowup PRIVATE brae_core)
+add_test(NAME turb_blowup COMMAND test_turb_blowup)
+
+# rhoSimpleFoam's createFields.H against real OpenFOAM. The oracle is OpenFOAM's own
+# `rhoSimpleFoam -postProcess -func "writeObjects(phi,rho)"`, which builds createFields.H's field set and
+# writes it without solving -- no instrumented OpenFOAM build required. Carries the control that
+# distinguishes compressibleCreatePhi.H's interpolate(rho*U) from pEqn.H's interpolate(rho)*flux(U).
+add_executable(test_rho_create_fields_cpp tests/test_rho_create_fields_cpp.cu)
+target_include_directories(test_rho_create_fields_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_create_fields_cpp PRIVATE brae_core)
+add_test(NAME rho_createfields_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_createfields_vs_openfoam.sh)
+
+# rhoSimpleFoam's UEqn.H against OpenFOAM's own assembled momentum matrix (tools/dumpPEqn stage harness:
+# rAU, internalCoeffs, boundaryCoeffs). OpenFOAM's muEff is injected so this measures the ASSEMBLY and not
+# the unported compressible turbulence closure. Carries the control that distinguishes the compressible
+# divDevRhoReff (dynamic mu_eff) from the incompressible divDevReff (kinematic nu_eff).
+add_executable(test_rho_ueqn_cpp tests/test_rho_ueqn_cpp.cu)
+target_include_directories(test_rho_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_ueqn_cpp PRIVATE brae_core)
+add_test(NAME rho_ueqn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_ueqn_vs_openfoam.sh)
+
+# rhoSimpleFoam's EEqn.H against OpenFOAM's own assembled energy equation (dumpPEqn stage harness:
+# stage_Ekp, stage_he, stage_eD, stage_eSrc, stage_alphaEff). OpenFOAM's alphaEff is injected so this
+# measures the ASSEMBLY. Carries the control that distinguishes the two he.name() arms --
+# Ekp = 0.5|U|^2 + p/rho for `e` against K = 0.5|U|^2 for `h`.
+add_executable(test_rho_eeqn_cpp tests/test_rho_eeqn_cpp.cu)
+target_include_directories(test_rho_eeqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_eeqn_cpp PRIVATE brae_core)
+add_test(NAME rho_eeqn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_eeqn_vs_openfoam.sh)
+
+# rhoSimpleFoam's pEqn.H against OpenFOAM -- BOTH branches, by running OpenFOAM twice on the same fixture
+# with `transonic no` and `transonic yes` (and `consistent no`, so the driver reaches pEqn.H rather than
+# pcEqn.H). The transonic branch had no stage harness at all until this gate; one was added to
+# tools/dumpPEqn. Each run's control is the OTHER branch, which must not reproduce it.
+add_executable(test_rho_peqn_cpp tests/test_rho_peqn_cpp.cu)
+target_include_directories(test_rho_peqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_peqn_cpp PRIVATE brae_core)
+add_test(NAME rho_peqn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_peqn_vs_openfoam.sh)
+
+# rhoSimpleFoam's pcEqn.H -- the SIMPLEC pressure equation -- against OpenFOAM, BOTH branches, with
+# `consistent yes` so the driver reaches pcEqn.H. Its subsonic branch had no stage harness until this
+# gate. Controls: plain SIMPLE must not reproduce the SIMPLEC matrix, and the other transonic branch
+# must not either.
+add_executable(test_rho_pceqn_cpp tests/test_rho_pceqn_cpp.cu)
+target_include_directories(test_rho_pceqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_pceqn_cpp PRIVATE brae_core)
+add_test(NAME rho_pceqn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_pceqn_vs_openfoam.sh)
+set_tests_properties(rho_pceqn_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_pceqn_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_peqn_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_peqn_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_eeqn_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_eeqn_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_ueqn_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_ueqn_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_createfields_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_create_fields_cpp
+                     TIMEOUT 900)
 
 # heRhoThermo/perfectGas must parse identically to hePsiThermo, and heRhoThermo with any OTHER
 # equationOfState must be refused. Asserted at the PARSE level because brae is not run-to-run

@@ -36,7 +36,8 @@ public:
     //
     // This is NOT the same question as fixesValue(), and conflating them is a silent error:
     //   * slip / partialSlip are NOT assignable but do NOT fix a value;
-    //   * inletOutlet is a mixed BC, so not assignable, and does not fix a value either.
+    //   * inletOutlet derives from mixed but OVERRIDES assignable() back to TRUE
+    //     (inletOutletFvPatchField.H:164); outletInlet derives from the same base and does not.
     // constrainHbyA (simpleFoam/pEqn.H:3) branches on assignable(); adjustPhi (pEqn.H:6) branches on
     // fixesValue(). Using one for the other changes which patches keep U's boundary value in HbyA.
     virtual bool assignable() const { return true; }
@@ -582,7 +583,15 @@ template <typename T>
 class InletOutletPatchField : public ExtrapolatedValuePatchField<T>   // value()/refValue = inletValue
 {
 public:
-    bool assignable() const override { return false; }   // OF: inletOutlet derives from mixed
+    // TRUE, and this is NOT an oversight in OpenFOAM. mixedFvPatchField::assignable() is false
+    // (mixedFvPatchField.H:200), but inletOutletFvPatchField OVERRIDES it back to true
+    // (inletOutletFvPatchField.H:163-164) -- "True: this patch field is altered by assignment".
+    // outletInlet, which also derives from mixed, does NOT override and so really is false; the two
+    // differ on purpose. Inferring this from the base class instead of reading the derived one made
+    // constrainHbyA take U at every inletOutlet patch, which OpenFOAM does not do: measured on
+    // rhoSimpleFoam's pcEqn, HbyA's boundary was 1.3e-03 out and the resulting phiHbyA 3.5e-03, while the
+    // internal field was exact to 1.4e-15.
+    bool assignable() const override { return true; }    // OF inletOutletFvPatchField.H:164
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 3; }                  // inletOutlet (device: per-face fixedValue|zeroGradient)
 };
@@ -593,7 +602,9 @@ template <typename T>
 class OutletInletPatchField : public ExtrapolatedValuePatchField<T>   // value()/refValue = outletValue (= freestreamValue)
 {
 public:
-    bool assignable() const override { return false; }   // OF: outletInlet derives from mixed
+    // FALSE, and unlike inletOutlet this one really does inherit it: outletInletFvPatchField declares no
+    // assignable() of its own, so mixedFvPatchField's false stands (mixedFvPatchField.H:200).
+    bool assignable() const override { return false; }   // OF: outletInlet does NOT override mixed
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 4; }                  // outletInlet (device: per-face fixedValue|zeroGradient, opposite switch)
 };
