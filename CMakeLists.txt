@@ -490,6 +490,13 @@ add_test(NAME simple_turbulent_full
          COMMAND test_simple_turbulent ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 0 1576)
 set_tests_properties(simple_turbulent_full PROPERTIES LABELS slow TIMEOUT 900)
 
+# OpenFOAM v2406 RAS dictionary compatibility: both `RASModel` and `model` are accepted, but conflicting aliases
+# are refused rather than silently assigned precedence. Parser-only; no mesh or GPU is needed at runtime.
+add_executable(test_turbulence_parser tests/test_turbulence_parser.cu)
+target_include_directories(test_turbulence_parser PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_turbulence_parser PRIVATE brae_core)
+add_test(NAME turbulence_parser COMMAND test_turbulence_parser)
+
 add_executable(test_proc_interp tests/test_proc_interp.cu)
 target_include_directories(test_proc_interp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_proc_interp PRIVATE brae_core)

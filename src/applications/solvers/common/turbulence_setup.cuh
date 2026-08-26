@@ -1,6 +1,7 @@
 #pragma once
 // Shared turbulence model + start-field setup for the steady (gpuSimpleFoam) and transient (gpuPimpleFoam) drivers.
-// readTurbulenceModel: constant/turbulenceProperties RASModel -> ctl.turbulent/sst/sa/lm + coeffs. readTurbulenceFields:
+// readTurbulenceModel: constant/turbulenceProperties RAS/model or RASModel -> ctl.turbulent/sst/sa/lm + coeffs.
+// readTurbulenceFields:
 // reads k/second/nut (or nuTilda/nut for SA, +ReThetat/gammaInt for LM), the nut wall function from the 0/nut BC,
 // guards wall-function-on-non-wall patches, and applies the turbulent-inlet BCs. Bodies extracted verbatim from
 // gpuSimpleFoam so both drivers stay identical. Call readTurbulenceModel BEFORE readTurbulenceFields (needs ctl.sst).
@@ -21,7 +22,9 @@
 
 namespace brae {
 
-// constant/turbulenceProperties RASModel -> ctl turbulence flags + coeffs (ctl.turbulent must already be set).
+// constant/turbulenceProperties RAS/model or RASModel -> ctl turbulence flags + coeffs
+// (ctl.turbulent must already be set). The two OpenFOAM spellings are aliases: one may be used alone, while both
+// may be present only when their values match. A disagreement is rejected rather than assigned precedence.
 inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls& ctl)
 {
         // `simulationType laminar` DOES NOT MEAN "no model". OF selects a laminarModel, and the default
@@ -230,7 +233,18 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                                   "values and momentum uses that frozen nut (OF RASModel::correct() returns "
                                   "immediately). This is not the same as simulationType laminar.");
             }
-            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            // OpenFOAM v2406 writes `RAS { model kOmegaSST; }`; older retained cases use `RASModel`. Neither
+            // spelling wins when both are present: accepting only an exact match prevents a stale compatibility
+            // key from silently changing the selected model.
+            const bool hasLegacyModel = ras && ras->found("RASModel");
+            const bool hasV2406Model = ras && ras->found("model");
+            const std::string legacyModel = hasLegacyModel ? ras->wordOr("RASModel", "") : "";
+            const std::string v2406Model = hasV2406Model ? ras->wordOr("model", "") : "";
+            if (hasLegacyModel && hasV2406Model && legacyModel != v2406Model)
+                throw std::runtime_error(
+                    "brae: conflicting RAS turbulence model entries: `RASModel` is '" + legacyModel
+                    + "' but `model` is '" + v2406Model + "'. Remove one entry or make them match.");
+            const std::string model = hasLegacyModel ? legacyModel : (hasV2406Model ? v2406Model : "");
             ctl.lm  = (model == "kOmegaSSTLM");                 // Langtry-Menter transition = kOmegaSST + gamma-ReThetat
             ctl.sst = (model == "kOmegaSST") || ctl.lm;
             ctl.sa  = (model == "SpalartAllmaras");

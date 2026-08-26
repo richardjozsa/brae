@@ -45,6 +45,10 @@ Legend: ✓ supported & validated · ✗ not yet.
 Model coefficients are read from `turbulenceProperties` (defaults match OpenFOAM exactly). Wall functions:
 `nutkWallFunction`, `nutUSpaldingWallFunction`, and the standard k/epsilon/omega wall functions.
 
+For incompressible RAS dictionaries, brae accepts both the older `RASModel kOmegaSST;` spelling and the OpenFOAM
+v2406 `model kOmegaSST;` spelling inside `RAS { ... }`. If both keys are present, their values must match; a
+conflict is rejected instead of giving either spelling precedence.
+
 ## Boundary conditions
 
 The standard incompressible set: `fixedValue`, `zeroGradient`, `noSlip`, `slip`, `symmetry` / `symmetryPlane`,
