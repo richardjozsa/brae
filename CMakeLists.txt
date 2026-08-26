@@ -92,6 +92,7 @@ add_library(brae_core STATIC
     src/cuda/device_boundary_assembly.cu
     src/cuda/device_boundary_flow.cu
     src/cuda/device_divdevreff.cu
+    src/cuda/device_force.cu
     src/cuda/device_maxwell.cu
     src/cuda/device_ddt.cu
     src/cuda/device_kepsilon.cu
@@ -281,6 +282,19 @@ target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_forces PRIVATE brae_core)
 add_test(NAME forces
          COMMAND test_forces ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282 282)
+
+add_executable(test_force_coeffs tests/test_force_coeffs.cu)
+target_include_directories(test_force_coeffs PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_force_coeffs PRIVATE brae_core)
+add_test(NAME force_coeffs
+         COMMAND test_force_coeffs ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+
+# Optional direct comparison against a retained, read-only OpenFOAM bundle. The test is SKIP (not PASS)
+# when the caller has not supplied all three paths, so an absent local bundle cannot be mistaken for evidence.
+add_test(NAME force_coeffs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/force_coeffs_openfoam.sh
+                 $<TARGET_FILE:test_force_coeffs>)
+set_tests_properties(force_coeffs_openfoam PROPERTIES SKIP_RETURN_CODE 125)
 
 add_executable(test_gpu_mrf tests/test_gpu_mrf.cu)
 target_include_directories(test_gpu_mrf PRIVATE ${BRAE_HEADER_DIRS})
@@ -545,6 +559,12 @@ endforeach()
 add_executable(brae src/applications/solvers/simpleFoam/gpuSimpleFoam.cu)
 target_include_directories(brae PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae PRIVATE brae_core)
+add_test(NAME force_history
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/force_history.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/force_history_work)
+set_tests_properties(force_history PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 
 # The single-GPU device-resident TRANSIENT solver app (PIMPLE): brae_pimpleFoam <caseDir>. Reuses DeviceSimpleSolver's
 # three composable phases via pimpleStep, with implicit fvm::ddt(U). v1 laminar.

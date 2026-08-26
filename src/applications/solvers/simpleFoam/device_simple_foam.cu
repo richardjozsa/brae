@@ -77,6 +77,10 @@ namespace brae {
         ctorMark("enter");
         dm_   = buildDeviceMesh(m, g, fvp);
         ctorMark("deviceMesh built");
+        for (const FvPatch& p : fvp)
+            if (!isCoupledInterfaceType(p.type))
+                for (label i = 0; i < p.size; ++i)
+                    forceBoundaryCf_.push_back(g.Cf()[p.start + i]);
         cyc_  = buildDeviceCyclic(cyclics, g, fvp);
         ami_  = buildDeviceAMI(amis);
         for (const auto& c : cyclics) cycRuns_.push_back({c.patch, (label)c.faceCells.size()});
@@ -2360,6 +2364,102 @@ namespace brae {
             res.contGlobal = deviceDot(R, ones_) / sumV;
         }
         return res;
+    }
+
+    void DeviceSimpleSolver::setForcePatches(const std::vector<std::string>& patchNames)
+    {
+        if (patchNames.empty())
+            throw std::runtime_error("forceCoeffs: configured patch selection is empty");
+        DeviceForceSelection selected;
+        std::vector<label> bnd;
+        std::vector<scalar> cfx, cfy, cfz;
+        label flat = 0;
+        for (const FvPatch& p : fvp_)
+        {
+            if (isCoupledInterfaceType(p.type)) continue;
+            if (forcePatchSelected(p, patchNames))
+                for (label i = 0; i < p.size; ++i)
+                {
+                    bnd.push_back(flat + i);
+                    const vector& cf = forceBoundaryCf_[flat + i];
+                    cfx.push_back(cf.x);
+                    cfy.push_back(cf.y);
+                    cfz.push_back(cf.z);
+                }
+            flat += p.size;
+        }
+        if (bnd.empty())
+            throw std::runtime_error("forceCoeffs: configured patch selection matched no non-coupled patch faces");
+        selected.n = static_cast<int>(bnd.size());
+        selected.boundaryIndex.copyFrom(bnd);
+        selected.cfx.copyFrom(cfx);
+        selected.cfy.copyFrom(cfy);
+        selected.cfz.copyFrom(cfz);
+        forceSelection_ = std::move(selected);
+    }
+
+    ForceResult DeviceSimpleSolver::forceForPatches(scalar rhoRef, scalar pRef, const vector& CofR)
+    {
+        if (forceSelection_.n == 0)
+            throw std::runtime_error("forceCoeffs: force patches were not configured before sampling");
+
+        DeviceBuffer<scalar>& nutBnd = forceNutBnd_;
+        if (!ctl_.turbulent)
+        {
+            if (nutBnd.size() != static_cast<std::size_t>(dm_.nBndFaces))
+            {
+                nutBnd.resize(dm_.nBndFaces);
+                cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, nutBnd.size() * sizeof(scalar)), "forceCoeffs zero wall nut");
+            }
+        }
+        else if (ctl_.les)
+        {
+            // Pure LES has no k wall function. Its default calculated/zeroGradient boundary uses the adjacent
+            // algebraic nut, while an explicitly velocity-based wall BC is evaluated by the same device helper
+            // as the momentum predictor.
+            if (ctl_.nutWall == NutWall::Spalding)
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                                           ctl_.saCoeffs, nutBnd);
+            else if (ctl_.nutWall == NutWall::NutU)
+                deviceBoundaryNutU(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                                   ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, nutBnd);
+            else if (ctl_.nutWall == NutWall::Blended)
+                deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                                         ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, nutBnd);
+            else
+                deviceBCValue(dbExtrap_, dnut_, nutBnd);
+        }
+        else if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)
+            deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                                      ctl_.saCoeffs, nutBnd,
+                                      nutBndFile_.size() ? &nutBndFile_ : nullptr);
+        else if (ctl_.nutWall == NutWall::NutU)
+            deviceBoundaryNutU(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                               ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, nutBnd,
+                               nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);
+        else if (ctl_.nutWall == NutWall::Blended)
+            deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                                     ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, nutBnd,
+                                     nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);
+        else
+        {
+            // wallForces uses Cmu for the active model's nutkWallFunction. Reuse the device wall-nut kernel,
+            // changing only that coefficient for kOmegaSST where OF calls it betaStar rather than 0.09.
+            KEpsilonCoeffs wallCo = ctl_.keCoeffs;
+            if (ctl_.sst) wallCo.Cmu = ctl_.ksstCoeffs.betaStar;
+            deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, wallCo,
+                              ctl_.atmZ0, ctl_.atmBoundNut);
+        }
+
+        const DeviceForceResult d = deviceWallForceReduce(
+            dm_, dbU_, dbP_, Uk_[0], Uk_[1], Uk_[2], dp_, nutBnd, forceSelection_, ctl_.nu,
+            rhoRef, pRef, CofR, hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+        ForceResult result;
+        result.pressure = d.pressure;
+        result.viscous  = d.viscous;
+        result.momentP  = d.momentP;
+        result.momentV  = d.momentV;
+        return result;
     }
 
     // Advance one time level: roll the old-time velocity fields (t-2 <- t-1 <- current) and the time steps
