@@ -84,16 +84,17 @@ public:
     // cannot forget to run functionObjects. Returns the number not built.
     // `handledOutside` names types the CALLING SOLVER computes on its own, outside this lifecycle.
     // They are reported as APPROXIMATED rather than ignored, because that is what they are: brae's
-    // forceCoeffs, for example, is a single post-run print, whereas OF's forceCoeffs is a per-time-step
-    // functionObject (execute()/write(), forceCoeffs.H:547,550) that writes a coefficient HISTORY under
-    // postProcessing/. Reporting those as "ignored" would be false; reporting nothing would hide a real
+    // forceCoeffs, for example, is owned by the solver because its device reduction must run after the
+    // solver's pressure/velocity corrections, whereas OF's forceCoeffs is a per-time-step functionObject
+    // (execute()/write(), forceCoeffs.H:547,550) that writes a coefficient HISTORY under postProcessing/.
+    // Reporting those as "ignored" would be false; reporting nothing would hide a real
     // difference from OF. Neither is acceptable, so they get their own category.
     // The two "outside" lists exist because the SAME type can be faithful in one solver and an
     // approximation in another, and saying so accurately matters more than saying it uniformly:
     //
     //   pimpleFoam  forceCoeffs -> samples on the write cadence and writes
     //                              postProcessing/forceCoeffs/<time>/coefficient.dat, i.e. what OF does
-    //   simpleFoam  forceCoeffs -> a single post-run print; OF's runs every step and writes a history
+    //   simpleFoam  forceCoeffs -> samples after every completed device SIMPLE step and writes a history
     //
     // Calling both "approximated" would understate pimpleFoam; calling both "applied" would overstate
     // simpleFoam. Each solver declares which it is.

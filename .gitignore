@@ -3,6 +3,7 @@ build/
 *.a
 *.obj
 VTK/
+.codegraph/
 
 # validation/: commit the input cases the ctests actually read (mesh, dicts, and the OF reference
 # solutions the tests compare against). Keep the large unused OF-comparison cases out (saf_*, *_of,

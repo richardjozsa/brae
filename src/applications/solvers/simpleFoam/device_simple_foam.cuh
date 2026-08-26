@@ -43,12 +43,14 @@
 #include "cell_max_delta.cuh"      // cellMaxDeltaXYZ -> hmax_ (SA-IDDES filter width, maxDeltaxyz)
 #include "device_mrf.cuh"
 #include "device_divdevreff.cuh"
+#include "device_force.cuh"
 #include "device_ddt.cuh"          // transient fvm::ddt(U) for the PIMPLE path (no-op in steady SIMPLE)
 #include "device_amg.cuh"
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
 #include "solver_controls.cuh"
 #include "time_controls.cuh"   // CourantNumbers   // NutWall, DeviceSimpleControls, DeviceSimpleResidual (moved out for reuse)
+#include "forces.cuh"
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -115,6 +117,11 @@ public:
     void correctPressureVelocity(DeviceSimpleResidual& res);
 
     DeviceSimpleResidual step();
+
+    // Configure and evaluate the single simpleFoam forceCoeffs object. The selection buffers are built once;
+    // forceForPatches() then reduces the post-correction device fields and returns only force/moment scalars.
+    void setForcePatches(const std::vector<std::string>& patchNames);
+    ForceResult forceForPatches(scalar rhoRef, scalar pRef, const vector& CofR);
 
     // --- Transient (PIMPLE) interface -- reuses the three composable phases above under an outer/inner-corrector loop,
     // with the implicit fvm::ddt(U) folded into solveMomentumPredictor. setDdtScheme() switches this solver from steady
@@ -727,6 +734,9 @@ private:
     DeviceBuffer<scalar> gx, gy, gz;   // gradient workspace: grad(U) in the predictor, reused as grad(p) in the pressure phase
     DeviceBuffer<scalar> ReThetat_, gammaInt_, gammaIntEff_;                   // kOmegaSSTLM transition fields
     DeviceBuffer<scalar> dnutBndWall_;                                          // persistent Spalding wall-nut (SA warm seed)
+    DeviceForceSelection forceSelection_;                                       // configured patches, uploaded once
+    DeviceBuffer<scalar> forceNutBnd_;                                          // persistent wall-nut workspace for force reductions
+    std::vector<vector> forceBoundaryCf_;                                        // flattened non-coupled boundary centres
     DeviceBuffer<scalar> nuConst_, zeroSrc_, zeroBndU_, ones_;
 
     // Compressible state (rhoSimpleFoam). compressible_ stays false for every incompressible case, so

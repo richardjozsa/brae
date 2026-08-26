@@ -28,6 +28,7 @@
 #include "../common/read_surface_field.cuh"   // OF READ_IF_PRESENT for phi on restart
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
+#include "force_history.cuh"
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
 #include "brae_time.cuh"
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
@@ -185,11 +186,9 @@ int main(int argc, char** argv)
         audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
 
         // Account for controlDict.functions at STARTUP, not after the run: a case that refuses on an
-        // unsupported model, or that never reaches the post-run forces block, must still be told which
-        // of its functionObjects brae will not honour. forceCoeffs is declared APPROXIMATED because this
-        // driver prints it once at the end, whereas OF's runs every time step and writes a history
-        // (forceCoeffs.H:547,550) -- gpuPimpleFoam declares the same type APPLIED, because it does
-        // sample on the write cadence.
+        // unsupported model, or that never reaches the solver loop, must still be told which functionObjects
+        // it will not honour. simpleFoam forceCoeffs is applied by the driver immediately after each completed
+        // device SIMPLE step, outside Time's pre-step functionObject lifecycle.
 
 
         // startFrom is resolved by Time, as OF does in Time::setControls() (Time.C:149-188). This
@@ -218,13 +217,14 @@ int main(int argc, char** argv)
             }
         }
         const std::string fieldDir = caseDir + "/" + startStr;   // solver reads <startTime> exactly as in OpenFOAM
+        // The resolved start directory is the time origin for both the solver and the Brae history path.
+        const scalar startTimeVal = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
 
         // Time owns the functionObject lifecycle, as OF's Foam::Time does: the loop below never mentions
         // functionObjects, which is what stops a solver from being able to forget them. Placed here --
         // after the start directory resolves, but still BEFORE mesh, geometry and solver -- so the report
-        // reaches a case that refuses later, while the objects resolve those dependencies from the
-        // registry on first execute(). forceCoeffs is APPROXIMATED in this driver (a single post-run
-        // print); gpuPimpleFoam declares the same type APPLIED, because it samples on the write cadence.
+        // reaches a case that refuses later, while the objects resolve those dependencies from the registry
+        // on first execute(). forceCoeffs is applied by this steady driver at the post-solver sampling point.
         ObjectRegistry timeRegistry;
         std::vector<ScalarTransportFO*> scalarTransports;
         std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
@@ -261,7 +261,7 @@ int main(int argc, char** argv)
                 scalarTransports.push_back(fo.get());
                 return fo;
             });
-        time.readFunctionObjects(controlDict, foTypes, {"forceCoeffs"});
+        time.readFunctionObjects(controlDict, foTypes, {}, {"forceCoeffs"});
         const int   endTime   = controlDict.intOr("endTime", 1000);
         // Steady simpleFoam's endTime is an INTEGER iteration count. A fractional endTime (e.g. 0.3, copy-pasted from
         // a transient case) truncates to 0 -> the loop runs 0 iterations and would write the initial field as "the
@@ -382,6 +382,22 @@ int main(int argc, char** argv)
         timeRegistry.store("patches", &fvp);
         const label nC = m.nCells();
 
+        const FoamDict* forceDict = nullptr;
+        std::string forceName;
+        if (const FoamDict* funcs = controlDict.subDict("functions"))
+            for (const auto& s : funcs->subs)
+                if (s.second.wordOr("type", "") == "forceCoeffs")
+                {
+                    if (forceDict)
+                        throw std::runtime_error("simpleFoam supports one forceCoeffs object; found '"
+                                                 + forceName + "' and '" + s.first + "'");
+                    forceDict = &s.second;
+                    forceName = s.first;
+                }
+        const bool hasForceCoeffs = forceDict != nullptr;
+        const ForceCoeffsConfig forceConfig = hasForceCoeffs
+            ? readForceCoeffsConfig(forceName, *forceDict) : ForceCoeffsConfig{};
+
         GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC);
         U.evaluateBoundary();
         const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
@@ -464,6 +480,14 @@ int main(int argc, char** argv)
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                                   ctl.turbulent ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa) ? &tf.eps : nullptr, ctl.turbulent ? &tf.nut : nullptr,
                                   ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+        std::unique_ptr<ForceHistoryWriter> forceHistory;
+        if (hasForceCoeffs)
+        {
+            solver.setForcePatches(forceConfig.patches);
+            forceHistory = std::make_unique<ForceHistoryWriter>(caseDir, forceConfig, startTimeVal);
+            std::printf("  forceCoeffs: %s -> %s (one sample after every completed SIMPLE iteration)\n",
+                        forceName.c_str(), forceHistory->path().c_str());
+        }
         // uniformTotalPressure p0(t). OF samples p0_->value(t) at construction with the CURRENT
         // time and again in every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:73,149),
         // so the tables are handed over before the first step and re-evaluated per step inside the
@@ -537,7 +561,6 @@ int main(int argc, char** argv)
         // The RESOLVED start, not controlDict's startTime: `startFrom latestTime` can make them differ,
         // and every time value below is measured from the start. Taking the dict's value made a run
         // restarted from 10 name its output 1, 2, 3... -- overwriting the case's own early history.
-        const scalar startTimeVal  = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
         // Write cadence comes from Time, which owns the WriteControl -- as OF does in
         // Time::operator++ / TimeIO.C:277. This driver carried its own isWriteTime lambda; it was
         // measured identical to the shared one over 8 controlDict cases x 40 steps (including
@@ -612,13 +635,46 @@ int main(int argc, char** argv)
                 "iterations -- on a restart set it past the time you are restarting from.");
         int iter = 0;
         bool converged = false;
+        bool numericalFailure = false;
+        std::string stoppingReason;
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
         time.setSteps(static_cast<int>(nSteps));
         while (!converged && time.loop())
         {
             iter = time.timeIndex();
-            const DeviceSimpleResidual r = solver.step();
+            DeviceSimpleResidual r;
+            try
+            {
+                r = solver.step();
+            }
+            catch (...)
+            {
+                stoppingReason = "numerical_failure";
+                if (forceHistory) forceHistory->finish(stoppingReason, iter - 1);
+                throw;
+            }
+            // solver.step() returns only after momentum, every pressure/velocity correction, turbulence, and
+            // corrected-flux continuity work is complete. Sampling here therefore sees the completed SIMPLE
+            // state, while the reduction itself keeps U/p/gradients/wall nut on the device.
+            if (forceHistory)
+            {
+                const ForceResult F = solver.forceForPatches(forceConfig.rhoInf, forceConfig.pRef, forceConfig.CofR);
+                const ForceCoeffs C = forceCoeffs(F, forceConfig.dragDir, forceConfig.liftDir, forceConfig.pitchAxis,
+                                                  forceConfig.rhoInf, forceConfig.magUInf, forceConfig.Aref, forceConfig.lRef);
+                if (!(std::isfinite(C.Cd) && std::isfinite(C.Cl) && std::isfinite(C.Cm)
+                      && std::isfinite(F.total().x) && std::isfinite(F.total().y) && std::isfinite(F.total().z)))
+                {
+                    stoppingReason = "numerical_failure";
+                    numericalFailure = true;
+                    std::fprintf(stderr, "brae ERROR: forceCoeffs '%s': non-finite force sample at completed iteration %d\n",
+                                 forceConfig.name.c_str(), iter);
+                    break;
+                }
+                const double _forceEt = std::chrono::duration<double>(
+                    std::chrono::high_resolution_clock::now() - _runStart).count();
+                forceHistory->sample(startTimeVal + static_cast<scalar>(iter) * deltaT, iter, _forceEt, F, C);
+            }
             {
                 // OpenFOAM-style per-iteration report: Time, per-field solver residuals, continuity, turbulence, ExecutionTime.
                 const double _et = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - _runStart).count();
@@ -643,12 +699,15 @@ int main(int argc, char** argv)
             // Abort loudly and write nothing. Opt out (e.g. to inspect the field) with BRAE_ALLOW_NONFINITE=1.
             if (!std::getenv("BRAE_ALLOW_NONFINITE")
                 && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
-                throw std::runtime_error(
-                    "solution diverged: non-finite residual at iteration " + std::to_string(iter)
-                    + " (p=" + std::to_string(r.p) + " Ux=" + std::to_string(r.Ux)
-                    + " Uy=" + std::to_string(r.Uy) + " Uz=" + std::to_string(r.Uz) + "). Likely causes:"
-                    + " too-loose relaxation, a high-non-orthogonality mesh, a singular pressure system, or"
-                    + " turbulence blow-up. No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+            {
+                stoppingReason = "numerical_failure";
+                numericalFailure = true;
+                std::fprintf(stderr,
+                             "brae ERROR: solution diverged: non-finite residual at iteration %d "
+                             "(p=%g Ux=%g Uy=%g Uz=%g). No field written.\n",
+                             iter, r.p, r.Ux, r.Uy, r.Uz);
+                break;
+            }
             // Turbulence blow-up that stays FINITE. The check above only catches NaN/Inf, and a diverging
             // k-omega pair need not get there: measured on pitzDaily with linearUpwind on BOTH scalars,
             // omega reached 1e42 with k pinned at its 1e-15 floor, U stayed bounded (nut collapses, so the
@@ -663,12 +722,15 @@ int main(int argc, char** argv)
                 const scalar tm = solver.turbSumMag();
                 if (iter == 1) turbMag0 = tm;
                 if (!std::isfinite(tm) || (turbMag0 > 0 && tm > 1e12 * turbMag0))
-                    throw std::runtime_error(
-                        "solution diverged: turbulence blow-up at iteration " + std::to_string(iter)
-                        + " (sum|k|+sum|eps/omega| grew from " + std::to_string((double)turbMag0) + " to "
-                        + std::to_string((double)tm) + "). The momentum residuals can stay finite while this"
-                        + " happens, so the run would otherwise write a plausible-looking but wrong field."
-                        + " No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+                {
+                    stoppingReason = "numerical_failure";
+                    numericalFailure = true;
+                    std::fprintf(stderr,
+                                 "brae ERROR: solution diverged: turbulence blow-up at iteration %d "
+                                 "(sum|k|+sum|eps/omega| grew from %g to %g). No field written.\n",
+                                 iter, (double)turbMag0, (double)tm);
+                    break;
+                }
             }
             // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
             // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon
@@ -692,11 +754,19 @@ int main(int argc, char** argv)
                 time.write();   // OF splits write() from execute(); this driver owns its own cadence
             }
         }
+        // timeIndex() is the iteration that ran. An iteration-limited run is not converged, and an early
+        // numerical stop preserves only the samples that were actually completed.
+        const int nIter = time.timeIndex();
+        if (stoppingReason.empty()) stoppingReason = converged ? "converged" : "iteration_limit";
+        if (forceHistory) forceHistory->finish(stoppingReason, nIter);
         time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
-        // timeIndex() is the iteration that ran, so no -1: the for-loop this replaced incremented past it.
-        const int nIter = converged ? time.timeIndex() : static_cast<int>(nSteps);
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
+        if (forceHistory)
+            std::printf("  forceCoeffs stopping_reason=%s samples=%d metadata=%s\n",
+                        stoppingReason.c_str(), forceHistory->samples(), forceHistory->metadataPath().c_str());
+        if (numericalFailure)
+            return 1;
 
         // BRAE_DUMP_PHI: write the conservative face flux, the one quantity that carries between SIMPLE
         // iterations and is not in any written cell field. Diagnostic only.
@@ -809,37 +879,60 @@ int main(int argc, char** argv)
                 std::printf("forces (walls, rhoInf=1):  pressure=(%.5e %.5e %.5e)  viscous=(%.5e %.5e %.5e)  total=(%.5e %.5e %.5e)\n",
                             F.pressure.x, F.pressure.y, F.pressure.z, F.viscous.x, F.viscous.y, F.viscous.z, F.total().x, F.total().y, F.total().z);
 
-                // controlDict.functions. Every entry is now ACCOUNTED FOR through the shared
-                // FunctionObjectList: forceCoeffs is computed just below (reported as approximated,
-                // because brae prints it once here while OF's forceCoeffs runs every time step and
-                // writes a history -- forceCoeffs.H:547,550), and anything else is reported as ignored
-                // rather than silently skipped. Before this, a case could carry any number of
-                // functionObjects and the only one even looked at was forceCoeffs.
-                const FoamDict* funcs = controlDict.subDict("functions");
-                const FoamDict* fcd = nullptr;
-                if (funcs)
-                    for (const auto& s : funcs->subs)
-                        if (s.second.wordOr("type", "") == "forceCoeffs")
-                        {
-                            fcd = &s.second;
-                            break;
-                        }
-                if (fcd)
-                {
-                    auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
-                    const std::vector<std::string> fcP = fcd->wordListOr("patches", walls);
-                    const scalar rhoInf = fcd->scalarOr("rhoInf", 1.0), magUInf = fcd->scalarOr("magUInf", 1.0);
-                    const scalar Aref = fcd->scalarOr("Aref", 1.0), lRef = fcd->scalarOr("lRef", 1.0);
-                    const vector liftDir = toV(fcd->scalarListOr("liftDir", {}), vector{0,1,0});
-                    const vector dragDir = toV(fcd->scalarListOr("dragDir", {}), vector{1,0,0});
-                    const vector pitchAxis = toV(fcd->scalarListOr("pitchAxis", {}), vector{0,0,1});
-                    const vector CofR = toV(fcd->scalarListOr("CofR", {}), vector{0,0,0});
-                    const ForceResult Fc = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, fcP, rhoInf, 0.0, CofR, wCmu, wKappa, wE, nwb);
-                    const ForceCoeffs cc = forceCoeffs(Fc, dragDir, liftDir, pitchAxis, rhoInf, magUInf, Aref, lRef);
-                    std::printf("forceCoeffs (rhoInf=%.3g magUInf=%.3g Aref=%.3g lRef=%.3g):  Cd=%.6e  Cl=%.6e  Cm=%.6e\n",
-                                rhoInf, magUInf, Aref, lRef, cc.Cd, cc.Cl, cc.Cm);
-                }
             }
+        }
+        if (forceHistory)
+        {
+            // Keep the pre-history final calculation as a host-side oracle. This is one final full-field
+            // transfer, as before Task 2, and makes the final-Cd equivalence an executable check rather than
+            // comparing the console line with a value copied from the same history writer.
+            for (label c = 0; c < nC; ++c)
+                U.internal[c] = Ug[c];
+            p.internal = pg;
+            U.evaluateBoundary();
+            p.evaluateBoundary();
+            const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
+            const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
+            const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
+            const bool velNutWall = ctl.turbulent && (ctl.sa || ctl.nutWall != NutWall::Nutk);
+            const std::vector<scalar> legacyNutWall = velNutWall
+                ? solver.nutWall()
+                : std::vector<scalar>();
+            const std::vector<scalar> zeroNutWall = ctl.turbulent
+                ? std::vector<scalar>()
+                : std::vector<scalar>(forceBoundaryFaceCount(fvp), scalar(0));
+            const std::vector<scalar>* legacyNwb = velNutWall
+                ? &legacyNutWall
+                : (!ctl.turbulent ? &zeroNutWall : nullptr);
+            const std::vector<scalar> legacyK = ctl.turbulent ? solver.k() : std::vector<scalar>();
+            const ForceResult legacyF = wallForces(
+                U, p, legacyK, ctl.nu, m, g, fvp, forceConfig.patches,
+                forceConfig.rhoInf, forceConfig.pRef, forceConfig.CofR,
+                wCmu, wKappa, wE, legacyNwb);
+            const ForceCoeffs legacyC = forceCoeffs(
+                legacyF, forceConfig.dragDir, forceConfig.liftDir, forceConfig.pitchAxis,
+                forceConfig.rhoInf, forceConfig.magUInf, forceConfig.Aref, forceConfig.lRef);
+            const ForceCoeffs& historyC = forceHistory->last();
+            const scalar legacyTol = scalar(5e-6) * std::max({scalar(1), std::fabs(legacyC.Cd), std::fabs(historyC.Cd),
+                                                               std::fabs(legacyC.Cl), std::fabs(historyC.Cl),
+                                                               std::fabs(legacyC.Cm), std::fabs(historyC.Cm)});
+            bool historyOracleMismatch = false;
+            if (std::fabs(historyC.Cd - legacyC.Cd) > legacyTol
+                || std::fabs(historyC.Cl - legacyC.Cl) > legacyTol
+                || std::fabs(historyC.Cm - legacyC.Cm) > legacyTol)
+            {
+                historyOracleMismatch = true;
+                std::fprintf(stderr,
+                             "brae ERROR: forceCoeffs '%s': final history sample differs from the legacy final "
+                             "calculation beyond tolerance %.17g; history is preserved at %s\n",
+                             forceConfig.name.c_str(), legacyTol, forceHistory->path().c_str());
+                forceHistory->recordOracleDiscrepancy(historyC, legacyC, legacyTol);
+            }
+            const ForceCoeffs& cc = forceHistory->last();
+            std::printf("forceCoeffs (rhoInf=%.3g magUInf=%.3g Aref=%.3g lRef=%.3g):  Cd=%.6e  Cl=%.6e  Cm=%.6e\n",
+                        forceConfig.rhoInf, forceConfig.magUInf, forceConfig.Aref, forceConfig.lRef,
+                        cc.Cd, cc.Cl, cc.Cm);
+            if (historyOracleMismatch) return 1;
         }
     }
     catch (const std::exception& e)
