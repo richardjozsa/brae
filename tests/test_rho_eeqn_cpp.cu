@@ -29,10 +29,12 @@
 #include "foam_field_reader.cuh"
 #include "foam_dict.cuh"
 #include "fv_matrix_ops.cuh"
-#include "createFields_cpp.cuh"
-#include "EEqn_cpp.cuh"
+#include "rhoCreateFields_cpp.cuh"
+#include "rhoSimpleFoam_cpp.cuh"   // effectiveTransport: the solver's OWN muEff/alphaEff
+#include "rhoEEqn_cpp.cuh"
 
 #include <cmath>
+#include <fstream>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -227,6 +229,106 @@ int main(int argc, char** argv)
     const FoamDict* re = rf ? rf->subDict("equations") : nullptr;
     in.relaxHe = re ? re->scalarOr(f.heName, 1.0) : 1.0;
     std::printf("     relaxation %s = %g\n", f.heName.c_str(), (double)in.relaxHe);
+
+    // ---- 0. The three inputs the boundary terms are built from, each against OpenFOAM's own. With the
+    //         fixture's real inlet the case runs at ~523 m/s and the boundary flux is ~140x what the
+    //         neutralised inlet carries, so anything wrong here is visible only on the real case.
+    {
+        std::printf("  0. the boundary inputs, against OpenFOAM's own\n");
+
+        // brae's OWN alphaEff, which this gate otherwise only INJECTS. Injecting it keeps the assembly
+        // number attributable, but it also means the solver's transport has never been compared to
+        // OpenFOAM's here -- and a driver that assembles exactly from an alphaEff of its own making can
+        // still converge somewhere else. Asserted, because at this iteration both are built from the same
+        // p, T, nut and alphat.
+        {
+            std::vector<scalar> mineMu, mineAlpha;
+            std::vector<std::vector<scalar>> mineMuB, mineAlphaB;
+            cpu::rhoSimple::effectiveTransport(f, patches, mineMu, mineMuB, mineAlpha, mineAlphaB);
+            // Asserted against the LAMINAR half, thermo.alphahe(), because the turbulence model's nut
+            // and alphat at this exact point are the model's own state and not something createFields
+            // reconstructs. This is the half that was wrong: transportAlpha takes the VISCOSITY and the
+            // driver was handing it the temperature, for an alphaEff six orders too large.
+            const std::string lamPath = caseDir + "/" + dumpT + "/stage_alphaEffLam";
+            if (std::ifstream(lamPath.c_str()).good())
+            {
+                const std::vector<scalar> ofLam = rawInternal(readField<scalar>(lamPath), nC);
+                std::vector<scalar> mineLam(nC);
+                for (label c = 0; c < nC; ++c)
+                    mineLam[c] = mineAlpha[c] - 1.0 * (f.alphat.internal.empty()
+                                                       ? 0.0 : f.alphat.internal[c]);
+                report("brae's own laminar alphaEff == OpenFOAM's", relL2(mineLam, ofLam), 1e-12);
+                std::printf("     %-34s brae %.6e   OpenFOAM %.6e\n", "  (the value itself)",
+                            mineLam[0], ofLam[0]);
+            }
+            std::printf("     %-34s %.6e   (turbulent halves differ: this state has nut=0)\n",
+                        "full alphaEff vs OpenFOAM's", relL2(mineAlpha, alphaEff));
+        }
+        auto splitCmp = [&](const std::vector<scalar>& mine, const std::vector<scalar>& theirs,
+                            const char* what)
+        {
+            std::vector<char> onB(nC, 0);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                for (label i = 0; i < patches[pi].size; ++i) onB[patches[pi].faceCells[i]] = 1;
+            double di = 0, ni = 0, db = 0, nb = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                const double d = (double)mine[c] - (double)theirs[c];
+                if (onB[c]) { db += d*d; nb += (double)theirs[c]*theirs[c]; }
+                else        { di += d*d; ni += (double)theirs[c]*theirs[c]; }
+            }
+            std::printf("     %-34s interior %.6e   boundary cells %.6e\n", what,
+                        ni > 0 ? std::sqrt(di/ni) : 0.0, nb > 0 ? std::sqrt(db/nb) : 0.0);
+        };
+
+        const std::string keDivPath = caseDir + "/" + dumpT + "/stage_keDiv";
+        if (std::ifstream(keDivPath.c_str()).good())
+        {
+            // OpenFOAM's own div(phi,Ekp), the whole bounded Gauss upwind term. brae's helper carries the
+            // cell VOLUME (the fvMatrix convention `source -= V*field`); OpenFOAM's is per unit volume.
+            const std::vector<scalar> ofKeDiv = rawInternal(readField<scalar>(keDivPath), nC);
+            const std::vector<scalar> mineExt = cpu::rhoSimple::kineticEnergyDivergence(
+                f.U, f.p, f.rho, in, m, g, patches);
+            std::vector<scalar> mine(nC);
+            for (label c = 0; c < nC; ++c) mine[c] = mineExt[c] / g.V()[c];
+            splitCmp(mine, ofKeDiv, "div(phi,Ekp) vs OpenFOAM's");
+        }
+
+        const std::string phiEPath = caseDir + "/" + dumpT + "/stage_phiE";
+        if (std::ifstream(phiEPath.c_str()).good())
+        {
+            const FieldData<scalar> phiEFd = readField<scalar>(phiEPath);
+            const std::vector<std::vector<scalar>> ofPhiB = rawBoundary<scalar>(phiEFd, patches);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                double d = 0, n = 0;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const double a = (*in.phiBnd)[pi][i], b = ofPhiB[pi][i];
+                    d += (a-b)*(a-b); n += b*b;
+                }
+                std::printf("     phi on %-26s %.6e\n", patches[pi].name.c_str(),
+                            n > 0 ? std::sqrt(d/n) : std::sqrt(d));
+            }
+        }
+
+        // he's own boundary values, which the convection and laplacian coefficients are built from.
+        const FieldData<scalar> heFd = readField<scalar>(caseDir + "/" + dumpT + "/stage_he");
+        const std::vector<std::vector<scalar>> ofHeB = rawBoundary<scalar>(heFd, patches);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<scalar>& hv = he.boundary[pi]->value();
+            double d = 0, n = 0;
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                const double a = hv[i], b = ofHeB[pi][i];
+                d += (a-b)*(a-b); n += b*b;
+            }
+            std::printf("     he  on %-26s %.6e  (%s)\n", patches[pi].name.c_str(),
+                        n > 0 ? std::sqrt(d/n) : std::sqrt(d),
+                        he.boundary[pi]->fixesValue() ? "fixesValue" : "not-fixesValue");
+        }
+    }
 
     FvScalarMatrix E = cpu::rhoSimple::assembleEEqn(he, f.U, f.p, f.rho, in, m, g, patches);
     const std::vector<scalar> ofD   = rawInternal(readField<scalar>(caseDir + "/" + dumpT + "/stage_eD"), nC);

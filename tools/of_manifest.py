@@ -1221,17 +1221,17 @@ COMPONENTS = {
     "rhoSimpleFoam": [
         dict(name="rhoSimpleFoam_main", of_symbol="main",
              of_file="applications/solvers/compressible/rhoSimpleFoam/rhoSimpleFoam.C",
-             classification="HOST_ONLY", status="TODO",
+             classification="HOST_ONLY", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam.cu",
-             validation="",
+             validation="tests/rho_simple_end_to_end_vs_openfoam.sh -- THE WHOLE CASE in _cpp against real OpenFOAM, which is what PORT.md requires before any .cu is written. 112k-cell sbMatched TURBULENT, with the fixture's own kEpsilon, `consistent yes` + `transonic yes` so the path exercised is pcEqn.H transonic. 400 iterations from the same start: U 1.08e-04 (gated at 2e-3), p 1.4e-09, T 5.1e-06, rho 5.1e-06; residuals fall U 1.0 -> 1.3e-09, k -> 1.5e-09, epsilon -> 1.2e-10. The driver owns no numerics -- it composes the six gated components plus the gated kEpsilon closure and adds the order, the solves, thermo.correct() and the post-solve tail. RUN TO CONVERGENCE, NOT TO A TUTORIAL endTime: at 100 iterations the same comparison reads U 7.9e-04, which is trajectory drift rather than a difference in the equations, and 400 is where both codes have stopped moving. AN UNPORTED RAS MODEL IS REFUSED BY NAME (asserted by the gate) rather than run as if it were kEpsilon or laminar. WHAT THE GATE DOES NOT CLAIM: p, T and rho are reported and NOT gated, because on this fixture they barely move from their initial values (p within 3.6e-06 of uniform) so no bound could both pass a correct solver and fail one that did nothing -- the control proves that rather than assuming it. U carries the gate and its start state fails by 1.0; the gate also ASSERTS where the remaining U error lives, per patch and interior, so a defect that moved it elsewhere would fire.",
              note="The driver branches on simple.consistent(): pcEqn.H for SIMPLEC, pEqn.H otherwise. "
                   "Both must be ported -- the existing solver reached only one of them by case. Order is "
                   "UEqn, EEqn, then p; turbulence->correct() LAST, after the pressure solve."),
         dict(name="createFields", of_symbol="createFields.H",
              of_file="applications/solvers/compressible/rhoSimpleFoam/createFields.H",
              classification="HOST_ONLY", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/rhoSimpleFoam/createFields_cpp.cu",
+             brae_reference="src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/createFields.cu",
              validation="tests/rho_createfields_vs_openfoam.sh -- against OpenFOAM's OWN createFields.H, obtained by running rhoSimpleFoam -postProcess with writeObjects(phi,rho); postProcess.H builds the field set without solving. On a developed 112k-cell sbMatched state: rho 6.1e-16, phi 2.1e-15, initialMass 3.9e-16, psi exact, and a restart reads both fields byte-exact. THE CONTROL is the point: interpolate(rho)*flux(U), which is pEqn.H form and brae fvc::rhoFlux, reads 3.7e-04 against the same oracle -- 11 orders worse -- so the gate discriminates the two flux forms instead of passing either. It also asserts the fixture rho is non-uniform, because a uniform rho makes the two forms algebraically identical and the shipped 0.orig is uniform.",
              note="rho is READ_IF_PRESENT and falls back to thermo.rho() -- a restart reads it, a cold "
@@ -1242,7 +1242,7 @@ COMPONENTS = {
         dict(name="UEqn", of_symbol="UEqn.H",
              of_file="applications/solvers/compressible/rhoSimpleFoam/UEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/rhoSimpleFoam/UEqn_cpp.cu",
+             brae_reference="src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/UEqn.cu",
              validation="tests/rho_ueqn_vs_openfoam.sh -- against OpenFOAM's OWN assembled momentum matrix, via the tools/dumpPEqn stage harness (stage_rAU = 1/UEqn.A(), stage_UIC, stage_UBC, stage_muEff, stage_Uass) at SIMPLE iteration 1 on 112k-cell sbMatched: rAU 6.1e-15, internalCoeffs 7.1e-15, boundaryCoeffs 4.1e-15, per patch inlet/outlet/walls all at machine precision. OpenFOAM's own muEff is INJECTED so the number measures the assembly and not the unported compressible turbulence closure. THE CONTROL: assembling with the kinematic nu_eff -- the incompressible divDevReff -- reads 6.2e-01, fourteen orders worse, and forcing that form into the implementation fails the gate at 6.2e-01, so it discriminates the one thing that distinguishes this solver's momentum equation from simpleFoam's.",
              note="fvm::div(phi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(U) == fvOptions(rho,U), "
@@ -1251,7 +1251,7 @@ COMPONENTS = {
         dict(name="EEqn", of_symbol="EEqn.H",
              of_file="applications/solvers/compressible/rhoSimpleFoam/EEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/rhoSimpleFoam/EEqn_cpp.cu",
+             brae_reference="src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/EEqn.cu",
              validation="tests/rho_eeqn_vs_openfoam.sh -- against OpenFOAM's OWN assembled energy equation via the tools/dumpPEqn harness (stage_Ekp, stage_he, stage_eD, stage_eSrc, stage_alphaEff, stage_Upred) at SIMPLE iteration 1 on 112k-cell sbMatched: Ekp 6.4e-16 (and 6.1e-16 on every patch), EEqn.D() 3.8e-15, source+boundaryCoeffs 3.9e-15, interior and boundary cells both at machine precision. alphaEff and he are INJECTED so the number measures the assembly, not the unported compressible turbulence closure or the unported energy boundary types. THE CONTROL: the `h` arm (K = 0.5|U|^2) reads 1.0 against stage_Ekp and builds a convection term differing from the `e` arm by 100% of its own magnitude; forcing the h arm into the implementation fails the gate. NOTE the control is taken on the UNBOUNDED convection term on purpose -- `div(phi,Ekp)` is bounded, and at iteration 1 the bounded subtraction removes the near-uniform p/rho that IS the difference between the arms (|KE div| 1.3e-04 bounded against 1.4e+01 unbounded), so the assembled source at this state cannot discriminate them.",
              note="The kinetic-energy source DIFFERS BY ENERGY VARIABLE: he==e uses Ekp = 0.5|U|^2 + p/rho, "
@@ -1261,7 +1261,7 @@ COMPONENTS = {
         dict(name="pEqn", of_symbol="pEqn.H",
              of_file="applications/solvers/compressible/rhoSimpleFoam/pEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/rhoSimpleFoam/pEqn_cpp.cu",
+             brae_reference="src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/pEqn.cu",
              validation="tests/rho_peqn_vs_openfoam.sh -- BOTH branches, by running OpenFOAM twice on 112k-cell sbMatched with transonic no and transonic yes (and consistent no, so the driver reaches pEqn.H rather than pcEqn.H). Subsonic: rAU 6.1e-15, rhorAUf 4.8e-15, HbyA 2.2e-15, phiHbyA 6.4e-12, after adjustPhi 6.4e-12, pEqn.D() 3.3e-15, source 6.5e-14. Transonic: the same, plus phid 6.4e-12 and the psi*p subtraction 1.3e-15 (normalised by the pre-subtraction flux, because psi*p is rho for a perfect gas so the subtraction is a near-total cancellation -- residual 1.8e-10 of an inflow of 1.6e-04). The transonic branch had NO stage harness before this gate; one was added to tools/dumpPEqn. OpenFOAM own muEff, Uass, Upred, psi and rho are injected so the number is about pEqn.H and not about the turbulence closure or thermo.correct(). CONTROLS, each verified to fail: the other branch does not reproduce this one; dropping fvm::div(phid,p) fails transonic D at 3.1e-07; omitting pEqn.relax() on the transonic branch fails D at 1.1e-07 and source at 4.4e-06.",
              note="TWO BRANCHES, both required: simple.transonic() builds fvm::div(phid,p) with phid = "
@@ -1273,16 +1273,32 @@ COMPONENTS = {
         dict(name="pcEqn", of_symbol="pcEqn.H",
              of_file="applications/solvers/compressible/rhoSimpleFoam/pcEqn.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/rhoSimpleFoam/pcEqn_cpp.cu",
+             brae_reference="src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/pcEqn.cu",
              validation="tests/rho_pceqn_vs_openfoam.sh -- BOTH branches, with consistent yes so the driver reaches pcEqn.H. The comparison is taken from a RESTART at iteration 20, not from iteration 1: sbMatched starts from a uniform p, where fvc::grad(p) is analytically zero and BOTH SIMPLEC corrections are no-ops (OpenFOAM own HbyA correction moves it by 9e-10 there, pure round-off), so an iteration-1 gate would report machine precision while testing none of SIMPLEC. On the developed state the correction moves HbyA by 2.4e-01 and rAtU is 6.9x rAU. Results: rAU 5.1e-15, rAtU 5.2e-15, rhorAtU 5.5e-15, HbyA 2.1e-15, constrainHbyA boundary 6.7e-16, phiHbyA 1.4e-15, phid 1.4e-15, pcEqn.D() 4.2e-15; the two fvc::grad(p)-derived quantities sit at 1.4e-10 and 1.2e-09 and are bounded at 1e-8 with the alternatives ruled out in the test comments. CONTROLS, each verified to fail: plain SIMPLE reads 8.8e-01 against the SIMPLEC oracle; rAU in place of rAtU fails D at 8.8e-01; dropping the SIMPLEC flux correction fails phiHbyA at 2.6e-01; the other transonic branch disagrees. FOUND BY THIS GATE: inletOutlet assignable() was false in brae because it derives from mixed, but OpenFOAM OVERRIDES it back to true (inletOutletFvPatchField.H:164) -- constrainHbyA was taking U at every inletOutlet patch, worth 1.3e-03 on HbyA boundary and 3.5e-03 on phiHbyA. Shared code; outletInlet genuinely does inherit false and was correct.",
              note="The SIMPLEC pressure equation, selected by `consistent yes`. Carries its own rAtU = "
                   "1/(1/rAU - UEqn.H1()) and the (rAtU - rAU) flux correction -- the same shape that cost "
                   "real time in simpleFoam, so it is transcribed here rather than re-derived by guess."),
+        dict(name="kEpsilon_compressible", of_symbol="kEpsilon<BasicMomentumTransportModel>::correct",
+             of_file="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu",
+             brae_target="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu",
+             validation="tests/rho_kepsilon_vs_openfoam.sh -- against OpenFOAM's OWN kEpsilon, instrumented. tools/dumpKEpsilon is that model with writes added and its equations untouched, registered as kEpsilonDump through makeRASModel, so gradU, divU, GbyNu, G, both diffusivities, the mesh factors the laplacian coefficient is a product of, both off-diagonal sets and both assembled systems (before and after relax/boundaryManipulate) each have an oracle. On 112k-cell sbMatched at SIMPLE iteration 1, given OpenFOAM's own inputs: epsilon 5.0e-15, k 8.9e-16, nut 1.7e-15, alphat 2.3e-15, wall and interior alike, with every intermediate at the same order. THE CONTROL: substituting the MASS flux for the volumetric one in divU -- the one difference between the compressible and incompressible readings of this same templated model -- must be worse by at least 1e3x, measured 5.0e-06 against 5.0e-15. A term sweep drops each of the eight terms in turn and every one of them moves the answer. A short source array for a turbulent inlet is REFUSED by name, with a full-length array as the negative control.",
+             note="OpenFOAM has ONE templated kEpsilon.C; the compressible instantiation supplies alpha=1, "
+                  "rho as a field, alphaRhoPhi as the MASS flux and a nu that varies with T. TWO FLUXES, "
+                  "not one: fvm::div takes the mass flux while divU takes the VOLUMETRIC one, because "
+                  "compressibleTurbulenceModel::phi() divides by interpolate(rho). Four defects were found "
+                  "by reading the instrumented model's numbers rather than by reasoning -- the closure "
+                  "never being given the flux (so fvc::grad(U) read a stale outlet face value), k and "
+                  "epsilon never having updateCoeffs called (so every flux-conditional patch contributed "
+                  "nothing), the turbulent inlets being frozen at the case file's `value` instead of "
+                  "recomputed from U and k, and the diffusion terms being assembled orthogonally while "
+                  "the case asked for `corrected`. See PORT.md."),
         dict(name="createFieldRefs", of_symbol="createFieldRefs.H",
              of_file="applications/solvers/compressible/rhoSimpleFoam/createFieldRefs.H",
              classification="HOST_ONLY", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/rhoSimpleFoam/createFields_cpp.cu",
+             brae_reference="src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/createFields.cu",
              validation="tests/rho_createfields_vs_openfoam.sh -- psi == 1/(R T) exactly, from the same T that rho came from.",
              note="One line: psi is a const reference to thermo.psi(). It matters because pEqn uses psi "

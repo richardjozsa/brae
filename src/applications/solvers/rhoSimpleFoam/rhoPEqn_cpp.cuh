@@ -7,7 +7,7 @@
 //     also: src/finiteVolume/cfdTools/general/adjustPhi/adjustPhi.C:35-140
 //           src/finiteVolume/cfdTools/general/pressureControl/pressureControl.C (limit)
 //   brae:
-//     reference: src/applications/solvers/rhoSimpleFoam/pEqn_cpp.cu
+//     reference: src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
 //     cuda:      (pending -- the whole case runs in _cpp first, see PORT.md)
 //     tests:     tests/test_rho_peqn_cpp.cu
 //

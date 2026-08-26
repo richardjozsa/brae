@@ -179,4 +179,17 @@ std::vector<scalar> nutkWallFunction(
     scalar kappa = 0.41,
     scalar E = 9.8);
 
+// PER-FACE nu. The incompressible lineage has one kinematic viscosity for the whole domain; the
+// compressible one has mu(T)/rho, which differs face by face along a wall with a temperature gradient --
+// and nutkWallFunction is written in terms of nu_w, the value AT the face, not a case constant. An
+// overload rather than a changed signature so every existing caller keeps the scalar it already passes.
+std::vector<scalar> nutkWallFunction(
+    const FvPatch& wall,
+    const std::vector<scalar>& y,
+    const std::vector<scalar>& kInternal,
+    const std::vector<scalar>& nuFace,
+    scalar Cmu = 0.09,
+    scalar kappa = 0.41,
+    scalar E = 9.8);
+
 } // namespace brae

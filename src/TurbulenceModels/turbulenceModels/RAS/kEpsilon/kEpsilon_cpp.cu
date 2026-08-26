@@ -14,6 +14,31 @@ namespace kEpsilonRef {
 
 namespace {
 
+// D() and the full right-hand side of an assembled system, in the SAME form tools/dumpKEpsilon writes for
+// OpenFOAM's: the diagonal including the boundary internalCoeffs, and the source with boundaryCoeffs
+// folded into their face cells.
+void captureSystem(
+    const FvScalarMatrix&       M,
+    const std::vector<FvPatch>& patches,
+    std::vector<scalar>&        D,
+    std::vector<scalar>&        S,
+    std::vector<scalar>*        up = nullptr,
+    std::vector<scalar>*        lo = nullptr)
+{
+    if (up) *up = M.upper;
+    if (lo) *lo = M.lower;
+    D = M.diag;
+    S = M.source;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const label c = patches[pi].faceCells[i];
+            D[c] += M.internalCoeffs[pi][i];
+            S[c] += M.boundaryCoeffs[pi][i];
+        }
+}
+
+
 // DkEff / DepsilonEff as OpenFOAM builds them: `nut_/sigma + nu()` is a volScalarField, so its BOUNDARY
 // value comes from nut's OWN boundary, not from the adjacent cell. fvm::laplacian then takes that
 // boundary value for the patch coefficients.
@@ -31,13 +56,25 @@ SurfaceScalarField effectiveDiffusivity(
     scalar nu,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    // The compressible lineage multiplies the whole thing by rho and carries a nu that varies with T.
+    // Null throughout is the incompressible reading and reproduces the previous arithmetic exactly.
+    const std::vector<scalar>*              rho    = nullptr,
+    const std::vector<std::vector<scalar>>* rhoBnd = nullptr,
+    const std::vector<scalar>*              nuFld  = nullptr,
+    const std::vector<std::vector<scalar>>* nuBnd  = nullptr,
+    // OF's DkEff()/DepsilonEff(), i.e. WITHOUT the rho the compressible form multiplies in. Recorded for
+    // comparison against the model's own, nothing more.
+    std::vector<scalar>*                    DEffOut = nullptr)
 {
     (void)nutBndFlatPerPatch;
     std::vector<scalar> D(nutCell.size());
+    if (DEffOut) DEffOut->resize(nutCell.size());
     for (std::size_t c = 0; c < nutCell.size(); ++c)
     {
-        D[c] = nutCell[c] / sigma + nu;
+        const scalar nuc = nuFld ? (*nuFld)[c] : nu;
+        if (DEffOut) (*DEffOut)[c] = nutCell[c] / sigma + nuc;
+        D[c] = (nutCell[c] / sigma + nuc) * (rho ? (*rho)[c] : 1.0);
     }
     SurfaceScalarField sf = fvc::interpolate(D, m, g, patches);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -45,7 +82,8 @@ SurfaceScalarField effectiveDiffusivity(
         const std::vector<scalar>& nb = nutField.boundary[pi]->value();
         for (label i = 0; i < patches[pi].size; ++i)
         {
-            sf.boundary[pi][i] = nb[i] / sigma + nu;
+            const scalar nub = nuBnd ? (*nuBnd)[pi][i] : nu;
+            sf.boundary[pi][i] = (nb[i] / sigma + nub) * (rhoBnd ? (*rhoBnd)[pi][i] : 1.0);
         }
     }
     return sf;
@@ -124,7 +162,8 @@ void correct(
     const KEpsilonCoeffs& co,
     KEResiduals* res,
     bool bounded,
-    int dropTerm)
+    int dropTerm,
+    const Compressible* comp)
 {
     const label nC = m.nCells();
     const scalar Cmu25 = std::pow(co.Cmu, 0.25);
@@ -133,12 +172,31 @@ void correct(
 
     const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
     const std::vector<scalar> gByNu = GbyNu(gradU);
-    const std::vector<scalar> divU = fvc::div(phi, m, g, patches);
+    // divU is the DILATATION, so it comes from the VOLUMETRIC flux -- which for the compressible lineage
+    // is phi/interpolate(rho) and not the mass flux the div operator uses. `bounded` instead subtracts
+    // the divergence of the EQUATION's own flux. In the incompressible lineage both are div(phi) and the
+    // two lines below collapse to the one they replace.
+    const std::vector<scalar> divU =
+        (comp && comp->phiByRho) ? fvc::div(*comp->phiByRho, m, g, patches)
+                                 : fvc::div(phi, m, g, patches);
+    const std::vector<scalar> divPhi =
+        (comp && comp->phiByRho) ? fvc::div(phi, m, g, patches) : divU;
+
+    // alpha*rho on a cell: 1 in the incompressible lineage.
+    auto rhoAt = [&](label c) { return (comp && comp->rho) ? (*comp->rho)[c] : scalar(1.0); };
 
     std::vector<scalar> G(nC);
     for (label c = 0; c < nC; ++c)
     {
         G[c] = nutF[c] * gByNu[c];
+    }
+
+    if (res && res->captureStages)
+    {
+        res->gradU = gradU;
+        res->divU  = divU;
+        res->gByNu = gByNu;
+        res->G     = G;      // BEFORE the wall replacement below, which is where OpenFOAM writes it too
     }
 
     // createAveragingWeights: count the adjacent faces that carry an epsilonWallFunction PATCH FIELD.
@@ -164,8 +222,17 @@ void correct(
 
         const FvPatch& wp = patches[pi];
         const std::vector<scalar>& yw = yWall[pi];
+        // nu AT THE WALL FACE. The incompressible lineage has one number for the whole domain; the
+        // compressible one has mu(T)/rho, which differs face by face on a wall with a temperature
+        // gradient -- and it is nu_w, not the cell's, that the wall function is written in terms of.
+        auto nuAtFace = [&](label i)
+        {
+            return (comp && comp->nuBnd) ? (*comp->nuBnd)[pi][i] : nu;
+        };
+        std::vector<scalar> nuFace(wp.size);
+        for (label i = 0; i < wp.size; ++i) nuFace[i] = nuAtFace(i);
         const std::vector<scalar> nutw =
-            nutkWallFunction(wp, yw, k.internal, nu, co.Cmu, co.kappa, co.E);
+            nutkWallFunction(wp, yw, k.internal, nuFace, co.Cmu, co.kappa, co.E);
         const std::vector<vector>& Uw = U.boundary[pi]->value();
 
         for (label i = 0; i < wp.size; ++i)
@@ -178,15 +245,15 @@ void correct(
             // epsilonWallFunction, STEPWISE blender (its default: wallFunctionBlenders(dict,
             // blenderType::STEPWISE, 2)). Without lowReCorrection the log branch is taken on every face,
             // which is what this did unconditionally before.
-            const scalar yPlus = Cmu25 * yw[i] * std::sqrt(kc) / nu;
+            const scalar yPlus = Cmu25 * yw[i] * std::sqrt(kc) / nuAtFace(i);
             const scalar yPlusLam = brae::yPlusLam(co.kappa, co.E);
             const bool   resolved = co.epsLowRe && (yPlus < yPlusLam);
-            eps0[c] += resolved ? w * 2.0 * kc * nu / (yw[i] * yw[i])                        // epsilonVis
+            eps0[c] += resolved ? w * 2.0 * kc * nuAtFace(i) / (yw[i] * yw[i])               // epsilonVis
                                 : w * Cmu75 * std::pow(kc, 1.5) / (co.kappa * yw[i]);        // epsilonLog
             // ...and the production override is SKIPPED ENTIRELY on a resolved face -- OF's guard is
             // `if (!lowReCorrection_ || (yPlus > yPlusLam))`, not a scaling of the same term.
             if (!resolved)
-                G0[c] += w * (nutw[i] + nu) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
+                G0[c] += w * (nutw[i] + nuAtFace(i)) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
         }
     }
 
@@ -210,32 +277,80 @@ void correct(
             std::fill(nutForD.begin(), nutForD.end(), 0.0);
         }
         const SurfaceScalarField Df =
-            effectiveDiffusivity(nutForD, {}, nutField, co.sigmaEps, nu, m, g, patches);
+            effectiveDiffusivity(nutForD, {}, nutField, co.sigmaEps, nu, m, g, patches,
+                                 comp ? comp->rho : nullptr, comp ? comp->rhoBnd : nullptr,
+                                 comp ? comp->nu  : nullptr, comp ? comp->nuBnd  : nullptr,
+                                 (res && res->captureStages) ? &res->DepsilonEff : nullptr);
+
+        // fvMatrix's constructor calls psi.boundaryFieldRef().updateCoeffs() -- that is where OpenFOAM's
+        // flux-conditional boundaries (inletOutlet, and the turbulentMixingLength/Intensity inlets derived
+        // from it) read the flux and set their valueFraction. Without it every such patch keeps the
+        // valueFraction it was seeded with and contributes nothing to the system, whatever value it
+        // carries. The flux is the one this equation is convected by, which is the field the BC names.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            // OF kEpsilon.C: epsilon_.boundaryFieldRef().updateCoeffs() immediately before the equation.
+            // turbulentMixingLengthDissipationRateInlet reads k's CURRENT patch values there.
+            epsilon.boundary[pi]->updateTurbulentInlet({}, k.boundary[pi]->value(), co.Cmu);
+            epsilon.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+        }
 
         FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, epsilon, m, patches);
-        addEqual(M, fvm::laplacian(Df, epsilon, m, g, patches), -1.0);
+        if (res && res->captureStages)
+        {
+            captureSystem(M, patches, res->epsDivD, res->epsDivSrc, &res->epsDivUpper, &res->epsDivLower);
+            // `bounded Gauss upwind` is ONE scheme: boundedConvectionScheme wraps the Gauss operator and
+            // subtracts fvm::Sp(surfaceIntegrate(phi), vf). OpenFOAM's fvm::div returns the wrapped
+            // matrix, so the capture has to include the bounded term to be the same object -- brae adds
+            // it a few lines below, on the combined matrix.
+            if (bounded)
+                for (label c = 0; c < nC; ++c) res->epsDivD[c] -= divPhi[c] * g.V()[c];
+            res->gammaEpsFace = Df.internal;
+        }
+        {
+            // `Gauss linear corrected` changes TWO things, and kOmegaSST in this same directory already
+            // does both: the implicit face coefficient becomes gamma*nonOrthDeltaCoeffs*magSf, and the
+            // non-orthogonal part enters as an explicit source. Assembling the orthogonal laplacian
+            // instead is a silent scheme substitution -- the case asked for `corrected` -- and on this
+            // near-orthogonal mesh it moved the off-diagonals by only 2.2e-06 while moving epsilon by
+            // 6.5e-06, small enough to look like round-off and large enough not to be.
+            FvScalarMatrix L = fvm::laplacian(Df, epsilon, m, g, patches, co.correctedLaplacian);
+            if (co.correctedLaplacian)
+            {
+                std::vector<std::vector<scalar>> vb(patches.size());
+                for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = epsilon.boundary[pi]->value();
+                const std::vector<vector> gradVf = fvc::gaussGrad(epsilon.internal, vb, m, g, patches);
+                const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+                    Df, epsilon, gradVf, m, g, patches, co.snGradLimitCoeff);
+                for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
+            }
+            if (res && res->captureStages) captureSystem(L, patches, res->epsLapD, res->epsLapSrc,
+                                   &res->epsLapUpper, &res->epsLapLower);
+            addEqual(M, L, -1.0);
+        }
 
         for (label c = 0; c < nC; ++c)
         {
             const scalar V = g.V()[c];
 
             // == C1*GbyNu*Cmu*k
-            if (dropTerm != 1) M.source[c] += co.C1 * gByNu[c] * co.Cmu * k.internal[c] * V;
+            if (dropTerm != 1) M.source[c] += co.C1 * rhoAt(c) * gByNu[c] * co.Cmu * k.internal[c] * V;
 
             // - SuSp(((2/3)*C1 - C3)*divU, epsilon)
-            const scalar sp = (dropTerm == 2) ? 0.0 : ((2.0/3.0) * co.C1 - co.C3) * divU[c];
+            const scalar sp = (dropTerm == 2) ? 0.0 : ((2.0/3.0) * co.C1 - co.C3) * rhoAt(c) * divU[c];
             M.diag[c]   += V * std::fmax(sp, 0.0);
             M.source[c] -= V * std::fmin(sp, 0.0) * epsilon.internal[c];
 
             // - Sp(C2*epsilon/k, epsilon)
-            if (dropTerm != 3) M.diag[c] += co.C2 * epsilon.internal[c] / k.internal[c] * V;
+            if (dropTerm != 3) M.diag[c] += co.C2 * rhoAt(c) * epsilon.internal[c] / k.internal[c] * V;
 
             // `bounded`: - Sp(div(phi), epsilon). Vanishes where phi is conservative, so it cannot move
             // a converged state -- which is exactly why it needs its own measurement rather than being
             // assumed harmless.
-            if (bounded) M.diag[c] -= divU[c] * V;
+            if (bounded) M.diag[c] -= divPhi[c] * V;
         }
 
+        if (res && res->captureStages) captureSystem(M, patches, res->epsD0, res->epsSrc0);
         relaxMatrix(M, epsilon, m, patches, relaxEps);
         setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
         if (res)
@@ -271,6 +386,10 @@ void correct(
             }
             res->epsCellResidual = r;
         }
+        if (res && res->captureStages)
+        {
+            captureSystem(M, patches, res->epsD, res->epsSrc, &res->epsUpper, &res->epsLower);
+        }
         const SolverPerformance p = pbicgstab(M, epsilon.internal, m, patches, tol, relTol, maxIter);
         if (res) res->epsilon = p.initialResidual;
 
@@ -289,30 +408,71 @@ void correct(
             std::fill(nutForD.begin(), nutForD.end(), 0.0);
         }
         const SurfaceScalarField Df =
-            effectiveDiffusivity(nutForD, {}, nutField, co.sigmaK, nu, m, g, patches);
+            effectiveDiffusivity(nutForD, {}, nutField, co.sigmaK, nu, m, g, patches,
+                                 comp ? comp->rho : nullptr, comp ? comp->rhoBnd : nullptr,
+                                 comp ? comp->nu  : nullptr, comp ? comp->nuBnd  : nullptr,
+                                 (res && res->captureStages) ? &res->DkEff : nullptr);
+
+        // fvMatrix's constructor calls psi.boundaryFieldRef().updateCoeffs() -- that is where OpenFOAM's
+        // flux-conditional boundaries (inletOutlet, and the turbulentMixingLength/Intensity inlets derived
+        // from it) read the flux and set their valueFraction. Without it every such patch keeps the
+        // valueFraction it was seeded with and contributes nothing to the system, whatever value it
+        // carries. The flux is the one this equation is convected by, which is the field the BC names.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            // turbulentIntensityKineticEnergyInlet reads U's patch values.
+            k.boundary[pi]->updateTurbulentInlet(U.boundary[pi]->value(), {}, co.Cmu);
+            k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+        }
 
         FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, k, m, patches);
-        addEqual(M, fvm::laplacian(Df, k, m, g, patches), -1.0);
+        {
+            // `Gauss linear corrected` changes TWO things, and kOmegaSST in this same directory already
+            // does both: the implicit face coefficient becomes gamma*nonOrthDeltaCoeffs*magSf, and the
+            // non-orthogonal part enters as an explicit source. Assembling the orthogonal laplacian
+            // instead is a silent scheme substitution -- the case asked for `corrected` -- and on this
+            // near-orthogonal mesh it moved the off-diagonals by only 2.2e-06 while moving epsilon by
+            // 6.5e-06, small enough to look like round-off and large enough not to be.
+            FvScalarMatrix L = fvm::laplacian(Df, k, m, g, patches, co.correctedLaplacian);
+            if (co.correctedLaplacian)
+            {
+                std::vector<std::vector<scalar>> vb(patches.size());
+                for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = k.boundary[pi]->value();
+                const std::vector<vector> gradVf = fvc::gaussGrad(k.internal, vb, m, g, patches);
+                const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+                    Df, k, gradVf, m, g, patches, co.snGradLimitCoeff);
+                for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
+            }
+            addEqual(M, L, -1.0);
+        }
 
         for (label c = 0; c < nC; ++c)
         {
             const scalar V = g.V()[c];
 
             // == G   (the wall-overridden value at wall cells)
-            if (dropTerm != 5) M.source[c] += G[c] * V;
+            if (dropTerm != 5) M.source[c] += rhoAt(c) * G[c] * V;
 
             // - SuSp((2/3)*divU, k)
-            const scalar sp = (dropTerm == 6) ? 0.0 : (2.0/3.0) * divU[c];
+            const scalar sp = (dropTerm == 6) ? 0.0 : (2.0/3.0) * rhoAt(c) * divU[c];
             M.diag[c]   += V * std::fmax(sp, 0.0);
             M.source[c] -= V * std::fmin(sp, 0.0) * k.internal[c];
 
-            // - Sp(epsilon/k, k)
-            if (dropTerm != 7) M.diag[c] += epsilon.internal[c] / k.internal[c] * V;
+            // - Sp(alpha*rho*epsilon/k, k). The rho is NOT optional and its absence is not visible in
+            // the incompressible lineage, where it is 1: here rho is ~0.38, so leaving it out made k's
+            // destruction 2.6x too strong and k wrong across the whole field (3.3e-01 against OpenFOAM)
+            // while epsilon -- solved first, and correctly rho-weighted -- looked far better.
+            if (dropTerm != 7) M.diag[c] += rhoAt(c) * epsilon.internal[c] / k.internal[c] * V;
 
-            if (bounded) M.diag[c] -= divU[c] * V;
+            if (bounded) M.diag[c] -= divPhi[c] * V;
         }
 
+        if (res && res->captureStages) captureSystem(M, patches, res->kD0, res->kSrc0);
         relaxMatrix(M, k, m, patches, relaxK);
+        if (res && res->captureStages)
+        {
+            captureSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
+        }
         const SolverPerformance p = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter);
         if (res) res->k = p.initialResidual;
 
@@ -338,7 +498,30 @@ void correct(
         if (epsilon.boundary[pi]->isTurbulenceWallFunction())
         {
             nutField.boundary[pi]->setValue(
-                nutkWallFunction(patches[pi], yWall[pi], k.internal, nu, co.Cmu, co.kappa, co.E));
+                [&]
+                {
+                    // Per-face nu here too. This is the nut BOUNDARY update after correctNut, and it was
+                    // the one call site still reading the case-constant nu -- which the compressible
+                    // lineage does not have. Passing the scalar there put a 0 into a divisor and the
+                    // whole solve went non-finite inside the first iteration.
+                    if (!(comp && comp->nuBnd))
+                        return nutkWallFunction(patches[pi], yWall[pi], k.internal, nu,
+                                                co.Cmu, co.kappa, co.E);
+                    std::vector<scalar> nf(patches[pi].size);
+                    for (label i = 0; i < patches[pi].size; ++i) nf[i] = (*comp->nuBnd)[pi][i];
+                    return nutkWallFunction(patches[pi], yWall[pi], k.internal, nf,
+                                            co.Cmu, co.kappa, co.E);
+                }());
+
+    // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt. The momentum equation never asks for it; the
+    // ENERGY equation does, through alphaEff = CpByCpv*(alpha + alphat), so it is produced here where nut
+    // has just been corrected rather than derived again by the caller from a nut that may have moved.
+    if (comp && comp->alphat)
+    {
+        comp->alphat->resize(nC);
+        for (label c = 0; c < nC; ++c)
+            (*comp->alphat)[c] = rhoAt(c) * nutF[c] / comp->Prt;
+    }
             continue;
         }
 

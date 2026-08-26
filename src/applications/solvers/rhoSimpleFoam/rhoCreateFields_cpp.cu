@@ -1,5 +1,5 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
-#include "createFields_cpp.cuh"
+#include "rhoCreateFields_cpp.cuh"
 #include "foam_field_reader.cuh"
 #include "thermo_parse.cuh"
 #include "equation_of_state.cuh"
@@ -259,7 +259,8 @@ RhoSimpleFields createFields(
     // are derived from the SAME state rather than from two fields that could be an iteration apart.
     f.p = buildField<scalar>(readField<scalar>(timeDir + "/p"), patches, nC);
     f.p.evaluateBoundary();
-    f.T = buildField<scalar>(readField<scalar>(timeDir + "/T"), patches, nC);
+    const FieldData<scalar> tFd = readField<scalar>(timeDir + "/T");
+    f.T = buildField<scalar>(tFd, patches, nC);
     f.T.evaluateBoundary();
 
     // rho: READ_IF_PRESENT, else thermo.rho(). A restart continues from the written density; a cold start
@@ -298,6 +299,16 @@ RhoSimpleFields createFields(
 
     // U: MUST_READ.
     f.U = buildField<vector>(readField<vector>(timeDir + "/U"), patches, nC);
+
+    // createFields.H builds rho (line 22) BEFORE U (line 26), so when OpenFOAM constructs U's patches the
+    // rho field is already registered and flowRateInletVelocity's constructor-time updateCoeffs takes the
+    // REAL patch density -- not `rhoInlet`, which sbMatched even labels "Guess for rho" and which OF
+    // reaches only when no rho is registered at all. This must happen before phi is built below, because
+    // compressibleCreatePhi.H builds phi FROM U and the seed would otherwise be carried into the flux.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        f.U.boundary[pi]->updateAtConstruction(f.rho.boundary[pi]->value());
+    }
     f.U.evaluateBoundary();
 
     // compressibleCreatePhi.H: READ_IF_PRESENT, else linearInterpolate(rho*U) & Sf.
@@ -353,14 +364,112 @@ RhoSimpleFields createFields(
             f.psiBnd[pi][i] = perfectGasPsi(tb[i], f.thermo);
     }
 
-    // thermo.he() -- the variable EEqn transports. hConstThermo: Hs = Cp*(T - Tref) + Href, and the
-    // heat of formation Hf belongs to the ABSOLUTE enthalpy only, so it must not appear here.
-    f.he.resize(nC);
-    for (label c = 0; c < nC; ++c)
+    // thermo.he() -- the variable EEqn transports, WITH ITS BOUNDARY CONDITIONS.
+    //
+    // OpenFOAM does not give he the boundary conditions of T; basicThermo::heBoundaryTypes() derives
+    // ENERGY ones from them -- fixedValue becomes fixedEnergy, zeroGradient becomes gradientEnergy,
+    // inletOutlet becomes mixedEnergy. Those energy types are not a relabelling: a fixedValue patch's
+    // boundaryCoeffs come from its refValue, so an he built by borrowing T's patch fields carries a
+    // TEMPERATURE where the coefficients want an ENERGY, which reads as a source error on every
+    // inlet-adjacent cell and nowhere else.
+    //
+    // What is done here is the mapping for the set where it is EXACT for this thermo, and a refusal by
+    // name for anything else:
+    //     fixedValue    -> fixedValue   on he(T_b)          exact: fixedEnergy IS a fixedValue on he
+    //     zeroGradient  -> zeroGradient                     exact only because he is p-INDEPENDENT for
+    //                                                       perfectGas+hConst, so gradientEnergy's
+    //                                                       deltaCoeffs*(he(p_w,T_w) - he(p_c,T_c)) term
+    //                                                       vanishes when T's gradient does
+    //     inletOutlet   -> inletOutlet  on he(T_inletValue) exact: mixedEnergy is the same mixed BC with
+    //                                                       the energy refValue
+    // A janaf thermo, or a liquid whose he depends on p, breaks the second of those; the refusal below
+    // is what stops that from becoming a silent wrong answer.
     {
-        const scalar hs = f.thermo.Cp * (f.T.internal[c] - f.thermo.Tref) + f.thermo.Href;
-        // e = h - p/rho = h - R*T for a perfect gas.
-        f.he[c] = (f.heName == "e") ? hs - f.thermo.R * f.T.internal[c] : hs;
+        auto heOf = [&](scalar T)
+        {
+            const scalar hs = f.thermo.Cp * (T - f.thermo.Tref) + f.thermo.Href;
+            // e = h - p/rho = h - R*T for a perfect gas. Hf, the heat of formation, belongs to the
+            // ABSOLUTE enthalpy only and must not appear in the sensible energy EEqn transports.
+            return (f.heName == "e") ? hs - f.thermo.R * T : hs;
+        };
+        FieldData<scalar> heFd;
+        heFd.internalUniform = false;
+        heFd.internalField.resize(nC);
+        for (label c = 0; c < nC; ++c) heFd.internalField[c] = heOf(f.T.internal[c]);
+        for (const auto& tb : tFd.boundary)
+        {
+            PatchFieldData<scalar> b = tb;          // name, type and structure carried over
+            if (tb.type != "fixedValue" && tb.type != "zeroGradient" && tb.type != "inletOutlet"
+                && tb.type != "calculated" && tb.type != "empty" && tb.type != "symmetry"
+                && tb.type != "symmetryPlane" && tb.type != "wedge" && tb.type != "slip")
+                throw std::runtime_error(
+                    "brae: rhoSimpleFoam createFields cannot derive he's boundary condition from T's '"
+                    + tb.type + "' on patch '" + tb.name + "'. OpenFOAM maps T's boundary conditions to "
+                    "ENERGY ones (basicThermo::heBoundaryTypes) and brae implements that mapping only "
+                    "where it is exact for perfectGas+hConst. Refusing rather than transporting an "
+                    "energy under a temperature's boundary condition.");
+            b.uniformValue     = heOf(tb.uniformValue);
+            for (auto& v : b.values)      v = heOf(v);
+            b.refValueUniform ? (void)0 : (void)0;
+            for (auto& v : b.refValues)   v = heOf(v);
+            b.inletUniformValue = heOf(tb.inletUniformValue);
+            for (auto& v : b.inletValues) v = heOf(v);
+            heFd.boundary.push_back(std::move(b));
+        }
+        f.he = buildField<scalar>(heFd, patches, nC);
+        f.he.evaluateBoundary();
+    }
+
+    // compressible::turbulenceModel::New(rho, U, phi, thermo) -- the model is constructed here in
+    // createFields.H, and constructing it is what reads k, epsilon, nut and alphat. A laminar case reads
+    // none of them, which is why they are gated on the dictionary rather than on the files existing.
+    {
+        // OpenFOAM renamed turbulenceProperties to momentumTransport; both names are in the wild and a
+        // case carries exactly one. Neither present is a real case too -- rhoSimpleFoam constructs the
+        // model unconditionally, so a case with no dictionary at all is refused rather than assumed
+        // laminar, which would run a turbulent case with no closure and report nothing.
+        const std::string mtPath = caseDir + "/constant/momentumTransport";
+        const std::string tpPath = caseDir + "/constant/turbulenceProperties";
+        std::string dictPath;
+        if (fileExists(mtPath))      dictPath = mtPath;
+        else if (fileExists(tpPath)) dictPath = tpPath;
+        else
+            throw std::runtime_error(
+                "brae: rhoSimpleFoam found neither constant/momentumTransport nor "
+                "constant/turbulenceProperties. OpenFOAM constructs the turbulence model from one of "
+                "them in createFields.H; refusing rather than assuming the case is laminar.");
+        const FoamDict mt2 = readDict(dictPath);
+        const std::string sim = mt2.wordOr("simulationType", "laminar");
+        if (sim == "RAS")
+        {
+            const FoamDict* ras = mt2.subDict("RAS");
+            f.turbulent = !ras || ras->wordOr("turbulence", "on") != "off";
+            f.rasModel  = ras ? ras->wordOr("RASModel", "") : "";
+            if (f.turbulent)
+            {
+                if (f.rasModel != "kEpsilon")
+                    throw std::runtime_error(
+                        "brae: rhoSimpleFoam RASModel '" + f.rasModel + "' is not ported for the "
+                        "compressible lineage (kEpsilon is). Refusing rather than running a different "
+                        "closure, or none.");
+                f.k       = buildField<scalar>(readField<scalar>(timeDir + "/k"), patches, nC);
+                f.epsilon = buildField<scalar>(readField<scalar>(timeDir + "/epsilon"), patches, nC);
+                f.nut     = buildField<scalar>(readField<scalar>(timeDir + "/nut"), patches, nC);
+                f.k.evaluateBoundary();
+                f.epsilon.evaluateBoundary();
+                f.nut.evaluateBoundary();
+                if (fileExists(timeDir + "/alphat"))
+                {
+                    f.alphat = buildField<scalar>(readField<scalar>(timeDir + "/alphat"), patches, nC);
+                    f.alphat.evaluateBoundary();
+                }
+            }
+        }
+        else if (sim != "laminar")
+        {
+            throw std::runtime_error(
+                "brae: rhoSimpleFoam simulationType '" + sim + "' is neither laminar nor RAS. Refusing.");
+        }
     }
 
     f.pressureControl = makePressureControl(f.p, f.rho, simpleDict, nC);

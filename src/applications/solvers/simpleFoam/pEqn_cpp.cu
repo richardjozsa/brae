@@ -98,7 +98,10 @@ PressureStages pressurePredictor(
         {
             // adjustPhi branches on Up.fixesValue() && !isA<inletOutlet>(Up) -- fixesValue here, NOT
             // assignable; the two questions are different and both appear in this one file.
-            const bool fixed = U.boundary[pi]->fixesValue();
+            // `fixesValue() && !isA<inletOutlet>(Up)`, both halves. mixedFvPatchField::fixesValue() is
+            // TRUE and inletOutlet inherits it, so the exclusion is what keeps an inletOutlet outlet
+            // ADJUSTABLE -- which is the whole point of adjustPhi having something to scale.
+            const bool fixed = U.boundary[pi]->fixesValue() && !U.boundary[pi]->isInletOutlet();
             for (scalar v : st.phiHbyA.boundary[pi])
             {
                 if (v < 0.0)        massIn -= v;

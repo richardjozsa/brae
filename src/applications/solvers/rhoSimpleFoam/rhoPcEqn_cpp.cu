@@ -1,5 +1,5 @@
 // _cpp REFERENCE implementation -- see pcEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
-#include "pcEqn_cpp.cuh"
+#include "rhoPcEqn_cpp.cuh"
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity: linear inside, BOUNDARY field on faces

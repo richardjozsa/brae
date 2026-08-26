@@ -30,10 +30,10 @@
 #include "foam_field_reader.cuh"
 #include "foam_dict.cuh"
 #include "fv_matrix_ops.cuh"
-#include "createFields_cpp.cuh"
-#include "UEqn_cpp.cuh"
-#include "pEqn_cpp.cuh"
-#include "pcEqn_cpp.cuh"
+#include "rhoCreateFields_cpp.cuh"
+#include "rhoUEqn_cpp.cuh"
+#include "rhoPEqn_cpp.cuh"
+#include "rhoPcEqn_cpp.cuh"
 
 #include <cmath>
 #include <cstdio>

@@ -31,10 +31,12 @@
 #include "foam_field_reader.cuh"
 #include "foam_dict.cuh"
 #include "fv_matrix_ops.cuh"
-#include "createFields_cpp.cuh"
-#include "UEqn_cpp.cuh"
+#include "rhoCreateFields_cpp.cuh"
+#include "rhoSimpleFoam_cpp.cuh"   // effectiveTransport: the solver's OWN muEff
+#include "rhoUEqn_cpp.cuh"
 
 #include <cmath>
+#include <fstream>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -167,11 +169,138 @@ int main(int argc, char** argv)
     const std::vector<scalar> muEffInt = rawInternal(muEffFd, nC);
     const std::vector<std::vector<scalar>> muEffBnd = rawBoundary<scalar>(muEffFd, patches);
 
+    // brae's OWN muEff, which this gate otherwise only INJECTS. The injection above is deliberate -- it
+    // keeps the assembly number attributable to the assembly -- but its cost is that the solver's own
+    // viscosity is never compared to OpenFOAM's, and a driver that assembles exactly from a muEff of its
+    // own making still converges somewhere else. That is not hypothetical: alphaEff, injected into the
+    // energy gate for the same reason, was six orders too large because transportAlpha was handed a
+    // temperature where it takes a viscosity, and no gate could see it.
+    //
+    // Asserted against the LAMINAR half, thermo.mu(), because the turbulence model's nut at this point is
+    // the model's own state and not something createFields reconstructs.
+    {
+        std::printf("  0. brae's own transport, against OpenFOAM's\n");
+        std::vector<scalar> mineMu, mineAlpha;
+        std::vector<std::vector<scalar>> mineMuB, mineAlphaB;
+        cpu::rhoSimple::effectiveTransport(f, patches, mineMu, mineMuB, mineAlpha, mineAlphaB);
+
+        const std::string lamPath = caseDir + "/" + dumpT + "/stage_muLam";
+        if (std::ifstream(lamPath.c_str()).good())
+        {
+            const FieldData<scalar> lamFd = readField<scalar>(lamPath);
+            const std::vector<scalar> ofLam = rawInternal(lamFd, nC);
+            std::vector<scalar> mineLam(nC);
+            for (label c = 0; c < nC; ++c)
+            {
+                const scalar mut = (f.turbulent && !f.nut.internal.empty())
+                                 ? f.rho.internal[c] * f.nut.internal[c] : scalar(0);
+                mineLam[c] = mineMu[c] - mut;
+            }
+            report("brae's own laminar muEff == OpenFOAM's", relL2(mineLam, ofLam), 1e-12);
+            std::printf("     %-40s brae %.6e   OpenFOAM %.6e\n", "  (the value itself)",
+                        mineLam[0], ofLam[0]);
+
+            // The BOUNDARY too: divDevRhoReff's face viscosity takes the patch values, so a muEff that is
+            // right in the cell and wrong on the face still poisons the momentum coefficients there.
+            const std::vector<std::vector<scalar>> ofLamB = rawBoundary<scalar>(lamFd, patches);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                std::vector<scalar> a, b;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const scalar mutB = (f.turbulent && !f.nut.internal.empty())
+                                      ? f.rho.boundary[pi]->value()[i] * f.nut.boundary[pi]->value()[i]
+                                      : scalar(0);
+                    a.push_back(mineMuB[pi][i] - mutB);
+                    b.push_back(ofLamB[pi][i]);
+                }
+                std::printf("     laminar muEff on %-16s %.6e\n", patches[pi].name.c_str(), relL2(a, b));
+            }
+        }
+        std::printf("     %-40s %.6e   (turbulent halves differ in this state)\n",
+                    "full muEff vs OpenFOAM's", relL2(mineMu, muEffInt));
+    }
+
     // U EXACTLY as OpenFOAM assembled from. sbMatched's inlet is flowRateInletVelocity, whose value
     // depends on which rho it is fed -- a separate component with its own history in this repo. Taking
     // OpenFOAM's evaluated U here keeps this gate measuring the momentum ASSEMBLY; the BC gets its own.
     const FieldData<vector> uAssFd = readField<vector>(caseDir + "/" + dumpT + "/stage_Uass");
     const std::vector<std::vector<vector>> uAssBnd = rawBoundary<vector>(uAssFd, patches);
+    // flowRateInletVelocity: the invariant, and the control that it is not met by accident.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (f.U.boundary[pi]->bcCategory() != 9) continue;
+        const scalar mdot = f.U.boundary[pi]->flowRateValue();
+
+        // THE INVARIANT: createFields must leave the inlet carrying the case's prescribed mass flow.
+        // OpenFOAM's constructor reaches updateCoeffs before compressibleCreatePhi.H builds phi, so the
+        // flux is right from the very first iteration; brae seeded from `rhoInlet` and was 24% short.
+        scalar sumPhi = 0.0;
+        for (label i = 0; i < patches[pi].size; ++i) sumPhi += f.phi.boundary[pi][i];
+        report("createFields' inlet carries the prescribed mass flow",
+               std::fabs(sumPhi + mdot) / std::fabs(mdot), 1e-14);
+
+        // THE CONTROL: `rhoInlet` is the fallback OpenFOAM uses only when no rho field is registered, and
+        // sbMatched even labels it "Guess for rho". Building the inlet from it instead of the live patch
+        // rho must give a MEASURABLY different flux -- otherwise this fixture cannot tell the two apart
+        // and the assertion above would pass whichever density were used.
+        const std::vector<scalar>& rv = f.rho.boundary[pi]->value();
+        scalar sumRhoA = 0.0, sumGuessA = 0.0;
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            sumRhoA   += rv[i] * patches[pi].magSf[i];
+            sumGuessA += scalar(0.5) * patches[pi].magSf[i];   // sbMatched's rhoInlet
+        }
+        const double guessFlux = std::fabs(mdot) * (sumRhoA / sumGuessA);
+        check("control -- the rhoInlet guess would NOT deliver it",
+              std::fabs(guessFlux - std::fabs(mdot)) / std::fabs(mdot) > 1e-2);
+        std::printf("     %-40s live rho %+.9e   rhoInlet guess %+.9e\n",
+                    "  (the flux each density gives)", sumPhi, -guessFlux);
+    }
+
+    // updateCoeffs() for flowRateInletVelocity, at the point OpenFOAM calls it: the momentum assembly.
+    // OF holds the prescribed mass flow against the registered rho's PATCH values, which is the RELAXED
+    // solver rho of the previous iteration -- dumped as stage_rhoU so this reads the same field OF read
+    // rather than one reconstructed from p and T. Without this the inlet stays at the seed the
+    // constructor built from `rhoInlet`, which sbMatched even labels "Guess for rho" and OpenFOAM ignores.
+    {
+        const std::string rhoUPath = caseDir + "/" + dumpT + "/stage_rhoU";
+        if (std::ifstream(rhoUPath.c_str()).good())
+        {
+            const FieldData<scalar> rhoUFd = readField<scalar>(rhoUPath);
+            const std::vector<std::vector<scalar>> rhoUBnd = rawBoundary<scalar>(rhoUFd, patches);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                f.U.boundary[pi]->updateFromDensity(rhoUBnd[pi]);
+            }
+        }
+    }
+    // phi as OpenFOAM convects with. The momentum boundaryCoeffs are -phi_b*U_b, so with U's boundary
+    // matching, anything left in them is the flux.
+    {
+        const std::string phiUPath = caseDir + "/" + dumpT + "/stage_phiU";
+        if (std::ifstream(phiUPath.c_str()).good())
+        {
+            const FieldData<scalar> phiUFd = readField<scalar>(phiUPath);
+            const std::vector<std::vector<scalar>> ofPhiB = rawBoundary<scalar>(phiUFd, patches);
+            std::printf("  0. phi at the momentum assembly, against OpenFOAM's own\n");
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                double d = 0.0, n = 0.0, sa = 0.0, sb = 0.0;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const double a = f.phi.boundary[pi][i];
+                    const double b = ofPhiB[pi][i];
+                    d += (a - b) * (a - b);
+                    n += b * b;
+                    sa += a;
+                    sb += b;
+                }
+                std::printf("     %-18s %.6e   sum(brae) %+.6e  sum(OF) %+.6e\n",
+                            patches[pi].name.c_str(), n > 0.0 ? std::sqrt(d / n) : std::sqrt(d), sa, sb);
+            }
+        }
+    }
     {
         // Report how far brae's OWN boundary evaluation is from OpenFOAM's BEFORE overwriting it, so the
         // substitution is visible rather than silent. A measurement, not an assertion: the inlet BC is a

@@ -10,7 +10,7 @@
 //           src/finiteVolume/cfdTools/general/findRefCell/findRefCell.C:33-119    (setRefCell)
 //           src/thermophysicalModels/basic/fluidThermo/fluidThermo.C              (fluidThermo::New)
 //   brae:
-//     reference: src/applications/solvers/rhoSimpleFoam/createFields_cpp.cu
+//     reference: src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
 //     tests:     tests/test_rho_create_fields_cpp.cu
 //
 // TRANSCRIBED, NOT COPIED -- see PORT.md. simpleFoam's createFields_cpp is the structural model for how a
@@ -108,13 +108,27 @@ struct RhoSimpleFields
     // part of the field, not an afterthought -- taking the owner cell's value there would silently change
     // phid on every boundary face.
     std::vector<std::vector<scalar>> psiBnd;
-    std::vector<scalar>    he;                 // thermo.he(), the variable EEqn transports
+    // thermo.he(), the variable EEqn transports -- a FIELD, not an array, because it has boundary
+    // conditions of its own. OpenFOAM derives them from T's via basicThermo::heBoundaryTypes():
+    // fixedValue -> fixedEnergy, zeroGradient -> gradientEnergy, inletOutlet -> mixedEnergy. brae maps
+    // only the cases where that mapping is EXACT for this thermo and refuses the rest by name; see
+    // createFields_cpp.cu.
+    GeometricField<scalar> he;
 
     bool                   rhoWasRead = false; // false => computed from the equation of state
     bool                   phiWasRead = false; // false => interpolate(rho*U) & Sf
     scalar                 initialMass = 0.0;  // fvc::domainIntegrate(rho) = sum(rho*V)
 
     PressureControl        pressureControl;
+
+    // The RAS fields, when the case selects a model. OpenFOAM's compressible::turbulenceModel::New reads
+    // them as part of constructing the model, so they belong to createFields even though nothing in
+    // createFields.H names them: `turbulence` is built there and it is what owns k, epsilon and nut.
+    // alphat is the EddyDiffusivity's, and it is read rather than derived because a restart resumes from
+    // the value OpenFOAM wrote.
+    bool                   turbulent = false;   // momentumTransport simulationType RAS
+    std::string            rasModel;            // e.g. "kEpsilon"; empty when laminar
+    GeometricField<scalar> k, epsilon, nut, alphat;
 };
 
 // createFields.H + compressibleCreatePhi.H + createFieldRefs.H + pressureControl.

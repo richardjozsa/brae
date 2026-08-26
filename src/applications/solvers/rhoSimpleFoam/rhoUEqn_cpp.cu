@@ -1,5 +1,5 @@
 // _cpp REFERENCE implementation -- see UEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
-#include "UEqn_cpp.cuh"
+#include "rhoUEqn_cpp.cuh"
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"

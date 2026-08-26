@@ -7,7 +7,7 @@
 //     also: src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixATmul.C  (lduMatrix::H1)
 //           src/finiteVolume/fvMatrices/fvMatrix/fvMatrix.C             (fvMatrix::H1 over it)
 //   brae:
-//     reference: src/applications/solvers/rhoSimpleFoam/pcEqn_cpp.cu
+//     reference: src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
 //     cuda:      (pending -- the whole case runs in _cpp first, see PORT.md)
 //     tests:     tests/test_rho_pceqn_cpp.cu
 //
@@ -46,7 +46,7 @@
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
 #include "fvc.cuh"
-#include "pEqn_cpp.cuh"      // PressureInput / adjustPhi -- the same inputs, the same utility
+#include "rhoPEqn_cpp.cuh"      // PressureInput / adjustPhi -- the same inputs, the same utility
 #include <vector>
 
 namespace brae {

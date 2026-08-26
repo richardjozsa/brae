@@ -105,11 +105,12 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
-    src/applications/solvers/rhoSimpleFoam/createFields_cpp.cu
-    src/applications/solvers/rhoSimpleFoam/UEqn_cpp.cu
-    src/applications/solvers/rhoSimpleFoam/EEqn_cpp.cu
-    src/applications/solvers/rhoSimpleFoam/pEqn_cpp.cu
-    src/applications/solvers/rhoSimpleFoam/pcEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam_cpp.cu
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
     src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
     src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
@@ -1680,6 +1681,48 @@ target_include_directories(test_rho_pceqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_pceqn_cpp PRIVATE brae_core)
 add_test(NAME rho_pceqn_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_pceqn_vs_openfoam.sh)
+
+# rhoSimpleFoam END TO END: the _cpp driver runs the whole case and is compared against real OpenFOAM.
+# This is the gate PORT.md requires BEFORE any .cu is written for this solver. Laminar, because the
+# compressible turbulence closure is not ported -- and the binary asserts a turbulent case is REFUSED.
+add_executable(test_rho_simple_step_cpp tests/test_rho_simple_step_cpp.cu)
+target_include_directories(test_rho_simple_step_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_simple_step_cpp PRIVATE brae_core)
+add_test(NAME rho_simple_end_to_end_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_simple_end_to_end_vs_openfoam.sh)
+
+# The COMPRESSIBLE kEpsilon closure against OpenFOAM's own turbulence->correct(), which tools/dumpPEqn
+# brackets so every input it reads and every field it writes can be compared. Carries the control that
+# distinguishes the two fluxes: divU is the VOLUMETRIC one, the div operator takes the MASS one.
+add_executable(test_rho_kepsilon_cpp tests/test_rho_kepsilon_cpp.cu)
+target_include_directories(test_rho_kepsilon_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_kepsilon_cpp PRIVATE brae_core)
+# REGISTERED NOW: the closure agrees with OpenFOAM at machine precision -- epsilon 5.0e-15, k 8.9e-16,
+# nut 1.7e-15, wall and interior alike -- and so does every intermediate the gate can see, because
+# tools/dumpKEpsilon is OpenFOAM's own kEpsilon with writes added and its equations untouched. gradU,
+# GbyNu, G, divU, both diffusivities, the mesh factors, both off-diagonal sets and both assembled systems
+# each have an oracle rather than an argument. What that instrument found, in order:
+#   - the closure was never given the flux, so U's inletOutlet outlet evaluated on a seeded valueFraction
+#     and fvc::grad(U) read the wrong face value there (gradU exact in the interior, 1.5e-01 at the
+#     boundary -- the split is what named it);
+#   - k and epsilon never had updateCoeffs called on them either, so every flux-conditional patch
+#     contributed nothing to its system whatever value it carried;
+#   - the turbulent inlets were frozen at the case file's `value`. OpenFOAM RECOMPUTES refValue on every
+#     updateCoeffs, epsilon's from k's patch values and k's from U's;
+#   - the diffusion terms were assembled with `Gauss linear orthogonal` while the case asked for
+#     `corrected` -- a silent scheme substitution, and the last 5e-06.
+add_test(NAME rho_kepsilon_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_kepsilon_vs_openfoam.sh)
+set_tests_properties(rho_simple_end_to_end_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cpp
+                     TIMEOUT 1800)
+set_tests_properties(rho_kepsilon_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_kepsilon_cpp
+                     TIMEOUT 1800)
 set_tests_properties(rho_pceqn_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77

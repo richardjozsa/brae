@@ -24,7 +24,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_dict.cuh"
 #include "fvc.cuh"
-#include "createFields_cpp.cuh"
+#include "rhoCreateFields_cpp.cuh"
 
 #include <cmath>
 #include <cstdio>

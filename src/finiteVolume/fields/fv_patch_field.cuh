@@ -42,6 +42,45 @@ public:
     // fixesValue(). Using one for the other changes which patches keep U's boundary value in HbyA.
     virtual bool assignable() const { return true; }
 
+    // Is this specifically an inletOutlet? adjustPhi (pEqn.H) branches on
+    // `Up.fixesValue() && !isA<inletOutletFvPatchVectorField>(Up)` -- it needs BOTH questions, because
+    // mixedFvPatchField::fixesValue() is TRUE (mixedFvPatchField.H:197) and inletOutlet inherits it, so
+    // without the exclusion an inletOutlet outlet would be counted as a FIXED outflow and adjustPhi would
+    // have nothing adjustable left to balance against.
+    virtual bool isInletOutlet() const { return false; }
+
+    // OpenFOAM's updateCoeffs() for a flux-conditional BC. inletOutlet sets valueFraction = neg(phi) from
+    // the patch flux (inletOutletFvPatchField.C), which it reaches through the object registry; brae's
+    // host path has no registry, so the SOLVER pushes the flux in once per iteration, exactly where
+    // OpenFOAM would have looked it up. A no-op on every other patch type.
+    virtual void updateFromFlux(const std::vector<scalar>& /*phip*/) {}
+
+    // OF's flowRateInletVelocity RECOMPUTES its value in updateCoeffs, from the registered rho's PATCH
+    // field -- not from the face cells, and not from `rhoInlet`, which is only the fallback for a solver
+    // that registers no rho (flowRateInletVelocityFvPatchVectorField.C:updateCoeffs/updateValues):
+    //     avgU = -flowRate/gSum(rho*magSf);   value = avgU*n      n = patch().nf(), OUTWARD
+    // A patch that is not one does nothing here.
+    virtual void updateFromDensity(const std::vector<scalar>& /*rhop*/) {}
+
+    // The CONSTRUCTION-time half of the same thing, and it is a different branch. OF's dict constructor
+    // calls evaluate() -> updateCoeffs() only when the case supplies no `value`, so the inlet is already
+    // at avgU*n before createFields.H builds phi from it. When the case DOES supply a `value` OF keeps it
+    // verbatim and replaces it at the first momentum assembly instead. sbMatched gives no value;
+    // angledDuct gives `uniform (0 0 0)`, which makes OF's first inlet mass flux exactly zero. Taking
+    // either branch for both was measured at 303x on the convective boundaryCoeffs.
+    virtual void updateAtConstruction(const std::vector<scalar>& /*rhop*/) {}
+
+    // OF's turbulent inlets RECOMPUTE their refValue in updateCoeffs, from the patch fields as they stand
+    // at that moment -- they do not carry the value the case file was written with:
+    //   turbulentIntensityKineticEnergyInlet:      refValue = 1.5*intensity^2*magSqr(Up)
+    //   turbulentMixingLengthDissipationRateInlet: refValue = (Cmu^0.75/mixingLength)*kp^1.5
+    //   turbulentMixingLengthFrequencyInlet:       refValue = sqrt(kp)/(Cmu^0.25*mixingLength)
+    // Any other patch does nothing here.
+    virtual void updateTurbulentInlet(
+        const std::vector<vector>& /*Up*/,
+        const std::vector<scalar>& /*kp*/,
+        scalar                     /*Cmu*/) {}
+
     // Laplacian/gradient matrix coupling: snGrad = gradientInternalCoeffs * phi_P
     // + gradientBoundaryCoeffs. Default (zeroGradient/empty/calculated) contributes nothing.
     virtual std::vector<T> gradientInternalCoeffs() const { return std::vector<T>(patch_.size, T{}); }
@@ -97,6 +136,14 @@ public:
 
     const std::vector<T>& value() const { return value_; }
     void setValue(const std::vector<T>& v) { value_ = v; }   // e.g. nutkWallFunction writing nut at walls
+
+    // Replace the value the patch HOLDS, not merely the one it currently exposes. OF's operator==(...)
+    // on a fixedValue or calculated patch replaces the stored value, so a later evaluate() reproduces it.
+    // setValue writes value_ ALONE, and both families rebuild value_ from their stored copy on the next
+    // evaluate() -- which silently reverted a corrected flowRateInletVelocity inlet to the `rhoInlet`
+    // seed, at a measured 24% of the case's prescribed mass flow. Use this whenever the new value has to
+    // survive an evaluateBoundary().
+    virtual void setStoredValues(std::vector<T> v) { value_ = std::move(v); }
     // Coupled-patch neighbour (halo) values for the matrix; non-coupled patches return value().
     virtual const std::vector<T>& patchNeighbourField() const { return value_; }
     const FvPatch&        patch() const { return patch_; }
@@ -129,6 +176,12 @@ public:
     {
         for (label i = 0; i < this->patch_.size; ++i)
             this->value_[i] = uniform_ ? uniformValue_ : values_[i];
+    }
+    void setStoredValues(std::vector<T> v) override
+    {
+        uniform_ = false;
+        values_  = std::move(v);
+        evaluate({});
     }
     bool fixesValue() const override { return true; }
     bool assignable() const override { return false; }   // OF fixedValueFvPatchField.H:169
@@ -250,15 +303,59 @@ public:
               (valueUniform || !values.empty()) ? valueUniform : false,
               uniformValue,
               (valueUniform || !values.empty()) ? values : build(p, flowRate, isMass, rhoInlet)),
-          isMass_(isMass), flowRate_(flowRate)
+          isMass_(isMass),
+          flowRate_(flowRate),
+          hadValue_(valueUniform || !values.empty())
     {}
+
+    void updateAtConstruction(const std::vector<scalar>& rhop) override
+    {
+        if (hadValue_) return;      // OF keeps the case's `value` until the first momentum assembly
+        updateFromDensity(rhop);
+    }
     // 9 = flowRateInletVelocity: refValue recomputed per step from the live boundary rho (mass form only).
     int bcCategory() const override { return isMass_ ? 9 : 1; }
     scalar flowRateValue() const override { return flowRate_; }
 
+    // OF updateValues(rho), verbatim. Called where OpenFOAM calls updateCoeffs -- when the momentum
+    // equation is assembled -- so the inlet moves with the solution instead of staying at the seed the
+    // constructor built. The VOLUMETRIC branch is recomputed too: OF passes one{} rather than skipping,
+    // which matters when a case supplies both `volumetricFlowRate` and a `value` that disagrees with it.
+    void updateFromDensity(const std::vector<scalar>& rhop) override
+    {
+        const label n = this->patch_.size;
+        if (n == 0) return;
+        // REFUSE rather than treat a missing density as 1. Silently using the volumetric form for a
+        // massFlowRate inlet rescales the whole inlet by rho, which is the shape of the angledDuct defect.
+        if (isMass_ && rhop.size() < static_cast<std::size_t>(n))
+        {
+            throw std::runtime_error(
+                std::string("flowRateInletVelocity on patch '") + this->patch_.name
+                + "': massFlowRate needs rho on every face of the patch, and was given fewer. "
+                  "Refusing rather than falling back to a density this case did not ask for.");
+        }
+        scalar sumRhoA = 0.0;
+        for (label i = 0; i < n; ++i)
+        {
+            sumRhoA += (isMass_ ? rhop[i] : scalar(1)) * this->patch_.magSf[i];
+        }
+        if (!(sumRhoA > 0.0))
+        {
+            throw std::runtime_error(
+                std::string("flowRateInletVelocity on patch '") + this->patch_.name
+                + "': gSum(rho*magSf) is not positive, so no inlet velocity can be formed from the "
+                  "prescribed flow rate.");
+        }
+        const scalar avgU = -flowRate_ / sumRhoA;
+        std::vector<vector> v(n);
+        for (label i = 0; i < n; ++i) v[i] = avgU * this->patch_.nf[i];
+        this->setStoredValues(std::move(v));
+    }
+
 private:
     bool   isMass_;
     scalar flowRate_ = 0.0;
+    bool   hadValue_ = false;
 
     static std::vector<vector> build(
         const FvPatch& p,
@@ -548,6 +645,17 @@ public:
     bool fixesValue() const override { return false; }
 protected:
     T refValue(label i) const { return uniform_ ? uniformValue_ : (values_.empty() ? T{} : values_[i]); }
+
+public:
+    // OF writes `this->refValue() = ...`; the turbulent inlets do it every updateCoeffs.
+    void setRefValues(std::vector<T> v) { uniform_ = false; values_ = std::move(v); }
+    void setStoredValues(std::vector<T> v) override
+    {
+        setRefValues(std::move(v));
+        evaluate({});
+    }
+
+protected:
     bool           uniform_;
     T              uniformValue_;
     std::vector<T> values_;
@@ -571,58 +679,6 @@ class NutUSpaldingPatchField : public CalculatedPatchField<T>
 public:
     using CalculatedPatchField<T>::CalculatedPatchField;
     bool isNutUSpalding() const override { return true; }
-};
-
-// inletOutlet: flux-conditional mix (OF mixed, valueFraction = neg(phi), refValue = inletValue, refGrad = 0).
-// Per face: inflow (phi<0) -> fixedValue = inletValue; outflow (phi>=0) -> zeroGradient. The host evaluate()
-// does not see the flux; the DEVICE recomputes the per-face fixedValue|zeroGradient choice every iteration from
-// the patch flux (deviceUpdateInletOutlet). value()/refValue = inletValue (also the rest-start boundary value);
-// bcCategory()=3 marks the face inletOutlet for the device builder. (Device-resident solver path; the host CPU
-// assembly path treats category 3 as its zeroGradient base default, see scope in PORTING_INLETOUTLET_BC.md.)
-template <typename T>
-class InletOutletPatchField : public ExtrapolatedValuePatchField<T>   // value()/refValue = inletValue
-{
-public:
-    // TRUE, and this is NOT an oversight in OpenFOAM. mixedFvPatchField::assignable() is false
-    // (mixedFvPatchField.H:200), but inletOutletFvPatchField OVERRIDES it back to true
-    // (inletOutletFvPatchField.H:163-164) -- "True: this patch field is altered by assignment".
-    // outletInlet, which also derives from mixed, does NOT override and so really is false; the two
-    // differ on purpose. Inferring this from the base class instead of reading the derived one made
-    // constrainHbyA take U at every inletOutlet patch, which OpenFOAM does not do: measured on
-    // rhoSimpleFoam's pcEqn, HbyA's boundary was 1.3e-03 out and the resulting phiHbyA 3.5e-03, while the
-    // internal field was exact to 1.4e-15.
-    bool assignable() const override { return true; }    // OF inletOutletFvPatchField.H:164
-    using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
-    int bcCategory() const override { return 3; }                  // inletOutlet (device: per-face fixedValue|zeroGradient)
-};
-
-// outletInlet (freestreamPressure base): the flux-OPPOSITE of inletOutlet, outflow phi>=0 -> fixedValue(outletValue),
-// inflow phi<0 -> zeroGradient. Device category 4 (oioMask). value() = outletValue (= refValue).
-template <typename T>
-class OutletInletPatchField : public ExtrapolatedValuePatchField<T>   // value()/refValue = outletValue (= freestreamValue)
-{
-public:
-    // FALSE, and unlike inletOutlet this one really does inherit it: outletInletFvPatchField declares no
-    // assignable() of its own, so mixedFvPatchField's false stands (mixedFvPatchField.H:200).
-    bool assignable() const override { return false; }   // OF: outletInlet does NOT override mixed
-    using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
-    int bcCategory() const override { return 4; }                  // outletInlet (device: per-face fixedValue|zeroGradient, opposite switch)
-};
-
-// pressureInletOutletVelocity (OF directionMixedFvPatchVectorField): an outlet that allows backflow. Per face by the
-// flux sign (valueFraction = neg(phi)*(I - n n); value = vf&refValue + (I-vf)&pif): outflow (phi>=0) -> zeroGradient
-// (full extrapolation); inflow (phi<0) -> the TANGENTIAL velocity is fixed to refValue (default 0) while the NORMAL
-// component is zeroGradient, so the pressure sets the inflow speed (value = n*(n.U_cell)). The DEVICE recomputes the
-// per-face inflow value each step (deviceUpdatePressureInletOutletVelocity); bcCategory()=6 marks it. Vector-only;
-// a non-zero `tangentialVelocity` field is NOT supported and is now REFUSED at construction (it was
-// only a comment before, so a case carrying one ran with the tangential component silently zeroed).
-template <typename T>
-class PressureInletOutletVelocityPatchField : public ExtrapolatedValuePatchField<T>   // value() = written seed
-{
-public:
-    bool assignable() const override { return false; }   // OF: pressureInletOutletVelocity derives from directionMixed
-    using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
-    int bcCategory() const override { return 6; }                  // device: pressureInletOutletVelocity (outlet, adjustable flux)
 };
 
 // mixed (Robin) BC, OF mixedFvPatchField (refGrad = 0). value = (1-vf)*internal + vf*refValue; the per-face
@@ -684,7 +740,13 @@ public:
         // evaluateBoundary that follows a field read) the value stands as read: on a restart the file's
         // `value` is already OpenFOAM's converged blend, and re-blending it against the 0.5 seed threw it
         // away (restart_vs_openfoam, p L2rel 4.8e-03 against a 1e-03 bound).
-        if (!freestream_ || !vfUpdated_ || internal.empty()) return;
+        // The gate is `vfUpdated_`, NOT the family. What makes the blend defined is whether a REAL
+        // valueFraction has been computed for these faces: the freestream family gets one from
+        // updateMixedFreestream, and inletOutlet/outletInlet get one from updateFromFlux. The plain
+        // `mixed`/mixedEnergy shape sets neither -- brae carries no thermo conversion for it -- so it
+        // still falls through here and keeps the value as read, exactly as before.
+        (void)freestream_;
+        if (!vfUpdated_ || internal.empty()) return;
 
         const std::vector<T> pif = this->patchInternalField(internal);
         for (label i = 0; i < this->patch_.size; ++i)
@@ -737,13 +799,205 @@ public:
             r[i] = this->refValue(i) * vf_[i];
         return r;
     }
+protected:
+    // PROTECTED, not private, so a derived flux-conditional patch can SEED the valueFraction without
+    // going through setValueFraction() -- which also sets vfUpdated_, and that flag is what tells
+    // evaluate() a real blend is available. Seeding through it would make the first evaluateBoundary()
+    // after a field read blend against a fraction no iteration has computed, throwing away the value
+    // OpenFOAM wrote on a restart. The seed is a starting point; vfUpdated_ is a statement about
+    // whether the flow has been consulted, and the two are not the same thing.
+    std::vector<scalar> vf_;            // per-face valueFraction (freestream seed 0.5; flux-conditional 0)
+
 private:
     bool                velocitySign_;  // true: vf=0.5-0.5 U.n/|U| (velocity); false: 0.5+0.5 ... (pressure)
     bool                freestream_;    // this class also serves the plain `mixed`/mixedEnergy shape
     bool                vfUpdated_ = false;   // has a real valueFraction been computed yet?
-    std::vector<scalar> vf_;            // per-face valueFraction (seed 0.5; device recomputes from the flow angle)
 
     std::vector<T> refGrad_;
+};
+
+// inletOutlet: flux-conditional mix (OF mixed, valueFraction = neg(phi), refValue = inletValue, refGrad = 0).
+// Per face: inflow (phi<0) -> fixedValue = inletValue; outflow (phi>=0) -> zeroGradient. The host evaluate()
+// does not see the flux; the DEVICE recomputes the per-face fixedValue|zeroGradient choice every iteration from
+// the patch flux (deviceUpdateInletOutlet). value()/refValue = inletValue (also the rest-start boundary value);
+// bcCategory()=3 marks the face inletOutlet for the device builder. (Device-resident solver path; the host CPU
+// assembly path treats category 3 as its zeroGradient base default, see scope in PORTING_INLETOUTLET_BC.md.)
+template <typename T>
+class InletOutletPatchField : public MixedPatchField<T>   // value()/refValue = inletValue
+{
+public:
+    // TRUE, and this is NOT an oversight in OpenFOAM. mixedFvPatchField::assignable() is false
+    // (mixedFvPatchField.H:200), but inletOutletFvPatchField OVERRIDES it back to true
+    // (inletOutletFvPatchField.H:163-164) -- "True: this patch field is altered by assignment".
+    // outletInlet, which also derives from mixed, does NOT override and so really is false; the two
+    // differ on purpose. Inferring this from the base class instead of reading the derived one made
+    // constrainHbyA take U at every inletOutlet patch, which OpenFOAM does not do: measured on
+    // rhoSimpleFoam's pcEqn, HbyA's boundary was 1.3e-03 out and the resulting phiHbyA 3.5e-03, while the
+    // internal field was exact to 1.4e-15.
+    bool assignable() const override { return true; }    // OF inletOutletFvPatchField.H:164
+    bool isInletOutlet() const override { return true; }
+    // The mixed base takes a velocity-sign flag and a freestream flag for the far-field family; neither
+    // applies here, so the flux-conditional families get their own four-argument constructor and the
+    // valueFraction comes from updateFromFlux instead.
+    InletOutletPatchField(
+        const FvPatch& p,
+        bool uniform,
+        T uval,
+        std::vector<T> vals)
+        : MixedPatchField<T>(p, uniform, uval, std::move(vals), /*velocitySign=*/true)
+    {
+        // SEED THE VALUE FRACTION AT ZERO, not at the mixed base's 0.5. That 0.5 is the FREESTREAM
+        // seed -- a half-and-half flow-angle blend waiting for updateMixedFreestream -- and it is
+        // meaningless for a flux-conditional patch, which is either fully zeroGradient or fully
+        // fixedValue per face and never in between. Zero is the outflow branch, which is what this
+        // patch behaved as before it became mixed, so a field whose flux has not been pushed in yet is
+        // unchanged rather than half-fixed. Getting this wrong reports valueInternalCoeffs = 0.5 where
+        // OpenFOAM has 1, which measured 2.8e-01 on the momentum internalCoeffs.
+        this->vf_.assign(p.size, 0.0);
+    }
+
+    // inletOutletFvPatchField::updateCoeffs -- valueFraction = neg(phi): 1 where the flux ENTERS the
+    // domain (fixedValue on inletValue), 0 where it leaves (zeroGradient). `neg`, not `1 - pos0`: they
+    // agree everywhere except at phi exactly 0, where OpenFOAM takes the outflow branch.
+    void updateFromFlux(const std::vector<scalar>& phip) override
+    {
+        std::vector<scalar> vf(this->patch_.size, 0.0);
+        for (label i = 0; i < this->patch_.size && i < (label)phip.size(); ++i)
+            vf[i] = (phip[i] < 0.0) ? 1.0 : 0.0;
+        this->setValueFraction(std::move(vf));
+    }
+    int bcCategory() const override { return 3; }                  // inletOutlet (device: per-face fixedValue|zeroGradient)
+};
+
+// The two RAS inlets that derive from inletOutlet in OpenFOAM and recompute their refValue every
+// updateCoeffs. They differ from a plain inletOutlet in exactly that: the flux switch is the base's, the
+// inflow VALUE is not read from the case file but computed from the current U (for k) or the current k
+// (for epsilon/omega). Reading the file's `value` and keeping it is what a solver does when it never calls
+// updateCoeffs, and it leaves the inlet frozen at whatever state the case was written in.
+//   turbulentIntensityKineticEnergyInletFvPatchScalarField.C:      refValue = 1.5*sqr(intensity)*magSqr(Up)
+//   turbulentMixingLengthDissipationRateInletFvPatchScalarField.C: refValue = (Cmu^0.75/L)*pow(kp, 1.5)
+//   turbulentMixingLengthFrequencyInletFvPatchScalarField.C:       refValue = sqrt(kp)/(Cmu^0.25*L)
+template <typename T>
+class TurbulentInletPatchField : public InletOutletPatchField<T>
+{
+public:
+    enum Kind { intensityK, mixingLengthEpsilon, mixingLengthOmega };
+
+    TurbulentInletPatchField(
+        const FvPatch& p,
+        bool           uniform,
+        T              uval,
+        std::vector<T> vals,
+        Kind           kind,
+        scalar         coefficient)
+        : InletOutletPatchField<T>(p, uniform, uval, std::move(vals)),
+          kind_(kind),
+          coefficient_(coefficient)
+    {}
+
+    void updateTurbulentInlet(
+        const std::vector<vector>& Up,
+        const std::vector<scalar>& kp,
+        scalar                     Cmu) override
+    {
+        if constexpr (std::is_same<T, scalar>::value)
+        {
+            const bool fromU = (kind_ == intensityK);
+            const std::size_t have = fromU ? Up.size() : kp.size();
+            // REFUSE rather than fill what is missing with zeros. A short source array here would leave
+            // part of the inlet at refValue = 0 -- a silent no-turbulence inlet, which is exactly the
+            // kind of substitution that took four measurements to find the last time it happened.
+            if (have < static_cast<std::size_t>(this->patch_.size))
+            {
+                throw std::runtime_error(
+                    std::string("turbulent inlet on patch '") + this->patch_.name
+                    + "': updateCoeffs needs " + (fromU ? "U" : "k")
+                    + " on every face of the patch, and was given fewer. Refusing rather than "
+                      "computing an inlet value from a field that is not there.");
+            }
+            std::vector<scalar> r(this->patch_.size, scalar{0});
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                if (fromU)
+                {
+                    r[i] = 1.5 * (coefficient_ * coefficient_) * magSqr(Up[i]);
+                }
+                else if (kind_ == mixingLengthEpsilon)
+                {
+                    r[i] = (std::pow(Cmu, 0.75) / coefficient_) * std::pow(kp[i], 1.5);
+                }
+                else
+                {
+                    r[i] = std::sqrt(kp[i]) / (std::pow(Cmu, 0.25) * coefficient_);
+                }
+            }
+            this->setRefValues(std::move(r));
+        }
+        else
+        {
+            (void)Up;
+            (void)kp;
+            (void)Cmu;
+        }
+    }
+
+private:
+    Kind   kind_;
+    scalar coefficient_;      // intensity, or mixingLength
+};
+
+
+// outletInlet (freestreamPressure base): the flux-OPPOSITE of inletOutlet, outflow phi>=0 -> fixedValue(outletValue),
+// inflow phi<0 -> zeroGradient. Device category 4 (oioMask). value() = outletValue (= refValue).
+template <typename T>
+class OutletInletPatchField : public MixedPatchField<T>   // value()/refValue = outletValue (= freestreamValue)
+{
+public:
+    // FALSE, and unlike inletOutlet this one really does inherit it: outletInletFvPatchField declares no
+    // assignable() of its own, so mixedFvPatchField's false stands (mixedFvPatchField.H:200).
+    bool assignable() const override { return false; }   // OF: outletInlet does NOT override mixed
+    OutletInletPatchField(
+        const FvPatch& p,
+        bool uniform,
+        T uval,
+        std::vector<T> vals)
+        : MixedPatchField<T>(p, uniform, uval, std::move(vals), /*velocitySign=*/true)
+    {
+        // SEED THE VALUE FRACTION AT ZERO, not at the mixed base's 0.5. That 0.5 is the FREESTREAM
+        // seed -- a half-and-half flow-angle blend waiting for updateMixedFreestream -- and it is
+        // meaningless for a flux-conditional patch, which is either fully zeroGradient or fully
+        // fixedValue per face and never in between. Zero is the outflow branch, which is what this
+        // patch behaved as before it became mixed, so a field whose flux has not been pushed in yet is
+        // unchanged rather than half-fixed. Getting this wrong reports valueInternalCoeffs = 0.5 where
+        // OpenFOAM has 1, which measured 2.8e-01 on the momentum internalCoeffs.
+        this->vf_.assign(p.size, 0.0);
+    }
+
+    // outletInletFvPatchField::updateCoeffs -- valueFraction = pos0(phi), the exact opposite switch.
+    void updateFromFlux(const std::vector<scalar>& phip) override
+    {
+        std::vector<scalar> vf(this->patch_.size, 0.0);
+        for (label i = 0; i < this->patch_.size && i < (label)phip.size(); ++i)
+            vf[i] = (phip[i] >= 0.0) ? 1.0 : 0.0;
+        this->setValueFraction(std::move(vf));
+    }
+    int bcCategory() const override { return 4; }                  // outletInlet (device: per-face fixedValue|zeroGradient, opposite switch)
+};
+
+// pressureInletOutletVelocity (OF directionMixedFvPatchVectorField): an outlet that allows backflow. Per face by the
+// flux sign (valueFraction = neg(phi)*(I - n n); value = vf&refValue + (I-vf)&pif): outflow (phi>=0) -> zeroGradient
+// (full extrapolation); inflow (phi<0) -> the TANGENTIAL velocity is fixed to refValue (default 0) while the NORMAL
+// component is zeroGradient, so the pressure sets the inflow speed (value = n*(n.U_cell)). The DEVICE recomputes the
+// per-face inflow value each step (deviceUpdatePressureInletOutletVelocity); bcCategory()=6 marks it. Vector-only;
+// a non-zero `tangentialVelocity` field is NOT supported and is now REFUSED at construction (it was
+// only a comment before, so a case carrying one ran with the tangential component silently zeroed).
+template <typename T>
+class PressureInletOutletVelocityPatchField : public ExtrapolatedValuePatchField<T>   // value() = written seed
+{
+public:
+    bool assignable() const override { return false; }   // OF: pressureInletOutletVelocity derives from directionMixed
+    using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
+    int bcCategory() const override { return 6; }                  // device: pressureInletOutletVelocity (outlet, adjustable flux)
 };
 
 // processor: rank<->rank coupled patch. The exchange receives the NEIGHBOUR cells' values (the
@@ -1025,7 +1279,17 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // here we build an inletOutlet placeholder from the written `value` so buildField succeeds.
     if (d.type == "turbulentIntensityKineticEnergyInlet" || d.type == "turbulentMixingLengthDissipationRateInlet"
         || d.type == "turbulentMixingLengthFrequencyInlet")
-        return std::make_unique<InletOutletPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    {
+        // The file's `value` is the SEED only. OF recomputes refValue in updateCoeffs from the current U
+        // or k, so the patch carries the rule and its coefficient rather than the written number.
+        const bool ki = (d.type == "turbulentIntensityKineticEnergyInlet");
+        const auto kind = ki ? TurbulentInletPatchField<T>::intensityK
+                             : (d.type == "turbulentMixingLengthDissipationRateInlet"
+                                ? TurbulentInletPatchField<T>::mixingLengthEpsilon
+                                : TurbulentInletPatchField<T>::mixingLengthOmega);
+        return std::make_unique<TurbulentInletPatchField<T>>(
+            p, d.valueUniform, d.uniformValue, d.values, kind, ki ? d.intensity : d.mixingLength);
+    }
     // base `freestream` (e.g. k/omega) derives from inletOutlet in OF -> BINARY flux switch (kept).
     if (d.type == "freestream")
         return std::make_unique<InletOutletPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues);

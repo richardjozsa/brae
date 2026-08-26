@@ -60,9 +60,167 @@ needs it, by name, rather than substitute something plausible.
 | `slice/` | an earlier re-port attempt whose stated policy was "Tier B — copied, then re-validated". **Superseded by this file**: copying is what we are not doing |
 | `cpu/boundary_mu_eff.cuh` | predates this; not part of the ground-up port |
 
+## The compressible kEpsilon closure: four defects, found by reading OpenFOAM's own numbers
+
+`tools/dumpKEpsilon` is OpenFOAM's `kEpsilon` with writes added and its equations untouched, registered as
+`kEpsilonDump` through `makeRASModel`. It writes `gradU`, `divU`, `GbyNu`, `G`, both diffusivities, the
+mesh factors the laplacian coefficient is the product of, both assembled systems before and after
+`relax()`/`boundaryManipulate()`, and their off-diagonals. Every one of those has an oracle, so a
+disagreement names a term instead of starting an argument. `tests/rho_kepsilon_vs_openfoam.sh` selects it
+and `tests/test_rho_kepsilon_cpp.cu` does the comparison.
+
+The gap it was pointed at was epsilon 2.8e-02, k 5.2e-02, nut 3.1e-02. It was four separate defects.
+
+**1. The closure was never given the flux, so `fvc::grad(U)` read the wrong boundary face value.** `gradU`
+was exact in the interior (2.5e-14) and 1.5e-01 wrong in cells touching a patch — the split is what named
+it. `U`'s `inletOutlet` outlet had been evaluated on a seeded `valueFraction`, because nothing had pushed
+`phi` into it. In OpenFOAM this cannot happen: `fvMatrix`'s constructor calls
+`psi.boundaryFieldRef().updateCoeffs()`, and `updateCoeffs` is where a flux-conditional patch reads the
+flux. `U`'s boundary went to 0.0 on every patch once the flux was pushed, and `gradU`, `GbyNu` and `G`
+went to ~6e-15.
+
+**2. `k` and `epsilon` had no `updateCoeffs` either, so their boundaries contributed nothing.** With the
+`valueFraction` left at its seed every patch behaved as zero-gradient: brae's `boundaryCoeffs` summed to
+exactly zero where OpenFOAM's did not. The equations were being solved with the inlet absent. The fix is
+the same one OpenFOAM makes structurally — push the flux at the point the matrix is built — and it is now
+done at both assemblies in `kEpsilon_cpp.cu`.
+
+**3. The turbulent inlets were frozen at the case file's `value`.** OpenFOAM RECOMPUTES `refValue` on
+every `updateCoeffs`, from the patch fields as they stand at that moment:
+
+    turbulentIntensityKineticEnergyInletFvPatchScalarField.C:      refValue = 1.5*sqr(intensity)*magSqr(Up)
+    turbulentMixingLengthDissipationRateInletFvPatchScalarField.C: refValue = (Cmu^0.75/L)*pow(kp, 1.5)
+
+epsilon's comes from `k`'s patch values and k's from `U`'s. brae computed them once at setup, in helpers
+(`turbulent_inlet.cuh`) that no solver ever called. At the dump iteration the frozen inlet was 6.09x
+OpenFOAM's, and the boundary VALUE comparison could not see it — brae's refValue equalled the file's
+`value`, which is what the file's `value` is. Only the assembled coefficient showed it. These are now
+`TurbulentInletPatchField`, which carries the rule and its coefficient instead of a number, and the
+closure refreshes them where OpenFOAM does.
+
+**4. The diffusion terms were assembled with `Gauss linear orthogonal` while the case said `corrected`.**
+Every factor of the laplacian's face coefficient agreed with OpenFOAM's own — `nonOrthDeltaCoeffs`
+1.2e-14, `deltaCoeffs` 1.2e-14, `magSf` 4.6e-16, the interpolated diffusivity 2.9e-15 — and their product
+did not, at 2.2e-06. That is only possible if a different factor is being multiplied, and brae's
+five-argument `fvm::laplacian` is the orthogonal form: it selects `deltaCoeffs` where `corrected` selects
+`nonOrthDeltaCoeffs`, and it omits the explicit non-orthogonal source entirely. `kOmegaSST` in the same
+directory already takes both halves and passes the flag; `kEpsilon` never did, so the case's own
+`laplacianSchemes` was being silently substituted. On this near-orthogonal mesh it was worth 5e-06 in
+epsilon — small enough to read as round-off, and not round-off.
+
+After all four: epsilon 5.0e-15, k 8.9e-16, nut 1.7e-15, alphat 2.3e-15, wall and interior alike, with
+every intermediate at the same order and the term sweep still discriminating on all eight terms.
+
+**A note on the control.** `rho_kepsilon_vs_openfoam`'s divU control asserted `> 1e-3` absolute, and it
+passed throughout the period when the closure was 2.8e-02 out — that is, it could not tell a working
+`divU` from a broken one, because everything was broken. It now asserts that the wrong flux is worse than
+the right one by at least 1e3x, with an absolute floor. That is strictly stronger: a fixture with uniform
+rho, where the two fluxes coincide and nothing could discriminate, now fails the control instead of
+passing it vacuously.
+
 ## Open findings, turned up by the port and belonging to other components
 
-**`flowRateInletVelocity` disagrees with OpenFOAM by ~2.4e-01 on sbMatched.** Found while gating UEqn:
+**The device kEpsilon has the same `corrected` question, unmeasured.** `device_simple_foam.cu`'s
+turbulence assembly was not touched here, and the `_cpp` closure's defect 4 above — assembling the k and
+epsilon diffusion terms orthogonally while the case's `laplacianSchemes` says `corrected` — is worth
+checking there for the same reason. It is not asserted either way: the ten incompressible tutorials pass
+their gates, and on a near-orthogonal mesh the effect was 5e-06, which those bounds would not resolve. It
+is recorded rather than fixed because that path is validated and this session's scope was the compressible
+`_cpp` closure.
+
+
+## `flowRateInletVelocity`: three defects, and what un-neutralising the inlet exposed
+
+RETIRED, and the gates no longer substitute a plain `fixedValue` for it. `tests/rho_ueqn_vs_openfoam.sh`
+runs the fixture's own inlet and asserts the invariant: the patch carries EXACTLY the prescribed
+`massFlowRate`, `sum(phi) = -0.5` against OpenFOAM's `-0.5`. rAU went 4.58e-05 -> 6.13e-15 and the momentum
+`boundaryCoeffs` 4.15e-01 -> 4.89e-16.
+
+`flowRateInletVelocityFvPatchVectorField::updateValues` is `avgU = -flowRate/gSum(rho*magSf)`, with `rho`
+the registered field's PATCH values. Three things were wrong:
+
+1. **No per-iteration update.** OpenFOAM recomputes it in `updateCoeffs()`, which `fvMatrix`'s constructor
+   calls at every momentum assembly. The `_cpp` driver never did, so the inlet stayed at its seed. This is
+   the fifth instance of the same shape as the four kEpsilon defects.
+2. **No construction-time update.** `createFields.H` builds `rho` (line 22) BEFORE `U` (line 26), so
+   OpenFOAM's dict constructor already finds the real density -- and `compressibleCreatePhi.H` then builds
+   phi from an inlet that is already correct. brae seeded from `rhoInlet 0.5`, which sbMatched itself
+   labels "Guess for rho" and which OpenFOAM reaches ONLY when no rho field is registered. The seeded flux
+   was 24% short: -0.382 against -0.5. Note OpenFOAM has two branches here and both are real -- with a
+   `value` in the case it keeps that verbatim (angledDuct's `uniform (0 0 0)` makes OF's first inlet flux
+   exactly zero), without one it computes `avgU*n` at construction.
+3. **`setValue` was undone by the next `evaluate()`.** Both the fixedValue and the calculated families
+   rebuild `value_` from their stored copy on evaluate, so writing `value_` alone silently reverted the
+   corrected inlet to its seed -- which is why fixing (1) and (2) changed nothing until this was found.
+   `setStoredValues()` replaces what the patch HOLDS, as OpenFOAM's `operator==` does. `rho`'s boundary
+   writes in the driver had the same exposure and now use it too.
+
+Also corrected while here: `GeometricField::relax` is `operator==(prevIter + alpha*(...))` and
+`GeometricField::operator==` assigns BOTH halves (`internalFieldRef() = ...; boundaryFieldRef() == ...`),
+so `rho.relax()` relaxes the boundary. The driver relaxed only the internal field. Inert on this fixture,
+which sets `transonic yes` and therefore does not relax rho at all, but it is not inert in general.
+
+### What the neutralised inlet had been hiding
+
+**The gates had been validating an essentially incompressible case.** With its own inlet sbMatched runs at
+|U| ~ 523 m/s; the `fixedValue uniform (1 2 3)` substitute runs at 3.7 m/s. Every rhoSimpleFoam gate was
+therefore passing on a state where the kinetic-energy terms are four orders of magnitude smaller than the
+case's own.
+
+The energy gate on the real inlet is EXACT: `EEqn.D()` 1.68e-15, source 5.81e-16, and OpenFOAM's own
+`div(phi,Ekp)` reproduced to 5.46e-15 on boundary cells. An earlier note here claimed 2.34e-01 -- that
+measurement was taken with a test binary that had not been rebuilt after the `setStoredValues` fix, so it
+was reading the flowRateInletVelocity defect through a stale executable. `ctest` does not rebuild and
+neither does a hand-run gate script; rebuild before measuring.
+
+What the real inlet DID expose was a second defect, and a gap in how the gates were built.
+
+**`transportAlpha` was being handed a temperature where it takes a viscosity.** `transport_model.cuh`
+declares `transportAlpha(scalar mu, const ThermoCoeffs&)` -- `mu/Pr` for constTransport, the Eucken
+`kappa/Cp` built from mu for sutherland. The driver called `transportAlpha(T, f.thermo)`. At T = 1000 K
+that read as a viscosity of 1000 Pa.s and produced an `alphaEff` of 2.03e+03 against OpenFOAM's 3.26e-04
+-- six orders too large. It did not crash and it did not diverge: an over-diffusive energy equation
+returns a nearly uniform temperature, which on a low-speed fixture is very nearly the right answer. The
+symptom was the ENERGY residual alone stalling at 1.9e-03 while U, p, k and epsilon all reached 1e-08, and
+OpenFOAM's own `e` residual reaching 8.8e-08 on the same case is what made it a defect rather than a
+property of the equation.
+
+Fixed at both call sites (cell and boundary). Afterwards, end to end on the real inlet:
+
+| | before | after | OpenFOAM |
+|---|---|---|---|
+| e residual | 1.904e-03 | 6.714e-08 | 8.78e-08 |
+| U | 2.58e-02 | 8.48e-05 | -- |
+| T | 5.11e-02 | 1.48e-05 | -- |
+| p | 5.37e-02 | 6.76e-05 | -- |
+| rho | 3.60e-02 | 5.62e-05 | -- |
+
+**Why no gate could see it.** `rho_eeqn_vs_openfoam` INJECTS OpenFOAM's `alphaEff` and
+`rho_ueqn_vs_openfoam` injects its `muEff`, both deliberately, so that the assembly number stays
+attributable to the assembly. The cost is that the solver's OWN transport was never compared to
+OpenFOAM's -- a driver can assemble exactly from an `alphaEff` of its own making and still converge
+somewhere else. The energy gate now asserts brae's own laminar `alphaEff` against `thermo.alphahe()`,
+dumped as `stage_alphaEffLam`: 6.38e-16, 8.499993e-05 against 8.499993e-05. The turbulent halves are
+reported rather than asserted, because the model's nut and alphat at that point are its own state.
+
+`rho_simple_end_to_end_vs_openfoam` now runs the fixture's OWN inlet, and asserts the boundary condition's
+defining property beside the fields: the inlet delivers its prescribed `massFlowRate`.
+
+The momentum gate's `muEff` injection is closed the same way, against `thermo.mu()` dumped as
+`stage_muLam`: **9.70e-16**, 4.191435e-05 against 4.191435e-05, and exact on every patch boundary as well
+as in the cells -- `divDevRhoReff`'s face viscosity takes the patch values, so a muEff right in the cell
+and wrong on the face would still poison the momentum coefficients there. **No defect: the sibling was
+clean.** That is worth recording as a measurement rather than left unmeasured, because the reason for
+looking was that its twin `alphaEff` had been six orders wrong behind an identical injection, and "we
+checked and it was fine" is a different state of knowledge from "we never looked."
+
+Both gates still INJECT the full `muEff`/`alphaEff` for the assembly comparison, which remains the right
+design -- the injection is what keeps the assembly number attributable. What changed is that the solver's
+own laminar transport is now asserted beside it, so the injection can no longer hide a defect in it. The
+turbulent halves are reported and not asserted: the model's `nut` and `alphat` at that point are its own
+state, not something `createFields` reconstructs.
+
+**`flowRateInletVelocity` disagreed with OpenFOAM by ~2.4e-01 on sbMatched.** RETIRED, see above. Found while gating UEqn:
 with the fixture's own inlet in place, `rAU` read 4.58e-05 and the inlet's `boundaryCoeffs` 4.15e-01
 against OpenFOAM, while the outlet, the walls, and the inlet's `internalCoeffs` were all at machine
 precision. Replacing only the inlet with a plain `fixedValue` — changing nothing else — took those to
@@ -121,3 +279,113 @@ SIMPLEC; OpenFOAM's own HbyA correction moves the field by 9e-10 there, which is
 failing to cancel at p ~ 1.1e5. `tests/rho_pceqn_vs_openfoam.sh` therefore develops the fields for 20
 iterations and compares a restart, where the correction moves HbyA by 2.4e-01, and it **asserts** that
 `rAtU` differs from `rAU` so the fixture cannot quietly go inert again.
+
+**brae's host path had no `inletOutlet` flux switch — FIXED.** Found by the end-to-end gate. OpenFOAM's
+`inletOutlet` is a MIXED boundary condition with `valueFraction = neg(phi)`: fixedValue(inletValue) where
+the flux enters, zeroGradient where it leaves. brae's `_cpp` patch field was an extrapolated value — the
+outflow half only — while the device path handled the switch separately, so the host reference and the
+device solver did not implement the same boundary condition.
+
+It was not fixable by writing a different value: the mixed form changes the matrix **coefficients**
+(`valueInternalCoeffs = 1 − vf`, `gradientInternalCoeffs = −vf·deltaCoeffs`, …). What it needed was
+already in the tree — `MixedPatchField` existed for the freestream family with all four of OpenFOAM's
+coefficient expressions — so `inletOutlet` and `outletInlet` were reparented onto it rather than a second
+mixed implementation being written. Its blend gate was generalised from "is this the freestream family"
+to "has a real valueFraction been computed", which is the condition that was actually meant; the plain
+`mixed`/mixedEnergy shape sets neither and is unchanged.
+
+Two consequences had to move with it. brae's host has no object registry, so the SOLVER pushes `phi` in
+once per iteration (`updateFromFlux`) exactly where OpenFOAM's `updateCoeffs` would have looked it up. And
+`fixesValue()` is now TRUE for inletOutlet, inherited from mixed as in OpenFOAM — which makes
+`adjustPhi`'s `!isA<inletOutletFvPatchVectorField>` exclusion **required** rather than implied, in
+simpleFoam's `adjustPhi` as well as rhoSimpleFoam's. Without it an inletOutlet outlet counts as a fixed
+outflow and adjustPhi has nothing adjustable left to balance against.
+
+Measured end to end, before and after: U 1.29e-03 → **1.46e-04**, and at the outlet itself 1.47e-02 →
+**9.93e-06**; p 4.70e-08 → 1.50e-09. The gate's U bound came down from 2e-3 to 5e-4 with it, and the
+per-patch confinement is now asserted for every patch including the outlet.
+
+**A fixture can fail to discriminate a whole set of fields.** On sbMatched, p, T and rho barely move from
+their initial values — the start state is already within 3.1e-06 of OpenFOAM's converged p. No bound on
+those three can both pass a correct solver and fail one that did nothing, so the end-to-end gate reports
+them and gates only U, whose start state fails by 1.0. The control is what establishes that, per field,
+rather than it being assumed.
+
+## Two defects this port introduced, and what they cost to find
+
+**Colliding header basenames.** rhoSimpleFoam's files were named after OpenFOAM's — `UEqn_cpp.cuh`,
+`pEqn_cpp.cuh`, `createFields_cpp.cuh` — which is what "mirror OpenFOAM's tree" asks for. But brae puts
+every source directory on ONE include path, so `#include "UEqn_cpp.cuh"` became ambiguous and simpleFoam's
+own test started picking up rhoSimpleFoam's header. It compiled for five components because only specific
+targets were ever built; the first full build of the tree failed immediately. The files now carry a `rho`
+prefix (`rhoUEqn_cpp.cuh` and so on). OpenFOAM can share basenames across directories because each solver
+compiles with its own `-I`; brae cannot, and the mirror has to yield to that.
+
+The lesson is narrower than "build everything every time": a component gate that only builds its own
+target cannot see a collision it causes elsewhere, so a full build belongs at the end of a component even
+when its own gate is green.
+
+**A seed that meant something else.** Reparenting `inletOutlet` onto the existing `MixedPatchField`
+inherited its `valueFraction` seed of 0.5 — which is the FREESTREAM seed, a half-and-half flow-angle blend
+waiting for `updateMixedFreestream`. A flux-conditional patch is never half-fixed: it is fully zeroGradient
+or fully fixedValue per face. The seed had to be 0 (the outflow branch, i.e. the behaviour the patch had
+before it became mixed), and it had to be set WITHOUT going through `setValueFraction`, because that also
+raises `vfUpdated_` — the flag that tells `evaluate()` a real blend exists, and raising it early throws
+away the value OpenFOAM wrote on a restart. Getting it wrong reported `valueInternalCoeffs = 0.5` where
+OpenFOAM has 1, and the momentum gate caught it at 2.8e-01 on `internalCoeffs`.
+
+## The compressible turbulence closure — kEpsilon, partly done
+
+**The real tutorials now RUN.** rhoSimpleFoam's own fixture (kEpsilon, `consistent yes`, `transonic yes`)
+goes end to end where it was previously refused by name: residuals fall U 1.0 → 2.1e-02, k 1.0 → 2.7e-02,
+epsilon 5.4e-01 → 5.1e-03 over twelve iterations, and keep falling.
+
+**Ported by generalising, not forking.** OpenFOAM has ONE templated `kEpsilon.C`; what makes it
+compressible is the instantiation — alpha = 1, rho = the density field, `alphaRhoPhi` = the MASS flux, and
+a nu that varies with temperature. brae's `kEpsilonRef::correct()` therefore gained a `Compressible`
+parameter whose absence reproduces the incompressible lineage exactly, rather than a second
+transcription. That claim is measured, not asserted: the incompressible kEpsilon tests are **10/10
+unchanged**.
+
+**Two fluxes, not one.** The div operator takes the MASS flux while `divU` takes the VOLUMETRIC one —
+`compressibleTurbulenceModel::phi()` returns `phi/fvc::interpolate(rho)` when the stored flux has mass
+dimensions. In the incompressible lineage they are the same field. `bounded` takes the equation's own
+flux, which is the mass one.
+
+### Two defects found and fixed
+
+**A scalar `nu` the compressible lineage does not have.** The nut BOUNDARY update after `correctNut` was
+the one call site still reading the case-constant viscosity. The compressible path passes the viscosity as
+a field, so that scalar was 0 — it went into a divisor and the whole solve was non-finite inside the first
+iteration. `nutkWallFunction` gained a per-face overload; the existing scalar callers are untouched.
+
+**The k destruction term was missing its rho.** `- fvm::Sp(alpha*rho*epsilon/k, k)`. The rho is invisible
+in the incompressible lineage where it is 1; here rho is ~0.38, so k's destruction ran 2.6x too strong.
+Fixing it moved k from 3.31e-01 to **5.21e-02** against OpenFOAM and nut from 5.29e-01 to **3.14e-02**.
+
+### What is not done, and what is known about it
+
+epsilon is still **2.8e-02** out overall — **5.4e-15 at the wall** (the `setValues` constraint and the
+wall's epsilon and G are exact) and **7.4e-02 through the interior**. k follows it at 5.2e-02.
+
+Ruled out, each by measurement rather than by reading:
+- the linear solve — tightening the tolerance from 1e-12 to 1e-16 changes nothing, bit for bit;
+- the coefficients — Cmu 0.09, C1 1.44, C2 1.92, C3 0, sigmak 1.0, sigmaEps 1.3 in both, and the fixture
+  overrides none of them;
+- `GbyNu` — `gradU && devTwoSymm(gradU)`, and that expression is transpose-invariant, so brae's gradient
+  convention cannot be the cause;
+- `nut`'s wall boundary values — not re-evaluated away, confirmed bit-identical either way;
+- `setValues` — brae removes the constrained cell's off-diagonal from its NEIGHBOURS and corrects their
+  source, which is what OpenFOAM does and would otherwise have explained "wall exact, interior wrong".
+
+The term sweep points at the epsilon PRODUCTION: dropping it halves the disagreement (2.8e-02 → 1.4e-02).
+Against that, the epsilon equation's INITIAL RESIDUAL matches OpenFOAM to 0.16% (4.5319e-01 against
+4.53931e-01), so the assembled matrix is very nearly right and a stiff, source-dominated system is
+amplifying a small term error into a 7% field difference. Those two facts are not yet reconciled and that
+is the next thing to do.
+
+`tests/rho_kepsilon_vs_openfoam.sh` is the instrument: it brackets OpenFOAM's own `turbulence->correct()`
+via tools/dumpPEqn, runs brae's closure on OpenFOAM's exact inputs, and prints a per-term sweep and a
+wall/interior split. It is **not registered as a ctest** — the closure does not yet meet a bound worth
+asserting, and registering it against the numbers it currently produces would record a disagreement as a
+specification.

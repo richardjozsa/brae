@@ -34,4 +34,25 @@ std::vector<scalar> nutkWallFunction(
     return nutw;
 }
 
+std::vector<scalar> nutkWallFunction(
+    const FvPatch& wall,
+    const std::vector<scalar>& y,
+    const std::vector<scalar>& kInternal,
+    const std::vector<scalar>& nuFace,
+    scalar Cmu,
+    scalar kappa,
+    scalar E)
+{
+    const scalar Cmu25  = std::pow(Cmu, 0.25);
+    const scalar yplLam = yPlusLam(kappa, E);
+    std::vector<scalar> nutw(wall.size);
+    for (label i = 0; i < wall.size; ++i)
+    {
+        const scalar kc  = kInternal[wall.faceCells[i]];
+        const scalar nuw = nuFace[i];
+        nutw[i] = nutkWallFunctionValue(yPlusWall(Cmu25, y[i], kc, nuw), nuw, yplLam, kappa, E);
+    }
+    return nutw;
+}
+
 } // namespace brae

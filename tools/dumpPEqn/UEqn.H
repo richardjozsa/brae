@@ -10,6 +10,15 @@
     if (runTime.timeIndex() == braeDumpIter())
     {
         volVectorField("stage_Uass", U).write();
+        // rho EXACTLY as it stands when the momentum equation is assembled -- the field
+        // flowRateInletVelocity::updateCoeffs looks up, so brae's inlet can be held against the same
+        // density OpenFOAM held it against. It is the RELAXED solver rho from the previous iteration,
+        // which is not thermo.rho() and not the face-cell values.
+        volScalarField("stage_rhoU", rho).write();
+        // phi EXACTLY as the momentum equation is convected by. From iteration 2 on this is the
+        // CONSERVATIVE flux the previous pressure solve left, which is not what compressibleCreatePhi.H
+        // would recompute from rho and U -- so a brae-side phi rebuilt at this point is a different field.
+        surfaceScalarField("stage_phiU", phi).write();
     }
 
     tmp<fvVectorMatrix> tUEqn
@@ -85,4 +94,9 @@
     {
         volVectorField("stage_Upred", U).write();
         volScalarField("stage_muEff", turbulence->muEff()).write();
+        // thermo.mu(), the LAMINAR half of muEff with no turbulence in it -- the twin of
+        // stage_alphaEffLam. muEff is INJECTED into the momentum gate so that its assembly number stays
+        // attributable, which also means brae's own viscosity had never been compared to OpenFOAM's.
+        // Its sibling alphaEff turned out to be six orders wrong behind exactly that injection.
+        volScalarField("stage_muLam", thermo.mu()).write();
     }

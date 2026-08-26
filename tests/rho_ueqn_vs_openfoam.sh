@@ -51,25 +51,13 @@ DUMP="$(command -v dumpPEqn || true)"
 cp -r "$W/case/0.orig" "$W/case/0"
 
 # THE INLET IS REPLACED BY A PLAIN fixedValue, and that is deliberate isolation, not convenience.
-# sbMatched's inlet is flowRateInletVelocity, whose value OpenFOAM derives from the mass flow rate and
-# whichever rho it is handed. brae disagrees with OpenFOAM there by ~2.4e-01 on this case -- a real finding,
-# but one belonging to that boundary condition, which is its own manifest component. Left in place it would
-# put a BC error inside a number that is supposed to say whether UEqn.H is assembled correctly, and a
-# number covering two components cannot be attributed to either.
-#
-# A uniform non-zero value in all three components is used so the inlet still exercises boundaryCoeffs in
-# every component rather than being trivially zero. It need not be physical: what is under test is the
-# assembly of a matrix from a given boundary state, and both codes are given the SAME state.
-python3 - "$W/case/0/U" <<'PYEOF'
-import re, sys
-p = sys.argv[1]
-s = open(p).read()
-s = re.sub(r'(inlet\s*\{)[^}]*\}',
-           r'\1\n        type            fixedValue;\n        value           uniform (1 2 3);\n    }',
-           s, count=1)
-open(p, 'w').write(s)
-PYEOF
-grep -q "fixedValue" "$W/case/0/U" || { echo "FAIL: could not neutralise the inlet BC"; exit 1; }
+# THE FIXTURE'S OWN INLET, as it ships. This gate used to neutralise sbMatched's flowRateInletVelocity
+# because brae's inlet disagreed with OpenFOAM by 2.4e-01 and would have dominated a number meant to be
+# about the momentum assembly. That boundary condition is now ported: OpenFOAM recomputes its value in
+# updateCoeffs() from the registered rho's PATCH values, at construction (createFields.H builds rho before
+# U) and again at every momentum assembly. With that in place the inlet carries EXACTLY the prescribed
+# massFlowRate -- sum(phi) = -0.5 against OpenFOAM's -0.5 -- and rAU went 4.58e-05 -> 6.13e-15,
+# boundaryCoeffs 4.15e-01 -> 4.89e-16. Neutralising it now would only hide the coupling it exercises.
 
 python3 - "$W/case" <<'PYEOF'
 import os, re, sys

@@ -1,5 +1,5 @@
 // _cpp REFERENCE implementation -- see pEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
-#include "pEqn_cpp.cuh"
+#include "rhoPEqn_cpp.cuh"
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity: linear inside, BOUNDARY field on faces
@@ -80,13 +80,12 @@ bool adjustPhi(
         // adjustPhi branches on `Up.fixesValue() && !isA<inletOutlet>(Up)` -- fixesValue, NOT assignable.
         // The two questions appear within a few lines of each other in pEqn.H and are not the same one.
         //
-        // The `!isA<inletOutlet>` half needs no counterpart here: OpenFOAM adds it because
-        // inletOutletFvPatchField derives from mixedFvPatchField, whose fixesValue() is true when the
-        // valueFraction is 1, and an inletOutlet at full inflow would otherwise be counted as a FIXED
-        // outflow. brae represents inletOutlet as a mixed BC whose fixesValue() is false (see
-        // fv_patch_field.cuh), so the exclusion is already implied. If that representation ever changes,
-        // this line changes with it.
-        const bool fixed = U.boundary[pi]->fixesValue();
+        // BOTH halves are needed, and the second is not decoration: mixedFvPatchField::fixesValue() is
+        // TRUE (mixedFvPatchField.H:197) and inletOutlet inherits it, so without the exclusion an
+        // inletOutlet outlet counts as a FIXED outflow and adjustPhi has nothing adjustable left to
+        // balance the inflow against -- it would then reach the "continuity error cannot be removed"
+        // fatal error on a case OpenFOAM solves.
+        const bool fixed = U.boundary[pi]->fixesValue() && !U.boundary[pi]->isInletOutlet();
         for (label i = 0; i < patches[pi].size; ++i)
         {
             const scalar v = phi.boundary[pi][i];
@@ -123,7 +122,7 @@ bool adjustPhi(
 
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        const bool fixed = U.boundary[pi]->fixesValue();   // see the note above on isA<inletOutlet>
+        const bool fixed = U.boundary[pi]->fixesValue() && !U.boundary[pi]->isInletOutlet();
         if (fixed) continue;
         for (label i = 0; i < patches[pi].size; ++i)
             if (phi.boundary[pi][i] > 0.0) phi.boundary[pi][i] *= massCorr;

@@ -8,7 +8,7 @@
 //           (divDevRhoReff -- the COMPRESSIBLE overload, taking rho)
 //           src/finiteVolume/cfdTools/general/MRF/MRFZoneList.C  (DDt(rho, U) == rho*DDt(U))
 //   brae:
-//     reference: src/applications/solvers/rhoSimpleFoam/UEqn_cpp.cu
+//     reference: src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
 //     cuda:      (pending -- the whole case runs in _cpp first, see PORT.md)
 //     tests:     tests/test_rho_ueqn_cpp.cu
 //

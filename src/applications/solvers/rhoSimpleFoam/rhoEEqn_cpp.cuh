@@ -7,7 +7,7 @@
 //     also: src/finiteVolume/finiteVolume/convectionSchemes/boundedConvectionScheme/
 //           boundedConvectionScheme.C  (fvmDiv AND fvcDiv -- the bounded term has BOTH forms)
 //   brae:
-//     reference: src/applications/solvers/rhoSimpleFoam/EEqn_cpp.cu
+//     reference: src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
 //     cuda:      (pending -- the whole case runs in _cpp first, see PORT.md)
 //     tests:     tests/test_rho_eeqn_cpp.cu
 //
@@ -75,7 +75,7 @@
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
 #include "fvc.cuh"
-#include "UEqn_cpp.cuh"      // DivScheme -- the same scheme set, named once
+#include "rhoUEqn_cpp.cuh"      // DivScheme -- the same scheme set, named once
 #include <string>
 #include <vector>
 

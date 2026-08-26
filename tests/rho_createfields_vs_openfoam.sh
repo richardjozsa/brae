@@ -71,6 +71,13 @@ mkdir -p "$W/cold"
 for f in p T U; do
     cp "$W/case/$ITERS/$f" "$W/cold/$f" || exit 1
 done
+# The RAS fields come too. This gate is about rho and phi being COMPUTED rather than read -- that is what
+# `cold` means here -- but the case is a kEpsilon case, and OpenFOAM's createFields.H constructs the
+# turbulence model, which reads k, epsilon, nut and alphat. A directory without them is not a cold start,
+# it is an incomplete case, and brae now says so rather than running a RAS case with no closure.
+for f in k epsilon nut alphat; do
+    [ -f "$W/case/$ITERS/$f" ] && cp "$W/case/$ITERS/$f" "$W/cold/$f"
+done
 
 # 3. The ORACLE: OpenFOAM's own createFields.H run on exactly those p, T and U. Everything except rho and
 #    phi is carried over, so the turbulence model postProcess builds has its fields, and rho and phi are

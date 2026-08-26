@@ -69,6 +69,23 @@ struct KEResiduals
     // measured. A residual concentrated at the wall means the wall treatment; at the inlet or outlet, a
     // boundary condition; spread through the interior, the operator.
     std::vector<scalar> epsCellResidual;
+
+    // The intermediates the two equations are built from, captured so a disagreement can NAME the term
+    // rather than only be measured on the solved field. tools/dumpKEpsilon is an instrumented copy of
+    // OpenFOAM's own kEpsilon that writes exactly these (stage_divU, stage_GbyNu, stage_G, and both
+    // assembled systems), so each one has an oracle instead of an argument.
+    std::vector<scalar> divU, gByNu, G;
+    std::vector<tensor> gradU;
+    // OPT-IN, because the driver asks for the residuals every outer iteration and would otherwise pay to
+    // copy every intermediate with them. The gate sets it; the solver does not.
+    bool captureStages = false;
+    std::vector<scalar> epsDivUpper, epsDivLower, epsLapUpper, epsLapLower;
+    std::vector<scalar> epsUpper, epsLower, kUpper, kLower;   // the off-diagonals a per-cell view misses
+    std::vector<scalar> epsDivD, epsDivSrc, epsLapD, epsLapSrc;   // the two fvm terms on their own
+    std::vector<scalar> DepsilonEff, DkEff;
+    std::vector<scalar> gammaEpsFace;    // the interpolated rho*DepsilonEff the laplacian is built from
+    std::vector<scalar> epsD0, epsSrc0, kD0, kSrc0;   // assembled, BEFORE relax and the wall setValues
+    std::vector<scalar> epsD, epsSrc, kD, kSrc;   // D() and source + boundaryCoeffs, before each solve
 };
 
 // GbyNu = gradU && devTwoSymm(gradU).
@@ -79,6 +96,37 @@ std::vector<scalar> correctNut(
     const std::vector<scalar>& k,
     const std::vector<scalar>& epsilon,
     const KEpsilonCoeffs& co);
+
+// THE COMPRESSIBLE INSTANTIATION. OpenFOAM has ONE kEpsilon.C, templated on the lineage, and what the
+// compressible one supplies is alpha = 1, rho = the density field, alphaRhoPhi = the MASS flux, and a
+// nu that varies with temperature. Every term below is already OpenFOAM's; this struct is what turns the
+// incompressible reading of them into the compressible one, so there is one transcription rather than two:
+//
+//     epsEqn:  div(alphaRhoPhi, eps) - laplacian(alpha*rho*DepsilonEff, eps)
+//           == C1*alpha*rho*GbyNu*Cmu*k - SuSp(((2/3)C1 - C3)*alpha*rho*divU, eps)
+//                                       - Sp(C2*alpha*rho*eps/k, eps)
+//
+// TWO FLUXES, NOT ONE, and this is the trap. The div operator takes the MASS flux, while
+//     divU = fvc::div(fvc::absolute(this->phi(), U))
+// takes the VOLUMETRIC one -- and compressibleTurbulenceModel::phi() returns `phi_/fvc::interpolate(rho)`
+// when the stored flux has mass dimensions (compressibleTurbulenceModel.C). In the incompressible lineage
+// the two are the same field and the distinction is invisible; here they differ by rho, and using the mass
+// flux for divU would put a density into a dilatation.
+//
+// The `bounded` Sp term takes the EQUATION's flux, not divU, for the same reason: boundedConvectionScheme
+// subtracts fvc::div(faceFlux) with the faceFlux it was handed, which is the mass flux.
+struct Compressible
+{
+    const std::vector<scalar>*              rho      = nullptr;   // cells; null => the incompressible 1
+    const std::vector<std::vector<scalar>>* rhoBnd   = nullptr;
+    const std::vector<scalar>*              nu       = nullptr;   // cells, mu/rho; null => the scalar nu
+    const std::vector<std::vector<scalar>>* nuBnd    = nullptr;
+    const SurfaceScalarField*               phiByRho = nullptr;   // VOLUMETRIC flux, for divU only
+    // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt, which the energy equation needs and the
+    // momentum equation does not. Written out when supplied.
+    std::vector<scalar>*                    alphat   = nullptr;
+    scalar                                  Prt      = 1.0;
+};
 
 // One kEpsilon::correct(). Updates k, epsilon and nut in place.
 void correct(
@@ -99,10 +147,12 @@ void correct(
     const KEpsilonCoeffs& co = {},
     KEResiduals* res = nullptr,
     bool bounded = false,    // `bounded Gauss <scheme>` on div(phi,k) and div(phi,epsilon)
-    int  dropTerm = 0);      // DIAGNOSTIC: epsilon eqn 1 production, 2 divU SuSp, 3 destruction,
+    int  dropTerm = 0,       // DIAGNOSTIC: epsilon eqn 1 production, 2 divU SuSp, 3 destruction,
                              // 4 diffusion; k eqn 5 production G, 6 divU SuSp, 7 destruction eps/k,
                              // 8 diffusion nut/sigmak
                              // (epsilonWallFunction's lowReCorrection rides on KEpsilonCoeffs::epsLowRe)
+    // LAST, so every existing positional caller is unchanged. Null is the incompressible lineage.
+    const Compressible* comp = nullptr);
 
 } // namespace kEpsilonRef
 } // namespace cpu

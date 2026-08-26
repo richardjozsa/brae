@@ -1,5 +1,5 @@
 // _cpp REFERENCE implementation -- see EEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
-#include "EEqn_cpp.cuh"
+#include "rhoEEqn_cpp.cuh"
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the SAME face rule for alphaEff
