@@ -18,6 +18,10 @@
 // { foo 1e-5; }` converge instantly, which is exactly what `checked` exists to stop.
 
 #include "cf_types.cuh"
+#include "fv_patch.cuh"
+#include <array>
+#include <cmath>
+#include <limits>
 #include <regex>
 #include "foam_dict.cuh"
 #include <string>
@@ -72,6 +76,60 @@ public:
     }
 
     bool ok(scalar residual, const std::string& field) { return ok(residual, target(field)); }
+
+    // OpenFOAM's vector maxResidual<U>() is the maximum over the components that are actually solved by
+    // the mesh. Empty patches remove their normal component from fvMesh::validComponents(); a wedge is
+    // deliberately not treated as an empty patch because OpenFOAM's solutionD keeps its circumferential
+    // direction available for swirl. An all-invalid mask is a malformed/unsupported mesh state: consume
+    // the U criterion but fail it rather than treating the missing solve as a zero residual.
+    bool okVelocity(scalar ux, scalar uy, scalar uz, const std::array<bool, 3>& valid) {
+        scalar residual = 0;
+        bool haveComponent = false;
+        const scalar components[3] = {ux, uy, uz};
+        for (int cmpt = 0; cmpt < 3; ++cmpt)
+            if (valid[cmpt]) {
+                if (!haveComponent || components[cmpt] > residual) residual = components[cmpt];
+                haveComponent = true;
+            }
+        return ok(haveComponent ? residual : std::numeric_limits<scalar>::infinity(), "U");
+    }
+
+    // Host-side equivalent of fvMesh::validComponents() for the mesh representation used by the simpleFoam
+    // driver. The existing parallel simpleFoam path uses the same empty-patch normal test. Patch normals are
+    // explicit mesh geometry; no residual magnitude or field value is used to infer dimensionality.
+    static std::array<bool, 3> validVelocityComponents(const std::vector<FvPatch>& patches) {
+        std::array<bool, 3> valid = {true, true, true};
+        for (const FvPatch& patch : patches)
+            if (patch.type == "empty" && patch.size > 0 && !patch.nf.empty()) {
+                scalar axis[3] = {0, 0, 0};
+                const std::size_t nFaces = std::min<std::size_t>(
+                    static_cast<std::size_t>(patch.size), patch.nf.size());
+                for (std::size_t i = 0; i < nFaces; ++i) {
+                    axis[0] += std::fabs(patch.nf[i].x);
+                    axis[1] += std::fabs(patch.nf[i].y);
+                    axis[2] += std::fabs(patch.nf[i].z);
+                }
+                const int normal = axis[0] >= axis[1] && axis[0] >= axis[2]
+                    ? 0 : (axis[1] >= axis[2] ? 1 : 2);
+                valid[normal] = false;
+            }
+        return valid;
+    }
+
+    // Read-only presentation of the configured entries. It intentionally does not query the dictionary: an
+    // unknown entry remains auditable until a real solved field consumes it during criteriaSatisfied().
+    std::string summary() const {
+        if (!dict_) return {};
+        if (dict_->leaves.empty()) return "<empty>";
+        std::string out;
+        for (const auto& entry : dict_->leaves) {
+            if (!out.empty()) out += ", ";
+            out += entry.first;
+            out += "=";
+            out += entry.second.empty() ? "<missing>" : entry.second.back();
+        }
+        return out;
+    }
 
     // OF's `achieved && checked`, plus the empty-dict short circuit.
     bool converged(bool achieved) const { return active() && achieved && checked_ > 0; }

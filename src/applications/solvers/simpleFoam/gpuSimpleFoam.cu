@@ -19,6 +19,7 @@
 #include "turbulent_inlet.cuh"
 #include "foam_dict.cuh"
 #include "dict_audit.cuh"
+#include "../common/residual_control.cuh"
 #include "scheme_parse.cuh"
 #include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
@@ -34,6 +35,7 @@
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -342,14 +344,18 @@ int main(int argc, char** argv)
 
         const FoamDict* simple = fvSolution.subDict("SIMPLE");
         const FoamDict* resCtl = simple ? simple->subDict("residualControl") : nullptr;
-        const bool hasRC = (resCtl != nullptr);
-        const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1, rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
+        ResidualControl residualControl(resCtl);
         // consistent / nNonOrthogonalCorrectors / bodyForce are read by readLinearSolverControls above.
 
         std::printf("brae (device-resident) | case=%s | %s%s | nu=%.3g\n", caseDir.c_str(),
                     simType.c_str(), ctl.turbulent ? (ctl.sst ? " (kOmegaSST)" : " (kEpsilon)") : "", ctl.nu);
-        std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s\n",
-                    ctl.relaxU, ctl.relaxP, ctl.tolP, ctl.tolU, endTime, hasRC ? "on" : "off");
+        const std::string rcSummary = residualControl.summary();
+        std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s%s%s%s\n",
+                    ctl.relaxU, ctl.relaxP, ctl.tolP, ctl.tolU, endTime,
+                    residualControl.active() ? "on" : "off",
+                    residualControl.active() ? " [" : "",
+                    residualControl.active() ? rcSummary.c_str() : "",
+                    residualControl.active() ? "]" : "");
         std::printf("  schemes: bounded(U=%d,k=%d,eps=%d) linearUpwind(U)=%d nonOrth(corrected)=%d nonOrthLimit=%.3g consistent(SIMPLEC)=%d limitedLinear(k=%d,eps=%d) linearUpwind(k=%d,eps=%d)\n",
                     ctl.bounded, ctl.boundedK, ctl.boundedEps, ctl.linearUpwind, ctl.nonOrth, ctl.nonOrthLimit, ctl.consistent, ctl.limitedK, ctl.limitedEps, ctl.luK, ctl.luEps);
         std::printf("  grad(U) cellLimited k=%.3g (0=unlimited)\n", ctl.gradULimitK);
@@ -377,6 +383,17 @@ int main(int argc, char** argv)
         { std::vector<AMIInterface> amisInit; buildGeometryPatchesAndAMI(m, g, fvpBuilt, amisInit); }
         _tsLap("geometry build");
         const std::vector<FvPatch> fvp = std::move(fvpBuilt);
+        const std::array<bool, 3> validU = ResidualControl::validVelocityComponents(fvp);
+        if (residualControl.active()) {
+            std::string validUSummary;
+            for (int cmpt = 0; cmpt < 3; ++cmpt)
+                if (validU[cmpt]) {
+                    if (!validUSummary.empty()) validUSummary += ",";
+                    validUSummary += cmpt == 0 ? "Ux" : (cmpt == 1 ? "Uy" : "Uz");
+                }
+            std::printf("  residualControl U valid components=%s\n",
+                        validUSummary.empty() ? "<none>" : validUSummary.c_str());
+        }
         timeRegistry.store("mesh", &m);
         timeRegistry.store("geometry", &g);
         timeRegistry.store("patches", &fvp);
@@ -548,11 +565,7 @@ int main(int argc, char** argv)
         {
             std::printf("  No finite volume options present\n");   // OF createFvOptions.H message
         }
-        // OF simpleControl::criteriaSatisfied: an unlisted field is not a criterion, and a run only
-        // converges if at least one criterion was ACTUALLY checked (see solvers/common/residual_control.cuh).
-        int rcChecked = 0;
         scalar turbMag0 = 0;   // sum|turb| at iteration 1; baseline for the blow-up tripwire
-        auto ok = [&](scalar res, scalar ctlv) { if (ctlv < 0) return true; ++rcChecked; return res < ctlv; };
         // OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time)
         const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
         const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);   // OF default GREAT -> only the final state
@@ -732,21 +745,18 @@ int main(int argc, char** argv)
                     break;
                 }
             }
-            // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
-            // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon
-            // still far from tol -- the substantive bug this fixes. Unlisted fields have target -1 -> ok() ignores
-            // them (OF). U stays gated on Ux alone: brae tracks no valid/solved directions, so the out-of-plane
-            // component of a 2D/empty or wedge case has a DEGENERATE residual (stuck ~0.1, never reaching tol) that
-            // would wrongly block convergence on every 2D case -- gating all U components needs that infra first.
-            rcChecked = 0;
-            converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU);
-            if (converged)
-                for (const auto& e : turbulenceReport())
-                    if (!ok(e.perf.initialResidual, resCtl->scalarOr(e.field, -1))) { converged = false; break; }
-            // OF's `checked` safety: `residualControl { }`, or a dict naming only fields brae does not
-            // check, must NOT report convergence. Without this brae stopped after ONE iteration and wrote
-            // a plausible-looking field set (simpleControl.C:51-57).
-            converged = converged && rcChecked > 0;
+            // OpenFOAM simpleControl checks every configured field that has a solve performance in this
+            // iteration. Keep the accumulated result on the right of each expression: `&&` short-circuits
+            // only the already-computed boolean, while the left-hand residualControl.ok() is always called.
+            // U is one vector criterion: okVelocity takes the maximum initial residual over valid solved
+            // components, matching solutionControl::maxResidual<vector>().
+            residualControl.beginIteration();
+            bool achieved = true;
+            achieved = residualControl.ok(r.p, "p") && achieved;
+            achieved = residualControl.okVelocity(r.Ux, r.Uy, r.Uz, validU) && achieved;
+            for (const auto& e : turbulenceReport())
+                achieved = residualControl.ok(e.perf.initialResidual, e.field) && achieved;
+            converged = residualControl.converged(achieved);
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
             if (!converged && iter != nSteps && time.writeControl().isWriteTime(iter, tval))
             {

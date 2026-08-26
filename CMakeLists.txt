@@ -1119,6 +1119,12 @@ add_executable(test_residual_control tests/test_residual_control.cu)
 target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_residual_control PRIVATE brae_core)
 add_test(NAME residual_control COMMAND test_residual_control)
+add_test(NAME residual_control_driver
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/residual_control_driver.sh
+                 $<TARGET_FILE:brae>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/residual_control_driver_work)
+set_tests_properties(residual_control_driver PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 120)
 
 add_executable(test_overset_refused tests/test_overset_refused.cu)
 target_include_directories(test_overset_refused PRIVATE ${BRAE_HEADER_DIRS})
