@@ -16,10 +16,12 @@
 #include "acmi_area_scaling.cuh"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -168,11 +170,57 @@ static int runCyclicDeviceOracle(const std::string& caseDir)
     return 0;
 }
 
+static std::string forceCoeffsDictionaryText()
+{
+    return "type forceCoeffs;\n"
+           "patches (body);\n"
+           "rho rhoInf;\n"
+           "rhoInf 1.0;\n"
+           "magUInf 1.0;\n"
+           "Aref 0.112032;\n"
+           "lRef 1.04;\n"
+           "liftDir (0 0 1);\n"
+           "dragDir (1 0 0);\n"
+           "pitchAxis (0 1 0);\n"
+           "CofR (-0.502 0 0);\n";
+}
+
+static void writeTextFile(const fs::path& path, const std::string& text)
+{
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("cannot create parser test fixture '" + path.string() + "'");
+    out << text;
+    if (!out) throw std::runtime_error("cannot write parser test fixture '" + path.string() + "'");
+}
+
+static ForceCoeffsConfig readStandaloneForceConfig(const FoamDict& file)
+{
+    const FoamDict* selected = nullptr;
+    std::string selectedName;
+    for (const auto& s : file.subs)
+    {
+        const bool hasType = s.second.found("type");
+        const std::string type = hasType ? s.second.wordOr("type", "") : "<missing>";
+        if (s.first == "forceCoeffs" && type != "forceCoeffs")
+            throw std::runtime_error("standalone forceCoeffs object '" + s.first + "' has type '" + type
+                                     + "', expected 'forceCoeffs'");
+        if (type != "forceCoeffs") continue;
+        if (selected)
+            throw std::runtime_error("standalone forceCoeffs file has more than one forceCoeffs object ('"
+                                     + selectedName + "' and '" + s.first + "')");
+        selected = &s.second;
+        selectedName = s.first;
+    }
+    if (!selected)
+        throw std::runtime_error("standalone forceCoeffs file has no forceCoeffs object with type 'forceCoeffs'");
+    return readForceCoeffsConfig(selectedName, *selected);
+}
+
 static ForceCoeffsConfig readCaseForceConfig(const std::string& caseDir)
 {
     const std::string standalone = caseDir + "/system/forceCoeffs";
     if (fs::exists(standalone))
-        return readForceCoeffsConfig("forceCoeffs", readDict(standalone));
+        return readStandaloneForceConfig(readDict(standalone));
 
     const FoamDict control = readDict(caseDir + "/system/controlDict");
     const FoamDict* funcs = control.subDict("functions");
@@ -192,7 +240,67 @@ static ForceCoeffsConfig readCaseForceConfig(const std::string& caseDir)
     return readForceCoeffsConfig(name, *selected);
 }
 
-static scalar readOpenFoamCd(const std::string& path, scalar wantedTime)
+static int runForceConfigParserTests()
+{
+    const fs::path root = fs::temp_directory_path()
+        / ("brae-force-coeffs-parser-"
+           + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(root / "system");
+    const fs::path standalone = root / "system/forceCoeffs";
+    const fs::path control = root / "system/controlDict";
+    int fails = 0;
+    auto check = [&](bool ok, const char* name) {
+        std::printf("  %-44s %s\n", name, ok ? "OK" : "FAIL");
+        if (!ok) ++fails;
+    };
+    auto throwsContaining = [&](const std::string& needle) {
+        try
+        {
+            (void)readCaseForceConfig(root.string());
+        }
+        catch (const std::exception& e)
+        {
+            return std::string(e.what()).find(needle) != std::string::npos;
+        }
+        return false;
+    };
+
+    writeTextFile(standalone, "forceCoeffs\n{\n" + forceCoeffsDictionaryText() + "}\n");
+    const ForceCoeffsConfig named = readCaseForceConfig(root.string());
+    check(named.name == "forceCoeffs" && named.patches == std::vector<std::string>{"body"}
+              && std::fabs(named.Aref - 0.112032) < 1e-15,
+          "standalone named forceCoeffs dictionary");
+
+    std::error_code ec;
+    fs::remove(standalone, ec);
+    writeTextFile(control, "functions\n{\n  coeffs\n  {\n" + forceCoeffsDictionaryText() + "}\n}\n");
+    const ForceCoeffsConfig inlineConfig = readCaseForceConfig(root.string());
+    check(inlineConfig.name == "coeffs" && inlineConfig.patches == std::vector<std::string>{"body"},
+          "inline functions forceCoeffs dictionary");
+
+    fs::remove(control, ec);
+    writeTextFile(standalone, "other\n{\n  type forces;\n}\n");
+    check(throwsContaining("no forceCoeffs object"), "standalone missing forceCoeffs object fails");
+
+    writeTextFile(standalone,
+                  "first\n{\n" + forceCoeffsDictionaryText() + "}\n"
+                  "second\n{\n" + forceCoeffsDictionaryText() + "}\n");
+    check(throwsContaining("more than one forceCoeffs object"), "standalone duplicate objects fail");
+
+    writeTextFile(standalone, "forceCoeffs\n{\n  type forces;\n}\n");
+    check(throwsContaining("expected 'forceCoeffs'"), "standalone malformed object fails");
+
+    fs::remove_all(root, ec);
+    return fails;
+}
+
+struct OpenFoamCoefficientRow
+{
+    scalar time = 0;
+    scalar Cd = 0;
+};
+
+static OpenFoamCoefficientRow readOpenFoamCd(const std::string& path, scalar wantedTime)
 {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot read retained OpenFOAM coefficient file '" + path + "'");
@@ -203,7 +311,7 @@ static scalar readOpenFoamCd(const std::string& path, scalar wantedTime)
         std::istringstream row(line);
         scalar time = 0, cd = 0;
         if (row >> time >> cd && std::fabs(time - wantedTime) <= 1e-9)
-            return cd;
+            return {time, cd};
     }
     throw std::runtime_error("retained OpenFOAM coefficient file has no row at requested time "
                              + std::to_string(wantedTime));
@@ -221,25 +329,41 @@ static int runRetainedOpenFoamComparison(const std::string& caseDir, const std::
     buildGeometryPatchesAndAMI(m, g, fvp, amis);
     const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);
     const std::string fieldDir = caseDir + "/" + timeName;
+    const scalar wantedTime = std::stod(timeName);
+    const fs::path canonicalCase = fs::weakly_canonical(fs::path(caseDir));
+    const fs::path canonicalCoefficient = fs::weakly_canonical(fs::path(coefficientPath));
+    const std::string coefficientRelative = fs::relative(canonicalCoefficient, canonicalCase).generic_string();
+    if (coefficientRelative.empty() || coefficientRelative == ".."
+        || coefficientRelative.rfind("../", 0) == 0)
+        throw std::runtime_error("retained OpenFOAM coefficient file is outside the retained case: '"
+                                 + coefficientPath + "'");
+    const std::string timeMetadataPath = fieldDir + "/uniform/time";
+    if (!fs::exists(timeMetadataPath) && !fs::exists(timeMetadataPath + ".gz"))
+        throw std::runtime_error("retained OpenFOAM time metadata is missing for field directory '" + fieldDir + "'");
+    const FoamDict timeMetadata = readDict(timeMetadataPath);
+    const scalar resolvedTime = timeMetadata.scalarOr("value", std::numeric_limits<scalar>::quiet_NaN());
+    if (!std::isfinite(resolvedTime) || std::fabs(resolvedTime - wantedTime) > 1e-9)
+        throw std::runtime_error("retained OpenFOAM time metadata does not match requested time '" + timeName + "'");
+    auto requireField = [&](const char* fieldName) {
+        const std::string path = fieldDir + "/" + fieldName;
+        if (!fs::exists(path) && !fs::exists(path + ".gz"))
+            throw std::runtime_error("retained OpenFOAM field '" + path + "' is missing");
+    };
+    for (const char* fieldName : {"U", "p", "k", "nut"}) requireField(fieldName);
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, m.nCells());
     GeometricField<scalar> p = buildField<scalar>(readField<scalar>(fieldDir + "/p"), fvp, m.nCells());
     U.evaluateBoundary();
     p.evaluateBoundary();
 
-    std::vector<scalar> k;
-    const std::string kPath = fieldDir + "/k";
-    if (fs::exists(kPath))
-    {
-        const FieldData<scalar> kfd = readField<scalar>(kPath);
-        k = kfd.internalUniform ? std::vector<scalar>(m.nCells(), kfd.internalUniformValue) : kfd.internalField;
-    }
+    const FieldData<scalar> kfd = readField<scalar>(fieldDir + "/k");
+    if (!kfd.internalUniform && static_cast<label>(kfd.internalField.size()) != m.nCells())
+        throw std::runtime_error("retained OpenFOAM k field does not match the retained mesh cell count");
+    const std::vector<scalar> k = kfd.internalUniform
+        ? std::vector<scalar>(m.nCells(), kfd.internalUniformValue) : kfd.internalField;
     std::vector<scalar> nutBnd(forceBoundaryFaceCount(fvp), scalar(0));
-    if (fs::exists(fieldDir + "/nut"))
-    {
-        GeometricField<scalar> nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, m.nCells());
-        nut.evaluateBoundary();
-        nutBnd = flattenNonCoupled(nut, fvp);
-    }
+    GeometricField<scalar> nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, m.nCells());
+    nut.evaluateBoundary();
+    nutBnd = flattenNonCoupled(nut, fvp);
     const FoamDict transport = readDict(caseDir + "/constant/transportProperties");
     const scalar nu = transport.scalarOr("nu", 1e-5);
     const ForceResult host = wallForces(U, p, k, nu, m, g, fvp, cfg.patches, cfg.rhoInf, cfg.pRef,
@@ -265,14 +389,37 @@ static int runRetainedOpenFoamComparison(const std::string& caseDir, const std::
     const scalar oracleErr = forceMaxRelative(deviceForce, host);
     const ForceCoeffs brae = forceCoeffs(deviceForce, cfg.dragDir, cfg.liftDir, cfg.pitchAxis,
                                          cfg.rhoInf, cfg.magUInf, cfg.Aref, cfg.lRef);
-    const scalar ofCd = readOpenFoamCd(coefficientPath, std::stod(timeName));
-    const scalar cdRel = std::fabs(brae.Cd - ofCd) / std::max(scalar(1), std::fabs(ofCd));
-    std::printf("direct retained OpenFOAM forceCoeffs: time=%s Brae Cd=%.17g OF Cd=%.17g rel=%.3e\n",
-                timeName.c_str(), brae.Cd, ofCd, cdRel);
-    std::printf("direct device/host force oracle maxRel=%.3e\n", oracleErr);
+    const OpenFoamCoefficientRow ofRow = readOpenFoamCd(coefficientPath, wantedTime);
+    const scalar signedAbsoluteDifference = brae.Cd - ofRow.Cd;
+    // Percentage policy: when |OpenFOAM Cd| <= 1e-12, a percentage is undefined. Report that explicitly and
+    // use an absolute tolerance of 1e-12 for the gate; otherwise report the signed (Brae-OpenFOAM)/|OpenFOAM|.
+    constexpr scalar cdNearZero = 1e-12;
+    constexpr scalar cdPercentageTolerance = 0.5; // existing direct-comparison threshold, in percentage points
+    const bool percentageDefined = std::fabs(ofRow.Cd) > cdNearZero;
+    const scalar signedPercentageDifference = percentageDefined
+        ? 100.0 * signedAbsoluteDifference / std::fabs(ofRow.Cd) : 0.0;
+    std::printf("direct retained OpenFOAM forceCoeffs:\n");
+    std::printf("  case=%s\n", canonicalCase.string().c_str());
+    std::printf("  time=%s field_time=%.17g coefficient_row_time=%.17g\n",
+                timeName.c_str(), resolvedTime, ofRow.time);
+    std::printf("  fields=U,p,k,nut from %s/%s\n", canonicalCase.string().c_str(), timeName.c_str());
+    std::printf("  coefficient_row=%s\n", canonicalCoefficient.string().c_str());
+    std::printf("  Brae Cd=%.17g\n", brae.Cd);
+    std::printf("  OpenFOAM Cd=%.17g\n", ofRow.Cd);
+    std::printf("  signed absolute difference (Brae-OpenFOAM)=%+.17g\n", signedAbsoluteDifference);
+    if (percentageDefined)
+        std::printf("  signed percentage difference ((Brae-OpenFOAM)/abs(OpenFOAM))=%+.9g%%\n",
+                    signedPercentageDifference);
+    else
+        std::printf("  signed percentage difference ((Brae-OpenFOAM)/abs(OpenFOAM))=undefined "
+                    "(|OpenFOAM Cd| <= %.1e)\n", cdNearZero);
+    std::printf("  device-versus-host force reduction discrepancy "
+                "(max |device-host|/max(1,|host|))=%.3e\n", oracleErr);
     // This is a direct same-mesh/same-field coefficient gate, not a copied expected value. The gate is
     // deliberately the existing force-validation tolerance; it is not adjusted toward a known Cd.
-    const bool ok = oracleErr <= 5e-10 && cdRel <= 5e-3;
+    const bool cdOk = percentageDefined ? std::fabs(signedPercentageDifference) <= cdPercentageTolerance
+                                        : std::fabs(signedAbsoluteDifference) <= cdNearZero;
+    const bool ok = oracleErr <= 5e-10 && cdOk;
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -349,6 +496,7 @@ int main(int argc, char** argv)
         catch (const std::exception& e) { rhoFailed = std::string(e.what()).find("unsupported") != std::string::npos; }
         check(rhoFailed, "unsupported rho behavior fails clearly");
 
+        fails += runForceConfigParserTests();
         if (runCyclicDeviceOracle(argc > 1 ? argv[1] : "validation/cyclicChannel") != 0) ++fails;
         std::printf("%s\n", fails ? "FAIL" : "PASS");
         return fails ? 1 : 0;
