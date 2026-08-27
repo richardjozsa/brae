@@ -32,6 +32,7 @@ std::vector<vector> gaussGrad(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& fp = patches[pi];
+        if (fp.type == "empty") continue;   // empty patches have no finite-volume contribution
         const std::vector<scalar>& pv = p.boundary[pi]->value();
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += Sf[fp.start + i] * pv[i];
@@ -65,6 +66,7 @@ std::vector<tensor> gaussGrad(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& fp = patches[pi];
+        if (fp.type == "empty") continue;   // empty patches have no finite-volume contribution
         const std::vector<vector>& uv = U.boundary[pi]->value();
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += outer(Sf[fp.start + i], uv[i]);

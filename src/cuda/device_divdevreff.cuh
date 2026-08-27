@@ -30,6 +30,18 @@ struct DeviceProcStress
     const std::vector<label>*                procStart = nullptr;
 };
 
+// Optional device-resident snapshots for numerical diagnosis. The production path leaves these null, so
+// there is no extra copy in a normal simpleFoam iteration. The snapshots are taken after the same stages
+// used by deviceDivDevReff: the cell gradient after its optional limiter, the boundary gradient, cell sigma,
+// and boundary sigma after processor-face replacement.
+struct DeviceDivDevReffStages
+{
+    DeviceBuffer<scalar>* gradCell = nullptr;      // 9*nCells, q=3*row+column
+    DeviceBuffer<scalar>* gradBoundary = nullptr;  // 9*nBndFaces, q=3*row+column
+    DeviceBuffer<scalar>* sigmaCell = nullptr;     // 9*nCells, q=3*row+column
+    DeviceBuffer<scalar>* sigmaBoundary = nullptr; // 9*nBndFaces, q=3*row+column
+};
+
 // nuCell (nC), nuBnd (nBndFaces), the effective viscosity at cells / boundary faces (nu for laminar).
 // cyc (optional): a periodic interface, its faces contribute to gradU AND to the tensor divergence, so the
 // boundary-column stress stays consistent with the interior (else x-invariance drifts on periodic meshes).
@@ -52,7 +64,8 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       // no probe), laminar, 10 steps: at the tutorial's nu = 1e-6 the difference from
                       // OpenFOAM is 6.5e-07 either way, but at nu = 1e-3 -- the size of a turbulent nut --
                       // it is 4.7e-04 unlimited against 6.7e-08 limited. A factor of 7000.
-                      scalar gradULimitK = 0.0);
+                      scalar gradULimitK = 0.0,
+                      DeviceDivDevReffStages* stages = nullptr);
 
 // Exported for the Maxwell model -- see the definitions in device_divdevreff.cu.
 void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,

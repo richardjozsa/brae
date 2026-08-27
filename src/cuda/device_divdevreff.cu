@@ -46,6 +46,7 @@ void gradBKernel(
     int nB,
     const label* __restrict__ fc,
     const label* __restrict__ bndGFace,
+    const label* __restrict__ bndIsEmpty,
     const scalar* __restrict__ Sfx,
     const scalar* __restrict__ Sfy,
     const scalar* __restrict__ Sfz,
@@ -62,6 +63,15 @@ void gradBKernel(
 {
     const int bi = blockIdx.x * blockDim.x + threadIdx.x;
     if (bi >= nB) return;
+
+    // OpenFOAM's emptyFvPatch contributes neither a boundary gradient nor a boundary tensor. Keep the
+    // diagnostic/intermediate field consistent with fvc::gradUBoundary as well as with tensorDivKernel,
+    // which excludes these faces from the final divergence.
+    if (bndIsEmpty[bi])
+    {
+        for (int q = 0; q < 9; ++q) gradB[q*nB + bi] = 0.0;
+        return;
+    }
 
     const int c = fc[bi], f = bndGFace[bi];
 
@@ -184,7 +194,7 @@ void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
     deviceBCValue(dbU.comp[1], Uy, uyb);
     deviceBCValue(dbU.comp[2], Uz, uzb);
     gradB.resize(static_cast<std::size_t>(9) * nB);
-    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
                                       dbU.comp[0].deltaCoeffs.data(), gradB.data());
     cudaCheck(cudaGetLastError(), "boundaryGradU");
@@ -223,7 +233,8 @@ void deviceDivDevReff(
     const DeviceCyclic* cyc,
     const DeviceAMI* ami,
     const DeviceProcStress* proc,
-    scalar gradULimitK)
+    scalar gradULimitK,
+    DeviceDivDevReffStages* stages)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
@@ -274,17 +285,27 @@ void deviceDivDevReff(
     // Gauss gradient AFTER the coupled-patch contributions are in, which is exactly here.
     if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);
 
+    auto snapshot = [](DeviceBuffer<scalar>* dst, const DeviceBuffer<scalar>& src, const char* what)
+    {
+        if (!dst) return;
+        dst->resize(src.size());
+        cudaCheck(cudaMemcpy(dst->data(), src.data(), src.size()*sizeof(scalar), cudaMemcpyDeviceToDevice), what);
+    };
+    snapshot(stages ? stages->gradCell : nullptr, gradU, "ddr stage gradCell");
+
     // sigma cell
     DeviceBuffer<scalar> sigmaC(static_cast<std::size_t>(9) * nC);
     sigmaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuCell.data(), sigmaC.data());
     cudaCheck(cudaGetLastError(), "ddr sigmaC");
+    snapshot(stages ? stages->sigmaCell : nullptr, sigmaC, "ddr stage sigmaCell");
 
     // boundary gradient + sigma boundary
     DeviceBuffer<scalar> gradB(static_cast<std::size_t>(9) * nB);
-    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
                                       /* bnd deltaCoeffs */ dbU.comp[0].deltaCoeffs.data(), gradB.data());
     cudaCheck(cudaGetLastError(), "ddr gradB");
+    snapshot(stages ? stages->gradBoundary : nullptr, gradB, "ddr stage gradBoundary");
     DeviceBuffer<scalar> sigmaB(static_cast<std::size_t>(9) * nB);
     sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());
     cudaCheck(cudaGetLastError(), "ddr sigmaB");
@@ -316,6 +337,8 @@ void deviceDivDevReff(
             proc->halo->waitExchange();   // the next component reuses the recv buffer
         }
     }
+
+    snapshot(stages ? stages->sigmaBoundary : nullptr, sigmaB, "ddr stage sigmaBoundary");
 
     if (stageDumpActive() && stageDumpFirstOnly("ddrSigma"))
     {   // sigma = nuEff*dev2(T(grad(U))) per cell, the input to the tensor divergence. Packed 9*nC,
