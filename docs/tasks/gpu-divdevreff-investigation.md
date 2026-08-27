@@ -1,44 +1,25 @@
-# GPU `divDevReff` investigation
+# GPU `divDevReff` investigation: rebuilt evidence
 
 Date: 2026-08-27
 Branch: `investigate/gpu-divdevreff`
 Accepted baseline: `62984d4` (`Fix gpuSimpleFoam residual control semantics`)
+HEAD under test: `b74820e` (`close gpu divdevreff review findings`)
 Tolerance: `STAGE_TOL = 1e-12` (unchanged)
 
-## Verdict
+This is a verification refresh. The previous full-suite and Ahmed solver
+records were collected with stale executables. The all-target rebuild and all
+measurements below were redone after the four empty-face fixes in `b74820e`.
+No production code was changed during this refresh.
 
-The original discrepancy was a real empty-patch contribution defect in the
-gradient path, not a GPU z-indexing or tensor-contraction defect. Both
-`fvc::gaussGrad` and the device scalar Gauss-gradient kernel accumulated
-values from faces on an `empty` patch. `fvc::div`, `fvc::gradUBoundary`, and
-the device tensor-divergence kernel already excluded those faces. The four
-production fixes are retained; this document records the evidence and the
-regression coverage.
+## Finding
 
-The original first divergent stage was cell `grad(U)`. With the original
-source behavior, the z-row measurements were:
+The original `4.933e-02` was caused by empty-patch faces being included in
+both the host and device Gauss-gradient paths, while the divergence paths
+already excluded those faces. It was not a tensor-layout, owner/neighbour
+sign, boundary-index, or GPU z-indexing defect. The first divergent stage was
+cell `grad(U)`.
 
-| component | maximum absolute difference | maximum host magnitude | maximum GPU magnitude | relative difference | cell |
-|---|---:|---:|---:|---:|---:|
-| `zx` | `3.788e-13` | `3.103e-11` | `3.105e-11` | `1.221e-02` | `5816` |
-| `zy` | `3.022e-14` | `1.503e-12` | `1.508e-12` | `2.011e-02` | `4579` |
-| `zz` | `1.517e-14` | `8.337e-13` | `8.369e-13` | `1.819e-02` | `3532` |
-
-The final z source was structurally near zero, which made its relative error
-ill-conditioned. The accepted-baseline instrumented result was:
-
-| source component | maximum absolute difference | maximum host magnitude | maximum GPU magnitude | relative difference | cell / face classification |
-|---|---:|---:|---:|---:|---|
-| `x` | `1.694066e-21` | `6.609412e-06` | `6.609412e-06` | `2.563111e-16` | `342`; internal, inlet, empty |
-| `y` | `2.223461e-21` | `9.964522e-07` | `9.964522e-07` | `2.231378e-15` | `12222`; internal, wall, empty |
-| `z` | `3.152534e-22` | `6.390980e-21` | `6.417854e-21` | `4.932786e-02` | `8464`; internal, empty |
-
-Thus `4.933e-02` was noise on a quantity whose host magnitude was only
-`6.391e-21`, not evidence of a meaningful z force or a GPU tensor defect.
-
-## Reproduction and gate proof
-
-The unchanged accepted-baseline command failed as reported:
+The historical failing result was:
 
 ```text
 GPU divDevReff source (nCells=12225):
@@ -48,165 +29,244 @@ GPU divDevReff source (nCells=12225):
 FAIL
 ```
 
-The legacy varying-`Uz` pitzDaily configuration is now a gate. It is retained
-deliberately: it exercises the empty-face production path, even though the
-field is not physically compatible with pitzDaily's empty front/back
-patches. The corrected result is:
+Its original final-z diagnostic was already structurally tiny:
+
+| component | maximum absolute difference | maximum host magnitude | maximum GPU magnitude | relative difference | cell |
+|---|---:|---:|---:|---:|---:|
+| `z` | `3.152534e-22` | `6.390980e-21` | `6.417854e-21` | `4.932786e-02` | `8464`, internal/empty |
+
+Thus the relative number was noise on a near-zero quantity, not a meaningful
+z source. After the fix, the rebuilt legacy gate reports:
 
 ```text
-legacy pitzDaily varying-Uz gated regression (nCells=12225, nInternalFaces=24170, nBoundaryFaces=25010):
-  V*div(sigma).x abs 1.694e-21 host 6.609e-06 gpu 6.609e-06 rel 2.563e-16 cell 342 touches[internal=yes wall=no inlet=yes outlet=no empty=yes]
-  V*div(sigma).y abs 2.012e-21 host 9.965e-07 gpu 9.965e-07 rel 2.019e-15 cell 12222 touches[internal=yes wall=yes inlet=no outlet=no empty=yes]
-  V*div(sigma).z abs 6.771e-36 host 2.362e-20 gpu 2.362e-20 rel 2.867e-16 cell 12222 touches[internal=yes wall=yes inlet=no outlet=no empty=yes]
-  first stage beyond relative 1e-12: none
+V*div(sigma).x abs 1.694e-21 host 6.609e-06 gpu 6.609e-06 rel 2.563e-16
+V*div(sigma).y abs 2.012e-21 host 9.965e-07 gpu 9.965e-07 rel 2.019e-15
+V*div(sigma).z abs 6.771e-36 host 2.362e-20 gpu 2.362e-20 rel 2.867e-16
+first stage beyond relative 1e-12: none
 PASS
 ```
 
-### Reverting the device skip
+For the same rebuilt legacy run, the stage maxima were:
 
-I temporarily removed only `if (bndIsEmpty[kk]) continue;` from
-`src/cuda/device_fvc.cu:100`, rebuilt `test_gpu_divdevreff` with `-j2`, and
-ran the pitzDaily gate. It failed with exit code 1. The first vector-path
-divergence was cell `grad(U)`; the final source was:
+| stage | maximum absolute difference | maximum host magnitude | maximum GPU magnitude | relative difference |
+|---|---:|---:|---:|---:|
+| cell `grad(U)` | `2.132e-12` | `6.289e+03` | `6.289e+03` | `3.389e-16` |
+| boundary `grad(U)` | `2.132e-12` | `1.232e+04` | `1.232e+04` | `1.730e-16` |
+| cell sigma | `2.137e-15` | `6.289e+00` | `6.289e+00` | `3.398e-16` |
+| boundary sigma | `2.137e-15` | `1.232e+01` | `1.232e+01` | `1.734e-16` |
 
-```text
-cell grad(U), zx: abs 5.541e-11 host 5.506e-11 gpu 3.105e-11 rel 1.006e+00 at 12173
-cell grad(U), zy: abs 2.858e-12 host 2.838e-12 gpu 1.508e-12 rel 1.007e+00 at 10877
-cell grad(U), zz: abs 2.425e-12 host 2.269e-12 gpu 8.369e-13 rel 1.069e+00 at 12173
-V*div(sigma).z abs 2.353e-20 host 2.362e-20 gpu 6.418e-21 rel 9.964e-01 cell 11531 touches[internal=yes wall=no inlet=no outlet=no empty=yes]
-first stage beyond relative 1e-12: scalar Gauss gradient
-FAIL
-```
-
-The harness names the scalar check first because it also guards the scalar
-kernel. The first divergent stage in the requested tensor pipeline remains
-cell `grad(U)`, as shown above. The device skip was then restored and rebuilt.
-
-### Reverting the host scalar skip
-
-I temporarily removed only `if (fp.type == "empty") continue;` from the
-scalar overload at `src/finiteVolume/finiteVolume/fvc.cu:35`, rebuilt, and ran
-the same command. It failed with exit code 1 because the independent scalar
-Gauss check caught the reversion:
-
-```text
-scalar Gauss gradient (empty-face ordering, n=12225):
-  z abs 3.207e-11 host 2.601e-12 gpu 3.207e-11 rel 1.233e+01 at 12173
-legacy ...
-  V*div(sigma).z abs 6.771e-36 host 2.362e-20 gpu 2.362e-20 rel 2.867e-16 ...
-  first stage beyond relative 1e-12: scalar Gauss gradient
-FAIL
-```
-
-The vector `divDevReff` portion stays green in this isolated reversion,
-because the vector host overload at `fvc.cu:69` was not reverted. That is why
-the scalar guard is present; the host-scalar reversion is not silently
-reported as a vector-kernel failure. The host skip was restored, rebuilt, and
-the registered `gpu_divdevreff` test passed again.
-
-## Formulation and layout audit
-
-The host and device implementations use the same conventions:
-
-- `grad(U)` is packed in row-major tensor slots
-  `xx, xy, xz, yx, yy, yz, zx, zy, zz`, with slot `q = 3*row + column`.
-  Each scalar `gaussGrad(U_i)` is `(dU_i/dx, dU_i/dy, dU_i/dz)`, and
-  `outer(Sf,U)` produces the OpenFOAM convention `G_ij = dU_j/dx_i`.
-- `sigma = nuEff * dev2(transpose(grad(U)))`. `dev2` subtracts two-thirds of
-  the trace from the diagonal; off-diagonal slots are unchanged. The test
-  compares every one of the nine slots at cell and boundary stages.
-- On internal faces, the owner contribution is positive and the neighbour
-  contribution is negative. Face stress is linearly interpolated as
-  `w*owner + (1-w)*neighbour`. Boundary contribution is positive and uses
-  `dot(Sf, sigmaFace)`.
-- `buildDeviceMesh` skips coupled-interface patches from the ordinary
-  boundary-face list, appends the remaining patch faces in patch/face order,
-  and uses `bndPerm` to gather them per cell. `boundaryTensorsSoA` applies the
-  same coupled-interface exclusion. The test now asserts that each host
-  tensor boundary snapshot has exactly `9 * dm.nBndFaces` scalars before any
-  `metric()` call.
-- Empty faces remain addressable in that common boundary ordering but carry an
-  empty flag. `deviceGaussGrad`, `gradBKernel`, and `tensorDivKernel` exclude
-  them. The host `fvc::gradUBoundary` and `fvc::div` also exclude them.
-- For non-empty boundary faces, both implementations use
-  `n = Sf/magSf`, `snGrad = (U_b-U_c)*deltaCoeffs`, and
-  `gradB = gradCell + outer(n, snGrad - dot(n, gradCell))`. Empty patches
-  return no boundary gradient. The scalar Gauss-gradient path uses evaluated
-  face values directly; it does not apply the tensor boundary `snGrad`
-  replacement.
-- No `deltaCoeffs` or `snGrad` correction is used by the final tensor
-  divergence itself; those quantities enter only the non-empty boundary
-  gradient stage. There is no owner/neighbour sign or boundary-face indexing
-  discrepancy in the stage comparisons.
-
-Changing the host `fvc.cu` exclusion is therefore a faithfulness correction,
-not moving the oracle. OpenFOAM's `emptyFvPatch` is a zero-size,
-reduced-dimensional constraint, so an empty patch must not contribute a
-finite-volume face sum. The local implementation already encoded that rule
-in `fvc.cu:201` (`gradUBoundary`), `fvc.cu:239` (`div`), and
+The four production hunks in `b74820e` remain unchanged. The host exclusion
+in `fvc.cu` is a faithfulness correction, not an oracle move: OpenFOAM's
+`emptyFvPatch` has zero face count in a reduced-dimensional mesh, so an empty
+patch contributes no finite-volume faces. This code already had the same
+exclusion in `fvc.cu:201` (`gradUBoundary`), `fvc.cu:239` (`div`), and
 `device_divdevreff.cu:167` (`tensorDivKernel`) before this investigation.
-The corresponding OpenFOAM references are
-[emptyFvPatchField](https://github.com/OpenFOAM/OpenFOAM-dev/blob/master/src/finiteVolume/fields/fvPatchFields/constraint/empty/emptyFvPatchField.H)
-and
-[gaussGrad](https://github.com/OpenFOAM/OpenFOAM-dev/blob/master/src/finiteVolume/finiteVolume/gradSchemes/gaussGrad/gaussGrad.C).
+See [OpenFOAM emptyFvPatchField](https://github.com/OpenFOAM/OpenFOAM-dev/blob/master/src/finiteVolume/fields/fvPatchFields/constraint/empty/emptyFvPatchField.H)
+and [OpenFOAM gaussGrad](https://github.com/OpenFOAM/OpenFOAM-dev/blob/master/src/finiteVolume/finiteVolume/gradSchemes/gaussGrad/gaussGrad.C).
 
-## Validation configurations
+## Stage and formulation evidence
 
-The test prints all nine tensor components for cell `grad(U)`, boundary
-`grad(U)`, cell `sigma`, and boundary `sigma`, plus all three source
-components. The following are the exact final-source records (each row has
-absolute difference, host magnitude, GPU magnitude, relative difference, and
-the maximizing cell with touch classification):
+The stage comparisons use row-major tensor slots
+`xx, xy, xz, yx, yy, yz, zx, zy, zz`, with `q = 3*row + column`.
+Each `gaussGrad(U_i)` is `(dU_i/dx, dU_i/dy, dU_i/dz)`, so the host and
+device use the OpenFOAM convention `G_ij = dU_j/dx_i`. The stress is
+`nuEff * dev2(transpose(grad(U)))`; transpose swaps the off-diagonal slots
+and `dev2` subtracts two-thirds of the trace from each diagonal.
 
-| configuration | source component | absolute difference | host magnitude | GPU magnitude | relative difference | result |
+Internal-face contributions use positive owner and negative neighbour signs.
+Boundary divergence uses `dot(Sf, sigmaFace)`. Non-empty boundary gradients
+use `n = Sf/magSf`, `snGrad = (U_b-U_c)*deltaCoeffs`, and the normal correction
+to the cell gradient. The final tensor divergence itself does not use
+`deltaCoeffs` or `snGrad`; they enter only the boundary-gradient stage.
+
+`buildDeviceMesh` skips coupled-interface patches from the ordinary boundary
+list and appends the remaining faces in patch/face order. The test helper
+mirrors that rule and now checks that its flattened host boundary tensor size
+is exactly `9 * dm.nBndFaces` before calling `metric()`. Empty faces remain
+addressable in that common ordering but are excluded from the cell-gradient,
+boundary-gradient, and tensor-divergence sums.
+
+The original-device-skip reversion proof remains:
+
+```text
+removed device_fvc.cu:100 empty-face skip
+cell grad(U), zx: abs 5.541e-11 host 5.506e-11 gpu 3.105e-11 rel 1.006e+00
+cell grad(U), zy: abs 2.858e-12 host 2.838e-12 gpu 1.508e-12 rel 1.007e+00
+cell grad(U), zz: abs 2.425e-12 host 2.269e-12 gpu 8.369e-13 rel 1.069e+00
+V*div(sigma).z abs 2.353e-20 host 2.362e-20 gpu 6.418e-21 rel 9.964e-01
+first stage beyond relative 1e-12: scalar Gauss gradient
+FAIL (exit 1)
+```
+
+The original-host-scalar-skip reversion also failed independently:
+
+```text
+removed fvc.cu:35 empty-face skip
+scalar Gauss gradient z abs 3.207e-11 host 2.601e-12 gpu 3.207e-11 rel 1.233e+01
+V*div(sigma).z abs 6.771e-36 host 2.362e-20 gpu 2.362e-20 rel 2.867e-16
+FAIL (exit 1)
+```
+
+The second reversion leaves the vector `divDevReff` stage green because only
+the scalar host overload was reverted; the independent scalar check is what
+proves that hunk is live.
+
+## Metric definition and validation cases
+
+The `Metric::relative` calculation in `tests/test_gpu_divdevreff.cu:53-55`
+is a field-norm gate, not a per-cell relative error. For one component it
+computes:
+
+```text
+hostMag = max over all field entries |host[i]|
+absDiff = max over all field entries |gpu[i] - host[i]|
+relative = absDiff / hostMag
+```
+
+The reported host and GPU magnitudes must therefore be read beside every
+relative number. The 3D negative control injects `1e-6` into one z-source
+entry. The z field maximum is `3.009e-04`, so the injected signal is
+`1e-6 / 3.009e-04 = 3.323e-03`, approximately `0.3%` of the z field max;
+the gate detects it.
+
+The rebuilt direct runs produced these final-source records:
+
+| configuration | source | absolute difference | host magnitude | GPU magnitude | relative difference | max cell / touch classification |
 |---|---|---:|---:|---:|---:|---|
-| legacy pitzDaily, varying `Uz` | x | `1.694e-21` | `6.609e-06` | `6.609e-06` | `2.563e-16` | pass; cell 342, internal/inlet/empty |
-| legacy pitzDaily, varying `Uz` | y | `2.012e-21` | `9.965e-07` | `9.965e-07` | `2.019e-15` | pass; cell 12222, internal/wall/empty |
-| legacy pitzDaily, varying `Uz` | z | `6.771e-36` | `2.362e-20` | `2.362e-20` | `2.867e-16` | pass; cell 12222, internal/wall/empty |
-| valid 2D pitzDaily, `Uz=0` | x | `1.694e-21` | `6.609e-06` | `6.609e-06` | `2.563e-16` | pass; cell 342, internal/inlet/empty |
-| valid 2D pitzDaily, `Uz=0` | y | `1.716e-21` | `9.965e-07` | `9.965e-07` | `1.723e-15` | pass; cell 144, internal/inlet/empty |
-| valid 2D pitzDaily, `Uz=0` | z | `6.019e-36` | `2.362e-20` | `2.362e-20` | `2.548e-16` | pass; cell 10832, internal/empty |
-| structured 3D box | x | `2.168e-19` | `4.160e-04` | `4.160e-04` | `5.212e-16` | pass; cell 40, internal/wall/inlet |
-| structured 3D box | y | `3.253e-19` | `1.723e-04` | `1.723e-04` | `1.887e-15` | pass; cell 23, internal/wall |
-| structured 3D box | z | `2.711e-19` | `3.009e-04` | `3.009e-04` | `9.008e-16` | pass; cell 49, internal/wall/outlet |
-| retained Issue 37 Ahmed mesh | x | `3.388e-20` | `5.741e-05` | `5.741e-05` | `5.902e-16` | pass; cell 183273, internal |
-| retained Issue 37 Ahmed mesh | y | `3.632e-20` | `4.847e-05` | `4.847e-05` | `7.494e-16` | pass; cell 104637, internal |
-| retained Issue 37 Ahmed mesh | z | `8.132e-20` | `1.242e-04` | `1.242e-04` | `6.546e-16` | pass; cell 237907, internal/wall |
+| legacy pitzDaily, varying `Uz` | x | `1.694e-21` | `6.609e-06` | `6.609e-06` | `2.563e-16` | `342`, internal/inlet/empty |
+| legacy pitzDaily, varying `Uz` | y | `2.012e-21` | `9.965e-07` | `9.965e-07` | `2.019e-15` | `12222`, internal/wall/empty |
+| legacy pitzDaily, varying `Uz` | z | `6.771e-36` | `2.362e-20` | `2.362e-20` | `2.867e-16` | `12222`, internal/wall/empty |
+| valid 2D pitzDaily, `Uz=0` | x | `1.694e-21` | `6.609e-06` | `6.609e-06` | `2.563e-16` | `342`, internal/inlet/empty |
+| valid 2D pitzDaily, `Uz=0` | y | `1.716e-21` | `9.965e-07` | `9.965e-07` | `1.723e-15` | `144`, internal/inlet/empty |
+| valid 2D pitzDaily, `Uz=0` | z | `6.019e-36` | `2.362e-20` | `2.362e-20` | `2.548e-16` | `10832`, internal/empty |
+| structured 3D box | x | `2.168e-19` | `4.160e-04` | `4.160e-04` | `5.212e-16` | `40`, internal/wall/inlet |
+| structured 3D box | y | `3.253e-19` | `1.723e-04` | `1.723e-04` | `1.887e-15` | `23`, internal/wall |
+| structured 3D box | z | `2.711e-19` | `3.009e-04` | `3.009e-04` | `9.008e-16` | `49`, internal/wall/outlet |
+| retained Issue 37 Ahmed mesh | x | `3.388e-20` | `5.741e-05` | `5.741e-05` | `5.902e-16` | `183273`, internal |
+| retained Issue 37 Ahmed mesh | y | `3.632e-20` | `4.847e-05` | `4.847e-05` | `7.494e-16` | `104637`, internal |
+| retained Issue 37 Ahmed mesh | z | `8.132e-20` | `1.242e-04` | `1.242e-04` | `6.546e-16` | `237907`, internal/wall |
 
-The valid 2D case has empty patches and uses `Uz=0`; its z source magnitude
-is `2.362e-20`, so z non-vacuity is not required. The box field has spatially
-varying nonzero `Ux`, `Uy`, and `Uz`, with `fixedValue` inlet, `zeroGradient`
-outlet, `noSlip` walls, and a symmetry-like patch. Its injected `1e-6` z
-perturbation gives relative `3.323e-03` and is detected. The retained Ahmed
-mesh's same negative control gives relative `8.050e-03` and is detected.
+The valid 2D field has `Uz=0` and is solution-direction-compatible. The
+legacy field deliberately retains spatially varying `Uz` as the negative
+control that catches the shared empty-face defect. The structured 3D box has
+non-zero, spatially varying `Ux`, `Uy`, and `Uz`; its boundary families are
+`noSlip` wall, symmetry-like/slip plane, fixedValue inlet, and zeroGradient
+outlet. All stage checks report no relative error above `1e-12`.
 
-For `../validation/kEpsCorrect`, the retained branch reports and accepts its
-structure rather than applying a constant 3D requirement:
+`../validation/kEpsCorrect` is structurally 2D and is not rejected for a
+near-zero z source:
 
 ```text
 mesh structure: emptyPatches=yes zExtent 1.000e-03 zNonDegenerate=yes -> structurally-2D
 structurally-2D bundle: z-source non-vacuity is not required
-V*div(sigma).z abs 4.702e-38 host 3.262e-22 gpu 3.262e-22 rel 1.442e-16 ...
+V*div(sigma).x abs 4.235e-22 host 1.248e-06 gpu 1.248e-06 rel 3.394e-16
+V*div(sigma).y abs 2.118e-21 host 5.963e-06 gpu 5.963e-06 rel 3.551e-16
+V*div(sigma).z abs 4.702e-38 host 3.262e-22 gpu 3.262e-22 rel 1.442e-16
+first stage beyond relative 1e-12: none
 PASS
 ```
 
-## Retained Ahmed path and solver impact
+## OpenFOAM-gated 2D cases
 
-The archive `/home/rj/brae-eval/case-issue37-0005-L2.tar` was extracted
-read-only into `/tmp/brae-task4-ahmed-review.Qriq99`. The archive was not
-modified. Its mesh has `313625` cells, `932581` internal faces, `45016`
-ordinary boundary faces, no empty patches, and z extent `1.400e+00`; it is
-genuinely 3D. The exact retained-mesh stage output included:
+The repository contains no `bump2D` or `turbulentFlatPlate` fixture or test
+registration. The actual empty-patch tutorial-like cases and their rebuilt
+CTest results were:
+
+| case | registered gates run | result |
+|---|---|---|
+| `pitzDaily` | `gpu_fvc`, `gpu_pressure`, `gpu_momentum`, `gpu_simple`, `gpu_step`, `gpu_boundary`, `gpu_boundary_vec`, `gpu_bndflux`, `gpu_resident`, `gpu_relax`, `gpu_divdevreff`, `gpu_kepsilon`, `gpu_kepsilon_correct`, `gpu_resident_turb`, `gpu_amg`, `gpu_driver`, `gpu_pimple`, `pimple_run`, `momentum_predictor`, `pimple_dispatch`, `force_history`, `brae_benchmark`, `linear_upwind_const`, `overset_refused`, `gpu_spmv`, `gpu_pcg`, `gpu_fvm`, `gpu_benchmark`, `gpu_amg_graph`, `gpu_loop_graph`, `gpu_crossover` | all listed passed; `gpu_divdevreff` passed in `0.31 s`; `residual_control_driver` failed as recorded below |
+| `pitzDaily282` | `gpu_komega_sst`, `forces`, `fields_bc`, `wall_function`, `fvc_grad`, `kepsilon` | all passed |
+| `pitzDailyTurb` | `turb_fixedpoint_12k`, `simple_turbulent_full` | both passed; full run `213.06 s` |
+| `pitzDailyTurbBig` | `turb_fixedpoint_49k` | passed |
+| `kEpsCorrect` | `kepsilon_correct`, `divdevreff` | both passed; the direct divDevReff run reports structurally 2D |
+| `lmFlatPlate` | `komegasstlm_flatplate` | passed |
+| `bump2D` | no fixture or registration | not present |
+| `turbulentFlatPlate` | no fixture or registration | not present |
+
+The MPI topology/field tests (`interface_exchange_np*`,
+`gpu_bind_np*`, `gpu_decompose_np*`, `decompose_exchange_np*`,
+`local_mesh_np*`, `proc_delta_np*`, `local_assembly_np*`,
+`local_convection_np*`, `processor_field_np*`, and `proc_interp_np*`) fail
+before numerical validation because this host's
+`mpiexec.openmpi` rejects CMake's `--oversubscribe` option. The scalar-gradient
+and solver gates above are serial and passed except for the separately
+discussed `residual_control_driver`.
+
+The pitzDaily cluster tests `gpu_amg_fused` and `gpu_cluster_spmv` also fail
+with the known unsupported-device/cluster-misconfiguration errors; they do
+not exercise the empty-face scalar-gradient gate.
+
+The registered OpenFOAM comparison wrappers
+`rho_vs_openfoam`, `ctl_vs_openfoam`, `ke_vs_openfoam`, `fr_vs_openfoam`,
+`tp_vs_openfoam`, `lu_vs_openfoam`, `suth_vs_openfoam`, `rhoE_vs_openfoam`,
+`wc_vs_openfoam`, `turbswitch_vs_openfoam`, `mx_vs_openfoam`,
+`rhotiming_vs_openfoam`, `hf_vs_openfoam`, `transonic_vs_openfoam`,
+`naca_vs_openfoam`, `sst_vs_openfoam`, `luturb_vs_openfoam`, `sa_vs_openfoam`,
+`io_vs_openfoam`, `ti_vs_openfoam`, `ke2_vs_openfoam`, `rx_vs_openfoam`,
+`pm_vs_openfoam`, `roundtrip_vs_openfoam`, `flowrate_vs_openfoam`,
+`restart_vs_openfoam`, `energy_vs_openfoam`, and `bc_vs_openfoam` were all
+skipped because their external OpenFOAM gates are not configured here. No
+OpenFOAM-gated result moved in this run.
+
+## Rebuilt solver residual result
+
+The residual driver at `CMakeLists.txt:1122` asserts the final observed `Uz`
+initial residual is in `[0.45, 0.65]`. I built `brae` from `62984d4` in a
+separate worktree at `/tmp/brae-task4-followup-baseline`, using the same CUDA
+12.6 / SM86 configuration and explicit MPI library paths, then ran the same
+driver twice per binary:
 
 ```text
-scalar Gauss gradient (n=313625):
+62984d4 run 1:
+converged at iteration 238 (<400): OK
+valid U components Ux,Uy and Uz initial residual 0.586352: OK
+epsilon/k initial residuals at convergence epsilon=0.00044484, k=0.000986499: OK
+unknown-only residualControl reaches endTime (400 iterations): OK
+
+62984d4 run 2:
+converged at iteration 238 (<400): OK
+valid U components Ux,Uy and Uz initial residual 0.577267: OK
+epsilon/k initial residuals at convergence epsilon=0.000444303, k=0.000990942: OK
+unknown-only residualControl reaches endTime (400 iterations): OK
+
+b74820e rebuilt HEAD run 1:
+Traceback (most recent call last):
+  File "<stdin>", line 14, in <module>
+AssertionError: 0.0119126
+
+b74820e rebuilt HEAD run 2:
+Traceback (most recent call last):
+  File "<stdin>", line 14, in <module>
+AssertionError: 0.0117552
+```
+
+The baseline values vary by `9.085e-03` but stay in the asserted range; HEAD
+values vary by `1.574e-04` and are far outside it. This controlled A/B shows
+that the large movement is associated with the b74820e code difference, not
+the small baseline run-to-run drift. It is a real production `simpleFoam`
+behavior change on the pitzDaily empty-patch path. The driver assertion is
+not changed in this task.
+
+## Retained Ahmed path and bounded force evidence
+
+The archive `/home/rj/brae-eval/case-issue37-0005-L2.tar` was never modified.
+It was extracted read-only into a fresh temporary directory for the manual
+diagnostic. Its mesh has `313625` cells, `932581` internal faces, `45016`
+ordinary boundary faces, no empty patches, and z extent `1.400e+00`.
+
+The rebuilt `test_gpu_divdevreff` invocation against that extraction returned
+zero and printed the following per-stage maxima:
+
+```text
+mesh structure: emptyPatches=no zExtent 1.400e+00 zNonDegenerate=yes -> genuinely-3D
+scalar Gauss gradient:
   x abs 3.144e-13 host 6.169e+01 gpu 6.169e+01 rel 5.096e-15
   y abs 5.684e-13 host 6.240e+01 gpu 6.240e+01 rel 9.109e-15
   z abs 2.793e-13 host 6.910e+01 gpu 6.910e+01 rel 4.042e-15
-cell grad(U), all nine components: maximum abs 9.095e-13, maximum host 3.583e+03, maximum GPU 3.583e+03, maximum relative 2.896e-16
-boundary grad(U), all nine components: maximum abs 9.095e-13, maximum host 4.159e+03, maximum GPU 4.159e+03, maximum relative 2.495e-16
-cell sigma, all nine components: maximum abs 8.882e-16, maximum host 3.583e+00, maximum GPU 3.583e+00, maximum relative 4.302e-16
-boundary sigma, all nine components: maximum abs 8.882e-16, maximum host 4.159e+00, maximum GPU 4.159e+00, maximum relative 3.704e-16
+cell grad(U): maximum abs 9.095e-13, host 3.583e+03, GPU 3.583e+03, rel 2.896e-16
+boundary grad(U): maximum abs 9.095e-13, host 4.159e+03, GPU 4.159e+03, rel 2.495e-16
+cell sigma: maximum abs 8.882e-16, host 3.583e+00, GPU 3.583e+00, rel 4.302e-16
+boundary sigma: maximum abs 8.882e-16, host 4.159e+00, GPU 4.159e+00, rel 3.704e-16
 final tensor-divergence source:
   x abs 3.388e-20 host 5.741e-05 gpu 5.741e-05 rel 5.902e-16
   y abs 3.632e-20 host 4.847e-05 gpu 4.847e-05 rel 7.494e-16
@@ -216,12 +276,7 @@ first stage beyond relative 1e-12: none
 PASS
 ```
 
-The maximum values above are reductions over the nine records; the binary
-also prints each `xx` through `zz` record individually. The full captured
-run was performed against the extracted `constant/polyMesh`, using a
-deterministic field with nonzero, spatially varying `Ux`, `Uy`, and `Uz`.
-
-The captured all-nine stage records for that run were:
+The exact all-nine records emitted by that rebuilt Ahmed invocation were:
 
 ```text
 cell grad(U):
@@ -266,74 +321,108 @@ boundary sigma:
   zz abs 8.882e-16 host 2.651e+00 gpu 2.651e+00 rel 3.350e-16 at 25059
 ```
 
-These are the raw all-nine records emitted by the test for the retained
-Ahmed run; the `scalar Gauss gradient` block immediately above the stage
-records contains its three scalar components.
+This retained Ahmed invocation is manual and uses a temporary extraction that
+no longer exists as a stable fixture. It is not regression-protected:
+`CMakeLists.txt:1567` registers only
+`validation/pitzDaily`. The current diagnostic run does not change that
+registration status.
 
-`device_simple_foam.cu:1056` calls `deviceDivDevReff` from
-`solveMomentumPredictor`, so the corrected production path is used by
-`simpleFoam`. `gpuPimpleFoam.cu:893` calls `DeviceSimpleSolver::pimpleStep`,
-which calls the same `solveMomentumPredictor` at
-`device_simple_foam.cu:3473`; the path is therefore also used by
-`pimpleFoam` when its momentum predictor is enabled.
+`device_simple_foam.cu:1056` calls `deviceDivDevReff` from the `simpleFoam`
+momentum predictor. `gpuPimpleFoam.cu:893` reaches the same predictor through
+`DeviceSimpleSolver::pimpleStep` at `device_simple_foam.cu:3473`, so the
+operator is also on the `pimpleFoam` path. The retained Ahmed mesh has no
+empty patches, so the specific empty-face branches are not exercised there.
+Thus `divDevReff` is exercised by both solver paths on the retained Ahmed
+mesh, but the empty-face condition fixed here is not; that particular defect
+cannot contribute an Ahmed source or Cd change through an empty face.
 
-The retained Ahmed mesh has no empty patches, so the specific empty-face
-correction is numerically neutral on that case: all four stages and all three
-source components agree to the displayed floating-point roundoff, and the
-nonzero z control is detected. This establishes no defect-driven Ahmed Cd
-change from this patch, but it is not a claim of a converged Ahmed Cd based
-on a synthetic operator test.
+To establish a noise floor, I extracted the same archive twice without its
+archived `postProcessing`, changed only each scratch `controlDict` to
+`endTime 3` and `writeInterval 1`, and ran the rebuilt HEAD `brae` twice.
+The raw final coefficient rows were:
 
-For an additional bounded production check, I extracted the same archive
-twice without its archived `postProcessing` directory, changed only the
-scratch copies to `endTime 3` and `writeInterval 1`, and ran the accepted
-baseline binary and the fixed binary with `brae -case`. Both returned 0,
-reached the three-iteration limit, and produced three clean coefficient
-samples. The fixed-minus-baseline maximum absolute deltas over the three
-samples were:
+```text
+HEAD run 1, time 3:
+Cd -866.71053984382888  Cl 270.74300806032460  Cm -187.32766075573130
+Fx -48.549657599891923  Fy 0.000489627880674850  Fz 15.165940339507145
 
-| quantity | maximum absolute delta over iterations 1--3 | final baseline | final fixed |
+HEAD run 2, time 3:
+Cd -866.71053998338277  Cl 270.74300794534349  Cm -187.32766073570400
+Fx -48.549657607709172  Fy 0.000489627807512569  Fz 15.165940330666361
+```
+
+The same-binary maximum absolute spread and the rebuilt-HEAD versus rebuilt-
+baseline maximum absolute delta over all three rows were:
+
+| quantity | same-HEAD-run max absolute spread | HEAD-baseline max absolute delta | max relative to baseline |
 |---|---:|---:|---:|
-| `Cd` | `4.0676e-07` | `-8.667105402889465e+02` | `-8.667105398821867e+02` |
-| `Cl` | `2.8386e-07` | `2.707430075161824e+02` | `2.707430078000454e+02` |
-| `Cm` | `6.0007e-08` | `-1.873276606389672e+02` | `-1.873276606989743e+02` |
-| `Fx` | `2.2785e-08` | `-4.854965762482563e+01` | `-4.854965760204058e+01` |
-| `Fy` | `4.1615e-10` | `4.896285878666162e-04` | `4.896290040153406e-04` |
-| `Fz` | `1.5901e-08` | `1.516594030902647e+01` | `1.516594032492734e+01` |
+| `Cd` | `1.395538902e-07` | `2.843780749e-07` | `3.026859833e-10` |
+| `Cl` | `1.149811055e-07` | `1.053500682e-07` | `3.891146406e-10` |
+| `Cm` | `2.002730071e-08` | `6.346326131e-08` | `3.387821162e-10` |
+| `Fx` | `7.817249070e-09` | `1.592972154e-08` | `3.026860226e-10` |
+| `Fy` | `7.316228060e-11` | `4.621022538e-10` | `9.437834490e-07` |
+| `Fz` | `6.440783906e-09` | `5.901290123e-09` | `3.891146868e-10` |
 
-The printed U/p residuals were identical; the final omega/k residuals differed
-only in the last displayed digits (`0.00413087` vs `0.00413101` and
-`0.00962754` vs `0.00962748`). These are the expected small GPU reduction
-ordering differences on a genuinely 3D mesh with no empty faces, not an
-empty-patch effect. The run stopped at the requested iteration limit and was
-not treated as converged.
+For `Cl` and `Fz`, the between-binary delta is inside the same-binary spread
+and each is therefore **indistinguishable from run-to-run noise**. `Cd`,
+`Cm`, `Fx`, and `Fy` exceed the measured same-HEAD spread. These
+three-iteration differences are tiny relative to the displayed coefficients,
+but the evidence does not justify claiming zero Cd impact or “no
+defect-driven change.” No final-force conclusion is made from the synthetic
+unit test alone.
 
-## Scalar Gauss-gradient scope and neutrality
+The values `Cd = -866.7` and `Cl = 270.7` are not “clean samples” or physical
+coefficients: forceCoeffs reference normalization is evidently not applied,
+as noted by contract section 2. They are only bounded-run diagnostic rows.
+The run reached the requested three-iteration limit and was not treated as
+converged.
 
-`device_fvc.cu:100` is shared by every device scalar Gauss gradient. The
-repository call sites include pressure gradients in the momentum/pressure
-path, gradient-based limiter and convection support, turbulence scalar
-gradients, and wall-distance-related gradient consumers. The scalar guard in
-this test proves that removing the skip is observable rather than a dead
-line.
+## Scalar-gradient scope
 
-For compatible 2D vector fields, opposing front/back area vectors cancel and
-the z tensor rows that should be zero are zero; the valid 2D source z
-magnitude is `2.362e-20` versus x `6.609e-06`. The deliberately varying-`Uz`
-legacy case is intentionally not used as a physical 2D neutrality claim; it
-is the empty-face regression gate. The full-suite comparison below provides
-the solver-level neutrality check for the shared scalar-gradient change.
+`device_fvc.cu:100` is shared by every device scalar Gauss gradient. That
+includes pressure gradients, gradient-based limiter/convection support,
+turbulence scalar gradients, scalar transport, energy-related paths, and
+wall-distance-related consumers. The pitzDaily scalar gate fails when the
+skip is removed, while the rebuilt serial pressure, turbulence, energy, force,
+MRF, and cyclic gates in the full suite remain green where their fixtures are
+available. On a compatible 2D field, the front/back empty-face area vectors
+are opposed, so their scalar Gauss contributions cancel; the valid-2D and
+serial full-suite gates provide the measured neutral result for that
+solution-direction construction. The full-suite name comparison against the
+accepted baseline likewise shows no new failure other than the explicitly
+recorded residual driver and known MPI/cluster environment cases. The
+aggregate b74820e A/B residual movement is nevertheless retained: this suite
+does not isolate that movement to the scalar hunk, and it is not honest to
+call the complete solver change numerically neutral.
 
-## Verification output
+## Rebuilt verification output
 
-The required direct commands were run with the MPI runtime library path and
-`-j2` build/test limits:
+GPU availability was checked first:
 
 ```text
 nvidia-smi --query-gpu=name,driver_version,memory.used --format=csv,noheader
 NVIDIA GeForce RTX 3090, 580.173.02, 1 MiB
+```
 
-nice -n 19 cmake --build build --target test_gpu_divdevreff -j2
+The required all-target rebuild succeeded:
+
+```text
+nice -n 19 cmake --build build --clean-first -j2
+build_rc=0
+[100%] Built target brae
+```
+
+The rebuild marker was `2026-08-27 07:20:42.143540437 UTC`. All 173
+top-level executable targets in `build/` had timestamps after that marker;
+the oldest product target was not pre-existing. Older executable bits found
+only below `CMakeFiles/` were compiler probes and older embedded benchmark
+worktree hook/sample files, not build targets.
+
+The required direct gate results were:
+
+```text
+nice -n 19 cmake --build . --target test_gpu_divdevreff -j2
+[100%] Built target brae_core
 [100%] Built target test_gpu_divdevreff
 
 ./test_gpu_divdevreff ../validation/pitzDaily
@@ -348,82 +437,115 @@ gpu_divdevreff ERROR: unrecognized or missing case path '/no/such/path' (expecte
 exit code 2
 ```
 
-The registered CTest invocation was also run verbatim in the build directory:
-
-```text
-nice -n 19 ctest --test-dir build -R '^gpu_divdevreff$' -V
-1/1 Test #214: gpu_divdevreff ...................   Passed    0.41 sec
-100% tests passed out of 1
-```
-
-The full unfiltered command completed with rc 8:
+The rebuilt full suite was run without filtering:
 
 ```text
 nice -n 19 ctest -j2 --output-on-failure
 80% tests passed, 48 tests failed out of 240
-Total Test time (real) = 215.39 sec
+Total Test time (real) = 213.13 sec
+ctest_rc=8
 ```
 
-The focused rows in that run were:
+The exact failure-name comparison was:
 
 ```text
-force_history .................... Passed
-divdevreff ....................... Passed
-simple_run ....................... Passed
-gpu_momentum ..................... Passed
-gpu_simple ....................... Passed
-gpu_resident_turb ............... Passed
-divdevreff_gradscheme ........... Passed
-gpu_divdevreff .................. Passed
-simple_step ...................... Passed
-residual_control ................ Passed
-force_coeffs .................... Passed
-simple_turbulent_full ........... Passed
-momentum_predictor .............. Passed
-residual_control_driver ......... Failed (AssertionError: 0.0118743)
-```
-
-Failure names were compared, not CTest numbers, because the working tree has
-additional registrations relative to the retained baseline log. The exact
-set difference was:
-
-```text
-review minus ~/brae-eval/ctest-cuda126.log:
-decompose_exchange_np1 np2 np4 np8
-gpu_bind_np1 np2 np4 np8
-gpu_decompose_np1 np2 np4 np8
-interface_exchange_np1 np2 np4 np8
-local_assembly_np1 np2 np4 np8
-local_convection_np1 np2 np4 np8
-local_mesh_np1 np2 np4 np8
-proc_delta_np1 np2 np4 np8
-proc_interp_np1 np2 np4 np8
-processor_field_np1 np2 np4 np8
+rebuilt minus ~/brae-eval/ctest-cuda126.log:
+decompose_exchange_np1
+decompose_exchange_np2
+decompose_exchange_np4
+decompose_exchange_np8
+gpu_bind_np1
+gpu_bind_np2
+gpu_bind_np4
+gpu_bind_np8
+gpu_decompose_np1
+gpu_decompose_np2
+gpu_decompose_np4
+gpu_decompose_np8
+interface_exchange_np1
+interface_exchange_np2
+interface_exchange_np4
+interface_exchange_np8
+local_assembly_np1
+local_assembly_np2
+local_assembly_np4
+local_assembly_np8
+local_convection_np1
+local_convection_np2
+local_convection_np4
+local_convection_np8
+local_mesh_np1
+local_mesh_np2
+local_mesh_np4
+local_mesh_np8
+proc_delta_np1
+proc_delta_np2
+proc_delta_np4
+proc_delta_np8
+proc_interp_np1
+proc_interp_np2
+proc_interp_np4
+proc_interp_np8
+processor_field_np1
+processor_field_np2
+processor_field_np4
+processor_field_np8
 residual_control_driver
 
-baseline minus review:
+baseline minus rebuilt:
 gpu_divdevreff
 ```
 
-The `*_np{1,2,4,8}` failures all report the environment's
-`mpiexec.openmpi: Error: unknown option "--oversubscribe"`. The remaining
-`residual_control_driver` failure is the known other-task assertion drift;
-the run reports the current initial `Uz` residual as `0.0118743`. There were
-no new non-MPI, non-`residual_control_driver` failures. The archived
-baseline's `restart_continuity`, `tracer_transport`, `dilu`, `brae_run`,
-`gpu_cluster`, `gpu_amg_fused`, and `gpu_cluster_spmv` failures remain.
+The 32 MPI failures report `mpiexec.openmpi: Error: unknown option
+"--oversubscribe"`. The remaining rebuilt-only failure,
+`residual_control_driver`, is not excused: its measured baseline/HEAD
+comparison is recorded above. The baseline failures
+`restart_continuity`, `tracer_transport`, `dilu`, `brae_run`, `gpu_cluster`,
+`gpu_amg_fused`, and `gpu_cluster_spmv` remain. The cluster failures report
+the known unsupported-device/cluster-misconfiguration errors.
+
+Focused rows from the same rebuilt CTest run were:
+
+```text
+force_coeffs ..................... Passed
+force_history .................... Passed
+divdevreff ....................... Passed
+divdevreff_gradscheme ............ Passed
+gpu_divdevreff ................... Passed
+gpu_resident_turb ................ Passed
+simple_run ....................... Passed
+simple_step ...................... Passed
+gpu_momentum ..................... Passed
+gpu_simple ....................... Passed
+residual_control ................. Passed
+residual_control_driver .......... Failed (AssertionError: 0.0116159)
+gpu_pimple ....................... Passed
+pimple_run ....................... Passed
+momentum_predictor ............... Passed
+```
 
 ## Files and remaining uncertainty
 
-The final repository changes are limited to the existing four production
-fixes, the investigation test, and this evidence document. `CMakeLists.txt`
-was inspected but did not need a change: its registered test continues to
-run `validation/pitzDaily`, while the binary accepts an explicitly supplied
-retained bundle for the manual Ahmed-path gate.
+This follow-up changes only:
 
-The production simpleFoam/pimpleFoam operator path is affected on meshes that
-actually contain empty patches; the retained Ahmed path is exercised and is
-not affected by this specific correction because it has no empty patches.
-The bounded retained Ahmed comparison supports no defect-driven Cd change
-from this patch, but it is only a three-iteration, non-converged run and
-does not establish a final physical Ahmed coefficient.
+```text
+docs/tasks/gpu-divdevreff-investigation.md
+```
+
+There are no CMake, test-source, or production-code changes in the follow-up
+working tree. The registered `gpu_divdevreff` test still covers only
+`validation/pitzDaily`; the Ahmed path remains a manual diagnostic.
+
+The exact demonstrated conclusions are:
+
+- the first operator-stage divergence was cell `grad(U)` from empty-face
+  accumulation, and the four fixes correct it;
+- the fixed operator gate passes valid 2D, invalid legacy 2D negative-control,
+  true 3D, and fresh Ahmed-mesh diagnostics;
+- rebuilt `simpleFoam` behavior on pitzDaily changed enough to invalidate the
+  residual driver's hard-coded `Uz` range, and that discrepancy is retained;
+- the three-iteration Ahmed force comparison is bounded but not a converged
+  Cd result; some component deltas are indistinguishable from noise and some
+  exceed the measured same-binary spread;
+- no claim of final Ahmed Cd neutrality is justified without a longer,
+  normalized, controlled production comparison.
