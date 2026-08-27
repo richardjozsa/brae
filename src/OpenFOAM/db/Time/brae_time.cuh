@@ -39,6 +39,13 @@
 #include "write_control.cuh"
 #include "start_time.cuh"   // OF Time::setControls() startFrom (Time.C:149)   // OF writeControl/writeInterval cadence, which Time owns   // noticeIgnored: the established "never drop an input silently" channel
 #include <functional>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <optional>
+#include <stdexcept>
 #include <map>
 #include <memory>
 #include <string>
@@ -46,6 +53,58 @@
 #include <vector>
 
 namespace brae {
+
+// The small restart-control dictionary OpenFOAM writes below every output time.
+// This is deliberately only time-controller state: field oldTime().oldTime() is not checkpointed.
+struct RestartTimeState
+{
+    scalar value = 0;
+    std::string name;
+    long index = 0;
+    scalar deltaT = 0;
+    scalar deltaT0 = 0;
+};
+
+inline std::optional<RestartTimeState> readRestartTimeState(
+    const std::string& caseDir, const std::string& timeName)
+{
+    const std::string path = caseDir + "/" + timeName + "/uniform/time";
+    if (!std::filesystem::exists(path)) return std::nullopt;
+
+    const FoamDict d = readDict(path);
+    RestartTimeState s;
+    s.value = d.scalarOr("value", std::numeric_limits<scalar>::quiet_NaN());
+    s.name = d.wordOr("name", "");
+    s.index = d.intOr("index", -1);
+    s.deltaT = d.scalarOr("deltaT", std::numeric_limits<scalar>::quiet_NaN());
+    s.deltaT0 = d.scalarOr("deltaT0", std::numeric_limits<scalar>::quiet_NaN());
+    if (!std::isfinite(s.value) || s.name.empty() || s.index < 0
+        || !(std::isfinite(s.deltaT) && s.deltaT > 0)
+        || !(std::isfinite(s.deltaT0) && s.deltaT0 > 0))
+        throw std::runtime_error("invalid restart time state in " + path);
+    return s;
+}
+
+inline void writeRestartTimeState(const std::string& outputDir, const RestartTimeState& s)
+{
+    const std::filesystem::path uniform = std::filesystem::path(outputDir) / "uniform";
+    std::filesystem::create_directories(uniform);
+    std::ofstream out(uniform / "time");
+    if (!out) throw std::runtime_error("cannot write restart time state in " + uniform.string());
+    out << "FoamFile\n{\n"
+        << "    version     2.0;\n"
+        << "    format      ascii;\n"
+        << "    class       dictionary;\n"
+        << "    location    \"" << std::filesystem::path(outputDir).filename().string() << "/uniform\";\n"
+        << "    object      time;\n}\n\n"
+        << std::setprecision(std::numeric_limits<scalar>::max_digits10)
+        << "value           " << s.value << ";\n"
+        << "name            " << s.name << ";\n"
+        << "index           " << s.index << ";\n"
+        << "deltaT          " << s.deltaT << ";\n"
+        << "deltaT0         " << s.deltaT0 << ";\n";
+    if (!out) throw std::runtime_error("failed writing restart time state in " + uniform.string());
+}
 
 // One functionObject. Mirrors OF's functionObject virtual interface: a solver never calls these, Time
 // does. Returning false from execute()/write() reports failure without aborting the run, as in OF.

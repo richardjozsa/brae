@@ -1646,6 +1646,13 @@ add_test(NAME pimple_run
                  ${CMAKE_CURRENT_BINARY_DIR}/pimple_run_work)
 set_tests_properties(pimple_run PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 
+add_test(NAME pimple_restart_state
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_restart_state.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/pimple_restart_state_work)
+set_tests_properties(pimple_restart_state PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
+
 # PIMPLE/momentumPredictor: the same case with the switch on and off must give DIFFERENT fields (and the
 # default must equal `on`). See the header of the script for why the log line is not enough.
 add_test(NAME momentum_predictor

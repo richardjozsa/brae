@@ -274,6 +274,21 @@ try
                                             controlDict.wordOr("startFrom", "startTime"),
                                             timeName(startTime));
     startTime = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
+    long timeIndex = 0;
+    scalar deltaT0 = deltaT;
+    if (const auto restartState = readRestartTimeState(caseDir, startStr))
+    {
+        startTime = restartState->value;
+        deltaT = restartState->deltaT;
+        deltaT0 = restartState->deltaT0;
+        timeIndex = restartState->index;
+        std::printf("gpuPimpleFoam: restored time state from %s/uniform/time "
+                    "(index=%ld deltaT=%g deltaT0=%g)\n",
+                    startStr.c_str(), timeIndex, deltaT, deltaT0);
+    }
+    else if (startTime != scalar(0))
+        std::printf("gpuPimpleFoam: no %s/uniform/time; using controlDict deltaT=%g\n",
+                    startStr.c_str(), deltaT);
     const std::string fieldDir = caseDir + "/" + startStr;
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
     const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
@@ -626,7 +641,7 @@ try
         });
     Time time(controlDict, nullptr, 0, foTypes, {}, {"forceCoeffs"});
 
-    auto writeTimeDir = [&](const std::string& tname) {
+    auto writeTimeDir = [&](const std::string& tname, scalar tvalue) {
         const std::string outDir = caseDir + "/" + tname;
         std::filesystem::create_directories(outDir);
         // scalarTransport tracers: OF's transported field is AUTO_WRITE (scalarTransport.C
@@ -693,6 +708,7 @@ try
                 }
             }
         }
+        writeRestartTimeState(outDir, RestartTimeState{tvalue, tname, timeIndex, deltaT, deltaT0});
         std::printf("written %s\n", outDir.c_str());
         // purgeWrite, from Time's WriteControl -- measured identical to this driver's copy and
         // purging at the same point (immediately after the write).
@@ -787,7 +803,6 @@ try
 
     // ---- transient time loop ----
     const scalar tEnd = endTime + 0.5 * deltaT;
-    long timeIndex = 0;
     std::string lastWritten;
     scalar lastTime = startTime;
     scalar lastForceSampleTime = std::numeric_limits<scalar>::quiet_NaN();
@@ -810,7 +825,7 @@ try
     {
         const CourantNumbers c0 = courant();
         deltaT = setInitialDeltaT(deltaT, c0.CoNum, timeControls);
-        std::printf("Courant Number mean: %g max: %g\ndeltaT = %g\n", c0.meanCoNum, c0.CoNum, deltaT);
+        std::printf("Courant Number mean: %g max: %g\ndeltaT = %.17g\n", c0.meanCoNum, c0.CoNum, deltaT);
     }
     // Does any cyclicACMI carry a time `scale`? Then the geometry is rebuilt every step even on a
     // static mesh; without one, a static mesh keeps the single setup-time build it always had.
@@ -903,6 +918,7 @@ try
         const bool anyMotion = meshMotion.active || vclMotion.active || acmiTimeScale;
         const DeviceSimpleResidual r =
             solver.pimpleStep(deltaT, nOuter, nCorr, anyMotion ? meshUpdate : std::function<void(int)>());
+        deltaT0 = deltaT;
         // OF order: the Courant number is evaluated on the flux the step just produced, and deltaT for
         // the NEXT step follows from it (CourantNo.H then setDeltaT.H, both at the top of the loop).
         if (timeControls.adjustTimeStep)
@@ -919,7 +935,7 @@ try
             && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
         const bool isWrite = time.writeControl().isWriteTime(timeIndex, t);
-        if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
+        if (isWrite) { writeTimeDir(tn, t); lastWritten = tn; time.write(); }
         bool sample = false;
         if (forceInterval > 0)
             sample = (timeIndex % forceInterval) == 0;
@@ -939,7 +955,7 @@ try
     time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
     {
         const std::string tn = timeName(lastTime);
-        if (tn != lastWritten) writeTimeDir(tn);
+        if (tn != lastWritten) writeTimeDir(tn, lastTime);
         // Preserve one terminal observation for sparse cadences, but never duplicate a sample already emitted by
         // the loop for this completed step.
         if (!std::isfinite(lastForceSampleTime) || std::fabs(lastForceSampleTime - lastTime) > 1e-12)
