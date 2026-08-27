@@ -95,8 +95,8 @@ public:
     // The two "outside" lists exist because the SAME type can be faithful in one solver and an
     // approximation in another, and saying so accurately matters more than saying it uniformly:
     //
-    //   pimpleFoam  forceCoeffs -> samples on the write cadence and writes
-    //                              postProcessing/forceCoeffs/<time>/coefficient.dat, i.e. what OF does
+    //   pimpleFoam  forceCoeffs -> samples on its function-object writeControl/writeInterval and writes
+    //                              postProcessing/forceCoeffs/<time>/coefficient.dat
     //   simpleFoam  forceCoeffs -> samples after every completed device SIMPLE step and writes a history
     //
     // Calling both "approximated" would understate pimpleFoam; calling both "applied" would overstate

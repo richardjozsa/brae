@@ -22,7 +22,7 @@ cd yourTransientCase && brae
 | **Turbulence** | laminar; URANS: k-epsilon, realizable k-epsilon, k-omega SST, k-omega SST-LM, Spalart-Allmaras; hybrid/LES: SA-DDES, SA-IDDES, k-omega SST-DDES, k-omega SST-IDDES, Smagorinsky |
 | **Restart** | seamless — writes and re-reads `phi` and the `ddt0(...)` state, so a restart continues the same trajectory |
 | **I/O** | standard OpenFOAM case in, standard time directories out (U, p, phi, turbulence); ASCII & binary mesh |
-| **Not yet** | adaptive `deltaT` (`adjustTimeStep`/`maxCo`), MRF, `fvOptions`, runtime function objects, multi-GPU |
+| **Not yet** | MRF, general runtime function objects, multi-GPU |
 
 Legend: ✓ supported · ✗ not yet.
 
@@ -37,7 +37,7 @@ Legend: ✓ supported · ✗ not yet.
 | Implicit `fvm::ddt` on **turbulence transport** (k, epsilon, omega, nuTilda) | ✓ true URANS, not quasi-steady |
 | `ddt0(...)` state written and re-read on restart (`backward`, `CrankNicolson`) | ✓ |
 | Fixed `deltaT` | ✓ |
-| `adjustTimeStep` / `maxCo` (Courant-limited dt) | ✗ — refused at start-up, not silently ignored |
+| `adjustTimeStep` / `maxCo` (Courant-limited dt) | ✓ |
 
 `writeControl timeStep` and `runTime`/`adjustableRunTime`, `writeInterval` and `purgeWrite` behave as in
 `Foam::Time`.
@@ -110,7 +110,6 @@ An impulsive start at fixed `deltaT` diverges for **both** solvers (Courant blow
 
 These stop the run with a message rather than producing a quietly wrong answer:
 
-- `adjustTimeStep yes` — use a fixed `deltaT` under your target Courant number.
 - `constant/MRFProperties` with an active zone.
 - `system/fvOptions` or `constant/fvOptions`.
 

@@ -9,11 +9,11 @@
 // (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. BOTH the momentum ddt AND the
 // turbulence transport ddt (fvm::ddt(k/eps/omega/nuTilda)) are fully implicit + OF-exact -- the turbulence is transient
 // URANS/DES, not quasi-steady (see device_simple_foam.cu:294). fvSchemes div/laplacian schemes are parsed; phi output +
-// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs and forceCoeffs (Cd/Cl/Cm, sampled on the write
-// cadence to postProcessing/forceCoeffs/) are wired. NOT yet: MRF, fvOptions,
-// adjustTimeStep + maxCo (adaptive dt), a general functionObject framework (forceCoeffs above is hard-wired, NOT
+// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs and forceCoeffs (Cd/Cl/Cm, sampled on its
+// function-object cadence to postProcessing/forceCoeffs/) are wired. NOT yet: MRF and a general functionObject
+// framework (forceCoeffs above is hard-wired, NOT
 // a framework -- probes/fieldAverage/sampling/surfaces are still absent and are silently ignored), distributed
-// (multi-GPU) transient. The first three are REFUSED at start-up rather than silently skipped (see main).
+// (multi-GPU) transient. Unsupported physics is refused at start-up rather than silently skipped (see main).
 // Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae; `brae` hands
 // over to it whenever a case's controlDict says `application pimpleFoam` (solvers/common/solver_dispatch.cuh).
 #include "primitive_mesh.cuh"
@@ -52,6 +52,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
@@ -704,29 +705,34 @@ try
     // and stream to postProcessing/forceCoeffs/<startTime>/coefficient.dat, matching OF's layout closely enough
     // that the same plotting scripts work.
     //
-    // COST: wallForces runs fvc::gaussGrad over the whole mesh ON THE HOST and calls nearWallDist internally,
-    // both mesh-wide and single-threaded. On 6M cells that is seconds per call, so sampling EVERY timestep would
-    // dwarf the solve (16 000 calls). It is therefore sampled on the WRITE cadence by default -- 160 samples over
-    // this run, ~7 per shedding cycle, enough for a stable mean if not a spectrum. BRAE_FORCE_INTERVAL overrides
-    // it (in timesteps) when a finer Cd(t) trace is worth the cost.
+    // COST: each sample pulls the current fields to the host and evaluates wall forces there.  The case's
+    // forceCoeffs writeControl/writeInterval is authoritative despite that cost; BRAE_FORCE_INTERVAL remains an
+    // explicit timestep override for diagnostics.  Sampling overhead is measured by the focused driver test.
     std::vector<std::string> forceWalls;
     for (const auto& q : fvp)
         if (q.type == "wall") forceWalls.push_back(q.name);
     const FoamDict* fcFuncs = controlDict.subDict("functions");
-    // Account for EVERY controlDict.functions entry through the shared list. forceCoeffs is declared
-    // APPLIED here (not approximated as in gpuSimpleFoam): this driver samples on the write cadence and
-    // writes postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
+    // Account for EVERY controlDict.functions entry through the shared list. forceCoeffs is solver-owned because
+    // sampling must follow the completed device step, but its own writeControl/writeInterval selects the cadence.
     // Anything else is reported as ignored instead of being silently passed over.
-    // Time owns the functionObject lifecycle (OF Foam::Time). forceCoeffs is declared APPLIED here, not
-    // approximated: this driver samples on the write cadence and writes
-    // postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
 
     const FoamDict* fcDict = nullptr;
     if (fcFuncs)
         for (const auto& s : fcFuncs->subs)
             if (s.second.wordOr("type", "") == "forceCoeffs") { fcDict = &s.second; break; }
     const long forceInterval = std::getenv("BRAE_FORCE_INTERVAL")
-                             ? std::atol(std::getenv("BRAE_FORCE_INTERVAL")) : 0;   // 0 -> follow the write cadence
+                             ? std::atol(std::getenv("BRAE_FORCE_INTERVAL")) : 0;
+    const std::string forceWriteControl = fcDict ? fcDict->wordOr("writeControl", "timeStep") : "timeStep";
+    const scalar forceWriteInterval = fcDict ? fcDict->scalarOr("writeInterval", 1.0) : 1.0;
+    if (fcDict && (!(std::isfinite(forceWriteInterval) && forceWriteInterval > 0)
+        || (forceWriteControl == "timeStep"
+            && (forceWriteInterval < 1
+                || std::fabs(forceWriteInterval - std::round(forceWriteInterval)) > 1e-12))))
+        throw std::runtime_error("forceCoeffs writeInterval must be positive and integral for writeControl timeStep");
+    if (fcDict && forceWriteControl != "timeStep" && forceWriteControl != "runTime"
+        && forceWriteControl != "adjustableRunTime" && forceWriteControl != "writeTime")
+        throw std::runtime_error("forceCoeffs writeControl '" + forceWriteControl
+                                 + "' is unsupported; use timeStep, runTime, adjustableRunTime, or writeTime");
     std::ofstream fcOut;
     if (fcDict && ctl.turbulent && !forceWalls.empty()) {
         const std::string fdir = caseDir + "/postProcessing/forceCoeffs/" + timeName(startTime);
@@ -736,7 +742,9 @@ try
         fcOut.setf(std::ios::scientific); fcOut.precision(8);
         std::printf("  forceCoeffs: sampling Cd/Cl/Cm -> postProcessing/forceCoeffs/%s/coefficient.dat%s\n",
                     timeName(startTime).c_str(),
-                    forceInterval > 0 ? (" every " + std::to_string(forceInterval) + " steps").c_str() : " on the write cadence");
+                    forceInterval > 0
+                        ? (" every " + std::to_string(forceInterval) + " steps (BRAE_FORCE_INTERVAL override)").c_str()
+                        : (" on " + forceWriteControl + "/" + std::to_string(forceWriteInterval)).c_str());
     } else if (fcDict) {
         // Do not let a forceCoeffs block look like it is running when it is not.
         std::printf("  forceCoeffs: present in controlDict but NOT sampled (%s)\n",
@@ -781,6 +789,9 @@ try
     const scalar tEnd = endTime + 0.5 * deltaT;
     long timeIndex = 0;
     std::string lastWritten;
+    scalar lastTime = startTime;
+    scalar lastForceSampleTime = std::numeric_limits<scalar>::quiet_NaN();
+    long forceRunTimeIndex = 0;
     // Time drives the functionObject lifecycle; the transient loop keeps its own time-valued
     // advancement, which is a genuinely different shape from the steady solvers' iteration index and is
     // not worth restructuring for this. loop() fires start()/execute() at OF's points.
@@ -806,6 +817,7 @@ try
     const bool acmiTimeScale = hasACMITimeScale(m);
     for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
+        lastTime = t;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
         // OF pimpleFoam.C:139-160 -- the mesh update is INSIDE the PIMPLE outer loop, guarded by
         // `pimple.firstIter() || moveMeshOuterCorrectors`. So it is a callback handed to pimpleStep
@@ -908,13 +920,30 @@ try
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
         const bool isWrite = time.writeControl().isWriteTime(timeIndex, t);
         if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
-        // Sample Cd on the write cadence, or on BRAE_FORCE_INTERVAL when set (see the cost note above).
-        if (forceInterval > 0 ? (timeIndex % forceInterval == 0) : isWrite) sampleForces(t);
+        bool sample = false;
+        if (forceInterval > 0)
+            sample = (timeIndex % forceInterval) == 0;
+        else if (forceWriteControl == "timeStep")
+            sample = (timeIndex % static_cast<long>(std::llround(forceWriteInterval))) == 0;
+        else if (forceWriteControl == "writeTime")
+            sample = isWrite;
+        else
+        {
+            const scalar elapsed = t - startTime;
+            const scalar tol = 1e-10 * std::max(scalar(1), std::fabs(t));
+            const long intervalIndex = static_cast<long>(std::floor((elapsed + tol) / forceWriteInterval));
+            if (intervalIndex > forceRunTimeIndex) { forceRunTimeIndex = intervalIndex; sample = true; }
+        }
+        if (sample) { sampleForces(t); lastForceSampleTime = t; }
     }
     time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
     {
-        const std::string tn = timeName(startTime + deltaT * (scalar)timeIndex);
-        if (tn != lastWritten) { writeTimeDir(tn); sampleForces(startTime + deltaT * (scalar)timeIndex); }
+        const std::string tn = timeName(lastTime);
+        if (tn != lastWritten) writeTimeDir(tn);
+        // Preserve one terminal observation for sparse cadences, but never duplicate a sample already emitted by
+        // the loop for this completed step.
+        if (!std::isfinite(lastForceSampleTime) || std::fabs(lastForceSampleTime - lastTime) > 1e-12)
+            sampleForces(lastTime);
     }
     return 0;
 }

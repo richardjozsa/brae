@@ -1665,8 +1665,8 @@ add_test(NAME pimple_dispatch
                  ${CMAKE_CURRENT_BINARY_DIR}/pimple_dispatch_work)
 set_tests_properties(pimple_dispatch PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 
-# The transient solver's refusals: MRF / fvOptions / adjustTimeStep are applied by the STEADY driver and not yet
-# by this one, so a case using them must stop rather than be marched with the physics quietly missing. Includes
+# The transient solver's refusal guards: unsupported MRF/fvOptions inputs must stop rather than be marched with
+# physics quietly missing; adaptive time stepping and supported fvOptions are positive controls. Includes
 # the negative controls (an INACTIVE MRF zone, and a clean case) so the guards cannot creep. Dict-only, no GPU.
 add_test(NAME pimple_guards
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_guards.sh
