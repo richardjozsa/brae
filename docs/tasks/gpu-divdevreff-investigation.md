@@ -1,9 +1,10 @@
 # GPU `divDevReff` investigation: rebuilt evidence
 
 Date: 2026-08-27
-Branch: `investigate/gpu-divdevreff`
+Branch: `fix/task4-regression-closure`
 Accepted baseline: `62984d4` (`Fix gpuSimpleFoam residual control semantics`)
-HEAD under test: `b74820e` (`close gpu divdevreff review findings`)
+HEAD under test: `9ff1fe3` (`refresh divdevreff evidence after full rebuild`), including
+the production fixes in `b74820e`
 Tolerance: `STAGE_TOL = 1e-12` (unchanged)
 
 This is a verification refresh. The previous full-suite and Ahmed solver
@@ -208,44 +209,69 @@ The registered OpenFOAM comparison wrappers
 skipped because their external OpenFOAM gates are not configured here. No
 OpenFOAM-gated result moved in this run.
 
-## Rebuilt solver residual result
+## Residual-control regression closure
 
-The residual driver at `CMakeLists.txt:1122` asserts the final observed `Uz`
-initial residual is in `[0.45, 0.65]`. I built `brae` from `62984d4` in a
-separate worktree at `/tmp/brae-task4-followup-baseline`, using the same CUDA
-12.6 / SM86 configuration and explicit MPI library paths, then ran the same
-driver twice per binary:
+The original focused reproduction had four passes and one failure:
+`residual_control_driver` stopped at its hard-coded assertion that the final
+`Uz` initial residual must be in `[0.45, 0.65]`. The rebuilt pitzDaily log
+reports `residualControl U valid components=Ux,Uy`; its `frontAndBack` patch is
+`empty`, so `Uz` is an invalid solution direction. The empty-face Gauss
+gradient correction changes that unsolved component's incidental residual from
+the old roughly `0.58` range to roughly `0.012`. That movement is expected for
+the corrected operator and is not evidence of a valid-component residual
+control regression.
+
+The earlier controlled comparison remains part of the evidence: two
+`62984d4` runs reported `Uz` values `0.586352` and `0.577267`, while two
+rebuilt pre-closure HEAD runs reported `0.0119126` and `0.0117552` before the
+driver assertion stopped them. This demonstrates that the production change
+altered the invalid-direction diagnostic; it does not demonstrate that the
+valid `Ux,Uy` residual criterion changed incorrectly.
+
+This matches OpenFOAM's component semantics. `fvMatrix<Type>::solveSegregated`
+gets `validComponents` from `psi.mesh().validComponents<Type>()` and skips a
+component whose entry is `-1` before solving it ([OpenFOAM source,
+lines 125-132](https://github.com/OpenFOAM/OpenFOAM-dev/blob/master/src/finiteVolume/fvMatrices/fvMatrix/fvMatrixSolve.C#L125-L132)).
+The accepted `test_residual_control` unit test independently verifies that an
+empty z patch produces `{true,true,false}` and that a `1e30` `Uz` residual does
+not block a 2D `U` criterion. Brae's `ResidualControl::okVelocity()` follows
+the same rule: it takes the maximum only over valid components, while the
+solver still calls the `p`, `U`, and every reported turbulence criterion.
+
+The driver now derives the controlled value from the actual final solve block,
+reads the generated case's configured thresholds, and asserts
+`max(Ux,Uy) < U_threshold`, `p < p_threshold`, and both `epsilon` and `k`
+below their configured turbulence threshold. It reports `Uz` for diagnosis but
+does not use it as a criterion. The unknown-only residual-control case still
+has to reach the 400-iteration limit, preserving the non-vacuous-control
+check. This is a semantic assertion, not a widened range or an expected-value
+fit.
+
+Three repeated runs of the corrected driver on rebuilt `brae` produced:
 
 ```text
-62984d4 run 1:
-converged at iteration 238 (<400): OK
-valid U components Ux,Uy and Uz initial residual 0.586352: OK
-epsilon/k initial residuals at convergence epsilon=0.00044484, k=0.000986499: OK
-unknown-only residualControl reaches endTime (400 iterations): OK
-
-62984d4 run 2:
-converged at iteration 238 (<400): OK
-valid U components Ux,Uy and Uz initial residual 0.577267: OK
-epsilon/k initial residuals at convergence epsilon=0.000444303, k=0.000990942: OK
-unknown-only residualControl reaches endTime (400 iterations): OK
-
-b74820e rebuilt HEAD run 1:
-Traceback (most recent call last):
-  File "<stdin>", line 14, in <module>
-AssertionError: 0.0119126
-
-b74820e rebuilt HEAD run 2:
-Traceback (most recent call last):
-  File "<stdin>", line 14, in <module>
-AssertionError: 0.0117552
+run 1: iteration=240 valid=Ux,Uy Ux=0.000634615 Uy=0.00411298 Uz=0.0118438 controlled_U=max(Ux,Uy)=0.00411298 threshold=0.01 p=0.00282134
+run 2: iteration=240 valid=Ux,Uy Ux=0.00064691 Uy=0.00419553 Uz=0.0119886 controlled_U=max(Ux,Uy)=0.00419553 threshold=0.01 p=0.00286828
+run 3: iteration=240 valid=Ux,Uy Ux=0.000635346 Uy=0.00412151 Uz=0.0119036 controlled_U=max(Ux,Uy)=0.00412151 threshold=0.01 p=0.00280676
 ```
 
-The baseline values vary by `9.085e-03` but stay in the asserted range; HEAD
-values vary by `1.574e-04` and are far outside it. This controlled A/B shows
-that the large movement is associated with the b74820e code difference, not
-the small baseline run-to-run drift. It is a real production `simpleFoam`
-behavior change on the pitzDaily empty-patch path. The driver assertion is
-not changed in this task.
+The corresponding semantic checks also passed on every run:
+
+```text
+converged at iteration 240 (<400): OK
+valid U components=Ux,Uy: OK
+U initial residuals Ux=0.000634615, Uy=0.00411298, Uz=0.0118438; controlled U=max(Ux,Uy)=0.00411298 < configured U threshold 0.01: OK
+p initial residual 0.00282134 < configured p threshold 0.01: OK
+epsilon/k initial residuals at convergence epsilon=0.000439473, k=0.000977065 < configured turbulence threshold 0.001: OK
+unknown-only residualControl reaches endTime (400 iterations): OK
+```
+
+Therefore the classification is **brittle test, not production residual-control
+regression**. The production solver uses the valid `Ux,Uy` maximum and requires
+the configured `p`, `epsilon`, and `k` criteria; the old assertion incorrectly
+treated the intentionally unsolved `Uz` solve diagnostic as the controlled
+value. The divDevReff correction remains active throughout these runs; no
+production hunk was reverted.
 
 ## Retained Ahmed path and bounded force evidence
 
@@ -371,11 +397,13 @@ but the evidence does not justify claiming zero Cd impact or “no
 defect-driven change.” No final-force conclusion is made from the synthetic
 unit test alone.
 
-The values `Cd = -866.7` and `Cl = 270.7` are not “clean samples” or physical
-coefficients: forceCoeffs reference normalization is evidently not applied,
-as noted by contract section 2. They are only bounded-run diagnostic rows.
-The run reached the requested three-iteration limit and was not treated as
-converged.
+The values `Cd = -866.7` and `Cl = 270.7` are not clean samples or physical
+coefficients. Reference normalization **was applied**: with `Fx = -48.55`,
+`rhoInf = 1`, `magUInf = 1`, and `Aref = 0.112032`, the denominator is
+`0.5*1*1^2*0.112032 = 0.056016`, giving `Cd = -48.55/0.056016 ≈ -866.7`.
+The three-iteration state is an unphysical early diagnostic and must not be
+compared with converged OpenFOAM `Cd`. The run reached the requested
+three-iteration limit and was not treated as converged.
 
 ## Scalar-gradient scope
 
@@ -389,11 +417,14 @@ available. On a compatible 2D field, the front/back empty-face area vectors
 are opposed, so their scalar Gauss contributions cancel; the valid-2D and
 serial full-suite gates provide the measured neutral result for that
 solution-direction construction. The full-suite name comparison against the
-accepted baseline likewise shows no new failure other than the explicitly
-recorded residual driver and known MPI/cluster environment cases. The
-aggregate b74820e A/B residual movement is nevertheless retained: this suite
-does not isolate that movement to the scalar hunk, and it is not honest to
-call the complete solver change numerically neutral.
+accepted baseline likewise shows no new numerical failure in the operator
+gates; the prior `residual_control_driver` name was the stale `Uz` assertion
+corrected in this follow-up, while the known MPI/cluster environment cases
+remain. The aggregate b74820e A/B movement in the invalid `Uz` diagnostic is
+retained, but the residual-control closure above shows that it is excluded
+from the pitzDaily criterion. This does not establish neutrality of every
+valid-component production quantity; it establishes that the old driver
+failure was not a valid-component residual-control regression.
 
 ## Rebuilt verification output
 
@@ -518,10 +549,31 @@ simple_step ...................... Passed
 gpu_momentum ..................... Passed
 gpu_simple ....................... Passed
 residual_control ................. Passed
-residual_control_driver .......... Failed (AssertionError: 0.0116159)
+residual_control_driver .......... Failed (stale Uz assertion; corrected below)
 gpu_pimple ....................... Passed
 pimple_run ....................... Passed
 momentum_predictor ............... Passed
+```
+
+After the regression-closure edit, the required focused CTest set was rerun:
+
+```text
+nice -n 19 ctest --test-dir build -j2 --output-on-failure -R '^(residual_control|residual_control_driver|gpu_divdevreff|divdevreff|divdevreff_gradscheme|gpu_resident_turb|simple_run|simple_step|gpu_momentum|gpu_simple|force_history|force_coeffs)$'
+force_coeffs ..................... Passed
+simple_step ...................... Passed
+simple_run ....................... Passed
+divdevreff ....................... Passed
+force_history .................... Passed
+residual_control ................. Passed
+residual_control_driver .......... Passed
+divdevreff_gradscheme ............ Passed
+gpu_momentum ..................... Passed
+gpu_simple ....................... Passed
+gpu_divdevreff ................... Passed
+gpu_resident_turb ................ Passed
+
+100% tests passed out of 12
+Total Test time (real) = 7.26 sec
 ```
 
 ## Files and remaining uncertainty
@@ -529,12 +581,13 @@ momentum_predictor ............... Passed
 This follow-up changes only:
 
 ```text
+tests/residual_control_driver.sh
 docs/tasks/gpu-divdevreff-investigation.md
 ```
 
-There are no CMake, test-source, or production-code changes in the follow-up
-working tree. The registered `gpu_divdevreff` test still covers only
-`validation/pitzDaily`; the Ahmed path remains a manual diagnostic.
+There are no CMake, solver, or production-code changes in the follow-up. The
+registered `gpu_divdevreff` test still covers only `validation/pitzDaily`; the
+Ahmed path remains a manual diagnostic.
 
 The exact demonstrated conclusions are:
 
@@ -542,8 +595,9 @@ The exact demonstrated conclusions are:
   accumulation, and the four fixes correct it;
 - the fixed operator gate passes valid 2D, invalid legacy 2D negative-control,
   true 3D, and fresh Ahmed-mesh diagnostics;
-- rebuilt `simpleFoam` behavior on pitzDaily changed enough to invalidate the
-  residual driver's hard-coded `Uz` range, and that discrepancy is retained;
+- rebuilt `simpleFoam` behavior on pitzDaily changed the invalid `Uz` diagnostic
+  as a consequence of empty-face correction; the driver now checks the valid
+  `Ux,Uy` criterion semantically;
 - the three-iteration Ahmed force comparison is bounded but not a converged
   Cd result; some component deltas are indistinguishable from noise and some
   exceed the measured same-binary spread;

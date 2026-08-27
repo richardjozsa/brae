@@ -62,37 +62,148 @@ run_case() {
 CONVERGED="$WORK/converged"
 make_case "$CONVERGED"
 run_case "$CONVERGED" converged
-python3 - "$WORK/converged.log" <<'PY'
+python3 - "$WORK/converged.log" "$CONVERGED" <<'PY'
 import re
 import sys
+from math import sqrt
 
 log = open(sys.argv[1]).read()
+case_dir = sys.argv[2]
 assert "residualControl U valid components=Ux,Uy" in log, log[:2000]
+valid = re.search(r"residualControl U valid components=([^\n]+)", log).group(1).split(",")
+assert valid == ["Ux", "Uy"], valid
+
+def mesh_list_body(path):
+    text = open(path).read()
+    match = re.search(r"(?m)^\s*\d+\s*\n\s*\(", text)
+    assert match, path
+    return text[match.end():]
+
+def read_points(path):
+    number = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    return [tuple(float(value) for value in match)
+            for match in re.findall(rf"\(\s*({number})\s+({number})\s+({number})\s*\)",
+                                    mesh_list_body(path))]
+
+def read_faces(path):
+    faces = []
+    for match in re.finditer(r"(\d+)\s*\(([^()]*)\)", mesh_list_body(path)):
+        indices = [int(value) for value in re.findall(r"[-+]?\d+", match.group(2))]
+        assert len(indices) == int(match.group(1)), (path, match.group(0))
+        faces.append(indices)
+    return faces
+
+def cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+def subtract(a, b):
+    return tuple(a[i] - b[i] for i in range(3))
+
+def face_area_vector(face, points):
+    vertices = [points[index] for index in face]
+    if len(vertices) == 3:
+        c = cross(subtract(vertices[1], vertices[0]), subtract(vertices[2], vertices[0]))
+        return tuple(0.5 * value for value in c)
+    centre = tuple(sum(vertex[i] for vertex in vertices) / len(vertices) for i in range(3))
+    summed = [0.0, 0.0, 0.0]
+    for index, this_point in enumerate(vertices):
+        next_point = vertices[(index + 1) % len(vertices)]
+        triangle_normal = cross(subtract(next_point, this_point), subtract(centre, this_point))
+        for component in range(3):
+            summed[component] += triangle_normal[component]
+    return tuple(0.5 * value for value in summed)
+
+def mesh_valid_components(poly_mesh):
+    boundary = open(poly_mesh + "/boundary").read()
+    list_start = re.search(r"(?m)^\s*\d+\s*\n\s*\(", boundary)
+    assert list_start, poly_mesh + "/boundary"
+    patches = []
+    for match in re.finditer(r"(?m)^\s*([A-Za-z0-9_.+-]+)\s*\{\s*(.*?)^\s*\}",
+                             boundary[list_start.end():], re.S):
+        body = match.group(2)
+        type_match = re.search(r"(?m)^\s*type\s+(\S+)\s*;", body)
+        faces_match = re.search(r"(?m)^\s*nFaces\s+(\d+)\s*;", body)
+        start_match = re.search(r"(?m)^\s*startFace\s+(\d+)\s*;", body)
+        assert type_match and faces_match and start_match, match.group(1)
+        patches.append((match.group(1), type_match.group(1),
+                        int(faces_match.group(1)), int(start_match.group(1))))
+
+    points = read_points(poly_mesh + "/points")
+    faces = read_faces(poly_mesh + "/faces")
+    valid = [True, True, True]
+    empty_axes = []
+    for name, patch_type, count, start in patches:
+        if patch_type != "empty" or count == 0:
+            continue
+        assert start + count <= len(faces), (name, start, count, len(faces))
+        axis = [0.0, 0.0, 0.0]
+        for face in faces[start:start + count]:
+            area = face_area_vector(face, points)
+            magnitude = sqrt(sum(value * value for value in area))
+            assert magnitude > 0.0, (name, face)
+            for component in range(3):
+                axis[component] += abs(area[component] / magnitude)
+        normal = 0 if axis[0] >= axis[1] and axis[0] >= axis[2] else (1 if axis[1] >= axis[2] else 2)
+        valid[normal] = False
+        empty_axes.append((name, normal, axis))
+    return [component for component, is_valid in enumerate(valid)
+            if is_valid], empty_axes
+
+expected_indices, empty_axes = mesh_valid_components(case_dir + "/constant/polyMesh")
+expected = [["Ux", "Uy", "Uz"][index] for index in expected_indices]
+assert valid == expected, (valid, expected, empty_axes)
+
+fv_solution = open(case_dir + "/system/fvSolution").read()
+rc_match = re.search(r"residualControl\s*\{([^}]*)\}", fv_solution, re.S)
+assert rc_match, fv_solution
+rc = rc_match.group(1)
+
+def target(field):
+    match = re.search(rf"^\s*{re.escape(field)}\s+([0-9.eE+-]+);", rc, re.M)
+    assert match, (field, rc)
+    return float(match.group(1))
+
+u_target = target("U")
+p_target = target("p")
+turb_match = re.search(r'^\s*"\(k\|epsilon\|omega\|f\|v2\)"\s+([0-9.eE+-]+);', rc, re.M)
+assert turb_match, rc
+turb_target = float(turb_match.group(1))
+
 match = re.search(r"SIMPLE solution converged in (\d+) iterations", log)
 assert match, log[-2000:]
 iteration = int(match.group(1))
 assert iteration < 400, iteration
 
-uz_values = re.findall(r"Solving for Uz, Initial residual = ([^,]+),", log)
-assert uz_values, log[:2000]
-uz_initial = float(uz_values[-1])
-assert 0.45 <= uz_initial <= 0.65, uz_initial
-
 blocks = re.findall(r"Time = (\d+)\n(.*?)(?=\nTime = \d+\n|\nSIMPLE solution converged)", log, re.S)
 last = next((body for number, body in blocks if int(number) == iteration), None)
 assert last is not None, iteration
-transport = {}
-for field in ("epsilon", "k"):
+
+def initial(field):
     field_match = re.search(rf"Solving for {field}, Initial residual = ([^,]+),", last)
     assert field_match, (field, last)
-    transport[field] = float(field_match.group(1))
-    assert transport[field] <= 1e-3, (field, transport[field])
+    return float(field_match.group(1))
+
+ux, uy, uz = (initial(field) for field in ("Ux", "Uy", "Uz"))
+p = initial("p")
+controlled_u = max(ux, uy)
+assert ux < u_target and uy < u_target, (ux, uy, u_target)
+assert controlled_u < u_target, (controlled_u, u_target)
+assert p < p_target, (p, p_target)
+transport = {}
+for field in ("epsilon", "k"):
+    transport[field] = initial(field)
+    assert transport[field] < turb_target, (field, transport[field], turb_target)
 
 print(f"converged at iteration {iteration} (<400): OK")
-print(f"valid U components Ux,Uy and Uz initial residual {uz_initial:.6g}: OK")
+print(f"valid U components={','.join(valid)}: OK")
+print(f"U initial residuals Ux={ux:.6g}, Uy={uy:.6g}, Uz={uz:.6g}; "
+      f"controlled U=max(Ux,Uy)={controlled_u:.6g} < configured U threshold {u_target:.6g}: OK")
+print(f"p initial residual {p:.6g} < configured p threshold {p_target:.6g}: OK")
 print("epsilon/k initial residuals at convergence "
       + ", ".join(f"{field}={value:.6g}" for field, value in transport.items())
-      + ": OK")
+      + f" < configured turbulence threshold {turb_target:.6g}: OK")
 PY
 
 UNKNOWN="$WORK/unknown-only"
