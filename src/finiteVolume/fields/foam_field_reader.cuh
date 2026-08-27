@@ -147,7 +147,28 @@ struct PatchFieldData
     scalar ablUref = 0, ablZref = 0, ablZ0 = 0.1, ablD = 0, ablKappa = 0.41, ablCmu = 0.09;
     bool   atmBoundNut = true;   // atmNutkWallFunction boundNut option (clamp nut>=0); z0 is stored in ablZ0.
     vector ablFlowDir{1, 0, 0}, ablZDir{0, 0, 1};
+    // OpenFOAM wallFunctionCoefficients, retained for yPlus observability. These belong to the active
+    // nut wall-function boundary condition, not to the turbulence model. Defaults match v2406/v2412.
+    scalar wallCmu = 0.09;
+    scalar wallKappa = 0.41;
+    scalar wallE = 9.8;
+    scalar wallN = 4.0;
+    int    wallMaxIter = 10;
+    scalar wallTolerance = 0.01;
 };
+
+inline bool isNutWallFunctionType(const std::string& type)
+{
+    return type == "nutkWallFunction"
+        || type == "nutUSpaldingWallFunction"
+        || type == "nutUWallFunction"
+        || type == "nutUBlendedWallFunction"
+        || type == "nutLowReWallFunction"
+        || type == "nutkRoughWallFunction"
+        || type == "nutURoughWallFunction"
+        || type == "nutUTabulatedWallFunction"
+        || type == "atmNutkWallFunction";
+}
 
 template <typename T>
 struct FieldData
@@ -453,6 +474,36 @@ inline FieldData<T> readField(const std::string& path)
                         ts.expect(";");
                         if (key == "kappa") p.ablKappa = v;
                         else p.ablCmu = v;
+                    }
+                    else if (key == "Cmu" && isNutWallFunctionType(p.type))
+                    {
+                        p.wallCmu = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "kappa" && isNutWallFunctionType(p.type))
+                    {
+                        p.wallKappa = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "E" && isNutWallFunctionType(p.type))
+                    {
+                        p.wallE = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "n" && isNutWallFunctionType(p.type))
+                    {
+                        p.wallN = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "maxIter" && isNutWallFunctionType(p.type))
+                    {
+                        p.wallMaxIter = ts.nextLabel();
+                        ts.expect(";");
+                    }
+                    else if (key == "tolerance" && isNutWallFunctionType(p.type))
+                    {
+                        p.wallTolerance = ts.nextScalar();
+                        ts.expect(";");
                     }
                     // surfaceNormalFixedValue refValue / uniformNormalFixedValue uniformValue: SCALAR (U_b = refValue * n).
                     else if ((key == "refValue" && p.type == "surfaceNormalFixedValue") ||

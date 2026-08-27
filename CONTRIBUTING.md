@@ -18,6 +18,9 @@ If you keep those two in mind, the rest is detail.
 
 - Keep PRs focused. One change, one story. A kernel rewrite and a refactor are two PRs.
 - **Build and test before you open it.** `cmake --build build -j --target brae && ctest --test-dir build`.
+- On this host, tests that load the private MPI runtime need the environment supplied before invoking CTest:
+  `LD_LIBRARY_PATH=/home/rj/brae-eval/deps/root/usr/lib/x86_64-linux-gnu:/home/rj/brae-eval/deps/root/usr/lib/x86_64-linux-gnu/openmpi/lib:$LD_LIBRARY_PATH`.
+  Test scripts inherit this environment and do not set or replace `LD_LIBRARY_PATH` themselves.
 - The hosted build-check (`ci.yml`) compiles every PR for sm_80 and sm_90. The full `ctest` runs on a real GB10
   (`gpu-test.yml`) after merge to `main`, so a green build-check is necessary but not sufficient. Say in the PR how
   you validated on a GPU.

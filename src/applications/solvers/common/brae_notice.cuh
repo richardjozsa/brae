@@ -83,4 +83,12 @@ inline void noticeApplied(const std::string& subject, const std::string& detail)
     if (std::getenv("BRAE_NOTICE_APPLIED")) detail::notice("applied", subject, detail);
 }
 
+// A solver-owned implementation is a positive, always-visible status. It is intentionally distinct from
+// [applied]: the latter is opt-in confirmation for ordinary dictionary consumers, while this one explains a
+// functionObject whose lifecycle is deliberately outside the generic Time list.
+inline void noticeSolverOwned(const std::string& subject, const std::string& detail)
+{
+    detail::notice("solver-owned", subject, detail);
+}
+
 }   // namespace brae

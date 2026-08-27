@@ -2,7 +2,8 @@
 // k-omega SST model coefficients, shared by the device (device_komega_sst) and CPU paths. Defaults = OpenFOAM
 // v2412 kOmegaSST defaults (kOmegaSSTBase.C constructor, getOrAddToDict values). Read from turbulenceProperties
 // RAS.kOmegaSSTCoeffs (absent keys keep OF defaults). kappa/E are the wall-function coeffs (the omega/nut wall
-// functions; OF reads them from the BC dicts, default 0.41/9.8); the wall-function Cmu == betaStar. A
+// functions; OF reads them from the BC dicts, default 0.41/9.8). The nut wall-function Cmu is a boundary-condition
+// coefficient (default 0.09), not SST betaStar; yPlus observability reads that value from the active nut BC. A
 // default-constructed struct reproduces the OF defaults exactly, so callers that don't read a dict stay faithful.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
@@ -19,7 +20,7 @@ struct KOmegaSSTCoeffs
     scalar betaStar = 0.09;                            // k destruction / Cmu             (:335)
     scalar a1 = 0.31, b1 = 1.0, c1 = 10.0;             // nut limiter (a1,b1) + Pk cap c1 (:344,353,362)
     bool   F3 = false;                                 // F3 near-wall correction switch  (:371)
-    scalar kappa = 0.41, E = 9.8;                      // wall-function coeffs (Cmu_wf == betaStar)
+    scalar kappa = 0.41, E = 9.8;                      // model-side wall-function defaults; Cmu_wf belongs to the BC
     scalar CDES1 = 0.78, CDES2 = 0.61;                 // kOmegaSST-DES/DDES C_DES blend (OF kOmegaSSTDES defaults)
     // kOmegaSST-IDDES (Gritskevich/Garbaruk/Schuetze/Menter 2012) blending constants. Exponents fixed per the reference
     // (f_dt cube, f_l ^10, f_t cube); only the multipliers are carried here (shared values with SA-IDDES).

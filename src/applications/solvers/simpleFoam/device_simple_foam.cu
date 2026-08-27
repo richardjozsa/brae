@@ -2398,12 +2398,8 @@ namespace brae {
         forceSelection_ = std::move(selected);
     }
 
-    ForceResult DeviceSimpleSolver::forceForPatches(scalar rhoRef, scalar pRef, const vector& CofR)
+    void DeviceSimpleSolver::evaluateNutBoundaryAtSample(DeviceBuffer<scalar>& nutBnd)
     {
-        if (forceSelection_.n == 0)
-            throw std::runtime_error("forceCoeffs: force patches were not configured before sampling");
-
-        DeviceBuffer<scalar>& nutBnd = forceNutBnd_;
         if (!ctl_.turbulent)
         {
             if (nutBnd.size() != static_cast<std::size_t>(dm_.nBndFaces))
@@ -2443,16 +2439,31 @@ namespace brae {
                                      nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);
         else
         {
-            // wallForces uses Cmu for the active model's nutkWallFunction. Reuse the device wall-nut kernel,
-            // changing only that coefficient for kOmegaSST where OF calls it betaStar rather than 0.09.
+            // Reuse the active k-based wall-nut kernel. The force/yPlus sample convention uses the SST
+            // betaStar coefficient here, as the existing force path did, rather than the model-independent
+            // host yPlus formula's wall-function Cmu coefficient.
             KEpsilonCoeffs wallCo = ctl_.keCoeffs;
             if (ctl_.sst) wallCo.Cmu = ctl_.ksstCoeffs.betaStar;
             deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, wallCo,
                               ctl_.atmZ0, ctl_.atmBoundNut);
         }
 
+    }
+
+    std::vector<scalar> DeviceSimpleSolver::nutBoundaryAtSample()
+    {
+        evaluateNutBoundaryAtSample(forceNutBnd_);
+        return forceNutBnd_.host();
+    }
+
+    ForceResult DeviceSimpleSolver::forceForPatches(scalar rhoRef, scalar pRef, const vector& CofR)
+    {
+        if (forceSelection_.n == 0)
+            throw std::runtime_error("forceCoeffs: force patches were not configured before sampling");
+
+        evaluateNutBoundaryAtSample(forceNutBnd_);
         const DeviceForceResult d = deviceWallForceReduce(
-            dm_, dbU_, dbP_, Uk_[0], Uk_[1], Uk_[2], dp_, nutBnd, forceSelection_, ctl_.nu,
+            dm_, dbU_, dbP_, Uk_[0], Uk_[1], Uk_[2], dp_, forceNutBnd_, forceSelection_, ctl_.nu,
             rhoRef, pRef, CofR, hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
         ForceResult result;
         result.pressure = d.pressure;

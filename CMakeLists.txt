@@ -1109,6 +1109,33 @@ target_include_directories(test_solver_notices PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_solver_notices PRIVATE brae_core)
 add_test(NAME solver_notices COMMAND test_solver_notices)
 
+# simpleFoam yPlus formulas, cadence/output contract, and solver-owned/unknown functionObject status.
+add_executable(test_yplus tests/test_yplus.cu)
+target_include_directories(test_yplus PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_yplus PRIVATE brae_core)
+add_test(NAME yplus_unit COMMAND test_yplus)
+
+set(BRAE_ISSUE37_RETAINED_ARCHIVE "" CACHE FILEPATH
+    "Fresh retained Issue 37 archive for yPlus validation; empty disables the retained tests")
+set(BRAE_ISSUE42_RETAINED_ARCHIVE "" CACHE FILEPATH
+    "Fresh retained Issue 42 archive for yPlus validation; empty disables the retained tests")
+
+add_executable(test_yplus_retained tests/test_yplus_retained.cu)
+target_include_directories(test_yplus_retained PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_yplus_retained PRIVATE brae_core)
+add_test(NAME yplus_retained
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/yplus_retained.sh
+                 $<TARGET_FILE:test_yplus_retained>
+                 "${BRAE_ISSUE37_RETAINED_ARCHIVE}"
+                 "${BRAE_ISSUE42_RETAINED_ARCHIVE}")
+set_tests_properties(yplus_retained PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 600)
+
+add_test(NAME yplus_output
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/yplus_output.sh
+                 $<TARGET_FILE:brae>
+                 "${BRAE_ISSUE37_RETAINED_ARCHIVE}")
+set_tests_properties(yplus_output PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 900)
+
 # Group C: fvSchemes entries must resolve within their own sub-dictionary (C1-C4).
 add_executable(test_scheme_blocks tests/test_scheme_blocks.cu)
 target_include_directories(test_scheme_blocks PRIVATE ${BRAE_HEADER_DIRS})

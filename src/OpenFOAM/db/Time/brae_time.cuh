@@ -76,6 +76,8 @@ public:
 class FunctionObjectList
 {
 public:
+    using OutsideNotice = std::pair<std::string, std::string>; // type -> truthful solver-owned semantics
+
     // OF functionObjectList::read(). Walks controlDict.functions and builds what it recognises.
     //
     // Anything it cannot build goes through noticeIgnored -- the SAME convention the rest of brae uses
@@ -83,7 +85,8 @@ public:
     // of centralising: a solver that adopts Time cannot forget to report, in the same way an OF solver
     // cannot forget to run functionObjects. Returns the number not built.
     // `handledOutside` names types the CALLING SOLVER computes on its own, outside this lifecycle.
-    // They are reported as APPROXIMATED rather than ignored, because that is what they are: brae's
+    // They are reported with an explicit solver-owned status rather than ignored, because that is what
+    // they are: brae's
     // forceCoeffs, for example, is owned by the solver because its device reduction must run after the
     // solver's pressure/velocity corrections, whereas OF's forceCoeffs is a per-time-step functionObject
     // (execute()/write(), forceCoeffs.H:547,550) that writes a coefficient HISTORY under postProcessing/.
@@ -100,7 +103,8 @@ public:
     // simpleFoam. Each solver declares which it is.
     int read(const FoamDict* functions,
              const std::vector<std::string>& approximatedOutside = {},
-             const std::vector<std::string>& appliedOutside = {})
+             const std::vector<std::string>& appliedOutside = {},
+             const std::vector<OutsideNotice>& outsideNotices = {})
     {
         objects_.clear();
         if (!functions) return 0;
@@ -127,10 +131,14 @@ public:
             if (haveFactory) { ++missed; continue; }
             if (listed(appliedOutside, type))
             {
-                noticeApplied(
-                    "functions/" + s.first,
-                    "type '" + type + "' is implemented by the solver outside the functionObject "
-                    "lifecycle, on OpenFOAM's own write cadence.");
+                std::string detail = "type '" + type + "' is implemented by the solver outside the "
+                                     "functionObject lifecycle.";
+                for (const auto& n : outsideNotices)
+                    if (n.first == type) { detail = n.second; break; }
+                bool custom = false;
+                for (const auto& n : outsideNotices) if (n.first == type) { custom = true; break; }
+                if (custom) noticeSolverOwned("functions/" + s.first, detail);
+                else        noticeApplied("functions/" + s.first, detail);
                 continue;
             }
             if (listed(approximatedOutside, type))
@@ -228,7 +236,8 @@ public:
     Time(const std::string& caseDir, const FoamDict& controlDict,
          const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
          const std::vector<std::string>& approximatedOutside = {},
-         const std::vector<std::string>& appliedOutside = {})
+         const std::vector<std::string>& appliedOutside = {},
+         const std::vector<FunctionObjectList::OutsideNotice>& outsideNotices = {})
       : owned_(controlDict), wc_(&owned_), nSteps_(0)
     {
         startName_ = resolveStartTime(caseDir,
@@ -236,7 +245,7 @@ public:
                                       controlDict.wordOr("startTime", "0"));
         owned_.setStartTime(static_cast<scalar>(std::strtod(startName_.c_str(), nullptr)));
         for (const auto& t : types) functionObjects_.registerType(t.first, t.second);
-        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside);
+        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside, outsideNotices);
     }
 
     // Register and read functionObjects AFTER construction. Needed because startFrom must resolve
@@ -248,10 +257,11 @@ public:
         const FoamDict& controlDict,
         const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
         const std::vector<std::string>& approximatedOutside = {},
-        const std::vector<std::string>& appliedOutside = {})
+        const std::vector<std::string>& appliedOutside = {},
+        const std::vector<FunctionObjectList::OutsideNotice>& outsideNotices = {})
     {
         for (const auto& t : types) functionObjects_.registerType(t.first, t.second);
-        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside);
+        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside, outsideNotices);
     }
 
     // The resolved start directory name -- OF's Time::timeName() at construction.
@@ -261,11 +271,12 @@ public:
     Time(const FoamDict& controlDict, WriteControl* wc, int nSteps,
          const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
          const std::vector<std::string>& approximatedOutside = {},
-         const std::vector<std::string>& appliedOutside = {})
+         const std::vector<std::string>& appliedOutside = {},
+         const std::vector<FunctionObjectList::OutsideNotice>& outsideNotices = {})
       : owned_(controlDict), wc_(wc ? wc : &owned_), nSteps_(nSteps)
     {
         for (const auto& t : types) functionObjects_.registerType(t.first, t.second);
-        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside);
+        functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside, outsideNotices);
     }
 
     // OF Time::loop(): test run(), advance, fire functionObjects. The solver writes

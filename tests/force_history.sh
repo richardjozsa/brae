@@ -109,6 +109,9 @@ assert 'stopping_reason=iteration_limit' in metadata, metadata
 assert 'sample_count=3' in metadata and 'completed_iterations=3' in metadata, metadata
 log = open(log_path).read()
 assert 'forceCoeffs: coeffs -> ' in log and 'braeForceHistory/coeffs/0/coefficient.dat' in log, log
+assert 'brae NOTICE [ignored] functions/coeffs' not in log, log
+assert log.count('brae NOTICE [solver-owned] functions/coeffs') == 1, log
+assert 'sampled per completed SIMPLE iteration' in log and 'not OpenFOAM-identical' in log, log
 m = re.findall(r'forceCoeffs .*Cd=([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)', log)
 assert m, log[-1000:]
 console_cd = float(m[-1]); history_cd = float(data[-1][1])

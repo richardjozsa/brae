@@ -122,6 +122,9 @@ public:
     // forceForPatches() then reduces the post-correction device fields and returns only force/moment scalars.
     void setForcePatches(const std::vector<std::string>& patchNames);
     ForceResult forceForPatches(scalar rhoRef, scalar pRef, const vector& CofR);
+    // Re-evaluate the active nut wall treatment from the completed device state. The momentum predictor's
+    // nutBndAll_ is intentionally not used here: it is the boundary state captured while assembling momentum.
+    std::vector<scalar> nutBoundaryAtSample();
 
     // --- Transient (PIMPLE) interface -- reuses the three composable phases above under an outer/inner-corrector loop,
     // with the implicit fvm::ddt(U) folded into solveMomentumPredictor. setDdtScheme() switches this solver from steady
@@ -399,6 +402,12 @@ public:
     std::vector<scalar> nutBoundary() const
     {
         return nutBndAll_.size() ? nutBndAll_.host() : std::vector<scalar>();
+    }
+    // Near-wall distance in the same flat, non-coupled boundary-face order as UBoundary()/nutBoundary().
+    // This is the geometric nearWallDist used by the active wall functions, not 1/deltaCoeffs at the face.
+    std::vector<scalar> boundaryWallDistance() const
+    {
+        return bndY_.size() ? bndY_.host() : std::vector<scalar>();
     }
     // Generic: evaluate any cell field on its own boundary descriptor.
     std::vector<scalar> boundaryOf(const DeviceBoundary& db, const DeviceBuffer<scalar>& f) const
@@ -736,6 +745,7 @@ private:
     DeviceBuffer<scalar> dnutBndWall_;                                          // persistent Spalding wall-nut (SA warm seed)
     DeviceForceSelection forceSelection_;                                       // configured patches, uploaded once
     DeviceBuffer<scalar> forceNutBnd_;                                          // persistent wall-nut workspace for force reductions
+    void evaluateNutBoundaryAtSample(DeviceBuffer<scalar>& nutBnd);             // shared by forceCoeffs and yPlus
     std::vector<vector> forceBoundaryCf_;                                        // flattened non-coupled boundary centres
     DeviceBuffer<scalar> nuConst_, zeroSrc_, zeroBndU_, ones_;
 

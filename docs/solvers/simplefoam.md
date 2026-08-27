@@ -42,8 +42,9 @@ Legend: ✓ supported & validated · ✗ not yet.
 | **k-omega SST-LM** (Langtry-Menter transition) | transitional airfoil; transition captured |
 | plain k-omega, RNG k-epsilon, LaunderSharma, RSM, LES | ✗ not yet |
 
-Model coefficients are read from `turbulenceProperties` (defaults match OpenFOAM exactly). Wall functions:
-`nutkWallFunction`, `nutUSpaldingWallFunction`, and the standard k/epsilon/omega wall functions.
+Model coefficients are read from `turbulenceProperties` (defaults match OpenFOAM exactly). Wall functions include
+`nutkWallFunction`, `nutUSpaldingWallFunction`, and the standard k/epsilon/omega wall functions. Solver-owned
+`yPlus` additionally implements the documented `nutUWallFunction` and `nutUBlendedWallFunction` paths.
 
 For incompressible RAS dictionaries, brae accepts both the older `RASModel kOmegaSST;` spelling and the OpenFOAM
 v2406 `model kOmegaSST;` spelling inside `RAS { ... }`. If both keys are present, their values must match; a
@@ -69,6 +70,94 @@ The standard incompressible set: `fixedValue`, `zeroGradient`, `noSlip`, `slip`,
 The vector-limited `limitedLinearV` falls back to its scalar form; `leastSquares` gradient and `cellLimited`-corrected
 combinations are not yet available.
 
+## Solver-owned yPlus
+
+`yPlus` is implemented only by `simpleFoam` for incompressible RAS `kOmegaSST`. It is not a generic OpenFOAM
+function-object lifecycle: Brae computes it after a completed SIMPLE iteration, when device U, k, wall nut and
+near-wall distance are mutually consistent, and emits it on the configured supported cadence. `pimpleFoam` yPlus is
+not implemented.
+
+The recognized dictionary is, for example:
+
+```text
+yPlus
+{
+    type yPlus;
+    libs ("libfieldFunctionObjects.so");  // recognized metadata; no OpenFOAM library is loaded
+    executeControl timeStep;
+    executeInterval 1;
+    writeControl writeTime;
+}
+```
+
+Supported `executeControl` values are `timeStep` and `writeTime`; supported `writeControl` values are `timeStep`,
+`writeTime` and `none`. Intervals must be positive integer iteration intervals. Unsupported controls are refused
+explicitly. Brae samples only when both the execute and write schedules are due: for example,
+`executeControl timeStep; executeInterval 2; writeControl timeStep; writeInterval 3;` samples at iterations 6,
+12, ... rather than at 3, 6, 9. This conjunction is the declared solver-owned cadence and is not an
+OpenFOAM-identical lifecycle. A final completed iteration is emitted for a `writeTime` object even when it is the
+iteration limit or the residual-control convergence iteration. `writeFields true` is accepted with a notice, but
+Brae writes no OpenFOAM `yPlus` volScalarField. No yPlus object means no Brae yPlus directory.
+
+Only geometric patches whose `polyMesh/boundary` type is `wall` are reported. Empty, processor, cyclic, inlet,
+outlet, symmetry and slip patches are excluded. `lowerWall` is reported in full; there is no implicit ground ROI.
+The active `nut` wall boundary configuration is resolved with the same exact/group/regex precedence as a field
+boundary. The currently supported paths are:
+
+1. An ordinary wall patch (no `nutWallFunction`-derived nut BC):
+   `yPlus = y * sqrt(nuEff * |snGrad(U)|) / nu`.
+2. `nutkWallFunction`: let
+   `yPlusInertial = Cmu^0.25 * y * sqrt(k_cell) / nu`. If it is below `yPlusLam`, use
+   `y * sqrt(nuEff * |snGrad(U)|) / nu`; otherwise use `yPlusInertial`.
+3. `nutUSpaldingWallFunction`: solve the OpenFOAM Spalding Newton iteration for `uTau`, seeded with the wall nut,
+   then use `yPlus = y*uTau/nu`.
+4. `nutUWallFunction`: perform OpenFOAM's ten-step log-law fixed-point iteration; below `yPlusLam`, use the same
+   viscous `nuEff`/`snGrad(U)` branch.
+5. `nutUBlendedWallFunction`: use the tangential `|U_cell-U_wall|`, combine the viscous and log-law friction
+   velocities with the configured binomial exponent `n` (default 4), under-relax for up to ten iterations, and use
+   `yPlus = y*uTau/nu`.
+
+In these expressions `nu` is molecular kinematic viscosity, `nuEff = nu + nut_wall`, `y` is the
+`nearWallDist` distance used by the turbulence model, and `snGrad(U)` is the wall-normal velocity gradient
+(`deltaCoeff*(U_wall-U_cell)`). `k_cell` is the adjacent cell k. Wall-function defaults are the OpenFOAM
+`wallFunctionCoefficients` defaults (`Cmu=0.09`, `kappa=0.41`, `E=9.8`, and path-specific iteration controls);
+they are boundary-condition coefficients, not the SST `betaStar`. Brae refuses rough, low-Re, tabulated and
+atmospheric nut paths rather than substituting one of these smooth-wall formulas.
+
+The formula provenance is OpenCFD OpenFOAM v2406/v2412 source: `functionObjects::yPlus`, the turbulence-model
+`yPlus()` methods, `nutkWallFunction`, `nutUSpaldingWallFunction`, `nutUWallFunction`,
+`nutUBlendedWallFunction`, `nearWallDist`, and `wallFunctionCoefficients`. The implementation is in
+`src/functionObjects/brae_yplus.cuh`, and the retained no-solve comparison is
+`tests/test_yplus_retained.cu`.
+
+### yPlus evidence files
+
+Brae never reads or overwrites an existing OpenFOAM `yPlus` field. Each configured object gets the collision-safe,
+Brae-owned namespace:
+
+```text
+postProcessing/braeYPlus/<object>/<start-time>/
+    faceValues.dat
+    patchSummary.dat
+    metadata.dat
+```
+
+`faceValues.dat` has the documented columns
+`solver_time iteration patch patch_local_face global_face face_area near_wall_distance yPlus`.
+`patchSummary.dat` has
+`solver_time iteration patch face_count total_area area_weighted_mean_yPlus minimum maximum percent_area_yPlus_30_300`.
+Both files use deterministic lexical patch ordering, patch-local face ordering, and scientific precision 17.
+`metadata.dat` records the solver/model, molecular viscosity, formula path, cadence, the explicit
+`openfoam_yPlus_field_read=false` provenance marker, stopping reason, completed iteration and sample count.
+
+The retained v2406/v2412 comparison predeclares `abs(yPlus_Brae-yPlus_OpenFOAM) <= 1e-5` and maximum relative
+difference `<= 5e-7`, with `|yPlus_OpenFOAM| <= 1e-12` excluded from the relative denominator. Those limits are set
+from the retained fields' `writePrecision 8` before the final differences are inspected.
+
+The namespace is append-only within one run and an existing object/start-time directory is a hard collision: Brae
+fails before truncating it. Retained OpenFOAM `2000/yPlus.gz` and
+`postProcessing/yPlus/0/yPlus.dat` remain separate evidence and are byte-preserved.
+
 ## Physics & function objects
 
 | feature | status |
@@ -77,8 +166,10 @@ combinations are not yet available.
 | cyclic / cyclicAMI interfaces (incl. turbulence transport across) | ✓ |
 | Porosity (Darcy-Forchheimer) | ✓ |
 | `fvOptions` (rotorDiskSource, meanVelocityForce, velocityDamping, ...) | ✓ (subset) |
-| `forces` / `forceCoeffs` (Cd, Cl, Cm) | ✓ validated (airfoil Cl within ~1% of OF) |
-| yPlus, wallShearStress, Q, vorticity, mag(U) writers | ✓ |
+| `forces` (Cd, Cl, Cm) | ✓ validated (airfoil Cl within ~1% of OF) |
+| `forceCoeffs` | ✓ solver-owned history; sampled after each completed SIMPLE iteration |
+| `yPlus` | ✓ only for simpleFoam + incompressible RAS `kOmegaSST`, with the paths below |
+| wallShearStress, Q, vorticity, mag(U) writers | ✗ |
 | general `fvOptions` framework, arbitrary function objects | ✗ (subset only) |
 
 ## Mesh & I/O

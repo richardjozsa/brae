@@ -32,6 +32,7 @@
 #include "force_history.cuh"
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
 #include "brae_time.cuh"
+#include "brae_yplus.cuh"
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 
 #include <algorithm>
@@ -187,17 +188,11 @@ int main(int argc, char** argv)
         audit.add(turbProps,   "constant/turbulenceProperties");
         audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
 
-        // Account for controlDict.functions at STARTUP, not after the run: a case that refuses on an
-        // unsupported model, or that never reaches the solver loop, must still be told which functionObjects
-        // it will not honour. simpleFoam forceCoeffs is applied by the driver immediately after each completed
-        // device SIMPLE step, outside Time's pre-step functionObject lifecycle.
-
-
         // startFrom is resolved by Time, as OF does in Time::setControls() (Time.C:149-188). This
         // driver carried its own copy of that scan; measured identical to the shared one on an
         // adversarial directory (numeric dir without U, non-integer time, 0.orig) before removing it.
-        Time time(caseDir, controlDict);   // startFrom resolves here; functionObjects are read below
-        std::string startStr = time.startName();
+        const std::string startStr = resolveStartTime(
+            caseDir, controlDict.wordOr("startFrom", "startTime"), controlDict.wordOr("startTime", "0"));
         // OF `restore0Dir` convention (NOT a solver fallback): tutorials needing a mesh-prep step (snappyHexMesh /
         // setFields / changeDictionary, e.g. motorBike) ship the flow fields in <startTime>.orig, because
         // snappyHexMesh writes mesh-level fields (cellLevel/pointLevel/...) INTO <startTime>. OpenFOAM's Allrun copies
@@ -263,7 +258,15 @@ int main(int argc, char** argv)
                 scalarTransports.push_back(fo.get());
                 return fo;
             });
-        time.readFunctionObjects(controlDict, foTypes, {}, {"forceCoeffs"});
+        // forceCoeffs and yPlus are solver-owned. They are read exactly once, after start-time resolution, so
+        // their positive status cannot be preceded by the generic list's contradictory "ignored" status. Their
+        // execution points are deliberately explicit below: after a completed SIMPLE iteration, outside the
+        // generic OpenFOAM functionObject lifecycle. This is not OpenFOAM-identical lifecycle behaviour.
+        const std::vector<FunctionObjectList::OutsideNotice> solverOwnedFunctionObjects = {
+            {"forceCoeffs", "type 'forceCoeffs' is solver-owned by simpleFoam and is sampled per completed SIMPLE iteration, outside the generic functionObject lifecycle; its lifecycle is not OpenFOAM-identical."},
+            {"yPlus", "type 'yPlus' is solver-owned by simpleFoam and is computed after a completed SIMPLE iteration on its configured cadence, outside the generic functionObject lifecycle; its lifecycle is not OpenFOAM-identical."}
+        };
+        Time time(caseDir, controlDict, foTypes, {}, {"forceCoeffs", "yPlus"}, solverOwnedFunctionObjects);
         const int   endTime   = controlDict.intOr("endTime", 1000);
         // Steady simpleFoam's endTime is an INTEGER iteration count. A fractional endTime (e.g. 0.3, copy-pasted from
         // a transient case) truncates to 0 -> the loop runs 0 iterations and would write the initial field as "the
@@ -415,6 +418,63 @@ int main(int argc, char** argv)
         const ForceCoeffsConfig forceConfig = hasForceCoeffs
             ? readForceCoeffsConfig(forceName, *forceDict) : ForceCoeffsConfig{};
 
+        const FoamDict* yPlusDict = nullptr;
+        std::string yPlusName;
+        if (const FoamDict* funcs = controlDict.subDict("functions"))
+            for (const auto& s : funcs->subs)
+                if (s.second.wordOr("type", "") == "yPlus")
+                {
+                    if (yPlusDict)
+                        throw std::runtime_error("simpleFoam supports one yPlus object; found '"
+                                                 + yPlusName + "' and '" + s.first + "'");
+                    yPlusDict = &s.second;
+                    yPlusName = s.first;
+                }
+        bool hasYPlus = yPlusDict != nullptr;
+        YPlusCadence yPlusCadence;
+        std::vector<YPlusPatchInput> yPlusPatchDefs;
+        if (hasYPlus)
+        {
+            try
+            {
+                if (!ctl.turbulent || !ctl.sst)
+                    throw std::runtime_error("support is limited to incompressible RAS kOmegaSST");
+                yPlusCadence = readYPlusCadence(yPlusName, *yPlusDict);
+                const FieldData<scalar> nutStartData = readField<scalar>(fieldDir + "/nut");
+                for (const FvPatch& patch : fvp)
+                {
+                    // OpenFOAM functionObjects::yPlus operates on wallFvPatch only. The geometric patch type is
+                    // authoritative, so empty/cyclic/processor, inlet/outlet, symmetry and slip patches never enter.
+                    if (patch.type != "wall") continue;
+                    if (patch.size <= 0)
+                        throw std::runtime_error("geometric wall patch '" + patch.name
+                            + "' is empty; refusing to write an incomplete wall report");
+                    const PatchFieldData<scalar>* wallData = findYPlusPatchData(nutStartData, patch);
+                    if (!wallData)
+                        throw std::runtime_error("no nut boundary configuration resolves to geometric wall patch '"
+                            + patch.name + "'");
+                    YPlusPatchInput out;
+                    out.name = patch.name;
+                    out.globalStart = patch.start;
+                    out.wall = readYPlusWallConfig(*wallData);
+                    yPlusPatchDefs.push_back(std::move(out));
+                }
+                if (yPlusPatchDefs.empty())
+                    throw std::runtime_error("no non-empty geometric wall patches were found");
+            }
+            catch (const std::exception& e)
+            {
+                hasYPlus = false;
+                yPlusPatchDefs.clear();
+                noticeIgnored("functions/" + yPlusName,
+                    "yPlus output refused: " + std::string(e.what())
+                    + "; simpleFoam continues without a Brae yPlus directory");
+            }
+            if (hasYPlus)
+                std::printf("  yPlus: %s (solver-owned, post-completed-SIMPLE-step; %zu geometric wall patch(es))\n",
+                            yPlusName.c_str(), yPlusPatchDefs.size());
+        }
+
         GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC);
         U.evaluateBoundary();
         const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
@@ -520,6 +580,20 @@ int main(int argc, char** argv)
             std::printf("brae -partition: mesh + AMG hierarchy cached to %s/constant/polyMesh/ (.brae_meshcache + .brae_amgcache).\n"
                         "  Run the solve normally; it will reload them warm.\n", caseDir.c_str());
             return 0;
+        }
+        std::unique_ptr<YPlusWriter> yPlusWriter;
+        if (hasYPlus)
+        {
+            std::string formula = "per geometric wall patch: ";
+            for (const auto& p : yPlusPatchDefs)
+            {
+                if (formula.back() != ' ') formula += "; ";
+                formula += p.name + "=" + yPlusWallPathName(p.wall.path);
+            }
+            yPlusWriter = std::make_unique<YPlusWriter>(caseDir, yPlusName, startStr, ctl.nu,
+                                                         "kOmegaSST", formula, yPlusCadence);
+            std::printf("  yPlus output: %s (faceValues.dat, patchSummary.dat, metadata.dat)\n",
+                        yPlusWriter->root().c_str());
         }
         if (mrfCfg.active) solver.setMRF(mrfZone, m, g, mrfCfg.nonRotatingPatches);
 
@@ -634,6 +708,65 @@ int main(int argc, char** argv)
             time.writeControl().recordWritten(caseDir, tname);
         };
 
+        // Build yPlus inputs only at a requested sample. This is the one deliberate host synchronisation for
+        // the observable: U/k remain device-resident between samples, while the active wall-nut treatment is
+        // re-evaluated from the completed device state. Do not use nutBoundary() here: nutBndAll_ is the value
+        // captured during momentum assembly and can be one turbulence correction behind current U and k. The flat
+        // boundary arrays use the exact non-coupled patch ordering built by DeviceSimpleSolver's descriptors.
+        std::size_t yPlusSnapshotBytes = 0;
+        auto collectYPlusSample = [&](int iteration, scalar timeValue) -> YPlusSample
+        {
+            const std::vector<vector> cellU = solver.U();
+            const std::vector<vector> boundaryU = solver.UBoundary();
+            const std::vector<scalar> cellK = solver.k();
+            const std::vector<scalar> boundaryNut = solver.nutBoundaryAtSample();
+            const std::vector<scalar> boundaryY = solver.boundaryWallDistance();
+            if (static_cast<label>(cellU.size()) != nC || static_cast<label>(cellK.size()) != nC)
+                throw std::runtime_error("yPlus: solver cell-field sizes do not match the mesh");
+            std::size_t expectedBoundary = 0;
+            for (const auto& patch : fvp)
+                if (!isCoupledInterfaceType(patch.type)) expectedBoundary += static_cast<std::size_t>(patch.size);
+            if (boundaryU.size() != expectedBoundary || boundaryNut.size() != expectedBoundary
+                || boundaryY.size() != expectedBoundary)
+                throw std::runtime_error("yPlus: solver boundary state is incomplete or has a patch-order mismatch");
+            yPlusSnapshotBytes = cellU.size() * sizeof(vector)
+                               + boundaryU.size() * sizeof(vector)
+                               + cellK.size() * sizeof(scalar)
+                               + boundaryNut.size() * sizeof(scalar)
+                               + boundaryY.size() * sizeof(scalar);
+
+            std::vector<YPlusPatchInput> patches = yPlusPatchDefs;
+            std::size_t flat = 0;
+            for (const auto& patch : fvp)
+            {
+                if (isCoupledInterfaceType(patch.type)) continue;
+                if (patch.type == "wall")
+                {
+                    auto it = std::find_if(patches.begin(), patches.end(), [&](const YPlusPatchInput& p)
+                    { return p.name == patch.name; });
+                    if (it == patches.end())
+                        throw std::runtime_error("yPlus: wall patch '" + patch.name + "' disappeared during sampling");
+                    it->faces.reserve(static_cast<std::size_t>(patch.size));
+                    for (label i = 0; i < patch.size; ++i)
+                    {
+                        const label c = patch.faceCells[static_cast<std::size_t>(i)];
+                        YPlusFaceInput f;
+                        f.area = patch.magSf[static_cast<std::size_t>(i)];
+                        f.y = boundaryY[flat + static_cast<std::size_t>(i)];
+                        f.deltaCoeff = patch.deltaCoeffs[static_cast<std::size_t>(i)];
+                        f.cellU = cellU[static_cast<std::size_t>(c)];
+                        f.wallU = boundaryU[flat + static_cast<std::size_t>(i)];
+                        f.normal = patch.nf[static_cast<std::size_t>(i)];
+                        f.k = cellK[static_cast<std::size_t>(c)];
+                        f.wallNut = boundaryNut[flat + static_cast<std::size_t>(i)];
+                        it->faces.push_back(f);
+                    }
+                }
+                flat += static_cast<std::size_t>(patch.size);
+            }
+            return evaluateYPlus(timeValue, iteration, std::move(patches), ctl.nu);
+        };
+
         // endTime is ABSOLUTE, not a run length. OF's Time::run() tests `value() < endTime - 0.5*deltaT`,
         // so a case restarted at 10 with endTime 20 runs TEN more steps and finishes at 20. Looping
         // `iter <= endTime` from 1 ran TWENTY and finished at 30 -- silently changing the iteration
@@ -665,6 +798,7 @@ int main(int argc, char** argv)
             {
                 stoppingReason = "numerical_failure";
                 if (forceHistory) forceHistory->finish(stoppingReason, iter - 1);
+                if (yPlusWriter) yPlusWriter->finish(stoppingReason, iter - 1);
                 throw;
             }
             // solver.step() returns only after momentum, every pressure/velocity correction, turbulence, and
@@ -758,7 +892,48 @@ int main(int argc, char** argv)
                 achieved = residualControl.ok(e.perf.initialResidual, e.field) && achieved;
             converged = residualControl.converged(achieved);
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
-            if (!converged && iter != nSteps && time.writeControl().isWriteTime(iter, tval))
+            const bool globalWrite = time.writeControl().isWriteTime(iter, tval);
+            if (yPlusWriter)
+            {
+                const bool finalCompleted = converged || iter == nSteps;
+                // A final completed state is the solver-owned equivalent of OpenFOAM's writeAndEnd. A
+                // writeTime object must receive that final sample even when its execute cadence did not
+                // happen to coincide with the final iteration; writeControl none remains none. For an
+                // explicit timeStep write cadence, the interval remains authoritative, including at end.
+                const bool finalWrite = finalCompleted && yPlusCadence.writeControl == "writeTime";
+                if ((yPlusCadence.sampleDue(iter, globalWrite) || finalWrite)
+                    && yPlusCadence.writeControl != "none")
+                {
+                    try
+                    {
+                        const auto yPlusBegin = std::chrono::high_resolution_clock::now();
+                        // Test-only fault injection verifies that an observable failure cannot be recorded as
+                        // solver divergence. It is inert unless a focused test explicitly sets this variable.
+                        if (std::getenv("BRAE_TEST_FAIL_YPLUS_SAMPLE"))
+                            throw std::runtime_error("test-injected yPlus evaluation failure");
+                        const YPlusSample sample = collectYPlusSample(iter, tval);
+                        // This is the transient host snapshot required by one sample: returned U/k/nut/y
+                        // values, excluding allocator overhead and the resulting face/summary rows.
+                        yPlusWriter->sample(sample);
+                        const double yPlusSeconds = std::chrono::duration<double>(
+                            std::chrono::high_resolution_clock::now() - yPlusBegin).count();
+                        std::printf("  yPlus sample iteration %d: wall=%.6f s host_snapshot_bytes=%zu faces=%zu\n",
+                                    iter, yPlusSeconds, yPlusSnapshotBytes, sample.faces.size());
+                    }
+                    catch (const std::exception& e)
+                    {
+                        // An observable failure is not evidence that SIMPLE diverged. Finalize only the
+                        // yPlus artifact with its own reason, disable later samples, and let the solver's
+                        // stopping reason continue to be decided by SIMPLE/residual control below.
+                        yPlusWriter->finish("yplus_output_failure", iter);
+                        noticeIgnored("functions/" + yPlusName,
+                            "sample at completed iteration " + std::to_string(iter) + " failed: " + e.what()
+                            + "; yPlus output is disabled, but simpleFoam solver and force history continue");
+                        yPlusWriter.reset();
+                    }
+                }
+            }
+            if (!converged && iter != nSteps && globalWrite)
             {
                 writeTimeDir(WriteControl::timeName(tval));
                 time.write();   // OF splits write() from execute(); this driver owns its own cadence
@@ -769,6 +944,7 @@ int main(int argc, char** argv)
         const int nIter = time.timeIndex();
         if (stoppingReason.empty()) stoppingReason = converged ? "converged" : "iteration_limit";
         if (forceHistory) forceHistory->finish(stoppingReason, nIter);
+        if (yPlusWriter) yPlusWriter->finish(stoppingReason, nIter);
         time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                               : "SIMPLE reached endTime (%d iterations)\n", nIter);
